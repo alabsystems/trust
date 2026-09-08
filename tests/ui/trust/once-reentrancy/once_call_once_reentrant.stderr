@@ -1,0 +1,42 @@
+error: the initializer of `O` can wait on `O` itself: a `std::sync::Once` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/once_call_once_reentrant.rs:17:11
+   |
+LL |       O.call_once(|| {
+   |  _______-
+LL | |         O.call_once(|| ());
+   | |           ^^^^^^^^^^^^^^^^ the initializer of `O` reaches this call, which waits on `O` again
+LL | |
+LL | |     })
+   | |______- this call starts the initializer of `O`
+   |
+   = note: call path: `init_o::{closure#0}` -> `O.call_once(..)`
+   = help: compute the value inside the initializer without waiting on `O` in it — read the input it needs directly instead of asking `O` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `O.call_once(|| use(v))`
+   = help: or, if the initializer can legitimately observe an uninitialized `O`, read `O.is_completed()` there — it never waits
+note: `O` is declared here
+  --> $DIR/once_call_once_reentrant.rs:13:1
+   |
+LL | static O: Once = Once::new();
+   | ^^^^^^^^^^^^^^
+
+error: the initializer of `P` can wait on `P` itself: a `std::sync::Once` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/once_call_once_reentrant.rs:29:7
+   |
+LL |     P.call_once(body_p)
+   |       ----------------- this call starts the initializer of `P`
+...
+LL |     P.call_once(|| ());
+   |       ^^^^^^^^^^^^^^^^ the initializer of `P` reaches this call, which waits on `P` again
+   |
+   = note: call path: `body_p` -> `P.call_once(..)`
+   = help: compute the value inside the initializer without waiting on `P` in it — read the input it needs directly instead of asking `P` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `P.call_once(|| use(v))`
+   = help: or, if the initializer can legitimately observe an uninitialized `P`, read `P.is_completed()` there — it never waits
+note: `P` is declared here
+  --> $DIR/once_call_once_reentrant.rs:22:1
+   |
+LL | static P: Once = Once::new();
+   | ^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

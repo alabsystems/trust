@@ -3308,9 +3308,7 @@ fn sem_operand_of_mir_recognizes_deref_self_and_declines_others() {
     let mut_ref = || Ty::Ref { mutable: true, inner: Box::new(u8t()) };
     let struct_ref = || Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
             name: "S".into(),
             fields: vec![("0".into(), u8t())],
             variants: vec![],
@@ -8302,9 +8300,7 @@ fn field_read_cast_leaf_func(
     let u32t = || Ty::Int { width: 32, signed: false };
     let self_ty = Ty::Ref {
         mutable: self_mutable,
-        inner: Box::new(Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
             name: "test::S".into(),
             fields: vec![("0".into(), u32t())],
             variants: vec![],
@@ -10063,6 +10059,7 @@ fn transparent_unwrap_multihop_field_return_certifies() {
         faithful_enum_repr: None,
         layout: None,
         enum_layout: None,
+        arbitrary_precision: None,
         adt_kind: Some(trust_types::AdtKind::Struct),
     };
     let chain = |variant: &str| -> Ty {
@@ -10245,11 +10242,9 @@ fn stable_callee_ids_are_membership_independent() {
     let (_, _, id_grown) = resolve(&grown, "z::target").expect("resolves");
     assert_eq!(id_small, id_grown, "the id must be membership-independent");
     assert!(id_small >= (1 << 63), "the id space is disjoint from the synthetic 0..7 range");
-    // CROSS-PATH agreement: the ::-suffix path and the compose lane's
-    // exact-only resolver must mint the SAME id for the same key — a
-    // single-path revert to positional ids fails here.
-    let (_, _, id_suffix) = resolve(&grown, "target").expect("resolves via unique suffix");
-    assert_eq!(id_small, id_suffix, "suffix path must agree with the exact path");
+    // Trust: EXACT-ONLY (2026-08-30) — the `::`-suffix tier is deleted; a
+    // bare-name lookup now fails closed even when unique.
+    assert!(resolve(&grown, "target").is_none(), "no suffix tier: exact-miss fails closed");
     let (_, _, id_exact) = super::adt_compose::resolve_certified_callee_exact(&grown, "z::target")
         .expect("resolves on the compose lane");
     assert_eq!(id_small, id_exact, "the compose lane's resolver must mint the same id");
@@ -10684,9 +10679,7 @@ fn either_is_left_shaped_func() -> trust_types::VerifiableFunction {
     };
     let either_ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
             name: "Either".to_string(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -10833,9 +10826,7 @@ fn discriminant_base_accepts_only_validated_enum_representations() {
         *inner = Box::new(ty);
     };
     let tag = || ("__tag".into(), Ty::Int { width: 64, signed: true });
-    let legacy = |fields| Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let legacy = |fields| Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
         name: "MaybeEnum".into(),
         fields,
         variants: vec![],
@@ -11003,9 +10994,7 @@ fn bound_matches_shaped_func(k: u128, tag_true: bool) -> trust_types::Verifiable
         Ty, VariantDef, VerifiableBody, VerifiableFunction,
     };
     let i32t = Ty::Int { width: 32, signed: true };
-    let bound_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let bound_ty = Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
         name: "std::ops::Bound".to_string(),
         fields: vec![
             ("__tag".to_string(), Ty::Int { width: 64, signed: true }),
@@ -11268,9 +11257,7 @@ fn capped_count_shaped_func() -> trust_types::VerifiableFunction {
     let u64t = Ty::Int { width: 64, signed: false };
     let ref_to = |name: &str, field_ty: Ty| Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
             name: name.to_string(),
             fields: vec![("padding".into(), Ty::Unit), ("value".into(), field_ty)],
             variants: vec![],
@@ -11661,9 +11648,7 @@ fn either_is_right_shaped_func() -> trust_types::VerifiableFunction {
     };
     let either_ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
             name: "Either".to_string(),
             fields: vec![
                 ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -17565,16 +17550,27 @@ fn call_return_recognizer_fails_closed_on_ambiguous_suffix() {
         None,
         "an ambiguous callee resolution MUST fail closed"
     );
-    // A UNIQUE suffix match, by contrast, resolves (the call-graph lane's
-    // resolution discipline, mirrored).
+    // Trust: EXACT-ONLY (2026-08-30) — the `::`-suffix tier is DELETED after a
+    // proven false verify (a caller bound to a path COUSIN's model; see
+    // `efht_d_adv2_suffix_resolution_must_not_borrow_a_path_cousins_model`).
+    // A UNIQUE suffix match now also fails closed: exact-miss means "not
+    // certified", never "less qualified".
     let mut u = std::collections::BTreeMap::new();
-    u.insert("a::helper".to_string(), helper_fact);
-    let cert = function_adequacy_witness_with_callees(&caller, &u)
-        .expect("a unique suffix resolution admits the shape");
+    u.insert("a::helper".to_string(), helper_fact.clone());
+    assert_eq!(
+        function_adequacy_witness_with_callees(&caller, &u),
+        None,
+        "a unique `::`-suffix match must fail closed — exact def-path only"
+    );
+    // The EXACT key, by contrast, admits and names itself.
+    let mut e = std::collections::BTreeMap::new();
+    e.insert("helper".to_string(), helper_fact);
+    let cert = function_adequacy_witness_with_callees(&caller, &e)
+        .expect("the exact def-path admits the shape");
     let ReturnCertificate::Call(call_cert) = &cert.ret else {
         panic!("expected the CALL return certificate");
     };
-    assert_eq!(call_cert.call.callee, "a::helper");
+    assert_eq!(call_cert.call.callee, "helper");
 }
 
 #[test]
@@ -20873,9 +20869,7 @@ fn call_arg_opaque_enum_is_narrow_and_reassignment_safe() {
     for bad_ty in [
         Ty::adt("S", vec![("value".into(), Ty::Bool)]),
         Ty::Unsupported { kind: "opaque".into(), detail: "not an enum".into() },
-        Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        Ty::Adt { arbitrary_precision: None,  adt_kind: None, layout: None,
             name: "Fake".into(),
             fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })],
             variants: vec![],
@@ -25402,6 +25396,7 @@ fn ref_self_probe_enum_ty() -> trust_types::Ty {
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
+        arbitrary_precision: None,
     }
 }
 
@@ -25421,6 +25416,7 @@ fn ref_self_probe_option_ty() -> trust_types::Ty {
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
+        arbitrary_precision: None,
     }
 }
 
@@ -25675,6 +25671,7 @@ fn nested_probe_option_ty() -> trust_types::Ty {
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
+        arbitrary_precision: None,
     }
 }
 
@@ -25880,6 +25877,7 @@ fn nested_ctor_arm_payload_declines_an_opaque_param_field() {
         disc_index_safe: true,
         faithful_enum_repr: None,
         enum_layout: None,
+        arbitrary_precision: None,
     };
     f.body.locals[1] = LocalDecl { index: 1, name: Some("a".into()), ty: opaque.clone() };
     let inner = Ty::adt(

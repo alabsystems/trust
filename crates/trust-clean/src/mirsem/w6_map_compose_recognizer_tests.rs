@@ -324,12 +324,14 @@ fn exact_resolver_declines_where_suffix_resolver_matches() {
     let func = load_dump(MAP_NONCAP);
     let mut callees = BTreeMap::new();
     callees.insert("inner::map_add1::{closure#0}".to_string(), closure_fact(&func));
-    // The production resolver ADMITS the unique suffix (the unsound behavior).
+    // Trust: 2026-08-30 — the contrast this pin recorded is CLOSED: the
+    // production resolver's `::`-suffix tier is deleted (proven false verify,
+    // `efht_d_adv2_*`), so BOTH resolvers now decline the suffix-only match.
     assert!(
-        resolve_certified_callee(&callees, "map_add1::{closure#0}").is_some(),
-        "the production resolver admits the unique `::`-suffix"
+        resolve_certified_callee(&callees, "map_add1::{closure#0}").is_none(),
+        "the production resolver no longer has a `::`-suffix tier"
     );
-    // The closure-lane EXACT resolver DECLINES it.
+    // The closure-lane EXACT resolver declines it, as it always did.
     assert!(
         resolve_certified_callee_exact(&callees, "map_add1::{closure#0}").is_none(),
         "the EXACT-only resolver must reject a suffix-only match"

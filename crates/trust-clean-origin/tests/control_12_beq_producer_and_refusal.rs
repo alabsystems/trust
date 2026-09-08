@@ -515,6 +515,17 @@ fn half_6_the_e6_import_vocabulary_did_not_move() {
             AdmissibleBody::Composed { .. } => "composed",
             AdmissibleBody::Select { .. } => "select",
             AdmissibleBody::SelectLiteral { .. } => "select-literal",
+            // The E6 per-field/checked-arith series (merged from the
+            // wip-recovery line): each named here so the vocabulary stays
+            // pinned BY TYPE with no wildcard, exactly as this test demands.
+            AdmissibleBody::ConstantInt { .. } => "constant-int",
+            AdmissibleBody::FieldProjection { .. } => "field-projection",
+            AdmissibleBody::ComparisonBool { .. } => "comparison-bool",
+            AdmissibleBody::BoolBinary { .. } => "bool-binary",
+            AdmissibleBody::CheckedArithmetic { .. } => "checked-arithmetic",
+            AdmissibleBody::GuardedNarrow { .. } => "guarded-narrow",
+            AdmissibleBody::WidenedEq { .. } => "widened-eq",
+            AdmissibleBody::AggregateFields { .. } => "aggregate-fields",
         }
     }
     let sample = AdmissibleBody::Projection { param: 0 };

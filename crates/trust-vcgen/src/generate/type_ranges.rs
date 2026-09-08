@@ -78,7 +78,7 @@ pub(super) fn checked_arith_result_value_vars(func: &VerifiableFunction) -> FxHa
                 continue;
             }
             if let Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p))) =
-                crate::unique_whole_local_def(func, decl.index)
+                crate::local_defs::unique_value_def(func, decl.index)
                 && set.contains(&place_to_var_name(func, p))
             {
                 set.insert(name);
@@ -268,6 +268,68 @@ pub(super) fn datatype_field_range_map(
 /// `None` (no bound — conservative) for anything it cannot type as a supported
 /// scalar. SOUNDNESS: read-only type resolution; it never changes a VC, only
 /// decides whether a sound range fact is attachable to the field's var.
+///
+/// The same variant-aware walk is required for a REAL Rust enum (`Ty::Adt`), and
+/// for the same reason `project_ty` cannot supply it: `Ty::Adt::fields` is the
+/// FLAT union/struct view an enum carries for the `SetDiscriminant` lowering —
+/// `[("__tag", i64), ("__v0_0", …), ("__v1_0", …)]` — so `project_ty` answers a
+/// variant-relative `Field(i)` with the flat slot `i`, which for every
+/// `Downcast(v).Field(0)` is `__tag: i64`. That is not a missing bound but a
+/// WRONG one, and it is wrong in BOTH directions:
+///
+///   * a payload NARROWER than `i64` (`u8`/`u16`/`u32`) gets only the useless
+///     `i64` range, so a safe obligation whose safety comes from the payload's
+///     own declared width is FALSE-REFUTED;
+///   * a payload WIDER in the unsigned direction (`u64`, `u128`, `i128`) gets a
+///     range that EXCLUDES its real values, deleting the genuine counterexample
+///     — a FALSE PROOF (`enum_payload_range_tests` pins both directions).
+///
+/// The variant field type read here is the one the ADT declares, so the emitted
+/// range is exactly the `u8 -> [0,255]` authority class `type_ranges` already
+/// uses for locals and parameters — no new axiom.
+///
+/// An enum carries the declared payload type in TWO places, and this walk reads
+/// the one the REST of the pipeline reads. `crate::place_ty_cow` — the resolver
+/// every other lane types this same place with — answers a `Downcast(v).Field(i)`
+/// on a `Ty::Adt` from the FLAT view's `__v{v}_*` slots and never consults
+/// `variants` at all. The SMT var this range fact is attached to is the one
+/// `place_to_var_name` mints for that place, and everything else said about that
+/// var is derived from `place_ty`'s answer; a bound taken from a DIFFERENT
+/// declaration of the same field would be a bound about a different type. So
+/// [`enum_variant_field_ty`] resolves the flat `__v{v}_*` slots FIRST, exactly as
+/// `place_ty_cow` does, and only falls back to the P4 `variants` list for shapes
+/// that declare variants without the synthetic flat names.
+///
+/// FAIL-CLOSED on a bare `Field` over a `Ty::Adt` enum, and deliberately NOT
+/// resolved through variant 0 the way the `Ty::Datatype` arm does. Without a
+/// `Downcast` there is no variant to read a declared type FROM: the flat step's
+/// answer for `Field(0)` is the synthetic `__tag`, the wrong bound this walk
+/// exists to stop emitting, and resolving it through variant 0 instead would
+/// bound a slot that is not variant 0's payload by variant 0's declared type.
+/// The var name carries the downcast (`e@0.0` vs `e.0`), so declining the
+/// un-downcast spelling withholds a bound from a DIFFERENT var than the payload
+/// reads use, and costs them nothing
+/// (`bare_field_on_multivariant_adt_enum_is_unbounded`).
+///
+/// NO BOUND BEATS A WRONG BOUND — and the enum decision may NOT be keyed on
+/// `Ty::Adt::variants` being non-empty. That field is `#[serde(default)]` on
+/// purpose (`trust_types::Ty::Adt`), so EVERY pre-P4 serialized `Ty::Adt` — dump
+/// fixtures, solver caches, proof certificates — deserializes with
+/// `variants: []` while KEEPING the enum-shaped flat view. Gating the
+/// variant-aware walk on `!variants.is_empty()` would send exactly those inputs
+/// back down the flat step and answer `Downcast(v).Field(0)` with `__tag: i64`
+/// again — the false-proof direction, measured (see
+/// `variants_erased_by_serde_default_answers_the_payload_slot_not_the_tag`).
+/// So the walk decides ENUM-NESS from what is PRESENT — a pending `Downcast`,
+/// the declared `variants`, the `adt_kind` stamp, or the synthetic flat-view
+/// field names — and DECLINES (returns `None`, emitting no range fact) whenever
+/// the shape is enum-relative and NEITHER declaration of the payload's type can
+/// answer it. See [`adt_shape_is_enum`] and [`enum_variant_field_ty`].
+///
+/// Declining is the last resort, not the first: the pre-P4 wire shape still
+/// carries the payload's declared type in its `__v{v}_*` slots, so on that shape
+/// the walk answers with the DECLARED type rather than dropping the fact. It
+/// drops the fact only where no declaration of that field survives at all.
 pub(super) fn resolve_field_scalar_range(
     func: &VerifiableFunction,
     place: &Place,
@@ -283,22 +345,61 @@ pub(super) fn resolve_field_scalar_range(
                 pending_variant = Some(*v);
             }
             trust_types::Projection::Field(idx) => {
-                if let Ty::Datatype { variants, .. } = ty.as_ref() {
-                    // A `Field` after a `Downcast(v)` selects variant v's i-th
-                    // field; a bare `Field` on a single-variant (struct-like)
-                    // datatype selects variant 0's i-th field. A multi-variant
-                    // datatype with no preceding downcast is ambiguous — fail
-                    // closed (no bound).
-                    let v = match pending_variant.take() {
-                        Some(v) => v,
-                        None if variants.len() == 1 => 0,
-                        None => return None,
-                    };
-                    let field_ty = variants.get(v)?.1.get(*idx)?.1.clone();
-                    ty = Cow::Owned(field_ty);
-                } else {
-                    pending_variant = None;
-                    ty = crate::step_place_ty_cow(ty, proj)?;
+                // Decide the step from the type ALONE first: the flat arm MOVES
+                // `ty`, which cannot happen while `ty.as_ref()` is borrowed.
+                let step = match ty.as_ref() {
+                    Ty::Datatype { variants, .. } => {
+                        // A `Field` after a `Downcast(v)` selects variant v's
+                        // i-th field; a bare `Field` on a single-variant
+                        // (struct-like) datatype selects variant 0's i-th
+                        // field. A multi-variant datatype with no preceding
+                        // downcast is ambiguous — fail closed (no bound).
+                        let v = match pending_variant {
+                            Some(v) => Some(v),
+                            None if variants.len() == 1 => Some(0),
+                            None => None,
+                        };
+                        match v.and_then(|v| variants.get(v)).and_then(|(_, f)| f.get(*idx)) {
+                            Some((_, field_ty)) => FieldStep::Variant(field_ty.clone()),
+                            None => FieldStep::Decline,
+                        }
+                    }
+                    Ty::Adt { variants, fields, adt_kind, .. } => {
+                        if pending_variant.is_some()
+                            || adt_shape_is_enum(variants, fields, adt_kind)
+                        {
+                            // Enum-relative: ONLY a DECLARED per-variant field
+                            // type may answer it. A bare `Field` (no `Downcast`)
+                            // names the flat aggregate slot every variant's
+                            // payload is written to, so no variant's declared
+                            // type bounds it — decline. With a `Downcast(v)`,
+                            // `enum_variant_field_ty` answers from whichever
+                            // declaration this value still carries.
+                            match pending_variant
+                                .and_then(|v| enum_variant_field_ty(variants, fields, v, *idx))
+                            {
+                                Some(field_ty) => FieldStep::Variant(field_ty),
+                                None => FieldStep::Decline,
+                            }
+                        } else {
+                            // A struct/union `Ty::Adt`: the flat view IS the
+                            // field list, so `project_ty`'s step is correct.
+                            FieldStep::Flat
+                        }
+                    }
+                    // Tuples/closures/arrays have no variants, so a pending
+                    // `Downcast` means the place is variant-relative against a
+                    // type that cannot express variants (a coroutine frame's
+                    // state field, a corrupted place). `project_ty` would answer
+                    // with slot `idx` of the un-downcast view — a DIFFERENT slot.
+                    _ if pending_variant.is_some() => FieldStep::Decline,
+                    _ => FieldStep::Flat,
+                };
+                pending_variant = None;
+                match step {
+                    FieldStep::Decline => return None,
+                    FieldStep::Variant(field_ty) => ty = Cow::Owned(field_ty),
+                    FieldStep::Flat => ty = crate::step_place_ty_cow(ty, proj)?,
                 }
             }
             _ => {
@@ -308,6 +409,100 @@ pub(super) fn resolve_field_scalar_range(
         }
     }
     crate::range::rust_scalar_range(ty.as_ref())
+}
+
+/// How [`resolve_field_scalar_range`] takes one `Field` step.
+enum FieldStep {
+    /// Resolved through the ADT's declared variant list.
+    Variant(Ty),
+    /// Resolved through `project_ty`'s flat field view (struct/tuple/closure).
+    Flat,
+    /// Enum-relative but unanswerable from the declared variants: emit NO range
+    /// fact. Losing a bound costs precision; keeping a wrong one is a false
+    /// proof.
+    Decline,
+}
+
+/// Variant `v`'s `idx`-th DECLARED field type on a `Ty::Adt` enum, read from
+/// whichever of the two declarations this value still carries.
+///
+/// `lower_enum_adt` writes the payload's type into the enum TWICE, in one loop,
+/// in one order: the flat union view gets `("__v{v}_{field_name}", ty)` and the
+/// P4 per-variant view gets `VariantDef { fields: [(field_name, ty)] }`. Only the
+/// flat half is `Serialize`d unconditionally — `variants` is `#[serde(default)]`,
+/// so it is ABSENT from every `Ty::Adt` written before PHASE 4 (dump fixtures,
+/// solver caches, proof certificates) while the flat half survives verbatim.
+///
+/// The flat half is therefore consulted FIRST, and not only because it is the
+/// half that survives: it is the half `crate::place_ty_cow` uses. That function
+/// resolves a `Downcast(v).Field(i)` on a `Ty::Adt` by taking the `i`-th field
+/// whose name carries the `__v{v}_` prefix and does not read `variants` at all,
+/// so it is the flat view that decides what type the rest of vcgen ascribes to
+/// this place. A range fact is a statement about the var `place_to_var_name`
+/// mints for that place; taking its width from the other declaration would state
+/// it about a different type than every other fact on the same var.
+///
+/// The prefix identifies the variant exactly — `__v1_` cannot match variant 11's
+/// `__v11_0`, because the trailing `_` of the prefix is a digit there — and the
+/// slots are pushed variant-by-variant in declaration order, so the `i`-th
+/// `__v{v}_`-prefixed slot IS variant `v`'s `i`-th declared field.
+///
+/// Returns `None` when neither declaration answers — no `__v{v}_` slot at index
+/// `idx` and no `variants[v].fields[idx]` — and the caller then emits no range
+/// fact. `__tag` carries no `__v` prefix and is not in any variant's field list,
+/// so no path through here can ever answer with it.
+fn enum_variant_field_ty(
+    variants: &[trust_types::VariantDef],
+    fields: &[(String, Ty)],
+    v: usize,
+    idx: usize,
+) -> Option<Ty> {
+    let prefix = format!("__v{v}_");
+    fields
+        .iter()
+        .filter(|(name, _)| name.starts_with(&prefix))
+        .nth(idx)
+        .or_else(|| variants.get(v).and_then(|variant| variant.fields.get(idx)))
+        .map(|(_, field_ty)| field_ty.clone())
+}
+
+/// Whether a `Ty::Adt` is an ENUM, decided from what is PRESENT in the value.
+///
+/// `variants` alone is not a sound test: it is `#[serde(default)]`, so a
+/// serialized enum whose JSON predates PHASE 4 (or whose `variants` key is
+/// otherwise absent) deserializes with an EMPTY list and would read as a
+/// struct. The other three signals survive that erasure independently:
+///
+///   * `adt_kind: Some(Enum)` — stamped by `trust-mir-extract`'s enum arm from
+///     rustc's `AdtDef`;
+///   * a `__tag` field — `lower_enum_adt` unconditionally leads the flat union
+///     view with the discriminant slot, and nothing else emits that name;
+///   * a `__v{variant}_{field}` field — the same lowering's per-variant payload
+///     slots.
+///
+/// A struct that literally declares a field named `__tag`/`__v0_x` is
+/// misclassified as an enum and simply loses its field range fact — a precision
+/// cost in the SAFE direction, and the reserved-looking spelling makes it rare.
+fn adt_shape_is_enum(
+    variants: &[trust_types::VariantDef],
+    fields: &[(String, Ty)],
+    adt_kind: &Option<trust_types::AdtKind>,
+) -> bool {
+    !variants.is_empty()
+        || matches!(adt_kind, Some(trust_types::AdtKind::Enum))
+        || fields.iter().any(|(name, _)| is_enum_flat_view_field_name(name))
+}
+
+/// The synthetic field names `trust-mir-extract`'s `lower_enum_adt` gives an
+/// enum's FLAT union view: the leading `__tag` discriminant slot and the
+/// per-variant `__v{variant_index}_{field_name}` payload slots.
+fn is_enum_flat_view_field_name(name: &str) -> bool {
+    if name == "__tag" {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("__v") else { return false };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest.as_bytes().get(digits) == Some(&b'_')
 }
 
 /// Invoke `f` on EVERY place a statement mentions — operand reads AND place-valued

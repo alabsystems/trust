@@ -40,12 +40,15 @@ class BatteryRunnerTests(unittest.TestCase):
     def test_current_canonical_inventory_is_exact(self) -> None:
         files = runner.discover(None)
         captured = runner.capture_fixture_inventory(files, canonical=True)
-        self.assertEqual(len(captured), 25)
+        # Derived, not hardcoded — this literal read 25 while the manifest
+        # held 26, and only stayed unnoticed because the inventory check
+        # above RAISES before this line is reached.
+        self.assertEqual(len(captured), len(runner.CANONICAL_FIXTURES))
         self.assertEqual(len(runner.fixture_snapshot(captured)), 64)
 
     def test_deleted_fixture_cannot_shrink_canonical_inventory(self) -> None:
         files = runner.discover(None)
-        with self.assertRaisesRegex(RuntimeError, "reviewed 25-fixture manifest"):
+        with self.assertRaisesRegex(RuntimeError, r"reviewed \d+-fixture manifest"):
             runner.capture_fixture_inventory(files[:-1], canonical=True)
 
     def test_duplicate_required_directive_is_rejected(self) -> None:

@@ -236,38 +236,99 @@ pub(super) fn generate_v2_safety_vcs(func: &VerifiableFunction) -> Vec<Verificat
 /// regeneration: identical-formula asserts in distinct blocks are surfaced
 /// separately so the seam can mark them Ambiguous (fail-closed). The result is a
 /// join table only: an entry licenses no rewrite by itself.
+///
+/// `None` means NO TABLE COULD BE PROVEN COMPLETE (the ambient verify budget cut the
+/// replay short). It is not "no rows" — that is `Some(vec![])`. The distinction is
+/// load-bearing: `Unique` is only sound relative to a COMPLETE enumeration, so a prefix
+/// must never be presented as a table. Callers turn `None` into an EMPTY
+/// `OverflowCheckOrigins` (every `resolve` misses, every check is kept) and report the
+/// overrun.
 pub fn overflow_vc_block_origins(
     func: &VerifiableFunction,
     summaries: Option<&crate::modular::SummaryDatabase>,
-) -> Vec<(BlockId, VerificationCondition)> {
+) -> Option<Vec<(BlockId, VerificationCondition)>> {
+    overflow_vc_block_origins_inner(func, summaries, true)
+}
+
+/// The pre-memoization behaviour of [`overflow_vc_block_origins`], for A/B equivalence
+/// testing ONLY: identical code path with the generation memos left INERT (no VC-gen
+/// scope entered), exactly as this function ran before the memo scope was added.
+///
+/// The equivalence obligation this exists to discharge: the memo scope is claimed to
+/// change only the COST of the replay and not one byte of its output — and this table's
+/// output is a codegen join key, so "not one byte" is the operative standard.
+#[cfg(test)]
+pub(crate) fn overflow_vc_block_origins_unmemoized(
+    func: &VerifiableFunction,
+    summaries: Option<&crate::modular::SummaryDatabase>,
+) -> Option<Vec<(BlockId, VerificationCondition)>> {
+    overflow_vc_block_origins_inner(func, summaries, false)
+}
+
+fn overflow_vc_block_origins_inner(
+    func: &VerifiableFunction,
+    summaries: Option<&crate::modular::SummaryDatabase>,
+    memoize: bool,
+) -> Option<Vec<(BlockId, VerificationCondition)>> {
     // This compiler-facing replay API runs independently of the ordinary
     // `generate_vcs_impl` boundary. Keep call-result havoc and intrinsic
     // safety recognition identical for MIR TailCall sites too.
+    //
+    // verifier-perf: run the replay inside a MEMO-LIVE, METER-DISABLED VC-gen scope.
+    // Every generation memo gates on `gen_work::scope_active()` alone, so on this path
+    // — which never entered a scope — all four were inert and the walk paid the full
+    // uncached cost of `place_to_var_name` (an `FxHashSet` over every local rebuilt at
+    // every place occurrence in every formula built or rewritten). Measured A/B on a
+    // checked-add chain: 3.7x at 16 blocks, 20.3x at 128 (112s -> 5.5s).
+    //
+    // The scope MUST be the unmetered variant. Arming the work meter here would let a
+    // trip substitute `gen_work_degraded_leaf()` into a materialized type, changing the
+    // rendered formula and therefore this table's canonical join key — which is
+    // required to be byte-identical to the production VC's. That failure is silent by
+    // construction (a changed key simply stops matching), and it is exactly the failure
+    // this function must not have. `gen_work_scope_unmetered` gives the memos and no
+    // meter; completeness is bounded and REPORTED below instead.
+    let _memo_scope = memoize.then(crate::gen_work_scope_unmetered);
     let tail_call_expanded = func.with_tail_calls_expanded();
     let func = tail_call_expanded.as_ref();
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
     let func = arithmetic_safe_func.as_ref();
-    let overflow: Vec<(BlockId, VerificationCondition)> =
-        generate_v2_safety_vcs_impl_with_origins(func, summaries)
-            .into_iter()
-            .filter(|(_, vc)| {
-                // DELIBERATELY excludes `VcKind::UncheckedArithmeticOverflow`.
-                // This table is the join key for the proven-overflow-check
-                // ELISION seam, and an `unchecked_{add,sub,mul}` block has no
-                // `Assert(Overflow)` to elide — it lowers to a lone `add nsw`/
-                // `nuw`. Handing the seam a block with no check to remove is at
-                // best a no-op and at worst licenses a rewrite of a block whose
-                // shape the seam does not model. Before the kind split these
-                // rows WERE `ArithmeticOverflow` and did reach here; keeping them
-                // out is a second, independent correctness gain from the split.
-                matches!(
-                    vc.kind,
-                    VcKind::ArithmeticOverflow { op: BinOp::Add | BinOp::Sub | BinOp::Mul, .. }
-                )
-            })
-            .collect();
+    // COMPLETENESS IS THE WHOLE POINT OF THIS TABLE, so a truncated walk is refused
+    // rather than returned. The consumer joins a KernelCertified row to a UNIQUE origin
+    // block and then DELETES that block's overflow `Assert`; a key maps to `Ambiguous`
+    // — and is refused — only because a SECOND block generated the same canonical
+    // string. Hand it a prefix of the enumeration and a key whose duplicate sat past
+    // the cut reads as `Unique`, licensing the deletion of a live overflow check on the
+    // authority of a proof belonging to a different block. Under-enumeration is
+    // therefore UNSOUND in a way that ordinary VC truncation is not, and `None` (no
+    // table at all, seam is a no-op, checks kept) is the only safe degradation. The
+    // caller reports the overrun.
+    let (generated, truncated) = generate_v2_safety_vcs_impl_with_origins_checked(func, summaries);
+    if truncated {
+        return None;
+    }
+    let overflow: Vec<(BlockId, VerificationCondition)> = generated
+        .into_iter()
+        .filter(|(_, vc)| {
+            // DELIBERATELY excludes `VcKind::UncheckedArithmeticOverflow`.
+            // This table is the join key for the proven-overflow-check
+            // ELISION seam, and an `unchecked_{add,sub,mul}` block has no
+            // `Assert(Overflow)` to elide — it lowers to a lone `add nsw`/
+            // `nuw`. Handing the seam a block with no check to remove is at
+            // best a no-op and at worst licenses a rewrite of a block whose
+            // shape the seam does not model. Before the kind split these
+            // rows WERE `ArithmeticOverflow` and did reach here; keeping them
+            // out is a second, independent correctness gain from the split.
+            matches!(
+                vc.kind,
+                VcKind::ArithmeticOverflow { op: BinOp::Add | BinOp::Sub | BinOp::Mul, .. }
+            )
+        })
+        .collect();
     if overflow.is_empty() {
-        return Vec::new();
+        // A COMPLETE enumeration that found no Add/Sub/Mul overflow row. Distinct from
+        // the `None` above: this is an empty table, not a missing one.
+        return Some(Vec::new());
     }
     // Reproduce the production discharge/augment (see `discharge_body_vcs`):
     // interval-dischargeable VCs keep their original formula; the rest are
@@ -279,18 +340,20 @@ pub fn overflow_vc_block_origins(
         overflow.iter().map(|(_, vc)| vc.clone()).collect();
     let report = abstract_interp::try_discharge_batch(&candidates, &merged_env);
     let discharged: FxHashSet<usize> = report.discharged.iter().map(|(i, _)| *i).collect();
-    overflow
-        .into_iter()
-        .enumerate()
-        .map(|(i, (bid, vc))| {
-            let final_vc = if discharged.contains(&i) {
-                vc
-            } else {
-                abstract_interp::augment_vc_with_abstract_state(&vc, &merged_env)
-            };
-            (bid, final_vc)
-        })
-        .collect()
+    Some(
+        overflow
+            .into_iter()
+            .enumerate()
+            .map(|(i, (bid, vc))| {
+                let final_vc = if discharged.contains(&i) {
+                    vc
+                } else {
+                    abstract_interp::augment_vc_with_abstract_state(&vc, &merged_env)
+                };
+                (bid, final_vc)
+            })
+            .collect(),
+    )
 }
 
 /// Whether an `Assert { OverflowNeg, expected: false }` somewhere in the function
@@ -455,10 +518,30 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
     func: &VerifiableFunction,
     summaries: Option<&crate::modular::SummaryDatabase>,
 ) -> Vec<(BlockId, VerificationCondition)> {
+    generate_v2_safety_vcs_impl_with_origins_checked(func, summaries).0
+}
+
+/// As [`generate_v2_safety_vcs_impl_with_origins`], but ALSO reports whether the ambient
+/// verify budget cut the walk short.
+///
+/// The rows are the same rows either way; what the flag adds is the ability to tell a
+/// COMPLETE enumeration from a prefix of one. Ordinary VC generation does not need the
+/// distinction — its caller re-reads the budget at the next phase checkpoint and
+/// discards the partial inventory wholesale. The overflow-elision join table does:
+/// there, "no row for this key" and "the row that would have made this key AMBIGUOUS was
+/// never generated" are the same observation, and only the second is a licence to delete
+/// a live overflow check. See `overflow_vc_block_origins`.
+pub(super) fn generate_v2_safety_vcs_impl_with_origins_checked(
+    func: &VerifiableFunction,
+    summaries: Option<&crate::modular::SummaryDatabase>,
+) -> (Vec<(BlockId, VerificationCondition)>, bool) {
+    // Set at every point the ambient budget cuts the generation walk short. The returned
+    // rows are then a PREFIX of the true set, not the set.
+    let mut truncated = false;
     let path_guards = v2_analyze_path_guards(func);
     let guard_paths_map = &path_guards.paths;
     // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let path_definition_map = v2_build_path_definition_map(func);
     let semantic_guards = match summaries {
         Some(s) => build_semantic_guard_map_with_summaries(func, s),
@@ -471,6 +554,32 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
     let mut block_vcs: Vec<(BlockId, VerificationCondition)> = Vec::new();
 
     for block in &func.body.blocks {
+        // Trust (L0 termination guarantee — VC GENERATION): poll the ambient
+        // per-function budget once per block.
+        //
+        // `trust_types::verify_budget` names "the VC-generation walks" as a
+        // choke point, but this walk had NO poll at all, so
+        // `-Ztrust-verify-function-budget-ms` could not bound VC generation:
+        // a function whose generation spun never reached the post-generation
+        // `preprocessing_budget_exceeded` checkpoint, and the budget that
+        // exists to prevent exactly that never fired. Measured on `nn-core`,
+        // `ny-core` and `clean-kernel`, all three spun here with no diagnostic.
+        //
+        // Breaking out is the ONLY sound degradation available. A gen-set
+        // oracle may not return a truncated answer on overrun — an
+        // under-approximated kill set lets a stale fact survive and vacuously
+        // discharge a real obligation (a false PROVE) — so the values stay
+        // exact and generation simply stops producing more rows. The caller in
+        // `rustc_mir_transform::trust_verify` then observes the spent budget at
+        // its existing checkpoint and applies the discipline `d9d9d675e3`
+        // already landed: advisory warns and substitutes one counted `Unknown`
+        // with the partial VCs DISCARDED, strict/certify/memory-safe keep the
+        // located hard error. This adds a poll to an existing mechanism; it
+        // does not introduce a second one.
+        if trust_types::verify_budget::budget_exhausted() {
+            truncated = true;
+            break;
+        }
         // 1. VCs from rustc Assert terminators that guard safety checks.
         // `unwind: _`: this loop emits the assert's OWN safety VC; the cleanup
         // successor is an unguarded CFG edge handled by the path/CHC machinery.
@@ -636,6 +745,31 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
                     contract_metadata: None,
                     obligation: None,
                 }),
+                // Trust (FIX A — trusted-std pointer-deref assert suppression):
+                // a rustc-inserted Null/Misaligned pointer-dereference UB assert
+                // whose OWN source span resolves under a CANONICAL sysroot std root
+                // (`library/{core,alloc,std}/src/…` or the remapped
+                // `/rustc/<hash>/library/…` form — the non-forgeable
+                // `sep_engine::is_trusted_std_span` gate, which fails closed on
+                // empty / `binary:` / user-crate spans) is STD-INTERNAL TCB: it is
+                // the `vec!` macro's inlined `Box::new_uninit` allocation pointer
+                // (non-null via `handle_alloc_error`, aligned to `Layout::align()`),
+                // NOT a user `&T`/`*raw` deref. Discharging it rests on
+                // allocation-provenance + trusted-std inlining (already trusted
+                // campaign-wide via F5), NOT the `&T` reference invariant. SKIP the
+                // VC at generation (mint nothing) so no un-modeled pointer formula
+                // is ever handed to a spec-predicate lane — dissolving the
+                // downstream `trust-types.Formula@1` schema-tag mismatch as a side
+                // effect. FAIL CLOSED: the SAME assert with an empty / `binary:` /
+                // synthetic / USER-CRATE span does NOT match this guard and falls
+                // through to the fail-closed `other` catch-all below, so a genuine
+                // `unsafe { *raw_ptr }` in user code keeps its refutable obligation.
+                AssertMessage::NullPointerDereference
+                | AssertMessage::MisalignedPointerDereference
+                    if crate::sep_engine::is_trusted_std_span(span) =>
+                {
+                    None
+                }
                 // Any safety assert that vcgen does not model above
                 // (NullPointerDereference, MisalignedPointerDereference,
                 // InvalidEnumConstruction, and any future AssertMessage) must
@@ -920,6 +1054,14 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         }
 
         for (stmt_index, stmt) in block.stmts.iter().enumerate() {
+            // Per-STATEMENT poll (see the per-block poll above). A block-level
+            // bound alone is too coarse: the pathological bodies are a single
+            // enormous block, so an overrun inside one block's statement walk
+            // would still spin unboundedly.
+            if trust_types::verify_budget::budget_exhausted() {
+                truncated = true;
+                break;
+            }
             let Statement::Assign { place, rvalue, span } = stmt else {
                 continue;
             };
@@ -1797,7 +1939,7 @@ pub(super) fn generate_v2_safety_vcs_impl_with_origins(
         ob_record_normalize(vc, func);
     }
 
-    block_vcs
+    (block_vcs, truncated)
 }
 
 /// The per-block path cap of [`v2_build_path_guard_map`]. A block that is
@@ -1944,7 +2086,16 @@ pub(super) fn v2_analyze_path_guards(func: &VerifiableFunction) -> PathGuardAnal
 
     while let Some((block_id, path_guards, mut path_blocks)) = queue.pop_front() {
         steps += 1;
-        if steps > cap {
+        // Trust (L0 termination guarantee): consult the AMBIENT per-function
+        // budget alongside this walk's own local `cap`. Measured 2026-08-31,
+        // `budget_exhausted()` appeared in exactly ONE file of this crate
+        // (`contracts.rs`) and in none of the VC-generation walks the budget
+        // docs named — so no timeout could bound this enumeration. Exhaustion
+        // here takes the EXISTING `BudgetTripped` collapse, a state this
+        // function already reaches and `path_guard_collapse_tests` already
+        // pins: every block degrades to the unguarded `[Vec::new()]` path, which
+        // strictly REMOVES hypotheses and so can only turn a PROVE into a FAIL.
+        if steps > cap || trust_types::verify_budget::budget_exhausted() {
             // COLLAPSE MODE 2 — the GLOBAL STEP BUDGET. This is the SECOND path
             // to an unguarded block formula, and it is the more dangerous one:
             // mode 1 (`MAX_PATHS_PER_BLOCK`, below) collapses the blocks that

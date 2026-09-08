@@ -1,0 +1,40 @@
+error: the initializer of `ARMED` can wait on `ARMED` itself: a `std::sync::OnceLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/self_wait_via_accessor.rs:23:13
+   |
+LL |     *cell().get_or_init(|| armed())
+   |             ^^^^^^^^^^^^^^^-------^
+   |             |              |
+   |             |              the initializer reaches the re-entrant wait through this call
+   |             the initializer of `ARMED` reaches this call, which waits on `ARMED` again
+   |
+   = note: call path: `armed::{closure#0}` -> `armed` -> `ARMED.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `armed` — read the input it needs directly instead of asking `ARMED` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `ARMED.get_or_init(|| v)` (or `ARMED.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `ARMED`, read `ARMED.get()` there — it never waits
+note: `ARMED` is declared here
+  --> $DIR/self_wait_via_accessor.rs:18:5
+   |
+LL |     static ARMED: OnceLock<bool> = OnceLock::new();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: the initializer of `SEEDED` can wait on `SEEDED` itself: a `std::sync::OnceLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/self_wait_via_accessor.rs:34:20
+   |
+LL |     *seeded_cell().get_or_init(|| seeded() + 1)
+   |                    ^^^^^^^^^^^^^^^--------^^^^^
+   |                    |              |
+   |                    |              the initializer reaches the re-entrant wait through this call
+   |                    the initializer of `SEEDED` reaches this call, which waits on `SEEDED` again
+   |
+   = note: call path: `seeded::{closure#0}` -> `seeded` -> `SEEDED.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `seeded` — read the input it needs directly instead of asking `SEEDED` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `SEEDED.get_or_init(|| v)` (or `SEEDED.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `SEEDED`, read `SEEDED.get()` there — it never waits
+note: `SEEDED` is declared here
+  --> $DIR/self_wait_via_accessor.rs:27:1
+   |
+LL | static SEEDED: OnceLock<u32> = OnceLock::new();
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

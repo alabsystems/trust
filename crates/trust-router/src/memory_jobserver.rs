@@ -540,18 +540,19 @@ pub fn default_per_job_limit_mb() -> Option<u64> {
     per_job_limit_mb_for(budget, jobs)
 }
 
+// Trust: the arithmetic below — the floor-then-cap that must not be written as
+// `clamp` (which panics when `budget < 1 GiB`), and the byte-to-mebibyte
+// conversion — now lives in the strict-lane VERIFIED crate `trust-budget`,
+// whose `ensures result <= budget_bytes` IS the property this function needs:
+// a job may not be promised more memory than the machine was budgeted, or the
+// shared coordinator refuses the reservation and every obligation in the unit
+// is declined before solver dispatch. `replaced_consumer_body_is_reproduced_
+// exactly` runs this function's ORIGINAL body against the replacement.
+//
+// `0` and `None` are the same answer here: the original ended
+// `(megabytes > 0).then_some(megabytes)`, so `Some(0)` was never constructible.
 fn per_job_limit_mb_for(budget: u64, jobs: u64) -> Option<u64> {
-    if budget == 0 {
-        return None;
-    }
-    const MIN_PER_JOB_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
-    // `clamp(min, max)` panics when a small host has budget < 1 GiB. Express
-    // the intended floor-then-cap directly so every nonzero budget is valid.
-    let per_job = (budget / jobs.max(1)).max(MIN_PER_JOB_BYTES).min(budget);
-    let megabytes = per_job / (1024 * 1024);
-    // Returning Some(0) would make a configured caller request an inert
-    // reservation. A sub-MiB effective budget is not representable by this API,
-    // so fail derivation and let the configured path stop before solver launch.
+    let megabytes = trust_budget::megabytes_of(trust_budget::per_job_bytes(budget, jobs));
     (megabytes > 0).then_some(megabytes)
 }
 
@@ -1619,8 +1620,14 @@ fn linux_cgroup_directory(
     mountinfo: &str,
     membership: &Path,
     unified: bool,
-) -> Result<Option<(PathBuf, PathBuf)>, String> {
-    let mut best: Option<(usize, PathBuf, PathBuf)> = None;
+) -> Result<Option<(PathBuf, PathBuf, bool)>, String> {
+    // The third element is whether the selected mount's ROOT FIELD is `/`, i.e.
+    // the whole hierarchy rather than a bind-mounted subtree. It was computed
+    // here and thrown away; the root exemption cannot be authenticated without
+    // it, because inside the initial namespace someone can still bind-mount a
+    // CONSTRAINED subtree at /sys/fs/cgroup and that subtree's own missing
+    // control file would otherwise read as "unbounded root".
+    let mut best: Option<(usize, PathBuf, PathBuf, bool)> = None;
     for (index, line) in mountinfo.lines().enumerate() {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         let Some(separator) = fields.iter().position(|field| *field == "-") else {
@@ -1650,11 +1657,12 @@ fn linux_cgroup_directory(
         };
         let specificity = root.components().count();
         let candidate = mount_point.join(relative);
-        if best.as_ref().is_none_or(|(current, _, _)| specificity > *current) {
-            best = Some((specificity, candidate, mount_point));
+        let root_is_hierarchy_root = root == Path::new("/");
+        if best.as_ref().is_none_or(|(current, _, _, _)| specificity > *current) {
+            best = Some((specificity, candidate, mount_point, root_is_hierarchy_root));
         }
     }
-    Ok(best.map(|(_, path, mount_point)| (path, mount_point)))
+    Ok(best.map(|(_, path, mount_point, at_root)| (path, mount_point, at_root)))
 }
 
 #[cfg(target_os = "linux")]
@@ -1707,6 +1715,7 @@ fn linux_visible_cgroup_limit_with<F>(
     directory: &Path,
     mount_root: &Path,
     limit_name: &str,
+    root_exemption_authenticated: bool,
     mut read: F,
 ) -> Result<Option<u64>, String>
 where
@@ -1738,6 +1747,23 @@ where
                 }
             }
             None => {
+                // AUTHENTICATED ROOT EXEMPTION. cgroup v2 legitimately omits
+                // memory.max at the real hierarchy root, so a missing file
+                // THERE is not evidence of a hidden bound — but only once the
+                // caller has PROVED this is that root. Two independent facts,
+                // both required, each closing one of the two ambiguities the
+                // deny-everything rule above was protecting against:
+                //   * initial cgroup namespace, proved by the kernel's reserved
+                //     inode, so a namespace cannot present a CONSTRAINED
+                //     descendant as `/`;
+                //   * mountinfo root field `/`, so a bind-mounted SUBTREE
+                //     inside that namespace cannot pose as the whole hierarchy.
+                // Missing at any NON-root level stays an error: there the file
+                // is mandatory and its absence is unexplained.
+                if ancestor == mount_root && root_exemption_authenticated {
+                    saw_mount_root = true;
+                    break;
+                }
                 return Err(format!(
                     "Linux cgroup memory authority is missing at a visible level: {}",
                     control.display()
@@ -1755,6 +1781,36 @@ where
     Ok(effective)
 }
 
+/// The kernel's reserved inode for the INITIAL cgroup namespace
+/// (`PROC_CGROUP_INIT_INO`, `include/linux/proc_ns.h`).
+///
+/// Initial namespaces get fixed inode numbers from a reserved range; every
+/// namespace created afterwards is allocated from nsfs and can never be handed
+/// a reserved value. Reading this number is therefore POSITIVE proof of being
+/// in the initial cgroup namespace, not an inference from absence of evidence —
+/// which is precisely what `linux_visible_cgroup_limit_with` requires before it
+/// will treat a missing control file at the mount root as an unbounded root.
+#[cfg(target_os = "linux")]
+const PROC_CGROUP_INIT_INO: u64 = 0xEFFF_FFFB;
+
+/// Parse the inode out of a `/proc/self/ns/cgroup` link target (`cgroup:[N]`).
+///
+/// Split out from the IO so the discrimination is unit-testable: a namespaced
+/// process reports a different, non-reserved inode here.
+#[cfg(target_os = "linux")]
+fn parse_cgroup_namespace_inode(link_target: &str) -> Option<u64> {
+    let rest = link_target.trim().strip_prefix("cgroup:[")?;
+    rest.strip_suffix(']')?.parse::<u64>().ok()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_in_initial_cgroup_namespace() -> bool {
+    std::fs::read_link("/proc/self/ns/cgroup")
+        .ok()
+        .and_then(|target| parse_cgroup_namespace_inode(&target.to_string_lossy()))
+        .is_some_and(|inode| inode == PROC_CGROUP_INIT_INO)
+}
+
 #[cfg(target_os = "linux")]
 fn linux_cgroup_memory_limit_bytes() -> Result<Option<u64>, String> {
     let cgroup = read_bounded_linux_control(Path::new("/proc/self/cgroup"))?;
@@ -1768,12 +1824,16 @@ fn linux_cgroup_memory_limit_bytes() -> Result<Option<u64>, String> {
         (None, Some(path)) => (path, false, "memory.limit_in_bytes"),
         (None, None) => return Ok(None),
     };
-    let (directory, mount_root) = linux_cgroup_directory(&mountinfo, &membership, unified)?
-        .ok_or_else(|| "current memory cgroup has no matching mounted authority".to_string())?;
+    let (directory, mount_root, mount_root_is_hierarchy_root) =
+        linux_cgroup_directory(&mountinfo, &membership, unified)?
+            .ok_or_else(|| "current memory cgroup has no matching mounted authority".to_string())?;
+    let root_exemption_authenticated =
+        mount_root_is_hierarchy_root && linux_in_initial_cgroup_namespace();
     linux_visible_cgroup_limit_with(
         &directory,
         &mount_root,
         limit_name,
+        root_exemption_authenticated,
         read_bounded_linux_control_optional,
     )
 }
@@ -1989,23 +2049,29 @@ mod tests {
             "29 23 0:26 /user.slice /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime - ",
             "cgroup2 cgroup rw\n"
         );
-        let (directory, root) =
+        let (directory, root, at_hierarchy_root) =
             linux_cgroup_directory(unified_mountinfo, Path::new("/user.slice/trust.scope"), true)
                 .expect("parse unified mountinfo")
                 .expect("find unified mount");
         assert_eq!(directory, Path::new("/sys/fs/cgroup/trust.scope"));
         assert_eq!(root, Path::new("/sys/fs/cgroup"));
+        assert!(
+            !at_hierarchy_root,
+            "this row's mountinfo ROOT FIELD is /user.slice -- a subtree, so it must not \
+             authenticate a root exemption even though it is mounted at /sys/fs/cgroup"
+        );
 
         let legacy_mountinfo = concat!(
             "30 23 0:27 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime - ",
             "cgroup cgroup rw,memory\n"
         );
-        let (directory, root) =
+        let (directory, root, at_hierarchy_root) =
             linux_cgroup_directory(legacy_mountinfo, Path::new("/legacy/trust"), false)
                 .expect("parse v1 mountinfo")
                 .expect("find v1 memory mount");
         assert_eq!(directory, Path::new("/sys/fs/cgroup/memory/legacy/trust"));
         assert_eq!(root, Path::new("/sys/fs/cgroup/memory"));
+        assert!(at_hierarchy_root, "this row's mountinfo ROOT FIELD is /");
         assert_eq!(
             decode_mountinfo_path(r"/sys/fs/cgroup/team\040space").expect("decode mount escape"),
             Path::new("/sys/fs/cgroup/team space")
@@ -2035,20 +2101,20 @@ mod tests {
     fn linux_cgroup_v2_missing_limit_at_any_visible_level_fails_closed() {
         let root = Path::new("/fixture-cgroup");
         let missing_visible_root =
-            linux_visible_cgroup_limit_with(root, root, "memory.max", |_| Ok(None));
+            linux_visible_cgroup_limit_with(root, root, "memory.max", false, |_| Ok(None));
         assert!(
             missing_visible_root.is_err(),
             "a `/` mount view does not authenticate the initial hierarchy root"
         );
 
         let child = root.join("child");
-        let missing_child = linux_visible_cgroup_limit_with(&child, root, "memory.max", |path| {
+        let missing_child = linux_visible_cgroup_limit_with(&child, root, "memory.max", false, |path| {
             if path == child.join("memory.max") { Ok(None) } else { Ok(Some("max\n".to_string())) }
         });
         assert!(missing_child.is_err(), "a missing non-root limit must fail closed");
 
         let bounded =
-            linux_visible_cgroup_limit_with(&child, root, "memory.max", |path| {
+            linux_visible_cgroup_limit_with(&child, root, "memory.max", false, |path| {
                 match path.strip_prefix(root).expect("fixture path under root") {
                     relative if relative == Path::new("child/memory.max") => {
                         Ok(Some("2048\n".to_string()))
@@ -2061,6 +2127,65 @@ mod tests {
             })
             .expect("all visible limits are exact and readable");
         assert_eq!(bounded, Some(1024), "the tightest visible ancestor wins");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authenticated_root_exemption_admits_only_the_root_and_only_when_proved() {
+        let root = Path::new("/fixture-cgroup");
+
+        // The whole point: with the proof supplied, a missing control file AT
+        // THE MOUNT ROOT means an unbounded hierarchy root, not a refusal.
+        // Without it this is exactly the case that must stay an error, which
+        // the sibling fail-closed test pins.
+        let exempt = linux_visible_cgroup_limit_with(root, root, "memory.max", true, |_| Ok(None))
+            .expect("an authenticated hierarchy root may omit memory.max");
+        assert_eq!(exempt, None, "an unbounded root imposes no limit");
+
+        // The exemption is scoped to the ROOT. A missing file at a non-root
+        // level is unexplained and must still fail closed even when the proof
+        // holds -- otherwise the authentication would launder every level.
+        let child = root.join("child");
+        let missing_child =
+            linux_visible_cgroup_limit_with(&child, root, "memory.max", true, |path| {
+                if path == child.join("memory.max") {
+                    Ok(None)
+                } else {
+                    Ok(Some("max\n".to_string()))
+                }
+            });
+        assert!(
+            missing_child.is_err(),
+            "authentication exempts the root, never an intermediate level"
+        );
+
+        // A real bound anywhere visible still wins over the exemption.
+        let bounded = linux_visible_cgroup_limit_with(&child, root, "memory.max", true, |path| {
+            if path == child.join("memory.max") {
+                Ok(Some("4096\n".to_string()))
+            } else {
+                Ok(None)
+            }
+        })
+        .expect("root exempt, child bounded");
+        assert_eq!(bounded, Some(4096), "an exempt root does not erase a real child bound");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_namespace_inode_discriminates_the_initial_namespace() {
+        assert_eq!(
+            parse_cgroup_namespace_inode("cgroup:[4026531835]"),
+            Some(PROC_CGROUP_INIT_INO),
+            "the kernel's reserved initial-cgroup-namespace inode"
+        );
+        // A namespaced process reports an nsfs-allocated inode, which is never
+        // drawn from the reserved range -- so this is positive proof, not an
+        // absence-of-evidence inference.
+        assert_ne!(parse_cgroup_namespace_inode("cgroup:[4026532461]"), Some(PROC_CGROUP_INIT_INO));
+        assert_eq!(parse_cgroup_namespace_inode("mnt:[4026531835]"), None, "wrong ns type");
+        assert_eq!(parse_cgroup_namespace_inode("cgroup:[]"), None);
+        assert_eq!(parse_cgroup_namespace_inode("garbage"), None);
     }
 
     #[test]
@@ -2702,3 +2827,4 @@ mod tests {
         assert!(lines.is_empty(), "brief contention must not leak the live process's row");
     }
 }
+

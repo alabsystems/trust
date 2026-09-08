@@ -42,14 +42,24 @@
 //!     panic-freedom obligation for a call to an absent callee (a std/extern
 //!     function whose body is not in the lowered bundle); the only call in
 //!     `opaque` is `std::hint::black_box`.
-//!   * `main` reports `0 proved, 2 failed, 0 unknown, 0 timed out,
-//!     1 runtime-checked out of 3 obligation(s)`. The two failures are the two
-//!     guarded asserts below: the verifier does not model what `opaque`
-//!     returns, so it counterexamples them with values that ignore
-//!     `opaque(3) == 3` (printed: `a = 1, b = 0, s = 7`). No overflow row is
+//!   * `main` reports `0 proved, 0 failed, 0 unknown, 0 timed out,
+//!     3 runtime-checked out of 3 obligation(s)` (re-measured 2026-08-30,
+//!     stage1 at main tip). The two guarded asserts used to come back as
+//!     FAILED with a counterexample over values the verifier does not model
+//!     (`opaque` returns havoc'd: printed `a = 1, b = 0, s = 7` — not a real
+//!     execution, since `opaque(3) == 3` makes both asserts pass at runtime).
+//!     bc65b2ca7d/017a2a2af5 introduced and 730b8d6cee deliberately RETAINED
+//!     the Assertion-kind proof-only bridge arm
+//!     (`bridge_ay_verdict_is_admissible`): a generic ay SAT on a user
+//!     `assert!` whose formula ranges over values no execution pins is not
+//!     admissible as a source refutation, so those two rows are demoted
+//!     Failed -> Unknown, and with their runtime fallback they land in the
+//!     runtime-checked bucket. Under the ratified completeness-gap policy a
+//!     runtime-checked-only gap is non-fatal, so the Level 0 incomplete
+//!     diagnostic for `main` is now a WARN (the strict error below still
+//!     fails the build — nothing turned green). No overflow row is
 //!     charged for the inlined wrapping ops — a control `main` differing only
-//!     in `a.wrapping_add(b)` vs `a + b` measures one obligation vs two, the
-//!     extra one failed.
+//!     in `a.wrapping_add(b)` vs `a + b` measures one obligation vs two.
 //!
 //! So the boundary that remains here is the opaque callee, not wrapping
 //! arithmetic. The differential evidence for the value-model fix itself (wrap
@@ -72,6 +82,15 @@ fn opaque(x: u64) -> u64 {
 fn main() {
 //~^ ERROR Trust Level 0 safety verification incomplete
 //~| ERROR Trust strict verification failed
+// RE-MEASURED (2026-08-30, composed stage with the held-refutation stamp): the
+// L0 header is ERROR again, as the stamp's audit predicted. main's asserts on
+// `opaque`-derived values carry live bridge SAT counterexamples; those rows
+// were HELD (proof-only Assertion bridge) and rode runtime-check tolerance to
+// a WARN. The stamp denies that tolerance (GapToleranceDenial::
+// RowRefutationHeld), so a held refutation is fatal. The old a=1,b=0,s=7
+// counterexample over havoc'd opaque() returns was a FALSE refutation and
+// stays demoted; these are the live ones. `opaque` itself keeps WARN: its one
+// row is absent-callee panic-freedom, runtime-checked, no refutation held.
     let a = opaque(3);
     let b = opaque(4);
     // Guarded window: no operation below can overflow at runtime. The asserts

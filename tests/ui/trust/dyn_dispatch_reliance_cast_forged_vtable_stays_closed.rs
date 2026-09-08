@@ -33,18 +33,28 @@
 //! operation, and forged vtables are being admitted.
 //!
 //! Measured before the element-projection arm existed, and required to be
-//! unchanged after it: `C-FLOW declined: trait Emit poisoned`, at `2 obligation(s)`
-//! — the `hardened_unsafe_operation` the raw cast raises, PLUS the `dyn` site that
-//! the poison keeps. The COUNT is the assertion, and 2 is the number that must not
-//! move: if the arm is ever widened into the set rule, this tuple would discharge
-//! and the count would drop to 1. The verdict must be identical either side of the
-//! arm landing — a fixture whose behavior moves when the arm lands would be testing
-//! the arm rather than the refusal.
+//! unchanged after it: `C-FLOW declined: trait Emit poisoned` — the
+//! `hardened_unsafe_operation` the raw cast raises, PLUS the `dyn` site that
+//! the poison keeps. Since cd4faf5cfa the `p as usize` expose adds a third
+//! fail-closed row (trust-mir-extract lowers the expose result to
+//! `ConstValue::OpaqueScalar`; trust-vcgen's 4ca0cb0eac operand collector
+//! refuses an identity-less opaque scalar as proof input — an
+//! UnsupportedMir -> Unknown row), so the pinned total is `3 obligation(s)`.
+//! Measured 2026-08-30 (stage1, main tip): the report shows
+//! `[hardened_unsafe_operation] FAILED`, the `[unknown]` OpaqueScalar row, AND
+//! the `[assert] runtime-checked` dyn-site panic-freedom row the poison keeps
+//! — the refusal did NOT open. The COUNT is the assertion, and 3 is the number
+//! that must not move: if the arm is ever widened into the set rule, this
+//! tuple would discharge its dyn row and the count would drop to 2. The
+//! verdict must be identical either side of the arm landing — a fixture whose
+//! behavior moves when the arm lands would be testing the arm rather than the
+//! refusal.
 //!
 //! The companion positive case is
 //! `dyn_dispatch_reliance_cast_array_element_no_poison.rs`: same crate shape with an
-//! ARRAY instead of a tuple, which must drop to `1 obligation(s)`. The pair is the
-//! boundary — this file alone would be satisfied by a rule that poisons everything.
+//! ARRAY instead of a tuple, which must drop to `2 obligation(s)` (unsafe op +
+//! expose row, no dyn row). The pair is the boundary — this file alone would be
+//! satisfied by a rule that poisons everything.
 #![no_std]
 #![allow(dead_code)]
 
@@ -61,8 +71,8 @@ impl Emit for A {
 }
 
 pub fn total() -> u32 {
-    //~^ ERROR 2 obligation(s) were not proved
-    //~| ERROR 2 obligation(s) were not fully verified
+    //~^ ERROR 3 obligation(s) were not proved
+    //~| ERROR 3 obligation(s) were not fully verified
     let a = A;
     let d: &dyn Emit = &a;
     // The principal appears in the source type — but in a TUPLE, alongside an

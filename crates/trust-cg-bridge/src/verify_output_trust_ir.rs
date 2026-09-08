@@ -76,12 +76,17 @@
 
 use std::collections::{HashMap, HashSet};
 
+use trust_cg_lower::abi::{AArch64AbiVariant, AppleAArch64ABI, ArgLocation};
+use trust_cg_lower::types::Type as ClassifierTy;
 use trust_ir::inst::{BinOp as IrBinOp, CastOp, ICmpOp, Inst, OverflowOp, UnOp as IrUnOp};
 use trust_ir::value::{BlockId, FuncId, ValueId};
 use trust_ir::{Constant, Module, Ty as IrTy};
-use trust_types::{BinOp, Formula};
+use trust_types::{BinOp, Formula, Sort};
 
-use crate::codegen_backend::{FunctionLinkage, TrustCgCodegenBackend, TrustCgTargetArch};
+use crate::codegen_backend::{
+    CompiledModule, EmittedModuleObject, FunctionLinkage, TrustCgCodegenBackend, TrustCgTargetArch,
+    assembled_internal_object_globals,
+};
 use crate::verify_output::{
     CertificationReport, Discharge, EmitPolicy, OutputVerdict, PreservedFunction, ProvenEvidence,
     VerifiedModuleObject, VerifyError, assert_merged_object_preserves_verified_text, b,
@@ -565,6 +570,107 @@ pub struct SpecSemantics {
     pub out_width: u32,
     /// Modeling preconditions to discharge from `reach` before using `value`.
     pub side_conditions: Vec<Formula>,
+    /// AMBIENT machine-environment assumptions the obligation is conditioned
+    /// on — presently only the WELL-FORMED-STACK bounds a stack-passed
+    /// argument needs (`SP` bounded away from both wrap edges, so the
+    /// prologue's frame stores provably do not alias the caller's
+    /// incoming-argument slots in array theory). Unlike `side_conditions`
+    /// these are NOT discharged from `reach`: they are assumptions about the
+    /// execution environment (AAPCS guarantees a valid stack), spelled into
+    /// BOTH obligations so the proof claim is "for every well-formed stack",
+    /// never an unconditional claim the wrap corner would falsify.
+    pub ambient_pre: Vec<Formula>,
+}
+
+/// STACK-ADDRESS SELECT NORMALIZER. Resolve `Select(Store(m, A1, v), A2)`
+/// STRUCTURALLY whenever both addresses are the symbolic entry stack pointer
+/// plus a constant (folded through `BvAdd`/`BvSub` chains): equal constants
+/// make the read the stored byte, differing constants make the store
+/// irrelevant. SOUNDNESS is pure modular arithmetic, no environmental
+/// assumption: `SP + c1 == SP + c2 (mod 2^64)  <=>  c1 == c2 (mod 2^64)`,
+/// because adding a shared base is a bijection on the bit-vector domain. Any
+/// address NOT of that shape stops the peel and is left for the solver, so a
+/// shape outside the argument stays exactly as hard — and as sound — as
+/// before. (Measured motivation: ay's QF_ABV lane does not converge on the
+/// raw per-byte store chains a frame prologue leaves in front of an
+/// incoming-stack-argument read — Unknown at 120s and 480s; after this
+/// rewrite the residue is trivial.)
+fn normalize_sp_selects(f: &Formula) -> Formula {
+    /// `Some(offset mod 2^64)` when the address is exactly SP-plus-constant.
+    fn sp_offset(f: &Formula) -> Option<u64> {
+        match f {
+            Formula::Var(name, _) if name == "SP" => Some(0),
+            Formula::BvAdd(a, c, 64) => match (&**a, &**c) {
+                (base, Formula::BitVec { value, width: 64 }) => {
+                    sp_offset(base).map(|b| b.wrapping_add(*value as u64))
+                }
+                _ => None,
+            },
+            Formula::BvSub(a, c, 64) => match (&**a, &**c) {
+                (base, Formula::BitVec { value, width: 64 }) => {
+                    sp_offset(base).map(|b| b.wrapping_sub(*value as u64))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    f.clone().map(&mut |node| {
+        let Formula::Select(arr, idx) = node else {
+            return node;
+        };
+        let Some(read_off) = sp_offset(&idx) else {
+            return Formula::Select(arr, idx);
+        };
+        let mut cur = *arr;
+        loop {
+            match cur {
+                Formula::Store(m, a, v) => match sp_offset(&a) {
+                    Some(store_off) if store_off == read_off => return *v,
+                    Some(_distinct) => cur = *m,
+                    None => {
+                        cur = Formula::Store(m, a, v);
+                        break;
+                    }
+                },
+                other => {
+                    cur = other;
+                    break;
+                }
+            }
+        }
+        Formula::Select(Box::new(cur), idx)
+    })
+}
+
+/// The backend's OWN placement of this signature's arguments, for the
+/// stack-passed binding. Every parameter must be a scalar the register
+/// fragment already models (widths 8/16/32/64) — a 128-bit or non-scalar
+/// parameter in an overflowing signature stays fail-closed, so the register
+/// slot accounting of the binding loop and the classifier's cannot diverge
+/// on the shapes this is consulted for.
+fn classify_stack_offsets(
+    module: &Module,
+    func_ty: &trust_ir::ty::FuncTy,
+) -> Result<Vec<ArgLocation>, String> {
+    let mut tys = Vec::with_capacity(func_ty.params.len());
+    for p in &func_ty.params {
+        let width = signature_reg_width(module, p, SigPosition::Parameter)?;
+        tys.push(match width {
+            8 => ClassifierTy::I8,
+            16 => ClassifierTy::I16,
+            32 => ClassifierTy::I32,
+            64 => ClassifierTy::I64,
+            other => {
+                return Err(format!(
+                    "stack-argument placement is modeled for 8/16/32/64-bit scalars only \
+                     (parameter width {other}; fail-closed)"
+                ));
+            }
+        });
+    }
+    Ok(AppleAArch64ABI::classify_params_with(AArch64AbiVariant::Darwin, &tys))
 }
 
 /// Derive the intended-semantics Formula of `function`'s return value over the
@@ -627,6 +733,8 @@ pub fn trust_ir_function_semantics(
     // why this is a running counter rather than `enumerate()`.
     let mut env: HashMap<ValueId, IrValue> = HashMap::new();
     let mut slot: u32 = 0;
+    let mut stack_placements: Option<Result<Vec<ArgLocation>, String>> = None;
+    let mut needs_stack_ambient = false;
     for (index, ((param_id, param_ty), sig_ty)) in
         entry.params.iter().zip(&func_ty.params).enumerate()
     {
@@ -665,9 +773,38 @@ pub fn trust_ir_function_semantics(
             pair
         } else {
             if slot >= 8 {
-                return Err("more than 8 integer arguments is outside the AAPCS64 register \
-                            fragment this gate models (fail-closed)"
-                    .into());
+                // STACK-PASSED scalar argument. The AArch64 backend places it
+                // via `AppleAArch64ABI::classify_params_with` (DarwinPCS packs
+                // narrow fixed args at natural size/alignment), and the callee
+                // loads it from the caller's outgoing area at [SP0 + offset] —
+                // SP0 being the symbolic entry stack pointer the machine
+                // walker seeds (`Var("SP")`). Binding the spec parameter to
+                // the SAME little-endian byte read of the SAME initial memory
+                // makes the two sides one term, exactly as the register
+                // binding above is one term with `read_gpr`. The offsets come
+                // from the CLASSIFIER ITSELF (single source of truth), never
+                // re-derived here; any disagreement between this loop's slot
+                // accounting and the classifier fails closed.
+                let placement =
+                    stack_placements.get_or_insert_with(|| classify_stack_offsets(module, func_ty));
+                let placement = placement.as_ref().map_err(|e| e.clone())?;
+                let Some(ArgLocation::Stack { offset, .. }) = placement.get(index).cloned() else {
+                    return Err(format!(
+                        "argument {index} overflowed the 8 GPR slots but the ABI classifier \
+                         did not place it on the stack; refusing to guess (fail-closed)"
+                    ));
+                };
+                let addr = Formula::BvAdd(
+                    b(Formula::Var("SP".into(), Sort::BitVec(64))),
+                    b(Formula::BitVec { value: offset as i128, width: 64 }),
+                    64,
+                );
+                let mem0 = crate::verify_output::mem_array_var();
+                let f =
+                    crate::verify_output::load_bytes_le_formula(&mem0, &addr, width.div_ceil(8));
+                needs_stack_ambient = true;
+                env.insert(*param_id, IrValue { f, width });
+                continue;
             }
             let f = match width {
                 64 => xn(slot),
@@ -683,6 +820,31 @@ pub fn trust_ir_function_semantics(
         env.insert(*param_id, IrValue { f, width });
     }
 
+    // The well-formed-stack ambient assumptions (see `SpecSemantics::
+    // ambient_pre`): SP0 at least 1 MiB from either wrap edge, so the frame's
+    // own stores (at SP0 - frame) and the incoming argument slots (at
+    // SP0 + offset) are provably distinct addresses in array theory. Every
+    // real AAPCS stack satisfies this by orders of magnitude.
+    let ambient_pre: Vec<Formula> = if needs_stack_ambient {
+        let mib = 1_i128 << 20;
+        vec![
+            // SP >= 2^20  ==  NOT (SP < 2^20)
+            Formula::Not(b(Formula::BvULt(
+                b(Formula::Var("SP".into(), Sort::BitVec(64))),
+                b(Formula::BitVec { value: mib, width: 64 }),
+                64,
+            ))),
+            // SP < 2^64 - 2^20
+            Formula::BvULt(
+                b(Formula::Var("SP".into(), Sort::BitVec(64))),
+                b(Formula::BitVec { value: (u64::MAX as i128) - mib, width: 64 }),
+                64,
+            ),
+        ]
+    } else {
+        Vec::new()
+    };
+
     let mut visited = Vec::new();
     let mut ev = SpecEval::new(&blocks);
     let outcome =
@@ -692,6 +854,7 @@ pub fn trust_ir_function_semantics(
         reach: outcome.reach,
         out_width,
         side_conditions: ev.side,
+        ambient_pre,
     })
 }
 
@@ -1263,12 +1426,16 @@ fn merge_reach(cond: Formula, then_reach: Formula, else_reach: Formula) -> Formu
 //
 // SOUNDNESS OF THE MEMO KEY. Reusing block `B`'s outcome across two different
 // paths is sound exactly when the evaluation cannot observe the difference. The
-// evaluation of `B` reads the incoming environment ONLY at values that are
-// referenced somewhere in the sub-CFG reachable from `B` and NOT defined inside
-// it — that is `live_in(B)`. So the memo is keyed on `(B, env restricted to
-// live_in(B))`, compared by VALUE (`Formula` is `Eq`), never on the block id
-// alone. Two paths that agree there cannot produce different outcomes; two that
-// disagree get separate entries.
+// evaluation of `B` reads the incoming environment at (1) values referenced
+// somewhere in the sub-CFG reachable from `B` and NOT defined inside it — that
+// is `live_in(B)` — and (2) `B`'s OWN BLOCK PARAMS, whose bound formulas are
+// supplied by the in-edge and can differ per predecessor even though the
+// params are SSA defs of `B`. So the memo is keyed on `(B, env restricted to
+// live_in(B) ∪ params(B))`, compared by VALUE (`Formula` is `Eq`), never on
+// the block id alone. Two paths that agree there cannot produce different
+// outcomes; two that disagree get separate entries. (Omitting (2) was a WRONG
+// SPEC generator: every param-carrying join collapsed to its first edge's
+// binding — pinned by tests/trust_ir_gate_diamond_shapes.rs.)
 //
 // `live_in` is computed by one backward pass in reverse topological order:
 //
@@ -1417,9 +1584,27 @@ fn live_in_sets(blocks: &HashMap<u32, &trust_ir::Block>) -> Option<HashMap<u32, 
         for d in defs.get(id)? {
             acc.remove(d);
         }
-        // Deterministic order so the memo key comparison is stable.
+        // THE MEMO KEY additionally carries the block's OWN params. A block
+        // param is an SSA def of this block, so the dataflow above rightly
+        // removes it from the set propagated to predecessors (each
+        // predecessor's key already covers the edge ARG values via its
+        // terminator's `modeled_operands`) — but its BOUND FORMULA is
+        // edge-supplied observable input to THIS block's evaluation, and it
+        // differs across in-edges. Omitting it collapsed every param-carrying
+        // join to the first edge's outcome: the diamond
+        // `if c { b } else { a }` memoized its join at the `b` binding and
+        // reused it on the `a` edge, producing an `Ite` with the SAME value in
+        // both arms — a wrong spec the solver then honestly "refuted" against
+        // correct machine code (see tests/trust_ir_gate_diamond_shapes.rs).
+        // `eval_ir_block` is always entered with the POST-binding environment,
+        // so the params are present in `env` when the key is built.
         let mut v: Vec<ValueId> = acc.iter().copied().collect();
+        if let Some(blk) = blocks.get(id) {
+            v.extend(blk.params.iter().map(|(p, _)| *p));
+        }
+        // Deterministic order so the memo key comparison is stable.
         v.sort_by_key(|id| id.index());
+        v.dedup_by_key(|id| id.index());
         live.insert(*id, v);
         live_set.insert(*id, acc);
     }
@@ -1559,10 +1744,15 @@ pub fn verify_trust_ir_output_preserved(
             None,
         );
     }
-    let obj = match backend.emit_object(&[lir]) {
+    let obj = match backend.emit_object_with_trust_ir_globals(&[lir], &source.module) {
         Ok(obj) => obj,
         Err(e) => {
-            return (OutputVerdict::Unknown { reason: format!("emit_object failed: {e:?}") }, None);
+            return (
+                OutputVerdict::Unknown {
+                    reason: format!("globals-aware emit_object failed: {e:?}"),
+                },
+                None,
+            );
         }
     };
 
@@ -1611,6 +1801,9 @@ pub struct GateObligation {
     /// Discharged from `spec_reach` after the vacuity firewall; a failure is
     /// `Unknown`, never `Refuted`.
     pub spec_side_conditions: Vec<Formula>,
+    /// Ambient machine-environment assumptions (see
+    /// [`SpecSemantics::ambient_pre`]) conditioning BOTH obligations.
+    pub ambient_pre: Vec<Formula>,
 }
 
 /// TEMPORARY MEASUREMENT HOOK (not for commit): run ONLY the machine half of
@@ -1631,7 +1824,13 @@ pub fn trust_ir_gate_obligation(
 ) -> Result<GateObligation, String> {
     // (1) THE SPEC — from the producer's trust-ir, never from the lowering.
     let spec = trust_ir_function_semantics(&source.module, source.func_id)?;
-    let SpecSemantics { value: spec_value, reach: spec_reach, out_width, side_conditions } = spec;
+    let SpecSemantics {
+        value: spec_value,
+        reach: spec_reach,
+        out_width,
+        side_conditions,
+        ambient_pre,
+    } = spec;
 
     // (2) THE MACHINE SIDE — derived ONLY from the emitted bytes.
     if arch != TrustCgTargetArch::AArch64 {
@@ -1645,13 +1844,31 @@ pub fn trust_ir_gate_obligation(
         return Err("emitted text section is empty".into());
     }
     let machine = symbolic_machine_outcome_traps(&code, base, out_width, false)?;
+    // STACK-ADDRESS NORMALIZATION. When the obligation carries the
+    // well-formed-stack ambient, resolve `Select(Store(m, SP0+c1, v),
+    // SP0+c2)` structurally before handing the formulas to ay: under the
+    // ambient bounds, `SP0+c1 == SP0+c2 <=> c1 == c2` for the small frame/
+    // argument offsets these chains carry, so a differing constant makes the
+    // store provably irrelevant and an equal constant makes the read the
+    // stored value. ay's QF_ABV lane was MEASURED not to converge on the raw
+    // chains (Unknown at 120s and 480s); after this rewrite it is handed only
+    // the trivial residue. The rewrite fires ONLY under the ambient that
+    // justifies it and ONLY on SP0-plus-constant addresses — anything else is
+    // left for the solver, so a shape outside the argument stays exactly as
+    // hard (and as sound) as before.
+    let (machine_value, machine_reach) = if ambient_pre.is_empty() {
+        (machine.value, machine.reach)
+    } else {
+        (normalize_sp_selects(&machine.value), normalize_sp_selects(&machine.reach))
+    };
     Ok(GateObligation {
         spec_value,
         spec_reach,
-        machine_value: machine.value,
-        machine_reach: machine.reach,
+        machine_value,
+        machine_reach,
         out_width,
         spec_side_conditions: side_conditions,
+        ambient_pre,
     })
 }
 
@@ -1663,6 +1880,7 @@ fn discharge_trust_ir_obligation(symbol: &str, obligation: &GateObligation) -> O
         machine_value,
         machine_reach,
         spec_side_conditions,
+        ambient_pre,
         ..
     } = obligation;
 
@@ -1734,8 +1952,14 @@ fn discharge_trust_ir_obligation(symbol: &str, obligation: &GateObligation) -> O
         // `spec_reach -> machine_reach`, spelled as `NOT spec_reach OR
         // machine_reach` because that is the connective set `formula_to_term`
         // lowers into ay. Same claim, no new translator surface.
-        let implication =
-            Formula::Or(vec![Formula::Not(b(spec_reach.clone())), machine_reach.clone()]);
+        let mut disjuncts = vec![Formula::Not(b(spec_reach.clone())), machine_reach.clone()];
+        // Ambient machine-environment assumptions weaken the claim to "for
+        // every well-formed stack" — spelled as extra NOT-disjuncts, staying
+        // inside the Or/Not connective set `formula_to_term` lowers.
+        for amb in ambient_pre {
+            disjuncts.insert(0, Formula::Not(b(amb.clone())));
+        }
+        let implication = Formula::Or(disjuncts);
         match discharge_valid(&implication) {
             Discharge::Proven => {}
             Discharge::CounterExample => {
@@ -1755,8 +1979,23 @@ fn discharge_trust_ir_obligation(symbol: &str, obligation: &GateObligation) -> O
         }
     }
 
-    // (5) OBLIGATION B — the values agree on every input the IR returns on.
-    let pre = if matches!(spec_reach, Formula::Bool(true)) { None } else { Some(spec_reach) };
+    // (5) OBLIGATION B — the values agree on every input the IR returns on,
+    // under the ambient machine-environment assumptions (if any). The
+    // conjunction is spelled NOT(OR(NOT ...)) to stay inside the lowered
+    // connective set.
+    let mut pre_conjuncts: Vec<Formula> = Vec::new();
+    if !matches!(spec_reach, Formula::Bool(true)) {
+        pre_conjuncts.push(spec_reach.clone());
+    }
+    pre_conjuncts.extend(ambient_pre.iter().cloned());
+    let pre_owned: Option<Formula> = match pre_conjuncts.len() {
+        0 => None,
+        1 => Some(pre_conjuncts.pop().expect("len checked")),
+        _ => Some(Formula::Not(b(Formula::Or(
+            pre_conjuncts.into_iter().map(|c| Formula::Not(b(c))).collect(),
+        )))),
+    };
+    let pre = pre_owned.as_ref();
     match discharge_equal_pre(machine_value, spec_value, pre) {
         Discharge::Proven => OutputVerdict::Proven {
             evidence: try_kernel_recheckable_proof(machine_value, spec_value, pre)
@@ -1776,6 +2015,103 @@ fn discharge_trust_ir_obligation(symbol: &str, obligation: &GateObligation) -> O
 // PART 3 — THE WHOLE-MODULE BUILD GATE
 // ===========================================================================
 
+/// Require every per-function clone to agree on the exact source global table
+/// and on every module table that can affect canonical initializer bytes.
+///
+/// The frontend renames one function in each clone, so comparing whole Modules
+/// would reject valid work. These are precisely the non-function inputs read by
+/// the canonical global encoder today. The encoded `ObjectGlobal` vectors are
+/// compared as a second, downstream tripwire.
+fn canonical_gate_global_module<'a>(
+    sources: &'a [TrustIrGateSource],
+) -> Result<&'a Module, VerifyError> {
+    let first = sources.first().ok_or(VerifyError::EmptyModule)?;
+    let first_globals = assembled_internal_object_globals(&first.module).map_err(|error| {
+        VerifyError::ModuleEmitFailed {
+            reason: format!("source global table is not emit-ready: {error}"),
+        }
+    })?;
+
+    for (index, source) in sources.iter().enumerate().skip(1) {
+        let same_source_context = source.module.globals == first.module.globals
+            && source.module.types == first.module.types
+            && source.module.structs == first.module.structs
+            && source.module.enums == first.module.enums
+            && source.module.records == first.module.records
+            && source.module.closure_types == first.module.closure_types
+            && source.module.target_info == first.module.target_info;
+        if !same_source_context {
+            return Err(VerifyError::ModuleEmitFailed {
+                reason: format!(
+                    "gate source #{index} (`{}`) carries a different global table or global \
+                     encoding context than source #0 (`{}`); refusing to choose one clone's \
+                     storage image for the merged object",
+                    source.symbol, first.symbol
+                ),
+            });
+        }
+        let globals = assembled_internal_object_globals(&source.module).map_err(|error| {
+            VerifyError::ModuleEmitFailed {
+                reason: format!(
+                    "gate source #{index} (`{}`) has a non-emittable global table: {error}",
+                    source.symbol
+                ),
+            }
+        })?;
+        if globals != first_globals {
+            return Err(VerifyError::ModuleEmitFailed {
+                reason: format!(
+                    "gate source #{index} (`{}`) canonicalizes to different object-global \
+                     bytes/attributes than source #0 (`{}`)",
+                    source.symbol, first.symbol
+                ),
+            });
+        }
+    }
+    Ok(&first.module)
+}
+
+/// Emit an explicitly ungated Trust-IR codegen unit without dropping the
+/// assembled module's global definitions.
+///
+/// This is not proof authority: it exists solely for the user's explicit
+/// `-Ztrust-cg-output-gate=off` acknowledgement. It still enforces identity,
+/// table agreement, canonical encoding, and collision checks.
+pub fn emit_trust_ir_module_object_unverified(
+    sources: &[TrustIrGateSource],
+    module: &CompiledModule,
+    backend: &TrustCgCodegenBackend,
+) -> Result<EmittedModuleObject, VerifyError> {
+    if sources.is_empty() || module.lir_functions.is_empty() {
+        return Err(VerifyError::EmptyModule);
+    }
+    if sources.len() != module.lir_functions.len() {
+        return Err(VerifyError::ModuleEmitFailed {
+            reason: format!(
+                "{} gate source(s) for {} lowered function(s)",
+                sources.len(),
+                module.lir_functions.len()
+            ),
+        });
+    }
+    for (index, (source, function)) in sources.iter().zip(&module.lir_functions).enumerate() {
+        if source.symbol != function.name {
+            return Err(VerifyError::ModuleEmitFailed {
+                reason: format!(
+                    "position {index} carries gate symbol `{}` but lowered function `{}`",
+                    source.symbol, function.name
+                ),
+            });
+        }
+    }
+    let source_module = canonical_gate_global_module(sources)?;
+    backend.emit_module_object_with_trust_ir_globals(module, source_module).map_err(|error| {
+        VerifyError::ModuleEmitFailed {
+            reason: format!("globals-aware emit_module_object failed: {error:?}"),
+        }
+    })
+}
+
 /// THE F1 BUILD GATE: verify every function of a trust-ir codegen unit, then
 /// emit ONE object and prove it carries each verified instruction stream
 /// verbatim.
@@ -1792,12 +2128,14 @@ fn discharge_trust_ir_obligation(symbol: &str, obligation: &GateObligation) -> O
 pub fn emit_trust_ir_module_object_verified(
     sources: &[TrustIrGateSource],
     linkage: &[FunctionLinkage],
+    statics: &[trust_cg_codegen::pipeline::ObjectGlobal],
     policy: EmitPolicy,
     backend: &TrustCgCodegenBackend,
 ) -> Result<(VerifiedModuleObject, CertificationReport), VerifyError> {
     if sources.is_empty() {
         return Err(VerifyError::EmptyModule);
     }
+    let source_module = canonical_gate_global_module(sources)?;
     let mut seen = HashSet::with_capacity(sources.len());
     for source in sources {
         if !seen.insert(source.symbol.as_str()) {
@@ -1820,6 +2158,7 @@ pub fn emit_trust_ir_module_object_verified(
     let mut report = CertificationReport::default();
     for source in sources {
         let (verdict, bytes) = verify_trust_ir_output_preserved(source, backend);
+        let mut unknown_reason: Option<String> = None;
         match verdict {
             OutputVerdict::Proven { evidence } => match evidence {
                 // [PROVED] — the clean kernel is the authority. The pair form is
@@ -1857,15 +2196,29 @@ pub fn emit_trust_ir_module_object_verified(
                 if policy == EmitPolicy::StrictProvenOnly {
                     return Err(VerifyError::Unknown { function: source.symbol.clone(), reason });
                 }
+                // An AllowUnknown verdict with NO bytes below is an early
+                // lower/emit failure whose reason lives HERE — carry it so the
+                // refusal names the real defect instead of a generic
+                // no-bytes line (measured: a narrow checked-add ISel refusal
+                // surfaced as "produced no shippable object bytes" and cost a
+                // re-derivation to attribute).
+                unknown_reason = Some(reason);
                 report.unknown += 1;
             }
         }
         match bytes {
             Some(bytes) => verified.push((source.symbol.clone(), bytes)),
             None => {
+                let detail = match unknown_reason.take() {
+                    Some(reason) => format!(
+                        "verification emission produced no shippable object bytes \
+                         (verdict was Unknown: {reason})"
+                    ),
+                    None => "verification emission produced no shippable object bytes".to_string(),
+                };
                 return Err(VerifyError::EmitFailed {
                     function: source.symbol.clone(),
-                    reason: "verification emission produced no shippable object bytes".to_string(),
+                    reason: detail,
                 });
             }
         }
@@ -1882,10 +2235,13 @@ pub fn emit_trust_ir_module_object_verified(
                 reason: format!("re-lower for the determinism check failed: {e}"),
             }
         })?;
-        let reemit = backend.emit_object(&[lir]).map_err(|e| VerifyError::EmitFailed {
-            function: name.clone(),
-            reason: format!("re-emit emit_object failed: {e:?}"),
-        })?;
+        let reemit =
+            backend.emit_object_with_trust_ir_globals(&[lir], &source.module).map_err(|e| {
+                VerifyError::EmitFailed {
+                    function: name.clone(),
+                    reason: format!("re-emit globals-aware emit_object failed: {e:?}"),
+                }
+            })?;
         if &reemit != bytes {
             return Err(VerifyError::EmitFailed {
                 function: name.clone(),
@@ -1912,17 +2268,20 @@ pub fn emit_trust_ir_module_object_verified(
         lir_functions.push(lir);
     }
     let function_count = lir_functions.len();
-    let module = crate::codegen_backend::CompiledModule {
+    let module = CompiledModule {
         name: "trust_cg.verified_trust_ir_module".to_string(),
         lir_functions,
         object_path: None,
         function_count,
         source_functions: None,
         linkage: linkage.to_vec(),
+        statics: statics.to_vec(),
     };
-    let emitted = backend.emit_module_object(&module).map_err(|e| {
-        VerifyError::ModuleEmitFailed { reason: format!("emit_module_object failed: {e:?}") }
-    })?;
+    let emitted = backend
+        .emit_module_object_with_trust_ir_globals(&module, source_module)
+        .map_err(|e| VerifyError::ModuleEmitFailed {
+            reason: format!("globals-aware emit_module_object failed: {e:?}"),
+        })?;
 
     // PHASE 3b — DISCHARGE THE BYTE-PRESERVATION OBLIGATION, using the SAME
     // read-back-from-the-shipped-object check the MIR gate uses.
@@ -2031,6 +2390,7 @@ mod tests_i128_pair {
         let source = TrustIrGateSource { symbol: "k".to_string(), module, func_id: FuncId::new(0) };
         let (object, report) = emit_trust_ir_module_object_verified(
             std::slice::from_ref(&source),
+            &[],
             &[],
             EmitPolicy::default(),
             &backend(),

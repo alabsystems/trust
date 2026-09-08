@@ -818,6 +818,58 @@ fn overflow_check_origins_fail_closed_for_identical_vcs_from_distinct_blocks() {
     assert_eq!(origins.0.get(&canonical_vc), Some(&OverflowOrigin::Ambiguous));
 }
 
+/// WHY `trust_vcgen::overflow_vc_block_origins` RETURNS AN `Option` AND WHY A REFUSAL
+/// MUST NOT DEGRADE TO "the rows I did manage to build".
+///
+/// `Ambiguous` is not a property of a row — it is a property of the ENUMERATION. The
+/// test above proves the map fails closed when it is SHOWN both blocks; this one proves
+/// the converse, which is the actual hazard: shown only a PREFIX, the identical input
+/// mints `Unique` and licenses a rewrite. Nothing downstream can detect the difference,
+/// because a short table and a complete one have the same type and the same shape.
+///
+/// So completeness has to be decided where it is known — inside the replay, which is the
+/// only code that can tell "the walk ended" from "the walk was cut off" — and a refusal
+/// has to arrive as `None`, never as a partial `Vec`.
+#[test]
+fn a_truncated_origin_enumeration_forges_a_unique_origin() {
+    let vc = test_vc(11);
+    let canonical_vc =
+        canonical_exact_vc_payload(&vc).expect("test VC must have a canonical payload");
+    let complete =
+        [(trust_types::BlockId(4), vc.clone()), (trust_types::BlockId(9), vc.clone())];
+
+    assert_eq!(
+        OverflowCheckOrigins::from_pairs(&complete).resolve(&canonical_vc),
+        None,
+        "the COMPLETE enumeration is ambiguous and must refuse"
+    );
+    assert_eq!(
+        OverflowCheckOrigins::from_pairs(&complete[..1]).resolve(&canonical_vc),
+        Some(BasicBlock::from_usize(4)),
+        "a PREFIX of that same enumeration mints Unique(bb4) — the elision seam would \
+         then delete bb4's live overflow Assert on the authority of a proof that is \
+         equally consistent with bb9. This is the failure a partial replay causes, and \
+         it is why the replay refuses instead of truncating."
+    );
+}
+
+/// The refusal path is INERT, not merely smaller: a `None` from the replay becomes the
+/// default table, every `resolve` misses, and every overflow check is kept.
+#[test]
+fn a_refused_origin_replay_yields_an_inert_table() {
+    let vc = test_vc(12);
+    let canonical_vc =
+        canonical_exact_vc_payload(&vc).expect("test VC must have a canonical payload");
+
+    let refused = OverflowCheckOrigins::default();
+    assert!(refused.0.is_empty());
+    assert_eq!(
+        refused.resolve(&canonical_vc),
+        None,
+        "a declined replay must license no elision at all"
+    );
+}
+
 #[test]
 fn overflow_check_origins_key_by_exact_vc_not_source_span() {
     let true_vc = test_vc(9);
@@ -4523,7 +4575,8 @@ fn fresh_vc_rekey_invalidates_legacy_compatible_proofs_and_retains_missing_vcs()
             &fresh_vcs,
             &snapshot,
         );
-    promote_structurally_dead_unreachable(&mut promoted_after_integrity_failure, None);
+    let _declined =
+        promote_structurally_dead_unreachable(&mut promoted_after_integrity_failure, None);
     promote_kernel_certifiable(&mut promoted_after_integrity_failure, None);
     let sentinel_index = promoted_after_integrity_failure
         .iter()
@@ -5878,6 +5931,263 @@ fn trust_mc_typed_chc_contract_binds_hardened_obligation_to_canonical_public_con
     );
 }
 
+/// Build a Bool-rooted `And` chain nested exactly `depth` levels deep.
+///
+/// `depth` is measured the way `validate_trust_spec_expr` measures it: the root
+/// sits at 0 and every child is one deeper, so the returned predicate's deepest
+/// node is at `depth`.
+fn trust_spec_predicate_nested_to_depth(depth: usize) -> trust_verifier_api::TrustSpecPredicate {
+    let flag =
+        trust_verifier_api::TrustSpecExpr::variable("panic_flag", trust_verifier_api::TrustSpecSort::Bool);
+    // `binary(And, flag, unary(Not, flag))` already reaches depth 2, and every
+    // wrap adds exactly one.
+    let mut root = trust_verifier_api::TrustSpecExpr::binary(
+        trust_verifier_api::TrustSpecBinaryOp::And,
+        flag.clone(),
+        trust_verifier_api::TrustSpecExpr::unary(
+            trust_verifier_api::TrustSpecUnaryOp::Not,
+            flag.clone(),
+        ),
+    );
+    for _ in 2..depth {
+        root = trust_verifier_api::TrustSpecExpr::binary(
+            trust_verifier_api::TrustSpecBinaryOp::And,
+            root,
+            flag.clone(),
+        );
+    }
+    trust_verifier_api::TrustSpecPredicate::new(
+        root,
+        vec![trust_verifier_api::TrustSpecVariable {
+            name: "panic_flag".to_string(),
+            sort: trust_verifier_api::TrustSpecSort::Bool,
+            origin: trust_verifier_api::TrustSpecVariableOrigin::Inferred,
+        }],
+    )
+}
+
+/// A hardened obligation carrying `predicate` as its typed formula payload, in
+/// the same shape as
+/// `trust_mc_typed_chc_contract_binds_hardened_obligation_to_canonical_public_contract`.
+fn hardened_trust_mc_obligation_with_predicate(
+    obligation_id: &str,
+    original_contract_id: &str,
+    predicate: &trust_verifier_api::TrustSpecPredicate,
+) -> trust_verifier_api::TrustObligation {
+    trust_verifier_api::TrustObligation {
+        obligation_id: obligation_id.to_string(),
+        kind: trust_verifier_api::ObligationKind::Custom {
+            namespace: "trust.vc.hardened".to_string(),
+            name: "panic_boundary".to_string(),
+        },
+        contract_id: Some(original_contract_id.to_string()),
+        proof_item_id: None,
+        source: native_trust_ir_test_source_location(17),
+        description: "hardened boundary (panic_boundary): assert can panic".to_string(),
+        required_strength: None,
+        summary_facts: Vec::new(),
+        metadata: vec![
+            trust_verifier_api::MetadataEntry {
+                key: TRUST_VC_HARDENED_CATEGORY_METADATA_KEY.to_string(),
+                value: "panic_boundary".to_string(),
+            },
+            trust_verifier_api::MetadataEntry {
+                key: TRUST_VC_FORMULA_SCHEMA_METADATA_KEY.to_string(),
+                value: trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION.to_string(),
+            },
+            trust_verifier_api::MetadataEntry {
+                key: TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY.to_string(),
+                value: serde_json::to_string(predicate).expect("TrustSpecPredicate should serialize"),
+            },
+            trust_verifier_api::MetadataEntry {
+                key: TRUST_SOURCE_DIGEST_METADATA_KEY.to_string(),
+                value: "11".repeat(32),
+            },
+            trust_verifier_api::MetadataEntry {
+                key: TRUST_VC_DIGEST_METADATA_KEY.to_string(),
+                value: "22".repeat(32),
+            },
+        ],
+    }
+}
+
+/// A VC the public API ACCEPTS can still lower to a contract the public API
+/// REJECTS, and when it does the whole function's native bundle must survive.
+///
+/// `validate_trust_spec_expr` bounds a typed formula's expression nesting by
+/// `MAX_CONTRACT_PREDICATE_JSON_DEPTH`; `validate_bounded_json` bounds the
+/// derived contract's JSON CONTAINER nesting by the same constant. The derived
+/// contract wraps the lowered constraint in `rules[0].body.constraints[0]`, so
+/// a formula at the first bound is necessarily past the second — the two
+/// bounds are not the same measurement and were never reconciled.
+///
+/// Before the fix `finalize_trust_mc_public_semantic_contracts` pushed that
+/// contract anyway and let `bundle.validate()` fail, and the error propagated
+/// with `?` out of `build_native_trust_ir_bundle_from_verifiable_functions` —
+/// discarding the native TrustIr bundle for the WHOLE function so that every
+/// requested obligation degraded to `EvidenceStatus::Unsupported`. That is the
+/// exact chain that cost a3d's `insphere_i128` all 26 of its rows.
+#[test]
+fn unrepresentable_derived_trust_mc_contract_is_declined_not_pushed_into_the_bundle() {
+    let (mut function, _, _) = native_trust_ir_compiler_function();
+    function.contracts.clear();
+
+    let original_contract_id = "contract:read_fixed_array_value:panic_boundary:source";
+    let mut bundle = trust_verifier_api::TrustContractBundle::empty(
+        "bundle-read-fixed-array-value-deep",
+        trust_verifier_api::BundleSubject::Function {
+            crate_name: "demo".to_string(),
+            path: function.def_path.clone(),
+        },
+    );
+    bundle.contracts.push(trust_verifier_api::TrustContract {
+        contract_id: original_contract_id.to_string(),
+        kind: trust_verifier_api::ContractKind::Asserts,
+        predicate: trust_verifier_api::ContractPredicate::TrustExpr {
+            text: "original hardened panic-boundary source context".to_string(),
+        },
+        source: native_trust_ir_test_source_location(17),
+        metadata: Vec::new(),
+    });
+
+    // Sit exactly ON the typed-formula bound. This is the premise of the whole
+    // test: the compiler is entitled to emit this VC.
+    let predicate = trust_spec_predicate_nested_to_depth(
+        trust_verifier_api::MAX_CONTRACT_PREDICATE_JSON_DEPTH,
+    );
+    predicate
+        .validate()
+        .expect("a formula at MAX_CONTRACT_PREDICATE_JSON_DEPTH is a VC the public API accepts");
+
+    let obligation_id = "vc:read_fixed_array_value:panic_boundary:1";
+    bundle.obligations.push(hardened_trust_mc_obligation_with_predicate(
+        obligation_id,
+        original_contract_id,
+        &predicate,
+    ));
+
+    let native_trust_ir_bundle =
+        build_native_trust_ir_bundle_for_test_verifier_api(&function, &mut bundle, &[])
+            .expect(
+                "one unrepresentable derived contract must not discard the whole function's \
+                 native TrustIr bundle",
+            )
+            .expect("the hardened obligation still requests trust-mc");
+    assert!(
+        !native_trust_ir_bundle.compiler_facts.obligation_sources.is_empty(),
+        "the surviving native bundle must still carry the function's proof obligations"
+    );
+
+    bundle
+        .validate()
+        .expect("the bundle the compiler hands to the verifier must validate");
+
+    let obligation = bundle
+        .obligations
+        .iter()
+        .find(|obligation| obligation.obligation_id == obligation_id)
+        .expect("hardened obligation should remain in the public bundle");
+
+    // NON-VACUITY: the decline actually happened. If the derived contract were
+    // representable after all, this assertion fails rather than letting the
+    // test pass for the wrong reason.
+    let public_contract_id = obligation.contract_id.as_deref();
+    assert_eq!(
+        public_contract_id,
+        Some(original_contract_id),
+        "a declined mint must leave the row's original contract identity untouched"
+    );
+    assert!(
+        !bundle.contracts.iter().any(|contract| {
+            contract.contract_id.starts_with("contract:trust-mc-typed-chc-public:")
+        }),
+        "no canonical public typed-CHC contract may be minted for an unrepresentable formula"
+    );
+    // THE TWO MINT SITES DECIDE INDEPENDENTLY, and the invariant is per-record
+    // representability, NOT that they agree.
+    //
+    // The authenticated native marker is appended before the SECOND
+    // `bundle.validate()?`, so it needs its own check or the poisoning merely
+    // relocates. But it is NOT built from the same encoding as the canonical
+    // contract: the marker goes through the native TrustIr request, which can
+    // reach a structural whole-CFG CHC where the canonical builder fell back to
+    // the flat `rules[0].body.constraints[0]` wrapper. On a3d's real
+    // `insphere_i128` both sites decline the same two rows
+    // (`panic_boundary:46`, `:48`); in this synthetic module the marker's own
+    // encoding stays inside the bound, so only the canonical mint declines.
+    //
+    // That asymmetry is SAFE, and asserting it away would be asserting a
+    // coincidence. A marker alone cannot authorize the direct typed-CHC lane:
+    // trust-bmc selects that lane through `obligation.contract_id`, and it
+    // explicitly refuses to let a native marker identity stand in for the
+    // canonical public link. So the row still falls to the whole-module
+    // transport route. What must hold is that EVERY record the bundle carries
+    // is one the bundle would accept — asserted here per record, so a future
+    // marker that IS past the bound fails here rather than at the second
+    // `bundle.validate()?`.
+    for contract in &bundle.contracts {
+        contract.validate().unwrap_or_else(|error| {
+            panic!(
+                "every contract the compiler pushes must be representable, but `{}` is not: {error}",
+                contract.contract_id
+            )
+        });
+    }
+
+    // FAIL-CLOSED, NOT ADMITTED. Losing the typed contract costs the row the
+    // DIRECT typed-CHC lane and nothing else: trust-bmc's direct-lane selector
+    // keys off exactly this contract identity, so the row is left to the
+    // whole-module transport route, which must still prove it.
+    assert!(
+        !public_contract_id
+            .expect("row keeps a contract identity")
+            .starts_with("contract:trust-mc-typed-chc"),
+        "a declined row must not be eligible for the direct typed-CHC lane"
+    );
+}
+
+/// The decline is reached through the same per-record checker bundle validation
+/// applies — not through a private re-implementation of it that could drift.
+#[test]
+fn derived_trust_mc_contract_decline_agrees_with_bundle_validation() {
+    let deep = trust_spec_predicate_nested_to_depth(
+        trust_verifier_api::MAX_CONTRACT_PREDICATE_JSON_DEPTH,
+    );
+    let shallow = trust_spec_predicate_nested_to_depth(4);
+    shallow.validate().expect("a shallow formula validates");
+
+    for (label, predicate, expect_minted) in
+        [("shallow", shallow, true), ("at-the-formula-bound", deep, false)]
+    {
+        let (mut function, _, _) = native_trust_ir_compiler_function();
+        function.contracts.clear();
+        let obligation = hardened_trust_mc_obligation_with_predicate(
+            "vc:read_fixed_array_value:panic_boundary:1",
+            "contract:read_fixed_array_value:panic_boundary:source",
+            &predicate,
+        );
+        let minted = super::trust_mc_public_typed_chc_contract_for_obligation(
+            "checked_transfer",
+            &function,
+            Some("demo"),
+            &obligation,
+            None,
+        )
+        .expect("minting must never fail the caller for an unrepresentable contract");
+
+        assert_eq!(
+            minted.is_some(),
+            expect_minted,
+            "{label}: mint decision disagrees with the public API bound"
+        );
+        if let Some(contract) = minted {
+            contract
+                .validate()
+                .unwrap_or_else(|error| panic!("{label}: a minted contract must validate: {error}"));
+        }
+    }
+}
+
 #[test]
 fn trust_mc_default_admission_accepts_only_exact_tls_address_nodes() {
     let exact_op = trust_ir::dialect::trust_rust::thread_local_addr("test::TLS");
@@ -7195,6 +7505,7 @@ fn full_verification_compiler_input_defers_direct_trust_vc_proof_unit() {
         &bundle,
         &bundle.obligations,
         Some(&native_trust_ir_bundle),
+        None,
         &trust_router::VerifierExecutionContext::new("trustc-native-trust-ir-test"),
     );
 
@@ -11411,6 +11722,7 @@ fn full_verification_compiler_input_classifies_missing_native_bundle_and_direct_
         &bundle,
         &bundle.obligations,
         None,
+        None,
         &trust_router::VerifierExecutionContext::new("trustc-native-trust-ir-missing-test"),
     );
 
@@ -11574,11 +11886,11 @@ fn local_external_bucket_is_verified_without_a_corpus_allowlist() {
 
     let bucket = trust_mir_extract::policy::PolicyBucket::ExternalDep;
     assert_eq!(
-        verification_scope_policy_decision(bucket, true, &default_policy),
+        verification_scope_policy_decision(bucket, true, false, &default_policy),
         TrustVerifyDecision::Verify
     );
     assert_eq!(
-        verification_scope_policy_decision(bucket, false, &default_policy),
+        verification_scope_policy_decision(bucket, false, false, &default_policy),
         TrustVerifyDecision::Skip(TrustVerifySkipReason::ExternalDependencyScope)
     );
 }
@@ -11606,33 +11918,115 @@ fn external_dependency_body_scope_routes_to_verifier_by_policy() {
     let bucket = trust_mir_extract::policy::PolicyBucket::ExternalDep;
 
     assert_eq!(
-        verification_scope_policy_decision(bucket, false, &normal_policy),
+        verification_scope_policy_decision(bucket, false, false, &normal_policy),
         TrustVerifyDecision::Skip(TrustVerifySkipReason::ExternalDependencyScope)
     );
     assert_eq!(
-        verification_scope_policy_decision(bucket, false, &dependency_policy),
+        verification_scope_policy_decision(bucket, false, false, &dependency_policy),
         TrustVerifyDecision::Verify
     );
     assert_eq!(
-        verification_scope_policy_decision(bucket, false, &full_policy),
+        verification_scope_policy_decision(bucket, false, false, &full_policy),
         TrustVerifyDecision::Skip(TrustVerifySkipReason::ExternalDependencyScope)
     );
     assert_eq!(
-        verification_scope_policy_decision(bucket, false, &full_dependency_policy),
+        verification_scope_policy_decision(bucket, false, false, &full_dependency_policy),
         TrustVerifyDecision::Verify
     );
 
     let trust_owned_bucket = trust_mir_extract::policy::PolicyBucket::TrustOwnedDefault;
     assert_eq!(
-        verification_scope_policy_decision(trust_owned_bucket, false, &normal_policy),
+        verification_scope_policy_decision(trust_owned_bucket, false, false, &normal_policy),
         TrustVerifyDecision::Skip(TrustVerifySkipReason::NonLocalMir)
     );
     assert_eq!(
-        verification_scope_policy_decision(trust_owned_bucket, false, &full_policy),
+        verification_scope_policy_decision(trust_owned_bucket, false, false, &full_policy),
         TrustVerifyDecision::Skip(TrustVerifySkipReason::NonLocalMir)
     );
     assert_eq!(
-        verification_scope_policy_decision(trust_owned_bucket, false, &full_dependency_policy),
+        verification_scope_policy_decision(trust_owned_bucket, false, false, &full_dependency_policy),
+        TrustVerifyDecision::Verify
+    );
+}
+
+/// Trust (cross-crate value composition, Edit 2): the declared-bundle-scope bit
+/// suppresses the NON-LOCAL scope skip for that def, and for that def only.
+///
+/// Pinned in BOTH directions on the same call: with the bit OFF the skip is
+/// exactly what it was, so the passing direction cannot be read as the skip
+/// having been deleted. This is the mutation proof the falsification plan asks
+/// for, in unit form — the UI arm proves the same thing end to end via
+/// `TRUST_NO_BUNDLE_DECLARED=1`.
+#[test]
+fn declared_bundle_scope_suppresses_the_non_local_skip_for_that_def_only() {
+    let normal_policy = test_policy(false, false);
+    let trust_owned_bucket = trust_mir_extract::policy::PolicyBucket::TrustOwnedDefault;
+
+    // OFF: today's behaviour, unchanged.
+    assert_eq!(
+        verification_scope_policy_decision(trust_owned_bucket, false, false, &normal_policy),
+        TrustVerifyDecision::Skip(TrustVerifySkipReason::NonLocalMir)
+    );
+    // ON: the same def is a verification SUBJECT.
+    assert_eq!(
+        verification_scope_policy_decision(trust_owned_bucket, false, true, &normal_policy),
+        TrustVerifyDecision::Verify
+    );
+
+    // The suppression is not global: the policy is untouched, so any OTHER
+    // non-local def — one whose crate was not declared — still skips.
+    assert!(should_skip_non_local_mir_for_policy(false, &normal_policy));
+    assert!(!normal_policy.include_dependencies);
+}
+
+/// Trust (cross-crate value composition, Edit 2): a DECLARED crate that lands
+/// in a non-`TrustOwned*` bucket is still skipped.
+///
+/// `ExternalDep`'s `unsupported_is_failure()` is `false`, so a capability gap
+/// in such a body becomes an assumption row rather than a failure — the wrong
+/// direction for a body whose verdict is about to grant assumption authority to
+/// a caller. `UpstreamRustModified` (`core`/`alloc`/`std`, `rustc_*`) is the
+/// same. The bit alone must not be enough.
+#[test]
+fn declared_bundle_scope_does_not_admit_a_non_trust_owned_bucket() {
+    let normal_policy = test_policy(false, false);
+
+    assert_eq!(
+        verification_scope_policy_decision(
+            trust_mir_extract::policy::PolicyBucket::ExternalDep,
+            false,
+            true,
+            &normal_policy
+        ),
+        TrustVerifyDecision::Skip(TrustVerifySkipReason::ExternalDependencyScope)
+    );
+    assert_eq!(
+        verification_scope_policy_decision(
+            trust_mir_extract::policy::PolicyBucket::UpstreamRustModified,
+            false,
+            true,
+            &normal_policy
+        ),
+        TrustVerifyDecision::Skip(TrustVerifySkipReason::NonLocalMir)
+    );
+    assert_eq!(
+        verification_scope_policy_decision(
+            trust_mir_extract::policy::PolicyBucket::Unknown,
+            false,
+            true,
+            &normal_policy
+        ),
+        TrustVerifyDecision::Skip(TrustVerifySkipReason::NonLocalMir)
+    );
+    // ...and a LOCAL def can never be a "bundle scope subject", so the bit
+    // cannot change any decision inside the crate being compiled.
+    assert_eq!(
+        verification_scope_policy_decision(
+            trust_mir_extract::policy::PolicyBucket::TrustOwnedDefault,
+            true,
+            true,
+            &normal_policy
+        ),
         TrustVerifyDecision::Verify
     );
 }
@@ -15106,6 +15500,7 @@ fn v1_bridge_does_not_turn_sat_user_assertion_approximation_into_a_refutation() 
         None,
         std::slice::from_ref(&assertion),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(assertion.clone(), bridge_test_unknown())],
     );
 
@@ -15145,6 +15540,7 @@ fn v1_bridge_demotes_preexisting_generic_assertion_sat_before_rekey() {
         None,
         std::slice::from_ref(&assertion),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(assertion.clone(), preexisting_sat)],
     );
 
@@ -15169,6 +15565,7 @@ fn v1_bridge_retains_unsat_user_assertion_proof_direction() {
         None,
         std::slice::from_ref(&assertion),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(assertion.clone(), bridge_test_unknown())],
     );
 
@@ -15207,6 +15604,7 @@ fn v1_bridge_bridges_generic_l0_refutation_without_an_entry_grounding_gate() {
         None,
         std::slice::from_ref(&safety),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(safety.clone(), bridge_test_unknown())],
     );
 
@@ -15232,6 +15630,7 @@ fn v1_bridge_retains_entry_grounded_l0_refutation_direction() {
         None,
         std::slice::from_ref(&safety),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(safety.clone(), bridge_test_unknown())],
     );
 
@@ -15258,6 +15657,7 @@ fn v1_bridge_keeps_postcondition_proof_only() {
         None,
         std::slice::from_ref(&postcondition),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(postcondition.clone(), bridge_test_unknown())],
     );
 
@@ -15297,6 +15697,7 @@ fn v1_bridge_requires_exact_bound_semantics_not_just_span() {
         None,
         std::slice::from_ref(&precise),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(native_placeholder, native_unknown)],
     );
 
@@ -15765,6 +16166,7 @@ fn v1_bridge_cannot_reseal_two_swapped_valid_bindings() {
         None,
         &[precise_a, precise_b],
         &mut swapped,
+        /* stamp_held_assert_refutations */ true,
         results.clone(),
     );
 
@@ -15821,6 +16223,7 @@ fn v1_bridge_disambiguates_distinct_exact_vcs_at_one_source_span() {
         None,
         &solver_vcs,
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         results,
     );
 
@@ -15849,6 +16252,7 @@ fn v1_bridge_rejects_duplicate_exact_vcs_even_with_valid_row_bindings() {
         None,
         &[vc.clone(), vc.clone()],
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(vc.clone(), bridge_test_unknown()), (vc.clone(), bridge_test_unknown())],
     );
 
@@ -15869,6 +16273,7 @@ fn v1_bridge_rejects_duplicate_exact_solver_carrier_only() {
         None,
         &[vc.clone(), vc.clone()],
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(vc, bridge_test_unknown())],
     );
 
@@ -15893,6 +16298,7 @@ fn v1_bridge_rejects_duplicate_exact_result_carrier_only() {
         None,
         std::slice::from_ref(&vc),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(vc.clone(), bridge_test_unknown()), (vc.clone(), bridge_test_unknown())],
     );
 
@@ -15916,6 +16322,7 @@ fn v1_bridge_does_not_solve_unsupported_capability_sentinels() {
         None,
         std::slice::from_ref(&unsupported),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(unsupported.clone(), bridge_test_unknown())],
     );
 
@@ -15960,6 +16367,7 @@ fn v1_bridge_rejects_ambiguous_same_span_arithmetic_fallback() {
         None,
         &[add_overflow, mul_overflow],
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(native_placeholder.clone(), native_unknown)],
     );
 
@@ -16002,6 +16410,7 @@ fn v1_bridge_rejects_unique_same_span_with_different_formula() {
         None,
         std::slice::from_ref(&neighboring),
         &mut bindings,
+        /* stamp_held_assert_refutations */ true,
         vec![(native.clone(), native_unknown)],
     );
 
@@ -19023,6 +19432,7 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
         &bundle,
         &dispatched,
         native_trust_ir_bundle.as_ref(),
+        None,
         &context,
     );
 
@@ -19068,7 +19478,8 @@ fn def_site_requires_marker_keeps_public_and_private_carriers_in_parity() {
         &snapshot,
     );
     let (results, _, _, _) =
-        bridge_v1_ay_proofs_into_native_results(500, None, &[], &mut bindings, legacy_results);
+        bridge_v1_ay_proofs_into_native_results(500, None, &[], &mut bindings,
+        /* stamp_held_assert_refutations */ true, legacy_results);
     let cleancic = (0..results.len()).map(|_| None).collect::<Vec<_>>();
     let authorities =
         build_result_proof_authorities(&results, &bindings, Some(&full_result), &cleancic);
@@ -19412,12 +19823,394 @@ fn entry_assumption_never_authorizes_unconditional_panic_freedom() {
 
 #[test]
 fn zero_obligation_registry_requires_the_complete_strict_acceptance_shape() {
-    assert!(zero_obligation_registry_gate(true, true, true, true));
-    for rejected in 0..4 {
-        let mut gates = [true; 4];
+    assert!(zero_obligation_registry_gate(true, true, true, true, true));
+    for rejected in 0..5 {
+        let mut gates = [true; 5];
         gates[rejected] = false;
-        assert!(!zero_obligation_registry_gate(gates[0], gates[1], gates[2], gates[3]));
+        assert!(
+            !zero_obligation_registry_gate(gates[0], gates[1], gates[2], gates[3], gates[4]),
+            "conjunct {rejected} must be load-bearing"
+        );
     }
+}
+
+/// FALSE PROOF #11 — the zero-obligation registry gate must REFUSE a function
+/// whose calls are not discharged, no matter how clean every other conjunct is.
+///
+/// Before the `all_calls_proven_panic_free` conjunct, an empty obligation set
+/// was read as "trivially panic-free" and registered into the UNCONDITIONAL
+/// `panic_free_proven_funcs`. Measured on the deployed driver, a function whose
+/// entire body is `leaf(a, 0)` for a same-crate divide-by-zero `leaf` produced
+/// `[PF_REG] established=true nrows=0` and `[NO OBLIGATIONS]`, and that
+/// registration then flipped OTHER callers' rows to Proved.
+///
+/// FAILS ON UNFIXED CODE: the four-argument gate had no way to express this, so
+/// the all-true-except-calls shape below returned `true`.
+#[test]
+fn zero_obligation_registry_refuses_an_undischarged_call() {
+    // Every strict-acceptance conjunct satisfied, calls NOT discharged.
+    assert!(
+        !zero_obligation_registry_gate(true, true, true, true, false),
+        "zero obligations is the ABSENCE of a question, not a proof: a function \
+         with an undischarged call must never enter the unconditional panic-free \
+         registry"
+    );
+    // ... and the converse: discharged calls alone do not license registration
+    // when any other conjunct fails.
+    assert!(!zero_obligation_registry_gate(false, true, true, true, true));
+}
+
+// ===========================================================================
+// FALSE PROOF #12 — the whole-function panic-freedom SUBSUMPTION premise.
+//
+// #11 was closed by minting the missing panic-freedom carrier for a resolved
+// same-crate call. That carrier IS the aggregate this lane subsumes, so the
+// repair produced bodies whose ONLY row is the aggregate — and the lane's
+// premise ("every OTHER row is a static proof") is an `all()` over an EMPTY
+// set, i.e. `true`. Measured on the deployed driver `sha256:18e5a9a90a1697f6`,
+// direct `trustc` lane, `-Z trust-verify-output=json`:
+//
+//   fn r1_calls_div_leaf(a: u64) -> u64 { r1_div_leaf(a, 0) }   // ALWAYS panics
+//   -> {"kind":"assert","outcome":"proved","solver":"trust-structural-subsumption",
+//       "description":"assertion: panic freedom: no assertion, `unreachable!`, or
+//        panic is reachable"}
+//   [PF_CALLGATE] fn=P::r1_calls_div_leaf UNREGISTERED callee blocks discharge: P::r1_div_leaf
+//   [PANIC_FREEDOM_SUBSUMPTION] discharged aggregate row 0 for P::r1_calls_div_leaf
+//
+// The two trace lines are the whole finding: the call gate had ALREADY answered
+// NO for this exact function, and this lane discharged anyway.
+//
+// WHY THESE TESTS FAIL ON UNFIXED CODE. Before the repair the lane's decision
+// was, verbatim, `if !premises_hold { return; }` where `premises_hold` is the
+// `all()` over non-aggregate rows — i.e. exactly the middle argument below and
+// NOTHING else. So on unfixed code the decision for every input here is the
+// value of `rows_all_static_proofs` alone: `(0, true, true)`, `(1, true, false)`
+// and `(2, true, false)` all decided TRUE, which is what each assertion denies.
+// ===========================================================================
+
+
+
+
+
+
+// ===========================================================================
+// FRONT B — conjunct (5) is REACHABILITY-aware. Tests against the pure core
+// `panic_block_row_unreachability_premise(target_block_count,
+// distinct_proved_target_formulas, any_target_row_unproved)`.
+//
+// WHAT THIS CORE DECIDES: "does this function's own FINAL row set carry an
+// authenticated static proof that EVERY `assert!`/`panic!` refutation-target
+// block is unreachable?" Only a `true` here may arm the panic-callee exemption
+// inside `all_calls_discharge_panic_free`.
+//
+// WHY THESE TESTS FAIL ON UNFIXED CODE. Before this change the exemption's only
+// input was the recorded refute-lane flag; there was no row-evidence source at
+// all and therefore no core to interrogate. The three-argument shape below did
+// not exist, so every one of these tests fails to COMPILE against unfixed code
+// — the strongest possible "fails on unfixed code". Against the naive
+// implementation this change could have been (`some row matched a target block`
+// -> exempt) every ADVERSARIAL case below decides TRUE, which each assertion
+// denies.
+// ===========================================================================
+
+/// **ADVERSARIAL: a REACHABLE panic must still refuse.** Its refutation VC is
+/// SAT, so the row is `Failed` — an unproved target row. Measured on the
+/// deployed driver (fixture `a_reachable_panic`): `[ASSERT_REFUTE] REFUTED
+/// Assertion { message: "panic call: core::panicking::panic_fmt" }`.
+#[test]
+fn frontb_a_reachable_panic_block_is_never_exempted() {
+    assert!(
+        !panic_block_row_unreachability_premise(1, 0, true),
+        "a refuted panic-call row is a REFUSAL, not a missing datum"
+    );
+    // One unproved matching row poisons the whole exemption even when the
+    // coverage count would otherwise line up: the exemption skips ALL target
+    // blocks at once, so partial evidence is no evidence.
+    assert!(!panic_block_row_unreachability_premise(1, 1, true));
+    assert!(!panic_block_row_unreachability_premise(2, 2, true));
+}
+
+/// **ADVERSARIAL: an UNKNOWN / TIMED-OUT unreachability proof must still
+/// refuse.** This is the explicit answer to "what happens when the
+/// unreachability proof is itself unknown or timed out". Two shapes, both
+/// refused: the row is present but not `Proved` (`any_unproved`), or the
+/// candidate was never emitted at all so no formula covers the block.
+/// Measured shape: `contract_panic_annotated`'s refute-lane candidate returns
+/// `Unknown { reason: "in-process ay returned unknown: (incomplete
+/// self-check-rejected)" }`.
+#[test]
+fn frontb_an_unknown_or_timed_out_unreachability_proof_is_never_exempted() {
+    assert!(
+        !panic_block_row_unreachability_premise(1, 0, true),
+        "Unknown/Timeout on the unreachability proof must fail closed"
+    );
+    assert!(
+        !panic_block_row_unreachability_premise(1, 0, false),
+        "a target block with NO row at all is the ABSENCE of a proof, never its \
+         satisfaction — the vcgen candidate loop SILENTLY skips a guardless or \
+         ungrounded target block"
+    );
+    assert!(!panic_block_row_unreachability_premise(3, 2, false));
+}
+
+/// **ADVERSARIAL: a function with NO refutation-target block never mints a
+/// vacuous `true`.** `all()`/count reasoning over an empty set is exactly false
+/// proof #12, and #11 before it. There is nothing to exempt, so the answer is
+/// `false` — behaviour-identical for the caller and unmistakable to a later
+/// reader.
+#[test]
+fn frontb_no_target_block_never_mints_a_vacuous_exemption() {
+    assert!(
+        !panic_block_row_unreachability_premise(0, 0, false),
+        "zero target blocks is the ABSENCE of a question, never its answer"
+    );
+    assert!(!panic_block_row_unreachability_premise(0, 5, false));
+    assert!(!panic_block_row_unreachability_premise(0, 0, true));
+}
+
+/// **ADVERSARIAL, AND THE SHARPEST ONE: a function with TWO OR MORE
+/// refutation-target blocks is refused outright, even when the counts line up.**
+/// MEASURED on the deployed driver (fixture `g_two_panics_one_live`): blocks 5
+/// and 9 are two distinct `panic!` failure blocks whose `Terminator::Call`
+/// carries a BYTE-IDENTICAL `SourceSpan` (`core/src/panic.rs:62:8-62:72`) and
+/// the same callee `core::panicking::panic_fmt` — post-inline, the span is
+/// core's, not the user's. So a row proving block 5 unreachable is
+/// indistinguishable from a row proving block 9, and "as many distinct proved
+/// formulas as blocks" would be satisfiable by two rows that BOTH came from
+/// block 5 while block 9 was silently skipped by the vcgen candidate loop. Rows
+/// cannot be keyed to blocks here, so the evidence is refused rather than
+/// approximated. Multi-panic functions keep the refute lane's own count-checked
+/// flag as their only route.
+#[test]
+fn frontb_two_or_more_panic_blocks_are_refused_because_rows_cannot_be_keyed() {
+    assert!(
+        !panic_block_row_unreachability_premise(2, 2, false),
+        "two target blocks share one span+callee post-inline; a row cannot be \
+         attributed to a block, so this evidence source must refuse"
+    );
+    assert!(!panic_block_row_unreachability_premise(2, 1, false));
+    assert!(!panic_block_row_unreachability_premise(5, 5, false));
+    assert!(!panic_block_row_unreachability_premise(5, 4, false));
+    assert!(!panic_block_row_unreachability_premise(5, 1, false));
+}
+
+/// **ADVERSARIAL: more proved formulas than blocks is also a refusal.** The
+/// count is an EQUALITY, not a `>=`. A surplus means the matcher admitted a row
+/// that is not one of this function's target blocks — a recognizer drift, and
+/// recognizer widening is the shape of five of the twelve false proofs.
+#[test]
+fn frontb_surplus_proved_formulas_are_a_refusal_not_a_bonus() {
+    assert!(!panic_block_row_unreachability_premise(1, 2, false));
+    assert!(!panic_block_row_unreachability_premise(2, 9, false));
+}
+
+/// **THE COMPLETENESS CONTROL.** A function whose every refutation-target block
+/// IS covered by its own distinct, proved, privately-authorized panic-call row
+/// must arm the exemption. Without this the change could be "return false
+/// always", which passes every adversarial test above and makes the whole front
+/// dead weight. The measured population this protects is
+/// `contract_panic_annotated` (1 target block, 1 proved row,
+/// `[PF_SUBSUME] bail(#12/call-gate)` today) and `clamp_via_helper`.
+#[test]
+fn frontb_a_fully_covered_dead_panic_surface_is_exempted() {
+    assert!(
+        panic_block_row_unreachability_premise(1, 1, false),
+        "the one-dead-panic shape must arm the exemption or this front is dead \
+         weight"
+    );
+}
+
+/// Every conjunct is load-bearing: flipping any single one off a satisfied shape
+/// must refuse.
+#[test]
+fn frontb_every_row_unreachability_conjunct_is_load_bearing() {
+    assert!(panic_block_row_unreachability_premise(1, 1, false));
+    assert!(!panic_block_row_unreachability_premise(0, 0, false), "target-count conjunct");
+    assert!(!panic_block_row_unreachability_premise(1, 0, false), "coverage-equality conjunct");
+    assert!(!panic_block_row_unreachability_premise(1, 1, true), "unproved-row conjunct");
+}
+
+
+/// The row-text matcher is an IDENTITY test on compiler-produced data, not a
+/// widenable recognizer. It accepts exactly the two shapes
+/// `trust_vcgen::v2_panic_call_vc_message` can reach this seam in — bare, and
+/// with the contract-panic marker — in either the `Assertion` message spelling
+/// or the `UnsupportedMir` transport restatement's `"assertion: …"` description
+/// with its optional `"; metadata_keys=[…]"` suffix. A DIFFERENT callee whose
+/// name merely starts with this one must not match (that is the `ends_with` /
+/// prefix family of bug, lesson 4).
+#[test]
+fn frontb_panic_call_row_text_matcher_is_an_identity_test() {
+    let callee = "core::panicking::panic_fmt";
+    assert!(described_row_is_panic_call_refutation_for(
+        "panic call: core::panicking::panic_fmt",
+        callee
+    ));
+    assert!(described_row_is_panic_call_refutation_for(
+        "assertion: panic call: core::panicking::panic_fmt",
+        callee
+    ));
+    assert!(described_row_is_panic_call_refutation_for(
+        "[trust-contract-panic] panic call: core::panicking::panic_fmt",
+        callee
+    ));
+    assert!(described_row_is_panic_call_refutation_for(
+        "assertion: [trust-contract-panic] panic call: core::panicking::panic_fmt",
+        callee
+    ));
+    assert!(described_row_is_panic_call_refutation_for(
+        "assertion: panic call: core::panicking::panic_fmt; metadata_keys=[a]",
+        callee
+    ));
+    // A longer callee name that STARTS with the one under test.
+    assert!(!described_row_is_panic_call_refutation_for(
+        "panic call: core::panicking::panic_fmt_nounwind",
+        callee
+    ));
+    // A different obligation family that merely mentions a panic.
+    assert!(!described_row_is_panic_call_refutation_for(
+        "panic freedom: no assertion, `unreachable!`, or panic is reachable",
+        callee
+    ));
+    assert!(!described_row_is_panic_call_refutation_for(
+        "[trust-absent-callee-assumption] call to absent callee `p::f` (body not in \
+         the lowered bundle) may panic",
+        callee
+    ));
+    // The always-refuted unused-annotation row must never be read as a proof.
+    assert!(!described_row_is_panic_call_refutation_for(
+        "[trust-contract-panic-unused] contract_panic(message_contains = \"x\") matched \
+         no panic call in this function",
+        callee
+    ));
+    // The monomorph tag rides inside the callee string; matching is exact.
+    assert!(described_row_is_panic_call_refutation_for(
+        "panic call: p::g::<__trust_args@ab12>",
+        "p::g::<__trust_args@ab12>"
+    ));
+    assert!(!described_row_is_panic_call_refutation_for(
+        "panic call: p::g::<__trust_args@ab12>",
+        "p::g::<__trust_args@ffff>"
+    ));
+}
+
+#[test]
+fn zero_obligation_registry_requires_authenticated_call_totality() {
+    let registerable = |function: &trust_types::VerifiableFunction,
+                        proven_names: &FxHashSet<String>,
+                        proven_identities: &FxHashSet<trust_types::CalleeIdentity>,
+                        abi_total: &FxHashSet<String>,
+                        type_total: &FxHashSet<String>| {
+        zero_obligation_registry_gate(
+            true,
+            true,
+            true,
+            true,
+            all_calls_target_proven_or_abi_total_in_sets(
+                proven_names,
+                proven_identities,
+                abi_total,
+                type_total,
+                function,
+            ),
+        )
+    };
+    let empty_names = FxHashSet::default();
+    let empty_identities = FxHashSet::default();
+
+    let mut leaf = native_trust_ir_panic_function(false);
+    leaf.body.blocks[1].terminator = trust_types::Terminator::Return;
+    assert!(registerable(&leaf, &empty_names, &empty_identities, &empty_names, &empty_names,));
+
+    let mut wrapper = native_trust_ir_panic_function(true);
+    let callee = "demo::ordinary_potentially_failing_callee";
+    let trust_types::Terminator::Call { func, callee_identity, .. } =
+        &mut wrapper.body.blocks[1].terminator
+    else {
+        panic!("fixture call terminator");
+    };
+    *func = callee.to_string();
+    *callee_identity = None;
+    assert!(
+        !registerable(&wrapper, &empty_names, &empty_identities, &empty_names, &empty_names,),
+        "an ordinary unproved callee must keep its empty-result wrapper out of the registry",
+    );
+
+    let identity = trust_types::CalleeIdentity {
+        stable_crate_id: 0x1973_d11b_2baa_21fa,
+        def_index: 17,
+        substs_digest: [0xaaaa, 0xbbbb],
+    };
+    let proven_names: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    let identities: FxHashSet<trust_types::CalleeIdentity> = [identity].into_iter().collect();
+    assert!(
+        !registerable(&wrapper, &proven_names, &identities, &empty_names, &empty_names,),
+        "a registered display name must not rescue an absent call identity",
+    );
+    {
+        let trust_types::Terminator::Call { callee_identity, .. } =
+            &mut wrapper.body.blocks[1].terminator
+        else {
+            unreachable!();
+        };
+        *callee_identity = Some(identity);
+    }
+    assert!(registerable(&wrapper, &proven_names, &identities, &empty_names, &empty_names,));
+
+    {
+        let trust_types::Terminator::Call { callee_identity, .. } =
+            &mut wrapper.body.blocks[1].terminator
+        else {
+            unreachable!();
+        };
+        *callee_identity =
+            Some(trust_types::CalleeIdentity { substs_digest: [0xaaaa, 0xbbbc], ..identity });
+    }
+    assert!(
+        !registerable(&wrapper, &proven_names, &identities, &empty_names, &empty_names,),
+        "a mismatched monomorphization identity must not authenticate the wrapper",
+    );
+
+    let abi_total: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(registerable(&wrapper, &proven_names, &empty_identities, &abi_total, &empty_names,));
+    let type_total: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(registerable(&wrapper, &proven_names, &empty_identities, &empty_names, &type_total,));
+
+    wrapper.body.blocks[1].terminator = trust_types::Terminator::TailCall {
+        func: callee.to_string(),
+        args: Vec::new(),
+        span: trust_types::SourceSpan::default(),
+        atomic: None,
+        is_foreign: false,
+        is_unsafe_sig: false,
+        callee_identity: None,
+    };
+    assert!(
+        !registerable(&wrapper, &proven_names, &identities, &empty_names, &empty_names,),
+        "a registered display name must not rescue an absent TailCall identity",
+    );
+    {
+        let trust_types::Terminator::TailCall { callee_identity, .. } =
+            &mut wrapper.body.blocks[1].terminator
+        else {
+            unreachable!();
+        };
+        *callee_identity = Some(identity);
+    }
+    assert!(registerable(&wrapper, &proven_names, &identities, &empty_names, &empty_names,));
+    {
+        let trust_types::Terminator::TailCall { callee_identity, .. } =
+            &mut wrapper.body.blocks[1].terminator
+        else {
+            unreachable!();
+        };
+        *callee_identity =
+            Some(trust_types::CalleeIdentity { def_index: identity.def_index + 1, ..identity });
+    }
+    assert!(
+        !registerable(&wrapper, &proven_names, &identities, &empty_names, &empty_names,),
+        "a TailCall identity mismatch must fail closed",
+    );
 }
 
 #[test]
@@ -19879,7 +20672,7 @@ fn dataflow_chc_is_env_gated_and_structural_mode_keeps_the_structural_error_edge
 }
 
 #[test]
-fn bodyless_nonunwind_foreign_call_requires_an_exact_registered_proof() {
+fn bodyless_nonunwind_foreign_call_requires_compiler_authenticated_authority() {
     let mut function = native_trust_ir_panic_function(false);
     let callee = "ffi::bodyless_nonunwind";
     let trust_types::Terminator::Call { func, is_foreign, target, .. } =
@@ -19891,16 +20684,1383 @@ fn bodyless_nonunwind_foreign_call_requires_an_exact_registered_proof() {
     *is_foreign = true;
     *target = Some(trust_types::BlockId(2));
 
-    let mut proven = FxHashSet::default();
+    let proven_names: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    let empty_identities = FxHashSet::default();
+    let empty_names = FxHashSet::default();
     assert!(
-        !all_calls_target_proven_panic_free_in_set(&proven, &function),
-        "bodyless/foreign/non-unwind classification must not be proof authority"
+        !all_calls_target_proven_or_abi_total_in_sets(
+            &proven_names,
+            &empty_identities,
+            &empty_names,
+            &empty_names,
+            &function,
+        ),
+        "neither a display-name registration nor bodyless/foreign classification is authority",
     );
-    proven.insert(callee.to_string());
+    let abi_total: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(all_calls_target_proven_or_abi_total_in_sets(
+        &proven_names,
+        &empty_identities,
+        &abi_total,
+        &empty_names,
+        &function,
+    ));
+}
+
+/// Build the `bodyless_nonunwind…` fixture with an arbitrary callee string in
+/// the single `Terminator::Call`, so the zero-obligation call gate can be
+/// exercised against one exact callee spelling at a time.
+fn zero_obligation_gate_fixture_calling(callee: &str) -> trust_types::VerifiableFunction {
+    let mut function = native_trust_ir_panic_function(false);
+    let trust_types::Terminator::Call { func, target, .. } =
+        &mut function.body.blocks[1].terminator
+    else {
+        panic!("fixture call terminator");
+    };
+    *func = callee.to_string();
+    *target = Some(trust_types::BlockId(2));
+    function
+}
+
+/// LANE-CONSISTENCY REPAIR (Front B). The zero-obligation lane's call gate must
+/// accept a callee the bridge's OWN audited total-call recognizer already
+/// accepts — the same recognizer the sibling gate
+/// `all_calls_discharge_panic_free` uses to seal the UNCONDITIONAL
+/// `InterproceduralCalleeClosure` authority.
+///
+/// FAILS ON UNFIXED CODE: before this repair the gate consulted the three
+/// Session registries ONLY, so `POISONED.try_with(|p| p.get())`'s closure — MIR
+/// `Terminator::Call` to `core::cell::Cell::<bool>::get`, TrustIr body
+/// `Undef Bool [FreshSymbolicHavoc]; Br; Return` because the bridge ELIDED that
+/// call — returned `false` and the function published
+/// `[native-verification-gap]` instead of registering.
+///
+/// The mono tag is deliberately present: `strip_generics` must swallow the
+/// trailing `::<__trust_args@HASH>` for the recognizer to fire, and an
+/// `ends_with`-style matcher would silently miss it.
+#[test]
+fn zero_obligation_call_gate_accepts_a_bridge_recognized_total_callee() {
+    let function = zero_obligation_gate_fixture_calling(
+        "core::cell::Cell::<bool>::get::<__trust_args@0123456789abcdef>",
+    );
     assert!(
-        all_calls_target_proven_panic_free_in_set(&proven, &function),
-        "only an exact registered proof may satisfy the interprocedural gate"
+        trust_ir_bridge::callee_is_recognized_total_no_panic(
+            "core::cell::Cell::<bool>::get::<__trust_args@0123456789abcdef>"
+        ),
+        "precondition: the bridge recognizer must accept the mono-tagged spelling"
     );
+    assert!(
+        all_calls_registry_or_bridge_total(
+            &FxHashSet::default(), &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(), &FxHashSet::default(),
+            &FxHashSet::default(), &FxHashSet::default(),
+            &function,),
+        "a callee the bridge already models as total (and therefore ELIDES, so it \
+         can never carry an obligation in EITHER lane) must not block the \
+         zero-obligation registry lane"
+    );
+}
+
+/// MATCHED-PAIR ANTI-CONTROL for the repair above. `Cell::set` is DELIBERATELY
+/// absent from the bridge's `EXACT_TOTAL` surface (`replace` then `drop(old)`
+/// can run a user `Drop`), so the recognizer declines it and the gate must keep
+/// failing closed. `rational::poison::{closure#0}` (which writes the flag) must
+/// therefore stay unproved while `rational::poisoned::{closure#0}` (which reads
+/// it) clears — if BOTH move, the recognizer widened and the repair is wrong.
+#[test]
+fn zero_obligation_call_gate_still_refuses_cell_set() {
+    let callee = "core::cell::Cell::<bool>::set::<__trust_args@0123456789abcdef>";
+    assert!(
+        !trust_ir_bridge::callee_is_recognized_total_no_panic(callee),
+        "Cell::set is deliberately not a recognized total call"
+    );
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &FxHashSet::default(), &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &FxHashSet::default(), &FxHashSet::default(),
+            &FxHashSet::default(), &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(callee),),
+        "the drop-running Cell::set must keep blocking zero-obligation registration"
+    );
+}
+
+/// FRONT B (R15) — the TYPED `Cell::<T>::set` arm fires ONLY on a grant published
+/// for THIS caller, and blocks otherwise.
+///
+/// THE DISCRIMINATION THIS TEST BUYS. The test above proves `Cell::set` blocks with
+/// no grant; on its own that is also what a completely inert change looks like.
+/// This one proves the arm is LIVE: the identical fixture flips purely because the
+/// caller's own typed grant set contains the exact call key. Run as a pair, they pin
+/// the arm's behaviour in both directions.
+#[test]
+fn cell_set_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
+    let callee = "core::cell::Cell::<bool>::set::<__trust_args@0123456789abcdef>";
+    let function = zero_obligation_gate_fixture_calling(callee);
+    let empty = FxHashSet::default();
+
+    // No grant ⇒ blocked (this is the state R14 measured: the bridge had already
+    // elided the call, and the gate refused anyway).
+    assert!(
+        !all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &empty, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function),
+        "without a typed grant the call must keep blocking"
+    );
+
+    // Grant present ⇒ accepted. This is the whole point of the round.
+    let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(
+        all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &empty, &empty, &granted, &FxHashSet::default(), &empty, &FxHashSet::default(), &function),
+        "a Cell::<T>::set call whose CONCRETE payload the compiler proved needs no \
+         drop glue must stop blocking the zero-obligation lane"
+    );
+}
+
+/// FRONT B (R15) — the typed grant is an EXACT call-key set, never a name pattern.
+///
+/// ADVERSARIAL. A grant minted for one monomorphization must not discharge a
+/// different one. `Cell::<bool>::set` is drop-glue-free; `Cell::<Option<Box<D>>>::set`
+/// (payload owning a user `Drop`) is not, and `mem::needs_drop` separates them
+/// (measured on the deployed driver: `bool`→false, `Option<Instant>`→false,
+/// `Option<Box<D>>`→true, so the collector poisons rather than grants the latter).
+/// If this arm were ever re-expressed as a name predicate — the shape of six of the
+/// thirteen false proofs — the panicking-payload spelling would ride the safe one's
+/// grant. It must not.
+#[test]
+fn cell_set_typed_grant_never_generalizes_across_monomorphizations() {
+    let safe = "core::cell::Cell::<bool>::set::<__trust_args@0123456789abcdef>";
+    let panicking =
+        "core::cell::Cell::<core::option::Option<alloc::boxed::Box<A::D>>>::set\
+         ::<__trust_args@fedcba9876543210>";
+    let empty = FxHashSet::default();
+    let granted: FxHashSet<String> = [safe.to_string()].into_iter().collect();
+
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(),
+            &empty,
+            &empty,
+            &granted, &FxHashSet::default(),
+            &empty, &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(panicking),),
+        "a grant for the drop-glue-free payload must NOT discharge a Cell::set whose \
+         payload owns a panicking Drop"
+    );
+
+    // ...and the string-only surfaces must STILL refuse both spellings, which is
+    // R14's `cellset_never_joins_the_name_only_total_surface` pin re-asserted from
+    // the compiler side. This arm adds a TYPED lane; it does not widen the name lane.
+    for spelling in [safe, panicking] {
+        assert!(
+            !trust_ir_bridge::callee_is_recognized_total_no_panic(spelling),
+            "`Cell::set` must stay off the name-only total surface: {spelling}"
+        );
+    }
+}
+
+/// FRONT B (R15) — a typed grant discharges ONLY the call it names. Every other
+/// callee in the same body keeps its own honest requirement.
+///
+/// This is the "anything the bridge did NOT elide must still block" control, in the
+/// shape the gate can actually see: one granted `Cell::set` does not buy amnesty for
+/// an unrelated unregistered callee sharing the body.
+#[test]
+fn cell_set_typed_grant_does_not_discharge_a_neighbouring_callee() {
+    let empty = FxHashSet::default();
+    let granted: FxHashSet<String> =
+        ["core::cell::Cell::<bool>::set".to_string()].into_iter().collect();
+    for other in [
+        "fa11::fa_leaf_div",
+        "core::panicking::panic",
+        "core::option::Option::<u32>::unwrap",
+        "ny_cert::rational::Rat::new",
+    ] {
+        assert!(
+            !all_calls_registry_or_bridge_total(
+                &empty, &FxHashSet::default(),
+                &empty,
+                &empty,
+                &granted, &FxHashSet::default(),
+                &empty, &FxHashSet::default(),
+                &zero_obligation_gate_fixture_calling(other),),
+            "`{other}` must keep blocking despite an unrelated Cell::set grant"
+        );
+    }
+}
+
+/// LEVER 3 — the TYPED MOVED-VALUE-ARGUMENT arm fires ONLY on a grant published for
+/// THIS caller, and blocks otherwise. Same matched-pair discipline as
+/// `cell_set_zero_gate_arm_fires_only_on_this_callers_typed_grant`: the first half
+/// alone is also what an inert change looks like, the second proves the arm is live.
+///
+/// MEASURED TARGET: `Option::<ny_cert::rational::Rat>::unwrap_or` is the second-most
+/// frequent `arm=NONE (blocks registration)` callee in ny `.gatelogs/R40.log`
+/// (8 lines; 13 across all `Option::unwrap_or` monomorphizations, plus 4 for
+/// `Result::unwrap_or` and 2 for `Option::ok_or`).
+#[test]
+fn moved_value_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
+    let callee = "core::option::Option::<ny_cert::rational::Rat>::unwrap_or";
+    let function = zero_obligation_gate_fixture_calling(callee);
+    let empty = FxHashSet::default();
+
+    // THE RETIREMENT PIN. trust-recon `957f47a332` removed this exact name from the
+    // string-only surface because `unwrap_or` DROPS its by-value argument on the
+    // branch it does not take, running the CALLER's `Drop::drop`. Without a typed
+    // record the call must still block — if this assertion ever flips, a name grant
+    // came back.
+    assert!(
+        !trust_ir_bridge::callee_is_recognized_total_no_panic(callee),
+        "the moved-value family must stay off the name-only total surface"
+    );
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty, &FxHashSet::default(),
+            &function,),
+        "without a typed grant the moved-value call must keep blocking"
+    );
+
+    // Grant present ⇒ accepted. The premise behind the grant is `!needs_drop` on
+    // EVERY by-value operand of the signature instantiated at this call site.
+    let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(
+        all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &granted,
+            &empty, &FxHashSet::default(),
+            &function,),
+        "an `Option::<T>::unwrap_or` whose CONCRETE operands the compiler proved need \
+         no drop glue must stop blocking the zero-obligation lane"
+    );
+}
+
+/// LEVER 3 — the typed grant is an EXACT call-key set, never a method-name pattern,
+/// and it never leaks to a neighbouring callee.
+///
+/// ADVERSARIAL. `Option::<Rat>::unwrap_or` is drop-glue-free; the retirement
+/// commit's published counterexample
+/// (`struct P; impl Drop for P { fn drop(&mut self) { panic!() } }` /
+/// `o.unwrap_or(P)`) is not, and `needs_drop` separates them at collection time, so
+/// the panicking monomorphization is POISONED rather than granted. If this arm were
+/// ever re-expressed as a name predicate — the shape of six of the thirteen false
+/// proofs — the panicking spelling would ride the safe one's grant.
+#[test]
+fn moved_value_typed_grant_never_generalizes_across_monomorphizations() {
+    let safe = "core::option::Option::<ny_cert::rational::Rat>::unwrap_or";
+    let panicking = "core::option::Option::<alloc::boxed::Box<A::D>>::unwrap_or";
+    let empty = FxHashSet::default();
+    let granted: FxHashSet<String> = [safe.to_string()].into_iter().collect();
+
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty,
+            &granted,
+            &empty, &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(panicking),),
+        "a grant for the drop-glue-free payload must NOT discharge an `unwrap_or` \
+         whose payload owns a panicking Drop"
+    );
+    // ...and a granted `unwrap_or` buys no amnesty for anything else in the body,
+    // including the closure-driving siblings that were never in this family.
+    for other in [
+        "core::option::Option::<ny_cert::rational::Rat>::unwrap",
+        "core::option::Option::<ny_cert::rational::Rat>::unwrap_or_else::<{closure@a.rs:1:1}>",
+        "core::option::Option::<ny_cert::rational::Rat>::unwrap_or_default",
+        "core::panicking::panic",
+        "fa11::fa_leaf_div",
+    ] {
+        assert!(
+            !all_calls_registry_or_bridge_total(
+                &empty, &FxHashSet::default(),
+                &empty,
+                &empty,
+                &empty,
+                &granted,
+                &empty, &FxHashSet::default(),
+                &zero_obligation_gate_fixture_calling(other),),
+            "`{other}` must keep blocking despite an unrelated moved-value grant"
+        );
+    }
+    // Neither spelling may ever join the NAME-ONLY surface (the retirement pin,
+    // re-asserted from the compiler side).
+    for spelling in [safe, panicking] {
+        assert!(
+            !trust_ir_bridge::callee_is_recognized_total_no_panic(spelling),
+            "moved-value-argument methods must stay off the name-only surface: {spelling}"
+        );
+    }
+}
+
+/// R16 FRONT A — the CONST-INITIALIZED thread-local `try_with` arm fires ONLY on a
+/// grant published for THIS caller, and blocks otherwise.
+///
+/// The two spellings differ only in the KEY they read, which the callee string does
+/// not record at all — `POISONED` (a `const {}` key, admissible) and `ARENA` (a LAZY
+/// key whose initializer is user code, false proof #13's shape) produce byte-similar
+/// `func_operand_name`s. That is precisely why the decision is made from `tcx` (the
+/// const-evaluated accessor) and recorded PER CALLER, and why `try_with` must stay
+/// off every name-only total surface.
+#[test]
+fn tls_const_init_try_with_grant_is_per_call_and_never_a_name_surface() {
+    let const_init = "std::thread::local::LocalKey::<core::cell::Cell<bool>>::try_with\
+         ::<{closure@crates/ny-cert/src/rational.rs:205:23: 205:26}, bool>\
+         ::<__trust_args@0123456789abcdef>";
+    let lazy = "std::thread::local::LocalKey::<core::cell::RefCell<ny_cert::rational::Arena>>\
+         ::try_with::<{closure@crates/ny-cert/src/rational.rs:312:26: 312:29}, \
+         num_rational::Ratio<num_bigint::bigint::BigInt>>::<__trust_args@fedcba9876543210>";
+    let empty = FxHashSet::default();
+    let granted: FxHashSet<String> = [const_init.to_string()].into_iter().collect();
+
+    // WITHOUT a grant the call keeps blocking registration.
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty, &FxHashSet::default(),
+            &empty, &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(const_init),),
+        "an un-granted `try_with` must keep the zero-obligation registry lane closed"
+    );
+    // WITH the grant, exactly that call clears.
+    assert!(
+        all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty, &FxHashSet::default(),
+            &granted, &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(const_init),),
+        "the per-caller const-init grant must discharge the call it names"
+    );
+    // ...and NOT the LAZY key's call, whose accessor runs user initializer code.
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(),
+            &empty,
+            &empty,
+            &empty, &FxHashSet::default(),
+            &granted, &FxHashSet::default(),
+            &zero_obligation_gate_fixture_calling(lazy),),
+        "a const-init grant must NOT discharge a LAZY key's `try_with` (false proof #13)"
+    );
+    // Neither spelling — nor `LocalKey::with` — may ever join the NAME-ONLY surface.
+    for spelling in [
+        const_init,
+        lazy,
+        "std::thread::local::LocalKey::<core::cell::Cell<bool>>::with\
+         ::<{closure@a.rs:1:1: 1:2}, bool>::<__trust_args@0123456789abcdef>",
+    ] {
+        assert!(
+            !trust_ir_bridge::callee_is_recognized_total_no_panic(spelling),
+            "`LocalKey::try_with`/`with` must stay off the name-only total surface: {spelling}"
+        );
+    }
+}
+
+/// FALSE PROOF #11 REGRESSION, re-asserted against the WIDENED gate. #11's
+/// callee was a same-crate `leaf(a, 0)` whose body the bridge BUNDLED and whose
+/// resolved-call arm charged nothing. No total surface recognizes a user-crate
+/// function, so the repair above cannot reopen it.
+#[test]
+fn zero_obligation_call_gate_still_refuses_the_false_proof_11_callee() {
+    for callee in [
+        "fa11::fa_leaf_div",
+        "ny_cert::rational::Rat::new",
+        "core::panicking::panic",
+        "core::option::Option::<u32>::unwrap",
+    ] {
+        assert!(
+            !trust_ir_bridge::callee_is_recognized_total_no_panic(callee),
+            "`{callee}` must not be a recognized total call"
+        );
+        assert!(
+            !all_calls_registry_or_bridge_total(
+                &FxHashSet::default(), &FxHashSet::default(),
+                &FxHashSet::default(),
+                &FxHashSet::default(),
+                &FxHashSet::default(), &FxHashSet::default(),
+                &FxHashSet::default(), &FxHashSet::default(),
+                &zero_obligation_gate_fixture_calling(callee),),
+            "`{callee}` must keep the zero-obligation registry lane closed"
+        );
+    }
+}
+
+/// The registry arms stay load-bearing and exact after the repair: an
+/// unrecognized callee is discharged ONLY by its exact identity in one of the
+/// three authenticated sets, never by a prefix/suffix lookalike.
+#[test]
+fn zero_obligation_call_gate_registry_arms_remain_exact() {
+    let callee = "demo::unrecognized_leaf";
+    let function = zero_obligation_gate_fixture_calling(callee);
+    let empty = FxHashSet::default();
+    assert!(!all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &empty, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function));
+
+    let mut lookalike = FxHashSet::default();
+    lookalike.insert("demo::unrecognized_leaf_extra".to_string());
+    lookalike.insert("unrecognized_leaf".to_string());
+    assert!(
+        !all_calls_registry_or_bridge_total(&lookalike, &FxHashSet::default(), &empty, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function),
+        "registry membership is exact-string, never a prefix/suffix match"
+    );
+
+    let mut exact = FxHashSet::default();
+    exact.insert(callee.to_string());
+    assert!(all_calls_registry_or_bridge_total(&exact, &FxHashSet::default(), &empty, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function));
+    assert!(all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &exact, &empty, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function));
+    assert!(all_calls_registry_or_bridge_total(&empty, &FxHashSet::default(), &empty, &exact, &empty, &FxHashSet::default(), &empty, &FxHashSet::default(), &function));
+}
+
+// ===========================================================================
+// R41 — the TYPED instantiated-`Self` arm (`typed-self-total`)
+// ===========================================================================
+//
+// WHY THIS ARM EXISTS. Four std trait calls are total ONLY because of what `Self`
+// (and, for the two conversion traits, the source type) actually IS:
+//   `<intN as Ord>::{max,min}`, `<intN as From<prim>>::from`,
+//   `<intN as TryFrom<intM>>::try_from`, `<str as ToString>::to_string`.
+// Three of them were STRING recognizers in trust-ir-bridge and the fourth was
+// written as one and reverted (`ccabd7b763`); all four rested on the claim that a
+// bare `u64`/`usize`/`str` spelling cannot be a user type. IT CAN — those are legal
+// generic-parameter names and a `ty::Param` renders BARE, so
+//
+//     #![allow(non_camel_case_types)]
+//     pub fn attack<u64: Ord>(a: u64, b: u64) -> u64 { a.max(b) }
+//
+// renders `<u64 as core::cmp::Ord>::max`, byte-for-byte the honest spelling, while
+// `Self` is the caller's choice — e.g. an `Evil` whose `Ord::cmp` is `panic!()`.
+// Measured on the deployed driver with `TRUST_PF_MATCH_TRACE=1`, the string arms
+// accepted exactly that (`arm=bridge-total`). The repair moves the decision onto
+// `TyCtxt` (`typed_self_total_std_call`) and records it PER CALLER, which is what
+// these tests pin.
+
+/// R41 — the arm fires ONLY on a grant published for THIS caller, and blocks
+/// otherwise. Same paired shape as the `Cell::set` and moved-value arms: the two
+/// directions together prove the arm is live rather than inert.
+#[test]
+fn typed_self_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
+    // The EXACT spelling the deployed driver renders for BOTH the honest
+    // `fn f(s: &str) -> String { s.to_string() }` and the forged
+    // `fn attack<str: Display + ?Sized>(t: &str) -> String { t.to_string() }`.
+    let callee = "<str as alloc::string::ToString>::to_string";
+    let function = zero_obligation_gate_fixture_calling(callee);
+    let empty = FxHashSet::default();
+
+    // The string surface must NOT decide this — it cannot tell the two apart.
+    assert!(
+        !trust_ir_bridge::callee_is_recognized_total_no_panic(callee),
+        "the bare `str` spelling is forgeable and must stay off the name-only surface"
+    );
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &empty, &function
+        ),
+        "without this caller's typed grant the call must keep blocking"
+    );
+
+    // With the caller's own TyCtxt-decided record, and only then, it clears.
+    let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(
+        all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+        ),
+        "a `to_string` whose instantiated `Self` the compiler confirmed is `TyKind::Str` \
+         must stop blocking the zero-obligation lane"
+    );
+}
+
+/// R41 ADVERSARIAL — the forger's spellings, and every near-miss, are refused by
+/// the STRING surface, so the only way in is the typed record.
+///
+/// This is the anti-forgery battery the removed arms lacked. Each spelling below
+/// was either produced by a real compilation of the attack crate on the deployed
+/// driver, or is the exact renaming a forger would try next.
+#[test]
+fn typed_self_arm_has_no_string_backdoor() {
+    use trust_ir_bridge::callee_is_recognized_total_no_panic as total;
+
+    // (a) generic parameters named `u64` / `usize` / `str` — the forgery itself.
+    for forged in [
+        "<u64 as core::cmp::Ord>::max",
+        "<u64 as core::cmp::Ord>::min",
+        "<u64 as core::convert::From<u8>>::from",
+        "<u64 as core::convert::TryFrom<u32>>::try_from",
+        "<str as alloc::string::ToString>::to_string",
+        "<usize as core::cmp::Ord>::max",
+    ] {
+        assert!(!total(forged), "forgeable bare-`Self` spelling must not be name-total: {forged}");
+    }
+
+    // (b) a user type in a module named to mimic the library path.
+    for mimic in [
+        "<mycrate::num::u64 as core::cmp::Ord>::max",
+        "<mycrate::T as mycrate::cmp::Ord>::max",
+        "<mycrate::S as mycrate::string::ToString>::to_string",
+        "<u64 as mycrate::convert::From<u8>>::from",
+    ] {
+        assert!(!total(mimic), "path mimicry must not be name-total: {mimic}");
+    }
+
+    // (c) the `__trust_crate@` duplicate-crate disambiguator must not launder it.
+    assert!(!total("__trust_crate@0123456789abcdef::<u64 as core::cmp::Ord>::max"));
+    assert!(!total(
+        "__trust_crate@0123456789abcdef::<str as alloc::string::ToString>::to_string"
+    ));
+    // …nor the monomorph-tag turbofish the extractor appends.
+    assert!(!total(
+        "<str as alloc::string::ToString>::to_string::<__trust_args@d440356f4eda3cbfcbc3129892185705>"
+    ));
+
+    // (d) the NEIGHBOURING compiler-stamped namespace must not cross-match into
+    // this family, and must keep working for its own.
+    assert!(!total("@trust-rustc-total-primitive-method::core::num::<impl u64>::max"));
+    assert!(total("@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add"));
+
+    // (e) the typed record is an EXACT call-key set: a lookalike key never rides a
+    // grant minted for a different one.
+    let callee = "<u64 as core::cmp::Ord>::max";
+    let function = zero_obligation_gate_fixture_calling(callee);
+    let empty = FxHashSet::default();
+    let other: FxHashSet<String> = ["<u32 as core::cmp::Ord>::max".to_string()].into_iter().collect();
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &other, &function
+        ),
+        "a grant for a DIFFERENT call key must not discharge this one"
+    );
+
+    // (f) the neighbouring PER-CALLER records must not cross-match either: a key
+    // granted as `cell-set` / `moved-value` / `tls-const-init` is a different
+    // proposition and lives in a different set.
+    let typed: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(
+        all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &typed, &function
+        ),
+        "control: the typed-self record itself does admit the key"
+    );
+}
+
+/// R41 — false proof #12's shape: an ABSENT caller yields an EMPTY record, and a
+/// premise over the empty set admits nothing.
+#[test]
+fn typed_self_empty_record_admits_nothing() {
+    let empty = FxHashSet::default();
+    for callee in [
+        "<u64 as core::cmp::Ord>::max",
+        "<str as alloc::string::ToString>::to_string",
+        "<u64 as core::convert::TryFrom<u32>>::try_from",
+        "R41::some_unrelated_leaf",
+    ] {
+        let function = zero_obligation_gate_fixture_calling(callee);
+        assert!(
+            !all_calls_registry_or_bridge_total(
+                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &empty, &function
+            ),
+            "an absent caller record must admit nothing: {callee}"
+        );
+    }
+}
+
+/// R41 — the same arm on the R18 interprocedural discharge seam, so the two gates
+/// cannot drift into disagreeing about this family.
+#[test]
+fn typed_self_discharge_arm_is_record_keyed() {
+    let empty = FxHashSet::default;
+    let callee = "<str as alloc::string::ToString>::to_string";
+    assert_eq!(
+        discharge_call_arm_admits(&empty(), &empty(), &empty(), &empty(), &empty(), callee),
+        None,
+        "no record ⇒ no discharge"
+    );
+    let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert_eq!(
+        discharge_call_arm_admits(&empty(), &empty(), &empty(), &empty(), &granted, callee),
+        Some("typed-self-total"),
+    );
+    assert_eq!(
+        discharge_call_arm_admits(
+            &empty(),
+            &empty(),
+            &empty(),
+            &empty(),
+            &granted,
+            "<u64 as core::cmp::Ord>::max"
+        ),
+        None,
+        "the record is an exact call-key set"
+    );
+}
+
+// ===========================================================================
+// R43 — `<String as Deref>::deref` on the typed instantiated-`Self` arm
+// ===========================================================================
+//
+// WHY THIS ONE NEEDED A LANG ITEM. `String` is a concrete foreign ADT, so there
+// is no `TyKind` to compare against the way the R41 arms compare `ty::Int`/
+// `ty::Str`. The anchor is `tcx.lang_items().string()`
+// (`library/alloc/src/string.rs:352` carries `#[lang = "String"]`; the
+// `#[rustc_diagnostic_item]`s in that file are on METHODS, not on the struct).
+//
+// MEASURED ON THE DEPLOYED DRIVER (`~/.trust-tc-recon`, 2026-08-22,
+// `TRUST_PF_MATCH_TRACE=1`), with `#![allow(non_camel_case_types)]`:
+//
+//     pub fn attack_deref<String: Deref<Target = str>>(s: &String) -> &str {
+//         <String as Deref>::deref(s)
+//     }
+//     pub fn honest_deref(s: &std::string::String) -> &str {
+//         <std::string::String as Deref>::deref(s)
+//     }
+//
+// printed
+//
+//     [PF_ZEROGATE] fn=FR::attack_deref arm=NONE … callee=<String as core::ops::deref::Deref>::deref
+//     [PF_ZEROGATE] fn=FR::honest_deref arm=NONE … callee=<alloc::string::String as core::ops::deref::Deref>::deref
+//
+// — so the two spellings DIFFER here, unlike the R41 primitive families: a
+// `ty::Param` renders BARE and cannot spell a crate root. That is a second,
+// independent reason the forgery fails, and it is deliberately NOT the reason
+// this arm relies on: the arm is decided from `ty_adt_def()` + the lang item, and
+// a `ty::Param` has no `ty_adt_def` at all. The tests below pin BOTH.
+
+/// R43 — the arm fires ONLY on a grant published for THIS caller, and blocks
+/// otherwise. Paired shape, so the arm is proved live rather than inert.
+#[test]
+fn string_deref_zero_gate_arm_fires_only_on_this_callers_typed_grant() {
+    // The EXACT spelling the deployed driver renders for the honest caller, and
+    // the exact key `.gatelogs/R42.log` recorded 6 times as `arm=NONE`.
+    let callee = "<alloc::string::String as core::ops::deref::Deref>::deref";
+    let function = zero_obligation_gate_fixture_calling(callee);
+    let empty = FxHashSet::default();
+
+    assert!(
+        !trust_ir_bridge::callee_is_recognized_total_no_panic(callee),
+        "`String::deref` must stay OFF the name-only surface: the arm is a lang-item \
+         identity on the instantiated `Self`, which a callee string does not carry"
+    );
+    assert!(
+        !all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &empty, &function
+        ),
+        "without this caller's typed grant the call must keep blocking"
+    );
+
+    let granted: FxHashSet<String> = [callee.to_string()].into_iter().collect();
+    assert!(
+        all_calls_registry_or_bridge_total(
+            &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+        ),
+        "a `deref` whose instantiated `Self` the compiler confirmed IS the `String` \
+         lang item must stop blocking the zero-obligation lane"
+    );
+}
+
+/// R43 ADVERSARIAL — the generic-parameter-named-`String` forgery, the
+/// `__trust_crate@` impostor, and every near-miss.
+#[test]
+fn string_deref_arm_has_no_string_backdoor() {
+    use trust_ir_bridge::callee_is_recognized_total_no_panic as total;
+
+    let honest = "<alloc::string::String as core::ops::deref::Deref>::deref";
+    let granted: FxHashSet<String> = [honest.to_string()].into_iter().collect();
+    let empty = FxHashSet::default();
+
+    // (a) THE FORGERY, exactly as the deployed driver rendered it for
+    //     `fn attack_deref<String: Deref<Target = str>>(..)`, plus the spellings a
+    //     forger would try next. None may be name-total, and none may ride the
+    //     honest key's grant.
+    for forged in [
+        "<String as core::ops::deref::Deref>::deref",
+        "<String as std::ops::Deref>::deref",
+        "<string as core::ops::deref::Deref>::deref",
+        "<String as core::ops::Deref>::deref",
+    ] {
+        assert!(!total(forged), "forgeable bare-`Self` spelling must not be name-total: {forged}");
+        let function = zero_obligation_gate_fixture_calling(forged);
+        assert!(
+            !all_calls_registry_or_bridge_total(
+                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+            ),
+            "a grant minted for the honest `alloc::string::String` key must not \
+             discharge the forged bare-`String` key: {forged}"
+        );
+    }
+
+    // (b) a user type in a module named to mimic the library path, and a user
+    //     `Deref` trait on the real `String` (orphan-forbidden, but the STRING
+    //     surface must decline it regardless).
+    for mimic in [
+        "<mycrate::string::String as core::ops::deref::Deref>::deref",
+        "<mycrate::alloc::string::String as core::ops::deref::Deref>::deref",
+        "<alloc::string::String as mycrate::ops::Deref>::deref",
+        "<alloc::string::String as mycrate::Deref>::deref",
+    ] {
+        assert!(!total(mimic), "path mimicry must not be name-total: {mimic}");
+        let function = zero_obligation_gate_fixture_calling(mimic);
+        assert!(
+            !all_calls_registry_or_bridge_total(
+                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+            ),
+            "path mimicry must not ride the honest grant: {mimic}"
+        );
+    }
+
+    // (c) the `__trust_crate@` duplicate-crate disambiguator must not launder it,
+    //     and neither may the monomorph-tag turbofish the extractor appends.
+    for impostor in [
+        "__trust_crate@0123456789abcdef::<alloc::string::String as core::ops::deref::Deref>::deref",
+        "<__trust_crate@0123456789abcdef::alloc::string::String as core::ops::deref::Deref>::deref",
+        "<alloc::string::String as core::ops::deref::Deref>::deref::<__trust_args@d440356f4eda3cbfcbc3129892185705>",
+    ] {
+        assert!(!total(impostor), "the disambiguator must not launder the spelling: {impostor}");
+        let function = zero_obligation_gate_fixture_calling(impostor);
+        assert!(
+            !all_calls_registry_or_bridge_total(
+                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+            ),
+            "a `__trust_crate@`/`__trust_args@` variant is a DIFFERENT key and must \
+             not ride the honest grant: {impostor}"
+        );
+    }
+
+    // (d) the sibling method this arm has NOT read, and other `Deref` receivers
+    //     that no arm recognizes. None may ride the `String` grant.
+    for other in [
+        "<alloc::string::String as core::ops::deref::DerefMut>::deref_mut",
+        "<alloc::string::String as core::ops::index::Index<core::ops::range::Range<usize>>>::index",
+        "<num_bigint::bigint::BigInt as core::ops::deref::Deref>::deref",
+        "<mycrate::MySmartPtr as core::ops::deref::Deref>::deref",
+    ] {
+        let function = zero_obligation_gate_fixture_calling(other);
+        assert!(
+            !all_calls_registry_or_bridge_total(
+                &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+            ),
+            "the record is an EXACT call-key set; `{other}` must not ride the \
+             `String::deref` grant"
+        );
+    }
+    // ...and the ONE `Deref` receiver that legitimately clears without this record
+    // clears on the BRIDGE's own pre-existing name arm (`is_vec_deref_slice_callee`,
+    // whose `Self` anchor is the CRATE-QUALIFIED `alloc::vec::Vec` — unforgeable by
+    // a `ty::Param`, which renders bare). Pinned so a future reader does not mistake
+    // it for a leak from this record, and so removing that arm is a visible change.
+    let vec_deref = "<alloc::vec::Vec<u8> as core::ops::deref::Deref>::deref";
+    assert!(
+        total(vec_deref),
+        "control: `Vec::deref` is discharged by the bridge's own name arm, not by \
+         the `String::deref` record"
+    );
+    assert!(all_calls_registry_or_bridge_total(
+        &empty, &FxHashSet::default(),
+        &empty,
+        &empty,
+        &empty,
+        &empty,
+        &empty,
+        &empty,
+        &zero_obligation_gate_fixture_calling(vec_deref),
+    ));
+
+    // (e) control: the honest key itself DOES clear, so (a)-(d) are refusals of a
+    //     live arm rather than of an inert one.
+    let function = zero_obligation_gate_fixture_calling(honest);
+    assert!(all_calls_registry_or_bridge_total(
+        &empty, &FxHashSet::default(), &empty, &empty, &empty, &empty, &empty, &granted, &function
+    ));
+}
+
+/// R43 — the same arm on the R18 interprocedural discharge seam, so the two gates
+/// cannot drift into disagreeing about this family.
+#[test]
+fn string_deref_discharge_arm_is_record_keyed() {
+    let empty = FxHashSet::default;
+    let honest = "<alloc::string::String as core::ops::deref::Deref>::deref";
+    assert_eq!(
+        discharge_call_arm_admits(&empty(), &empty(), &empty(), &empty(), &empty(), honest),
+        None,
+        "no record ⇒ no discharge"
+    );
+    let granted: FxHashSet<String> = [honest.to_string()].into_iter().collect();
+    assert_eq!(
+        discharge_call_arm_admits(&empty(), &empty(), &empty(), &empty(), &granted, honest),
+        Some("typed-self-total"),
+    );
+    assert_eq!(
+        discharge_call_arm_admits(
+            &empty(),
+            &empty(),
+            &empty(),
+            &empty(),
+            &granted,
+            "<String as core::ops::deref::Deref>::deref",
+        ),
+        None,
+        "the forged bare-`String` key must not ride the honest grant here either"
+    );
+}
+
+// ===========================================================================
+// R43 — the PARAMETRIC generic-callee arm on the absent-callee discharge
+// ===========================================================================
+//
+// THE DEFECT. `[PF_REG] fn=ny_cert::err_barrier established=true nrows=0` while
+// twelve call sites carry `[trust-absent-callee-assumption] call to absent callee
+// `ny_cert::err_barrier::<ny_cert::selfcheck::CheckError>` … may panic`
+// (`.gatelogs/R42.log`). The registry key is the ARGUMENT-FREE
+// `safe_def_path_str`; every call key carries the instantiated turbofish.
+//
+// THE TRAP THE REPAIR MUST NOT FALL INTO. Making the keys meet by stripping the
+// turbofish would discharge a generic function whose panic-freedom DEPENDS on its
+// type parameter for EVERY instantiation — false proof #14's mistake pointed the
+// other way. The repair therefore adds a SECOND premise about the callee's MIR
+// SHAPE (`body_is_parametrically_panic_free`), which is instantiation-invariant,
+// and keeps the verdict premise unchanged.
+
+/// R43 — the truth table of the two-registry gate. The generic row is the whole
+/// point: proven-but-not-parametric must stay REFUSED.
+#[test]
+fn proven_total_generic_callee_needs_the_parametric_premise() {
+    // NON-GENERIC callees are unaffected by the new premises (pre-R43 behaviour):
+    // the registry membership alone decides, exactly as before.
+    for &parametric in &[false, true] {
+        for &resolves in &[false, true] {
+            assert!(proven_total_callee_is_dischargeable(false, true, parametric, resolves));
+            assert!(
+                !proven_total_callee_is_dischargeable(false, false, parametric, resolves),
+                "parametric membership and target resolution are LICENCES to read the \
+                 registry through a monomorphized key, never substitutes for being in \
+                 the registry"
+            );
+        }
+    }
+
+    // GENERIC callees need ALL THREE conjuncts.
+    assert!(proven_total_callee_is_dischargeable(true, true, true, true));
+    assert!(
+        !proven_total_callee_is_dischargeable(true, true, false, true),
+        "THE CORE REFUSAL: a generic callee that IS registered panic-free but whose \
+         body is not parametrically panic-free (it has a call, a drop or an assert) \
+         must keep its obligation — its verdict is about the pre-monomorphization \
+         body only"
+    );
+    assert!(
+        !proven_total_callee_is_dischargeable(true, true, true, false),
+        "THE OVERRIDE REFUSAL: a parametric, registered TRAIT DEFAULT body whose call \
+         site resolves to an OVERRIDING impl (or does not resolve at all) must keep \
+         its obligation — a default `fn m(&self) -> u8` returning a constant is \
+         parametric while an `impl Tr for Evil` override that panics is not, and both \
+         render the SAME argument-free `safe_def_path_str`"
+    );
+    for &parametric in &[false, true] {
+        for &resolves in &[false, true] {
+            assert!(
+                !proven_total_callee_is_dischargeable(true, false, parametric, resolves),
+                "an unregistered generic callee is never dischargeable, whatever its \
+                 shape and target"
+            );
+        }
+    }
+}
+
+/// R43 — `body_is_parametrically_panic_free` is an ALLOWLIST over terminators.
+///
+/// The accepted shape is the one MEASURED for `fn err_barrier<E>(e: E) -> E { e }`
+/// on the deployed driver with `-Zdump-mir` (`bb0: { _0 = move _1; return; }`).
+/// Every rejected shape below is a real MIR terminator through which a type
+/// argument can smuggle a panic into an otherwise trivial generic body.
+#[test]
+fn parametric_panic_freedom_is_a_terminator_allowlist() {
+    fn body_of(kinds: Vec<TerminatorKind<'static>>) -> Body<'static> {
+        let blocks: IndexVec<BasicBlock, BasicBlockData<'static>> = kinds
+            .into_iter()
+            .map(|kind| {
+                BasicBlockData::new(
+                    Some(Terminator {
+                        source_info: SourceInfo::outermost(rustc_span::DUMMY_SP),
+                        kind,
+                        attributes: Default::default(),
+                    }),
+                    false,
+                )
+            })
+            .collect();
+        Body::new_cfg_only(blocks)
+    }
+    let bb0 = BasicBlock::from_usize(0);
+
+    // ACCEPTED: the identity shape, and a branchy but call-free/drop-free one.
+    assert!(body_is_parametrically_panic_free(&body_of(vec![TerminatorKind::Return])));
+    assert!(body_is_parametrically_panic_free(&body_of(vec![
+        TerminatorKind::Goto { target: bb0 },
+        TerminatorKind::Return,
+    ])));
+
+    // REFUSED: every panic-capable terminator, one at a time.
+    //
+    // `Drop` is the load-bearing one — it runs `Drop::drop` for the CALLER'S type
+    // argument, which is exactly how `fn sink<E>(_e: E) {}` panics at
+    // `E = PanickingDrop` while its generic body looks trivial.
+    assert!(
+        !body_is_parametrically_panic_free(&body_of(vec![
+            TerminatorKind::Drop {
+                place: Place::from(Local::from_usize(0)),
+                target: bb0,
+                unwind: UnwindAction::Continue,
+                replace: false,
+                drop: None,
+            },
+            TerminatorKind::Return,
+        ])),
+        "a generic `Drop` runs caller-chosen user code and must decline"
+    );
+    assert!(
+        !body_is_parametrically_panic_free(&body_of(vec![
+            TerminatorKind::UnwindResume,
+            TerminatorKind::Return,
+        ])),
+        "the allowlist is deliberately tighter than `cannot itself panic`: a \
+         cleanup path is evidence of a shape this predicate has not reasoned about"
+    );
+    assert!(
+        !body_is_parametrically_panic_free(&body_of(vec![
+            TerminatorKind::UnwindTerminate(rustc_middle::mir::UnwindTerminateReason::Abi),
+            TerminatorKind::Return,
+        ])),
+    );
+    assert!(
+        !body_is_parametrically_panic_free(&body_of(vec![
+            TerminatorKind::Unreachable,
+            TerminatorKind::Return,
+        ])),
+        "an allowlist declines terminators it has not reasoned about, including \
+         ones that are not panics"
+    );
+    assert!(
+        !body_is_parametrically_panic_free(&body_of(vec![
+            TerminatorKind::CoroutineDrop,
+            TerminatorKind::Return,
+        ])),
+    );
+    // ...and the acceptance is per-BLOCK, so one bad block in an otherwise clean
+    // body declines the whole body.
+    assert!(
+        !body_is_parametrically_panic_free(&body_of(vec![
+            TerminatorKind::Goto { target: bb0 },
+            TerminatorKind::Return,
+            TerminatorKind::CoroutineDrop,
+        ])),
+        "the predicate quantifies over ALL blocks"
+    );
+}
+
+// ===========================================================================
+// R40 — the WELL-FOUNDED zero-obligation panic-free BLESSING fixpoint
+// ===========================================================================
+//
+// The blessing rule is the EXISTING five-conjunct `zero_obligation_registry_gate`
+// re-asked against a monotonically growing registry, so these tests are about the
+// one new thing: WELL-FOUNDEDNESS. Every adversarial case below is a shape that a
+// greatest-fixed-point or an optimistic-assume-then-check scheme WOULD bless, and
+// each of those would be a false proof.
+
+fn blessing_candidate(def_path: &str, callees: &[&str]) -> ZeroObligationBlessingCandidate {
+    ZeroObligationBlessingCandidate {
+        def_path: def_path.to_string(),
+        // R45: these fixtures exercise the STRING arms, so every call carries the
+        // fail-closed `None` identity — the pre-R45 decision procedure exactly.
+        callees: callees.iter().map(|callee| ((*callee).to_string(), None)).collect(),
+        cell_set_total: FxHashSet::default(),
+        moved_value_total: FxHashSet::default(),
+        tls_try_with_total: FxHashSet::default(),
+        typed_self_total: FxHashSet::default(),
+    }
+}
+
+/// Run the fixpoint with the bound production uses (`len + 1`), which monotone
+/// growth over a finite set always satisfies.
+fn blessed_by_fixpoint(
+    candidates: &[ZeroObligationBlessingCandidate],
+    proven: &[&str],
+) -> FxHashSet<String> {
+    let proven: FxHashSet<String> =
+        proven.iter().map(|def_path| (*def_path).to_string()).collect();
+    zero_obligation_blessing_least_fixpoint(
+        candidates,
+        &proven,
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        &FxHashSet::default(),
+        candidates.len().saturating_add(1),
+    )
+    .expect("monotone growth over a finite candidate set converges within len + 1 rounds")
+}
+
+/// POSITIVE. A genuinely panic-free chain `leaf -> mid -> top`, where all three
+/// are zero-obligation candidates and the leaf calls nothing, blesses all three.
+///
+/// This is the lever: `mid` and `top` are unreachable for the single-shot gate
+/// unless `leaf` happened to register before them.
+#[test]
+fn zero_obligation_blessing_lifts_a_genuinely_total_chain() {
+    let candidates = [
+        blessing_candidate("demo::leaf", &[]),
+        blessing_candidate("demo::mid", &["demo::leaf"]),
+        blessing_candidate("demo::top", &["demo::mid"]),
+    ];
+    let blessed = blessed_by_fixpoint(&candidates, &[]);
+    for def_path in ["demo::leaf", "demo::mid", "demo::top"] {
+        assert!(blessed.contains(def_path), "`{def_path}` is genuinely panic-free and must bless");
+    }
+    assert_eq!(blessed.len(), 3);
+}
+
+/// POSITIVE — THE ORDER-INVERSION THE LEVER EXISTS FOR. A candidate whose only
+/// callee registers LATER than its own single evaluation is blessed as soon as
+/// that callee is in the registry, instead of being written off forever.
+#[test]
+fn zero_obligation_blessing_absorbs_a_late_arriving_callee_proof() {
+    let candidates = [blessing_candidate("demo::caller", &["demo::callee"])];
+    assert!(
+        blessed_by_fixpoint(&candidates, &[]).is_empty(),
+        "with the callee still unregistered the caller must stay unblessed"
+    );
+    assert!(
+        blessed_by_fixpoint(&candidates, &["demo::callee"]).contains("demo::caller"),
+        "a callee proved AFTER the caller's own gate ran must still lift the caller"
+    );
+}
+
+/// ADVERSARIAL — TWO MUTUALLY RECURSIVE ZERO-OBLIGATION FUNCTIONS.
+///
+/// Both have zero obligations and both are candidates; each is the other's only
+/// callee. A greatest fixed point (or "assume the peer, then check") blesses
+/// BOTH, and that is a false proof: an unconditional `a -> b -> a` never returns
+/// at all, and neither body's calls were ever discharged by anything.
+///
+/// A cycle simply never gets blessed. The CALLER of a cycle must not be blessed
+/// either — this is exactly `fa11::fa_caller_of_cycle`, which false proof #11
+/// measured as `established=true nrows=0`.
+#[test]
+fn zero_obligation_blessing_never_blesses_mutual_recursion_or_its_caller() {
+    let candidates = [
+        blessing_candidate("demo::a", &["demo::b"]),
+        blessing_candidate("demo::b", &["demo::a"]),
+        blessing_candidate("demo::caller_of_cycle", &["demo::a"]),
+    ];
+    assert!(
+        blessed_by_fixpoint(&candidates, &[]).is_empty(),
+        "no member of a call cycle — and no caller of one — may ever be blessed"
+    );
+}
+
+/// ADVERSARIAL — DIRECT SELF-RECURSION, handled by the SAME rule, not by an
+/// exception. `f` is never in its own frozen round view, so it can never
+/// discharge its own call.
+#[test]
+fn zero_obligation_blessing_never_blesses_self_recursion() {
+    let candidates = [blessing_candidate("demo::f", &["demo::f"])];
+    assert!(blessed_by_fixpoint(&candidates, &[]).is_empty(), "self-recursion must fail closed");
+
+    // ...and it is not rescued by ALSO calling something genuinely total.
+    let candidates = [
+        blessing_candidate("demo::leaf", &[]),
+        blessing_candidate("demo::f", &["demo::leaf", "demo::f"]),
+    ];
+    let blessed = blessed_by_fixpoint(&candidates, &[]);
+    assert!(blessed.contains("demo::leaf"));
+    assert!(
+        !blessed.contains("demo::f"),
+        "one discharged callee never buys amnesty for the self-edge"
+    );
+}
+
+/// ADVERSARIAL — A ZERO-OBLIGATION FUNCTION CALLING A GENUINELY PANICKING
+/// CALLEE. This is false proof #11 verbatim: `fa_caller_div0`'s whole body is
+/// `fa_leaf_div(a, 0)`, the bridge's resolved-call arm charged nothing, and the
+/// caller's obligation set came out EMPTY. No total surface recognizes a
+/// user-crate function, so the callee hits no arm and the caller never blesses.
+#[test]
+fn zero_obligation_blessing_never_blesses_a_call_to_a_panicking_callee() {
+    for callee in [
+        "fa11::fa_leaf_div",
+        "core::panicking::panic",
+        "core::option::Option::<u32>::unwrap",
+        "ny_cert::rational::Rat::new",
+    ] {
+        assert!(
+            !trust_ir_bridge::callee_is_recognized_total_no_panic(callee),
+            "precondition: `{callee}` must not be a recognized total call"
+        );
+        let candidates = [
+            blessing_candidate("fa11::fa_caller_div0", &[callee]),
+            // ...and the caller's own caller must not be lifted either.
+            blessing_candidate("fa11::fa_caller_of_caller", &["fa11::fa_caller_div0"]),
+        ];
+        assert!(
+            blessed_by_fixpoint(&candidates, &[]).is_empty(),
+            "`{callee}` must keep the whole chain above it unblessed"
+        );
+    }
+}
+
+/// ADVERSARIAL — A FUNCTION WHOSE OBLIGATIONS WERE NEVER GENERATED.
+///
+/// "Zero obligations" published by a run that never ASKED anything is exactly
+/// false proof #11. The discriminator is `native_run_is_vacuously_clean`, which
+/// production requires as a separate conjunct BEFORE candidacy is ever recorded,
+/// so such a function is absent from the candidate set entirely.
+///
+/// Two halves, both load-bearing:
+///   1. the discriminator really does reject a budget-expired / lowering-failed /
+///      never-dispatched run, and
+///   2. a non-candidate is neither blessed nor able to lift anything above it —
+///      the chain stops dead at the gap.
+#[test]
+fn zero_obligation_blessing_never_blesses_a_function_whose_obligations_were_never_generated() {
+    // (1) The discriminator. A run with NOTHING requested and nothing wrong is
+    // the only vacuously-clean shape.
+    let clean = native_run_result(
+        trust_verifier_api::VerificationRunStatus::Proved,
+        trust_verifier_api::VerificationRunSummary::default(),
+    );
+    assert!(
+        native_run_is_vacuously_clean(&clean),
+        "precondition: a genuinely empty, fully-dispatched run is vacuously clean"
+    );
+
+    // The per-function budget expired: `certify_impl`'s measured shape. NOT clean.
+    let mut timed_out = clean.clone();
+    timed_out.summary.timed_out = 1;
+    assert!(
+        !native_run_is_vacuously_clean(&timed_out),
+        "a budget-expired run asked nothing and proved nothing; it is not a proof"
+    );
+    // Typed-TrustIr lowering failed: an unmodeled construct was present.
+    let mut lowering_failed = clean.clone();
+    lowering_failed
+        .diagnostics
+        .push(format!("{NATIVE_TRUST_IR_LOWERING_FAILED_MARKER}: unsupported construct"));
+    assert!(
+        !native_run_is_vacuously_clean(&lowering_failed),
+        "a run whose lowering FAILED never verified this body"
+    );
+    // Obligations were requested but skipped / left unknown.
+    let mutations: [fn(&mut trust_verifier_api::VerificationRunSummary); 5] = [
+        |summary| summary.requested_obligations = 1,
+        |summary| summary.unknown = 1,
+        |summary| summary.skipped = 1,
+        |summary| summary.unsupported = 1,
+        |summary| summary.cancelled = 1,
+    ];
+    for mutate in mutations {
+        let mut run = clean.clone();
+        mutate(&mut run.summary);
+        assert!(!native_run_is_vacuously_clean(&run));
+    }
+    // ...and the gate keeps that conjunct load-bearing on its own.
+    assert!(!zero_obligation_registry_gate(true, true, true, false, true));
+
+    // (2) The consequence for the fixpoint: `demo::budget_expired` is NOT a
+    // candidate, so it cannot be blessed and cannot lift its caller.
+    let candidates = [
+        blessing_candidate("demo::leaf", &[]),
+        blessing_candidate("demo::top", &["demo::budget_expired"]),
+    ];
+    let blessed = blessed_by_fixpoint(&candidates, &[]);
+    assert!(blessed.contains("demo::leaf"));
+    assert!(
+        !blessed.contains("demo::budget_expired"),
+        "a function that is not a candidate must never be blessed by the fixpoint"
+    );
+    assert!(
+        !blessed.contains("demo::top"),
+        "a caller of a never-asked function must stay unblessed: blessing it is \
+         false proof #11 again"
+    );
+}
+
+/// The rounds are STAGED, one level of the chain per round: nothing is ever
+/// blessed on the strength of a membership acquired in the SAME round. The
+/// `leaf -> mid -> top` chain therefore needs three adding rounds plus one
+/// convergence round, and an under-sized bound fails CLOSED (blesses nothing)
+/// rather than publishing a partially-converged set.
+#[test]
+fn zero_obligation_blessing_stages_one_round_per_level_and_bounds_fail_closed() {
+    let candidates = [
+        blessing_candidate("demo::leaf", &[]),
+        blessing_candidate("demo::mid", &["demo::leaf"]),
+        blessing_candidate("demo::top", &["demo::mid"]),
+    ];
+    let empty = FxHashSet::default();
+    let run = |max_rounds| {
+        zero_obligation_blessing_least_fixpoint(
+            &candidates,
+            &empty,
+            &FxHashSet::default(),
+            &empty,
+            &empty,
+            max_rounds,
+        )
+    };
+    assert_eq!(run(0), None, "zero rounds must publish nothing");
+    for max_rounds in 1..=3 {
+        assert_eq!(
+            run(max_rounds),
+            None,
+            "{max_rounds} round(s) cannot converge a 3-deep chain; fail closed"
+        );
+    }
+    assert_eq!(
+        run(4).expect("three adding rounds plus one convergence round").len(),
+        3,
+        "one level per round is exactly what forbids same-round self-support"
+    );
+}
+
+/// The fixpoint's answer does not depend on the order the driver hands the
+/// candidates in — the production driver reads them out of an `FxHashMap`, whose
+/// iteration order is not stable. Order-independence is a consequence of the
+/// frozen per-round view, not of a sort.
+#[test]
+fn zero_obligation_blessing_is_independent_of_candidate_order() {
+    let forward = [
+        blessing_candidate("demo::leaf", &[]),
+        blessing_candidate("demo::mid", &["demo::leaf"]),
+        blessing_candidate("demo::top", &["demo::mid"]),
+        blessing_candidate("demo::a", &["demo::b"]),
+        blessing_candidate("demo::b", &["demo::a"]),
+    ];
+    let mut reversed: Vec<ZeroObligationBlessingCandidate> = Vec::new();
+    for candidate in forward.iter().rev() {
+        reversed.push(blessing_candidate(
+            &candidate.def_path,
+            // R45: `blessing_candidate` re-attaches the fail-closed `None` identity,
+            // so the reversed copy is the same candidate in both halves.
+            &candidate
+                .callees
+                .iter()
+                .map(|(callee, _identity)| callee.as_str())
+                .collect::<Vec<_>>(),
+        ));
+    }
+    assert_eq!(blessed_by_fixpoint(&forward, &[]), blessed_by_fixpoint(&reversed, &[]));
+    assert_eq!(blessed_by_fixpoint(&forward, &[]).len(), 3, "the cycle contributes nothing");
+}
+
+/// A candidate already present in the seed registry is not a blessing subject —
+/// it registered on its own evidence and is part of what the fixpoint is seeded
+/// FROM. It must not be re-published as a fixpoint blessing.
+#[test]
+fn zero_obligation_blessing_skips_already_registered_functions() {
+    let candidates = [blessing_candidate("demo::leaf", &[])];
+    assert!(
+        blessed_by_fixpoint(&candidates, &["demo::leaf"]).is_empty(),
+        "an already-registered function is seed, not a new blessing"
+    );
+}
+
+/// The six arms the fixpoint re-decides are the PRODUCTION arms, including the
+/// three PER-CALLER typed ones, which must stay per-caller: one candidate's typed
+/// grant may never discharge another candidate's identically-spelled call.
+#[test]
+fn zero_obligation_blessing_keeps_the_typed_arms_per_caller() {
+    let cell_set = "core::cell::Cell::<bool>::set::<__trust_args@0123456789abcdef>";
+    let granted = ZeroObligationBlessingCandidate {
+        cell_set_total: [cell_set.to_string()].into_iter().collect(),
+        ..blessing_candidate("demo::granted", &[cell_set])
+    };
+    let ungranted = blessing_candidate("demo::ungranted", &[cell_set]);
+    let blessed = blessed_by_fixpoint(&[granted, ungranted], &[]);
+    assert!(
+        blessed.contains("demo::granted"),
+        "the caller holding the typed grant must clear its own call"
+    );
+    assert!(
+        !blessed.contains("demo::ungranted"),
+        "a typed grant is published PER CALLER and must never leak to another body"
+    );
+
+    // LEVER 3 — the same property for the moved-value-argument arm, which the
+    // fixpoint must carry through per-candidate exactly like the `Cell::set` one.
+    let unwrap_or = "core::option::Option::<ny_cert::rational::Rat>::unwrap_or";
+    let mv_granted = ZeroObligationBlessingCandidate {
+        moved_value_total: [unwrap_or.to_string()].into_iter().collect(),
+        ..blessing_candidate("demo::mv_granted", &[unwrap_or])
+    };
+    let mv_ungranted = blessing_candidate("demo::mv_ungranted", &[unwrap_or]);
+    let blessed = blessed_by_fixpoint(&[mv_granted, mv_ungranted], &[]);
+    assert!(
+        blessed.contains("demo::mv_granted"),
+        "the caller holding the moved-value grant must clear its own call"
+    );
+    assert!(
+        !blessed.contains("demo::mv_ungranted"),
+        "a moved-value grant is published PER CALLER and must never leak"
+    );
+}
+
+/// The key-level core and the `VerifiableFunction`-level gate are the same
+/// decision: the split that lets the fixpoint reuse the arms must not have
+/// changed what the arms accept.
+#[test]
+fn zero_obligation_callee_key_core_agrees_with_the_body_level_gate() {
+    let empty = FxHashSet::default();
+    let registered: FxHashSet<String> = ["demo::registered".to_string()].into_iter().collect();
+    for callee in [
+        "demo::registered",
+        "demo::unregistered",
+        "core::cell::Cell::<bool>::get::<__trust_args@0123456789abcdef>",
+        "core::panicking::panic",
+    ] {
+        let function = zero_obligation_gate_fixture_calling(callee);
+        for proven in [&empty, &registered] {
+            // R45: both lanes are asked with the SAME identity registry, and the
+            // fixture's calls carry no identity, so the identity arm is inert on
+            // both sides and the parity being pinned is still the STRING arm list.
+            let identities: FxHashSet<trust_types::CalleeIdentity> = FxHashSet::default();
+            assert_eq!(
+                all_calls_registry_or_bridge_total(
+                    proven,
+                    &identities,
+                    &empty,
+                    &empty,
+                    &empty,
+                    &FxHashSet::default(),
+                    &empty,
+                    &FxHashSet::default(),
+                    &function,
+                ),
+                all_callee_keys_registry_or_bridge_total(
+                    proven,
+                    &identities,
+                    &empty,
+                    &empty,
+                    &empty,
+                    &FxHashSet::default(),
+                    &empty,
+                    &FxHashSet::default(),
+                    &function.def_path,
+                    &[(callee, None)],
+                    false,
+                ),
+                "the shared arm core must decide `{callee}` exactly as the body gate does"
+            );
+        }
+    }
 }
 
 #[test]
@@ -19916,14 +22076,15 @@ fn authenticated_callee_identity_is_exact_and_absence_fails_closed() {
     else {
         panic!("fixture call terminator");
     };
-    *func = "display::spelling::that_is_not_registered".to_string();
+    let callee = "display::spelling::also_registered_by_name";
+    *func = callee.to_string();
     *callee_identity = Some(identity);
     *target = Some(trust_types::BlockId(2));
 
-    let empty_names = FxHashSet::default();
+    let proven_names: FxHashSet<String> = [callee.to_string()].into_iter().collect();
     let identities: FxHashSet<trust_types::CalleeIdentity> = [identity].into_iter().collect();
     assert!(all_calls_target_proven_or_abi_total_in_sets(
-        &empty_names,
+        &proven_names,
         &identities,
         &FxHashSet::default(),
         &FxHashSet::default(),
@@ -19940,13 +22101,13 @@ fn authenticated_callee_identity_is_exact_and_absence_fails_closed() {
     }
     assert!(
         !all_calls_target_proven_or_abi_total_in_sets(
-            &empty_names,
+            &proven_names,
             &identities,
             &FxHashSet::default(),
             &FxHashSet::default(),
             &function,
         ),
-        "an absent identity must never be reconstructed from display text",
+        "an absent identity must never be reconstructed from a registered display name",
     );
 
     {
@@ -19955,14 +22116,12 @@ fn authenticated_callee_identity_is_exact_and_absence_fails_closed() {
         else {
             unreachable!();
         };
-        *callee_identity = Some(trust_types::CalleeIdentity {
-            substs_digest: [0xaaaa, 0xbbbc],
-            ..identity
-        });
+        *callee_identity =
+            Some(trust_types::CalleeIdentity { substs_digest: [0xaaaa, 0xbbbc], ..identity });
     }
     assert!(
         !all_calls_target_proven_or_abi_total_in_sets(
-            &empty_names,
+            &proven_names,
             &identities,
             &FxHashSet::default(),
             &FxHashSet::default(),
@@ -19972,7 +22131,7 @@ fn authenticated_callee_identity_is_exact_and_absence_fails_closed() {
     );
 
     function.body.blocks[1].terminator = trust_types::Terminator::TailCall {
-        func: "another::display::spelling".to_string(),
+        func: callee.to_string(),
         args: Vec::new(),
         span: trust_types::SourceSpan::default(),
         atomic: None,
@@ -19981,28 +22140,50 @@ fn authenticated_callee_identity_is_exact_and_absence_fails_closed() {
         callee_identity: Some(identity),
     };
     assert!(all_calls_target_proven_or_abi_total_in_sets(
-        &empty_names,
+        &proven_names,
         &identities,
         &FxHashSet::default(),
         &FxHashSet::default(),
         &function,
     ));
 
-    let trust_types::Terminator::TailCall { callee_identity, .. } =
-        &mut function.body.blocks[1].terminator
-    else {
-        unreachable!();
-    };
-    *callee_identity = None;
+    {
+        let trust_types::Terminator::TailCall { callee_identity, .. } =
+            &mut function.body.blocks[1].terminator
+        else {
+            unreachable!();
+        };
+        *callee_identity = None;
+    }
     assert!(
         !all_calls_target_proven_or_abi_total_in_sets(
-            &empty_names,
+            &proven_names,
             &identities,
             &FxHashSet::default(),
             &FxHashSet::default(),
             &function,
         ),
-        "TailCall identity absence must fail closed just like Call",
+        "a registered TailCall display name must not rescue an absent identity",
+    );
+
+    {
+        let trust_types::Terminator::TailCall { callee_identity, .. } =
+            &mut function.body.blocks[1].terminator
+        else {
+            unreachable!();
+        };
+        *callee_identity =
+            Some(trust_types::CalleeIdentity { def_index: identity.def_index + 1, ..identity });
+    }
+    assert!(
+        !all_calls_target_proven_or_abi_total_in_sets(
+            &proven_names,
+            &identities,
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            &function,
+        ),
+        "a registered TailCall display name must not rescue a mismatched identity",
     );
 }
 
@@ -24812,6 +26993,9 @@ fn bundled_assert_test_ledger(
             &mut ledger,
             member,
             Some(bundled_assert_test_identity(&member.name)),
+            // The existing gate tests exercise the FOREIGN path — the class the
+            // gate exists for — so the helper records non-local provenance.
+            false,
         )
         .expect("synthetic member source must serialize");
     }
@@ -24825,6 +27009,52 @@ fn bundled_assert_test_gate(
 ) -> Result<(), String> {
     let ledger = bundled_assert_test_ledger(members);
     ensure_bundled_member_asserts_exactly_charged(root, members, &ledger, vcs)
+}
+
+/// The 90f22093e9 local-member repair, both directions.
+///
+/// A LOCAL Assert-bearing member is exempt from the charging gate (the
+/// universal-root policy verifies it as its own root; its Asserts are charged
+/// there), so the gate admits it with NO caller-side charge rows at all. The
+/// SAME member recorded as foreign must still refuse — and a member whose
+/// provenance paths DISAGREE about locality must refuse too, because the
+/// exemption composes fail-closed (`def_is_local &=`). If the exemption is
+/// ever widened to foreign members, the second and third arms go red — that is
+/// the false-proof class the gate closes and the exact `Wrapping<u8>` canary.
+#[test]
+fn bundled_member_assert_gate_local_exemption_is_local_only() {
+    let root = bundled_assert_test_function_with_calls("root", "demo::root", &["member"]);
+    let member = exact_bundled_div_assert_member("member", "demo::member");
+    let members = [root.clone(), member.clone()];
+
+    let record = |ledger: &mut BundledMemberSourceIdentityLedger, local: bool| {
+        record_bundled_member_source_identity(
+            ledger,
+            &member,
+            Some(bundled_assert_test_identity(&member.name)),
+            local,
+        )
+        .expect("synthetic member source must serialize")
+    };
+
+    // Local: admitted with zero caller-side VCs.
+    let mut local_ledger = BundledMemberSourceIdentityLedger::default();
+    record(&mut local_ledger, true);
+    ensure_bundled_member_asserts_exactly_charged(&root, &members, &local_ledger, &[])
+        .expect("a LOCAL Assert-bearing member must be exempt from the charging gate");
+
+    // Foreign: the same member with no charge rows must refuse.
+    let mut foreign_ledger = BundledMemberSourceIdentityLedger::default();
+    record(&mut foreign_ledger, false);
+    ensure_bundled_member_asserts_exactly_charged(&root, &members, &foreign_ledger, &[])
+        .expect_err("a FOREIGN Assert-bearing member with no caller charge must refuse");
+
+    // Disagreeing provenance: fail closed, gate stays on.
+    let mut mixed_ledger = BundledMemberSourceIdentityLedger::default();
+    record(&mut mixed_ledger, true);
+    record(&mut mixed_ledger, false);
+    ensure_bundled_member_asserts_exactly_charged(&root, &members, &mixed_ledger, &[])
+        .expect_err("disagreeing locality provenance must keep the member gated");
 }
 
 fn exact_bundled_div_assert_member(
@@ -25223,6 +27453,7 @@ fn bundled_member_admission_error_is_a_strict_native_failure_not_vacuous_success
         &FxHashSet::default(),
         &FxHashSet::default(),
         &FxHashSet::default(),
+        None,
         None,
         &[],
         &[],

@@ -5,18 +5,15 @@
 
 use super::*;
 
+// Trust (W4/spine-derives-unreachable): moved to
+// `trust_types::terminator_obligations::block_span` — one definition, two
+// callers (this producer and the trust-ir spine), on the static_truth
+// precedent. This wrapper keeps every in-crate spelling.
 pub(super) fn v2_block_span(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
 ) -> SourceSpan {
-    block
-        .stmts
-        .iter()
-        .find_map(|stmt| match stmt {
-            Statement::Assign { span, .. } => Some(span.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| func.span.clone())
+    trust_types::terminator_obligations::block_span(func, block)
 }
 
 pub(super) fn v2_is_float_operand(func: &VerifiableFunction, operand: &Operand) -> bool {
@@ -645,7 +642,7 @@ pub(super) fn v2_formula_with_block_defs_at_point_recorded(
     end: usize,
     formula: Formula,
 ) -> (Formula, Formula, Vec<Formula>) {
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let body = version_rename_at(&formula, &sv, func, block.id, end);
     // Trust (ARM-B): the VERSIONED extract keeps pure place-read defs across a
     // later same-block clobber — sound HERE ONLY because every def below is
@@ -771,6 +768,26 @@ pub(super) fn version_block_def_at_establish(
     if subj.starts_with("arr$") {
         return def;
     }
+    // GEN-KEY == SUBJECT, the refusal `pin_in_place_update_reads` already
+    // carries (path_defs.rs), replicated at this second rebind site. A def
+    // whose raw lhs is a plain `Var` containing '#' — a caller-built local
+    // literally named `n#x` — has gen-key `n#x` but recovered subject `n`;
+    // rebinding it onto the BASE local's establish token would ship a
+    // hypothesis about a place this def never wrote (reachable since the
+    // gen-sets widened to raw destinations, which gives the base an establish
+    // point). Refuse. The `FpFromBits` peek-through keeps working:
+    // `formula_def_name` is `None` there, and the split subject IS the write's
+    // real destination.
+    if let Formula::Eq(l, _)
+    | Formula::Lt(l, _)
+    | Formula::Le(l, _)
+    | Formula::Gt(l, _)
+    | Formula::Ge(l, _) = &def
+        && let Formula::Var(raw, _) = &**l
+        && raw != &subj
+    {
+        return def;
+    }
     // A deref subject `x*` is established by the borrow `x = &..` of its base `x`.
     let base = subj.strip_suffix('*').unwrap_or(&subj).to_string();
     let Some(k) = block_def_establish_stmt(func, block, &base, end) else { return def };
@@ -858,27 +875,90 @@ pub(super) fn version_assert_passed_fact(
     }
 }
 
+/// Trust (THE TIME AXIS of the terminator-fact channel): does any ARGUMENT of
+/// this call render to a variable whose BASE name is `name`?
+///
+/// [`version_terminator_dest_fact`] rewrites EVERY occurrence of its subject's
+/// base name to the POST-call token. That is a PIN when every such occurrence
+/// denotes the value the terminator just defined, and a SILENT TIME SHIFT when
+/// one of them is a PRE-call read — an argument's own entry value, re-read
+/// against the post-state.
+///
+/// The shift is not "one imprecise fact". Every producer on this channel emits
+/// either an equality pinning the dest to a function of the arguments
+/// (`wrapping_neg`, `saturating_*`, the modeled intrinsics, `from_bits`) or a
+/// relation between the dest and an argument (min/max/clamp, and a rebound
+/// callee `ensures`). Collapse the two symbols and `dest == f(arg)` becomes the
+/// fixpoint equation `d == f(d)` and `result > n` becomes `n > n` — one
+/// STRENGTHENS the hypothesis, the other is outright UNSATISFIABLE. These facts
+/// are CONJOINED into the successors' guard set under the "SAT iff violation"
+/// convention, so a false hypothesis discharges every obligation in that scope,
+/// including obligations about locals the callee's contract never mentions.
+///
+/// The predicate is EXACT for the argument channel: the rewrite keys on the base
+/// name, so an argument matters here precisely when it renders to one. A
+/// PROJECTED read of the dest local (`n.0` where the dest is `n`) renders to a
+/// different base name, is not rewritten, and is correctly admitted.
+///
+/// RESIDUAL, stated rather than implied: a producer that traces BACKWARD from an
+/// argument can reach a local that is not itself an argument —
+/// `int_try_from_unwrap_or_facts`'s `_r = try_from(_x)` conduit is the one in
+/// tree. If that `_x` were the dest local this predicate would not see it. The
+/// durable repair for the whole channel is to build the dest occurrence ALREADY
+/// versioned: `version_rename_at` passes `#`-bearing names through untouched, so
+/// the blanket rewrite would not be needed at all. That is a change across eight
+/// fact producers with pinned SMT-LIB in each; this guard is not it.
+pub(super) fn terminator_args_read_name(
+    func: &VerifiableFunction,
+    args: &[Operand],
+    name: &str,
+) -> bool {
+    args.iter().any(|arg| {
+        crate::operand_to_formula(func, arg)
+            .free_variables()
+            .iter()
+            .any(|v| v.split('#').next() == Some(name))
+    })
+}
+
 /// Version a THREADED fact established by the block's TERMINATOR (a modeled
 /// total-call / min / max / clamp bound on a `Call` dest). The terminator runs
 /// after every statement, so the dest is pinned to the terminator marker `s{b}_t`
 /// (matching the terminator-aware OUT in the inter-block oracle); other operands are
 /// read at the block terminal. A successor that REASSIGNS the dest reads a distinct
 /// token, disconnecting the stale bound.
+///
+/// PRECONDITION, NOW ENFORCED: every occurrence of `dest_name` in `fact` must
+/// denote the value this terminator DEFINES. `None` — no fact at all — when one
+/// of them provably does not, i.e. when an argument of this same call renders to
+/// `dest_name` (see [`terminator_args_read_name`] for what the shift does and
+/// what it costs). Until 2026-08-31 this was an UNSTATED property of the MIR
+/// that reaches `TrustVerify` (rustc evaluates call arguments into fresh
+/// temporaries, and neither `CopyProp` nor `DestinationPropagation` merges a
+/// local read by a call terminator with that terminator's destination): no gate
+/// on the injection path refused the shape, and the only thing preventing it was
+/// emergent. Refusing costs a fact; retiming an argument read costs the
+/// soundness argument for every fact this channel carries.
 pub(super) fn version_terminator_dest_fact(
     sv: &StmtVersionCtx,
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
     dest_name: &str,
     fact: Formula,
-) -> Formula {
+) -> Option<Formula> {
+    if let Terminator::Call { args, .. } = &block.terminator
+        && terminator_args_read_name(func, args, dest_name)
+    {
+        return None;
+    }
     let read_versioned = version_rename_at(&fact, sv, func, block.id, block.stmts.len());
     let term_tok = format!("s{}_t", block.id.0);
-    read_versioned.map(&mut |node| match node {
+    Some(read_versioned.map(&mut |node| match node {
         Formula::Var(name, sort) if name.split('#').next() == Some(dest_name) => {
             Formula::Var(format!("{dest_name}#{term_tok}"), sort)
         }
         other => other,
-    })
+    }))
 }
 
 /// SOUNDNESS WITNESS for deleting `drop_havoced_block_defs`. The kill drops every
@@ -900,7 +980,8 @@ pub(crate) fn block_def_establish_subsumes_kill(func: &VerifiableFunction) -> us
     let mut residual = 0usize;
     for block in &func.body.blocks {
         let end = block.stmts.len();
-        let havoc: FxHashSet<String> = deref_store_havoc_names(func, block).into_iter().collect();
+        let havoc: FxHashSet<String> =
+            deref_store_havoc_names(func, block).iter().cloned().collect();
         if havoc.is_empty() {
             continue;
         }

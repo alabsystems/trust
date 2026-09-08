@@ -1,34 +1,41 @@
-//! The premises the CONSUMER-SIDE clause of `entry_sentinel_tie_is_sound` was
-//! believed dead under — and the counterexample that RETIRED that belief.
+//! The EDGE-SET premises under the entry-sentinel tie — re-derived 2026-08-29,
+//! when the whole-function quantifier and its "mint-side ⟹ consumer-side"
+//! `debug_assert!` were retired in favor of the MINT GATE
+//! (`full_graph_union_is_entry_only` in `pin_in_place_update_reads`).
 //!
-//! CORRECTED 2026-08-29, and the correction is the point of this header. This
-//! module previously said the clause was provably dead and that no fixture could
-//! isolate it. The death certificate had a HOLE: step (3) assumed the kill's
-//! gen-set key equals the pin's subject, but `block_def_subject` splits at '#', so
-//! a local whose NAME contains '#' separates them.
-//! `tests/entry_sentinel_tie_guards.rs::split_subject_escape` builds that shape and
-//! the production `debug_assert!` fires on the PRE-FIX code —
-//! "mint-side passed yet `n` still renders BARE at BlockId(3)/1".
+//! The division of labor is now: the mint gate owns "`#e` denotes the entry
+//! value" (checked at the ONE mint site, over the UNWIND-INCLUSIVE map), and the
+//! consumer-side clause of `entry_sentinel_tie_is_sound` owns "bare means entry
+//! where the tie lands" (`version_token_at(..).is_some()`, promoted from
+//! documented-dead to load-bearing). Both rest on EDGE-SET premises that live
+//! here, because they need the crate internals the argument is stated over —
+//! `v2_terminator_targets`, `full_graph_terminator_targets`, `StmtVersionCtx`,
+//! `v2_path_def_fixpoint` — so no oracle is a reimplementation:
 //!
-//! The clause is dead AGAIN only because `pin_in_place_update_reads` now ENFORCES
-//! the missing premise (0) at the mint site, guarded by
-//! `no_pin_when_the_defs_gen_key_is_not_its_subject`. The deadness therefore rests
-//! on a tested invariant rather than an unexamined assumption — which is the whole
-//! difference between this and what shipped before.
+//!  * step (1), unchanged: every edge `v2_terminator_targets` follows is also
+//!    explored by `v2_path_def_fixpoint`, so a consumer's mandatory v2 in-edge
+//!    is always intersected in. Guarded twice — edge-wise against the two
+//!    production successor functions the fixpoint dispatches on, and coarsely
+//!    against the real fixpoint's own reachability.
+//!  * step (1'), NEW with the gate: every edge the fixpoint can transport a
+//!    fact across is a predecessor edge of the full-graph entry-version map, so
+//!    a `{e}`-exactly union at a mint block really means "no writer on ANY
+//!    delivery path". Guarded edge-wise below; a future `Terminator` variant
+//!    whose facts travel an edge the map ignores would re-open the mixed-shape
+//!    false proof (`no_entry_sentinel_when_an_unwind_path_can_deliver_a_write`).
 //!
-//! The shapes below still cannot isolate it, and remain worth pinning: they record
-//! which routes are closed. What is no longer claimed is that every route is.
-//!
-//! `tests/entry_sentinel_tie_guards.rs` owns the tie's own planted violations and
-//! the corpus driver for the `debug_assert!`. What lives HERE is everything that
-//! needs the crate internals the argument is stated over — `v2_terminator_targets`,
-//! `StmtVersionCtx`, `v2_path_def_fixpoint` — so no oracle is a reimplementation.
-//!
-//! The load-bearing premise is step (1) of that argument: every edge
-//! `v2_terminator_targets` follows is also explored by `v2_path_def_fixpoint`, so a
-//! consumer's mandatory v2 in-edge is always intersected in. It is guarded twice —
-//! once edge-wise against the two production successor functions the fixpoint
-//! dispatches on, once coarsely against the real fixpoint's own reachability.
+//! HISTORY, kept because the corrections carry the lesson: this module
+//! previously argued the consumer-side clause dead. The death certificate's
+//! step (3) assumed the kill's gen-set key equals the pin's subject;
+//! `split_subject_escape` retired that. The clause then survived on premise (0)
+//! (gen-key == subject, enforced at the mint site) — until the quantifier
+//! itself was retired, which INVERTED the relationship: the clause became the
+//! LIVE refusal on the legitimate-mint/cleanup-consumer shape. Since
+//! 2026-08-30 (unwind-inclusive `block_entry_versions`) that shape versions
+//! its consumer read and the clause legitimately ADMITS there — the clause is
+//! kept fail-closed for the step-cap/unreachable corners, and the shape's new
+//! adjudication lives in
+//! `the_tie_at_a_cleanup_consumer_is_sound_and_the_stale_sibling_degrades`.
 //!
 //! NOT because nothing else would notice: dropping the `otherwise` arm of
 //! `discovered_clauses` reddens 60 lib tests, 57 of them pre-existing
@@ -59,7 +66,7 @@ use trust_types::{
 
 use super::StmtVersionCtx;
 use super::assert_refutation::v2_terminator_targets;
-use super::path_defs::v2_path_def_fixpoint;
+use super::path_defs::{full_graph_terminator_targets, v2_path_def_fixpoint};
 
 /// Every `tests/data/*.json` body — the real-MIR corpus the argument was measured
 /// over. Non-`.json` entries there are the Rust sources the fixtures were captured
@@ -142,6 +149,40 @@ fn every_v2_edge_is_also_a_fixpoint_edge() {
     }
 }
 
+/// STEP (1'). Every edge the fixpoint can transport a fact across must be a
+/// predecessor edge of the FULL-GRAPH entry-version map the `#e` mint gate
+/// consults. If a future `Terminator` variant's facts travel an edge the map
+/// ignores, a mint block's `{e}`-exactly union stops meaning "no writer on any
+/// delivery path" and the mixed-shape false proof re-opens.
+///
+/// PLANTED AND WATCHED: drop the `unguarded_successors` union from
+/// `full_graph_terminator_targets` and this goes red naming the lost unwind
+/// edge on all three unwind shapes.
+#[test]
+fn every_fixpoint_edge_is_a_full_graph_map_edge() {
+    for (name, func) in corpus().into_iter().chain(unwind_shapes()) {
+        for block in &func.body.blocks {
+            let full: HashSet<BlockId> =
+                full_graph_terminator_targets(&block.terminator, block.id).into_iter().collect();
+            let mut missed: Vec<usize> = fixpoint_enqueue_targets(&block.terminator, block.id)
+                .into_iter()
+                .filter(|t| !full.contains(t))
+                .map(|t| t.0)
+                .collect();
+            missed.sort_unstable();
+            missed.dedup();
+            assert!(
+                missed.is_empty(),
+                "{name} {:?}: the fixpoint can deliver facts to bb{missed:?}, which \
+                 the full-graph entry-version map has no predecessor edge for — \
+                 the `#e` mint gate's `{{e}}`-union no longer proves \
+                 entry-denotation.",
+                block.id
+            );
+        }
+    }
+}
+
 /// STEP (1) again, against the REAL fixpoint rather than a reconstruction of its
 /// dispatch. Coarser — reachability, not per-edge — but it is the only check that
 /// runs the function the argument is actually about.
@@ -178,15 +219,17 @@ fn u32_local(index: usize, name: &str) -> LocalDecl {
 }
 
 /// bb0 switches on `c` to the WRITER bb1 (`n = n / 3`, whose read renders bare and
-/// so is pinned to `n#e`) or to bb2, which never writes `n` and gotos the consumer
-/// bb4. bb1 reaches bb4 ONLY across its unwind edge.
+/// so is pinned — bb1's unwind-inclusive union is `{e}`, so the mint gate still
+/// stamps `n#e`) or to bb2, which never writes `n` and gotos the consumer bb4.
+/// bb1 reaches bb4 ONLY across its unwind edge.
 ///
-/// This is the shape that must isolate the consumer-side clause and does not: every
-/// block has a v2 in-edge, so the MINT-SIDE clause passes, and bb4 renders `n` bare,
-/// so the consumer-side clause is the only one that could refuse — yet the pinned
-/// def never arrives, because bb4's v2 in-edge from bb2 carries no `n` fact and the
-/// fixpoint intersects it against the unwind delivery. Only the terminator varies,
-/// so all three unwind-bearing terminators are covered by one shape.
+/// The historical role: this shape could not isolate the (then believed dead)
+/// consumer-side clause — every block has a v2 in-edge, so the retired
+/// whole-function quantifier passed, bb4 renders `n` bare, and yet the pinned def
+/// never arrives, because bb4's v2 in-edge from bb2 carries no `n` fact and the
+/// fixpoint intersects it against the unwind delivery. Post-narrowing it stays as
+/// the negative control for THAT join-intersection premise. Only the terminator
+/// varies, so all three unwind-bearing terminators are covered by one shape.
 fn unwind_only_writer(label: &str, terminator: Terminator) -> VerifiableFunction {
     VerifiableFunction {
         name: label.to_string(),
@@ -323,12 +366,16 @@ fn mentions_entry_sentinel(f: &Formula) -> bool {
 }
 
 /// The negative result, asserted rather than described: on all three unwind
-/// terminators the MINT-SIDE clause passes and the consumer renders `n` bare — so
-/// the consumer-side clause is the only one left that could refuse — and the pinned
-/// def is gone anyway, removed by the fixpoint's JOIN INTERSECTION.
+/// terminators the mint is gate-ADMITTED (`n#e` genuinely denotes entry at bb1)
+/// and the pinned def is gone anyway, removed by the fixpoint's JOIN
+/// INTERSECTION before any tie question arises. (Re-adjudicated 2026-08-30:
+/// the consumer used to render `n` bare — the unwind-blind rendering — which
+/// made the consumer-side clause the only refusal left; the unwind-inclusive
+/// entry map now versions the cleanup consumer's read, adding a second,
+/// earlier severance. The join-intersection loss is what remains isolated.)
 ///
 /// Each precondition is asserted so the fixture cannot pass for the wrong reason:
-/// without them "no tie" is equally consistent with the mint-side clause having
+/// without them "no `#e` at bb4" is equally consistent with the mint gate having
 /// refused, which is exactly the confusion this file exists to end.
 #[test]
 fn the_unwind_shapes_lose_the_pinned_def_to_the_join_not_to_the_mint_side_clause() {
@@ -337,14 +384,31 @@ fn the_unwind_shapes_lose_the_pinned_def_to_the_join_not_to_the_mint_side_clause
 
         assert!(
             func.body.blocks.iter().all(|b| sv.entry_map_covers(b.id, "n")),
-            "{label}: the MINT-SIDE clause must PASS here — a block with an empty \
-             entry-version map would refuse the tie before the consumer-side clause \
-             is ever consulted, and the shape would prove nothing"
+            "{label}: every block must be v2-covered — the RETIRED whole-function \
+             quantifier would have passed here, which is what made this shape \
+             unable to isolate the consumer-side clause; if coverage changes, \
+             the shape no longer records what it was measured to record"
         );
         assert!(
-            sv.version_token_at(&func, BlockId(4), 1, "n").is_none(),
-            "{label}: bb4 must render `n` BARE, or the consumer-side clause passes \
-             and there is nothing left to isolate"
+            sv.full_graph_union_is_entry_only(BlockId(1), "n"),
+            "{label}: the mint gate must ADMIT bb1's pin (its unwind-inclusive \
+             union is the entry seed), or the `n#e` asserted at bb3 below is \
+             minted by nothing"
+        );
+        // RE-ADJUDICATED 2026-08-30 (dropped-def write-visibility fix): bb4 used
+        // to render `n` BARE because `block_entry_versions` had no unwind arm —
+        // the exact rendering that let a rename-exempt bare fact unify across a
+        // write on the unwind shape (`tests/dropped_def_write_visibility.rs`).
+        // With the unwind-inclusive predecessor relation, the cleanup-only
+        // block versions its reads like any other, so the consumer-side clause
+        // is no longer the lone refusal on this shape — the versioned read
+        // severs the unification before the clause is even consulted. What this
+        // fixture still isolates is the JOIN-INTERSECTION loss below.
+        assert!(
+            sv.version_token_at(&func, BlockId(4), 1, "n").is_some(),
+            "{label}: bb4 is reached across bb1's cleanup edge downstream of the \
+             write, so its read of `n` must carry bb1's write token — bare here \
+             would resurrect the unwind-blind rendering"
         );
 
         let defs = v2_path_def_fixpoint(&func, &Default::default());

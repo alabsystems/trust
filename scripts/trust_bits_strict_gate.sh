@@ -87,11 +87,64 @@
 #   ABSENCE of one, so a change in the attribution direction is a red gate
 #   rather than a silent weakening.
 #
+# WHAT THIS GATE DID NOT SEE, and now does (2026-08-29)
+# -----------------------------------------------------
+# A mutation control that asserts only "function X was REFUSED" is satisfied by
+# ANY SUPERSET FAILURE, and one such failure is routine: a transient `trustd`
+# outage refuses EVERY obligation in the crate BEFORE solver dispatch, so the
+# run emits a nonzero rc, `Gate: FAIL`, and one `verification failed for
+# `<crate>::<fn>`` line for every function — a byte-perfect imitation of "the
+# mutation refuted exactly what it was supposed to refute". Demonstrated, not
+# hypothesised: replaying an archived outage log through the UNREPAIRED
+# `trust_ratio` gate printed `ok mutation A` with no FAIL line at all, and
+# through THIS file's unrepaired form it printed ELEVEN such lines.
+#
+# Commit deed5041441baf44b90455d633f28b3a41bc5f9b repaired the eleven gates that
+# existed then; this one landed after that scope and carried none of it. It now
+# has all three parts, verbatim from `scripts/trust_ratio_strict_gate.sh`:
+#
+#   * `require_env` INSIDE `run`/`runtests`, so every present and future run
+#     inherits it and an outage ABORTS the gate as INCONCLUSIVE (exit 3) rather
+#     than being scored as a pass OR as a refutation. The old `check_env` was
+#     hand-called at two of this file's eighteen run sites.
+#   * `no_rustc_error`, keyed on `error[E####]`: a mutation meant to break the
+#     PROOF must not have broken the BUILD, because obligations for code that
+#     did not lower are ABSENT, not refuted. Trust's own verification failures
+#     are bare `error:` lines carrying no code, so this cannot collide with the
+#     §9.1/§7.2 bundling refusals that mutations D and F are SUPPOSED to
+#     provoke.
+#   * a QUEUED `mut_ok`/`mut_end` pair. `ok mutation X` used to print the
+#     instant `rc != 0`, BEFORE the assertions that say what was refuted had
+#     run; the exit code stayed right but the line a human reads was not
+#     evidence. Nothing prints `ok` until its whole section has had its chance
+#     to fail.
+#
+# SPECIFICITY. `require_env` closes the outage class; a complement list closes
+# the rest, by naming functions that must stay GREEN in the same run. Mutations
+# B, D, H and I already had one, and E, J, K and L assert an exact per-function
+# obligation SPLIT (`16 proved, 1 runtime-checked, …`), which a general
+# regression cannot reproduce. A, C and G did not: each asserted only that
+# something went FAILED or UNKNOWN, which is what EVERYTHING does when the crate
+# stops verifying. Each new list is the set of functions that do not reach the
+# mutated one, read off this crate's call graph (every call site is a direct,
+# non-generic, same-module call, so a body's callees are exactly the `fn` names
+# appearing in it):
+#   A  nibble_ones          <- nobody                     (a leaf)
+#   C  raw_is_power_of_two  <- is_power_of_two <- round_up_pow2 <- round_down_pow2
+#   G  deposit              <- nobody                     (a leaf)
+#
 # Usage:  scripts/trust_bits_strict_gate.sh          (~25 min)
 set -uo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 SRC="$REPO_ROOT/crates/trust-bits/src/lib.rs"
-TARGO="${TARGO:-$REPO_ROOT/build/aarch64-apple-darwin/stage1/bin/targo}"
+# Trust: `build/host` is a symlink to `build/<host-triple>`, so this resolves on
+# every platform. It used to name `aarch64-apple-darwin` literally, which meant
+# that on any non-Apple host this gate could only ever print
+#   REFUSE: no targo at .../build/aarch64-apple-darwin/stage1/bin/targo
+# and exit 2 — measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
+# directory does not exist at all, for all 19 strict gates at once. A soundness
+# gate that cannot run on the host it is invoked from is not a strict gate.
+TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 
 [ -x "$TARGO" ] || { echo "REFUSE: no targo at $TARGO (set TARGO=...)"; exit 2; }
 # The ONLY discriminator that has held under every measurement: a stage whose
@@ -138,6 +191,8 @@ run() { # run [policy]; sets RC and LOG
   LOG="$(mktemp)"
   ( cd "$REPO_ROOT/crates" && TRUSTFLAGS="${1:-}" "$TARGO" trust check -p trust-bits ) > "$LOG" 2>&1
   RC=$?
+  require_env "${STEP:-run}"
+  no_rustc_error "${STEP:-run}"
 }
 # `--lib` is load-bearing. Measured 2026-08-29 on `trust-endian`: a concurrent
 # `x.py check` rebuilt `librustc_driver-<hash>.dylib`, stage1 `trustdoc` still
@@ -147,25 +202,85 @@ runtests() { # sets RC and LOG
   LOG="$(mktemp)"
   ( cd "$REPO_ROOT/crates" && "$TARGO" --unverified test -p trust-bits --lib ) > "$LOG" 2>&1
   RC=$?
+  require_env "${STEP:-tests}"
 }
 gate_line() { grep -oE 'Gate: [A-Z]+ \[strict lane, exit [0-9]+\]' "$LOG" | tail -1; }
 kinds() { grep -oE 'proved by kind: [a-z_=0-9, ]+' "$LOG" | tail -1; }
 fail() { echo "  FAIL $*"; fails=$((fails+1)); }
 
-# ENVIRONMENT, NOT A RESULT. A transient `trustd` outage makes EVERY obligation
-# report `unsupported MIR MemoryAdmission: … trust-memory-jobserver.sock:
-# Connection refused`, so the run publishes `0 proved / N inconclusive`,
-# `Gate: FAIL`, and many `error:` lines — a perfect imitation of a total crate
-# regression, on source that passed minutes earlier. Name it, do not count it.
-env_broken() { grep -q 'MemoryAdmission\|trust-memory-jobserver.sock' "$LOG"; }
-check_env() { # check_env <label>
+# ---------------------------------------------------------------------------
+# G1. AN ENVIRONMENT FAILURE IS NOT A RESULT, AND IT SATISFIES EVERY
+#     PRESENCE-ONLY ASSERTION. THIS IS DEMONSTRATED, NOT HYPOTHESISED.
+#
+# A transient `trustd` outage refuses EVERY obligation in the crate BEFORE
+# solver dispatch: each row becomes `UnsupportedMir/MemoryAdmission` with
+# outcome `unknown`, and the run emits a nonzero rc, `Gate: FAIL`, and one
+# ``verification failed for `<crate>::<fn>``` line for EVERY function in the
+# crate — a byte-perfect imitation of a correct refutation, including the
+# composition cascade.
+#
+# An outage therefore ABORTS the gate as INCONCLUSIVE (exit 3). It is never
+# scored as a pass and never scored as a refutation. The previous `check_env`
+# recorded a FAIL and continued, which is not the same thing: a red gate says
+# "trust-bits regressed", and that would have been a false statement about the
+# crate.
+env_broken() {
+  grep -qE 'MemoryAdmission|memory admission failed|trust-memory-jobserver\.sock|could not connect to selected endpoint|Connection refused' "$LOG"
+}
+require_env() { # require_env <label>
   if env_broken; then
-    echo "  ENV  $1: trustd memory admission was unavailable — every obligation went UNKNOWN"
-    echo "       before solver dispatch. This is NOT a trust-bits result. Re-run."
-    fails=$((fails+1))
-    return 1
+    echo "  ENV  $1: trustd memory admission was unavailable — every obligation was"
+    echo "       refused BEFORE solver dispatch, so this run is not a fact about the"
+    echo "       crate under test. Refusing to score it as a pass OR as a refutation."
+    ENVD="$(grep -oE 'could not connect to selected endpoint [^\\"]*' "$LOG" | head -1)"
+    [ -n "$ENVD" ] && echo "       $ENVD"
+    echo "INCONCLUSIVE (environment): trustd admission unavailable — re-run when it is up."
+    echo "       log kept at $LOG"
+    exit 3
+  fi
+}
+
+# A mutation meant to break the PROOF must not have broken the BUILD instead. A
+# crate that fails to compile emits NO obligations for what did not lower, so a
+# refutation-shaped verdict can be manufactured by a type error that has nothing
+# to do with the property under test. Trust's own verification failures are bare
+# `error:` lines carrying no code, so keying on `error[E####]` isolates the
+# rustc diagnostic without colliding with the bundling refusals that mutations
+# D and F are SUPPOSED to provoke.
+no_rustc_error() { # no_rustc_error <label>
+  if grep -qE '^error\[E[0-9]{4}\]' "$LOG"; then
+    fail "$1: rustc reported $(grep -oE '^error\[E[0-9]{4}\]' "$LOG" | head -1) — this run is supposed to exercise the PROOF, not the BUILD; obligations for code that did not lower are ABSENT, not refuted"
   fi
   return 0
+}
+
+# ---------------------------------------------------------------------------
+# G2. `ok` MUST MEAN "THIS SECTION'S OWN CONTENT ASSERTIONS HELD".
+#
+# `ok   mutation X` used to be printed on `[ "$RC" -ne 0 ]` ALONE, so the
+# transcript printed `ok` for a plain rustc type error, a missing driver, or an
+# unrelated regression. The gate's EXIT CODE stayed right — the greps after each
+# `ok` move `fails` separately — but the line a human reads was not evidence.
+#
+# Every ok-print is therefore QUEUED by `mut_ok` and flushed by `mut_end` at the
+# END of the section, once every assertion in that section has had its chance to
+# move `fails`. A section may queue more than one line, so the queue is an
+# array: if anything in the section failed, NONE of its ok lines are evidence.
+__OKS__=()
+mut_begin() { MUT_FAILS_AT="$fails"; __OKS__=(); }
+mut_ok() { __OKS__+=("$1"); }
+mut_end() {
+  [ "${#__OKS__[@]}" -gt 0 ] || return 0
+  local t
+  for t in "${__OKS__[@]}"; do
+    if [ "$fails" -eq "${MUT_FAILS_AT:-0}" ]; then
+      printf '  ok   %s\n' "$t"
+    else
+      printf '  ---- %s\n' "$t"
+      printf '       ^ NOT ok: see the FAIL line(s) above; this line is not evidence.\n'
+    fi
+  done
+  __OKS__=()
 }
 
 # `mutate <old> <new>` — refuses if the anchor is not unique, so a source edit
@@ -189,8 +304,8 @@ echo "trust-bits strict gate:"
 #    kind split — never on the Summary alone, and with the Gate line asserted
 #    PRESENT so a seal failure cannot read as a pass.
 # ---------------------------------------------------------------------------
+STEP="THE PASS"; mut_begin
 run
-check_env "pristine"
 G="$(gate_line)"
 [ -n "$G" ] || fail "pristine: no Gate: line — the lane did not run, or the report did not seal (vacuous)"
 [ "$RC" -eq 0 ] || fail "pristine: rc=$RC (expected 0)  $G"
@@ -209,8 +324,9 @@ for want in arithmetic_overflow_add=21 arithmetic_overflow_mul=12 arithmetic_ove
   case "$KINDS" in *"$want"*) ;; *) fail "pristine: expected $want in kind split — got: $KINDS";; esac
 done
 PRISTINE_KINDS="$KINDS"
-[ "$fails" -eq 0 ] && echo "  ok   pristine  $G  [43 postcondition + 36 safety + 35 hardened-twin, 0 unreachable]"
+mut_ok "pristine  $G  [43 postcondition + 36 safety + 35 hardened-twin, 0 unreachable]"
 rm -f "$LOG"
+mut_end
 
 # ---------------------------------------------------------------------------
 # 2. THE SAME PASS UNDER `-Ztrust-policy=certify`.
@@ -219,13 +335,13 @@ rm -f "$LOG"
 #    this control, "certify passed" is indistinguishable from "certify never
 #    ran".
 # ---------------------------------------------------------------------------
+STEP="THE SAME PASS UNDER '-Ztrust-policy=certify'"; mut_begin
 run "-Ztrust-policy=bogus_not_a_policy"
 grep -q "incorrect value \`bogus_not_a_policy\` for unstable option \`trust-policy\`" "$LOG" \
   || fail "TRUSTFLAGS control: a bogus policy was NOT rejected — the flag never reaches the compiler, so the certify run below proves nothing"
 rm -f "$LOG"
 
 run "-Ztrust-policy=certify"
-check_env "certify"
 G="$(gate_line)"
 [ -n "$G" ] || fail "certify: no Gate: line"
 [ "$RC" -eq 0 ] || fail "certify: rc=$RC (expected 0)  $G"
@@ -233,8 +349,9 @@ case "$G" in *"PASS [strict lane, exit 0]"*) ;; *) fail "certify: Gate is '$G'";
 grep -qE 'Summary: 114 proved, 0 failed, .*0 inconclusive \(114 total\)' "$LOG" \
   || fail "certify: summary differs from the default policy — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 [ "$(kinds)" = "$PRISTINE_KINDS" ] || fail "certify: the kind split differs from the default policy"
-[ "$fails" -eq 0 ] && echo "  ok   certify   $G"
+mut_ok "certify   $G"
 rm -f "$LOG"
+mut_end
 
 # ---------------------------------------------------------------------------
 # 3. MUTATION A — a tier-1 CONTRACT that is simply false.
@@ -243,6 +360,7 @@ rm -f "$LOG"
 #    but the parameter is a `u32`. Returning 5 from the all-ones arm makes the
 #    clause false on a reachable path.
 # ---------------------------------------------------------------------------
+STEP="mutation A"; mut_begin
 mutate '    if v & 15 == 15 {
         return 4;
     }' '    if v & 15 == 15 {
@@ -250,10 +368,19 @@ mutate '    if v & 15 == 15 {
     }'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation A: nibble_ones(15) -> 5 still satisfied 'ensures result <= 4'  $G"; else echo "  ok   mutation A (nibble_ones(15) -> 5 against 'ensures result <= 4')  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation A: nibble_ones(15) -> 5 still satisfied 'ensures result <= 4'  $G"; else mut_ok "mutation A (nibble_ones(15) -> 5 against 'ensures result <= 4')  rc=$RC  $G"; fi
 grep -q 'verification failed for `trust_bits::nibble_ones`' "$LOG" \
   || fail "mutation A: nibble_ones kept its bound while returning a value outside it"
+# SPECIFICITY. Refuting `nibble_ones` is also what a general regression does, so
+# name what must stay GREEN. `nibble_ones` is a LEAF that NOTHING in this crate
+# calls, so no other row can be downstream of this mutation; the list is the
+# other five tier-1 predicates, each on an independent chain.
+for f in is_power_of_two is_mask_low parity bit clamp_width clamp_index; do
+  grep -q "verification failed for \`trust_bits::$f\`" "$LOG" \
+    && fail "mutation A: $f was refuted by a nibble_ones-only break — nothing calls nibble_ones, so either this run went red for an unrelated reason (and is not evidence about the clause at all) or the tier-1 bounds are not independent"
+done
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 4. MUTATION B — the COMPOSITION CARRIER broken.
@@ -269,6 +396,7 @@ rm -f "$LOG"; restore
 #    deliberately NOT touched, so they must stay green in the same run. That
 #    makes this a specificity assertion as well as a sensitivity one.
 # ---------------------------------------------------------------------------
+STEP="mutation B"; mut_begin
 mutate '    if x & (x - 1) == 0 {
         return 1;
     }' '    if x & (x - 1) == 0 {
@@ -276,7 +404,7 @@ mutate '    if x & (x - 1) == 0 {
     }'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation B: a helper returning 2 still passed  $G"; else echo "  ok   mutation B (raw_is_power_of_two returns 2)  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation B: a helper returning 2 still passed  $G"; else mut_ok "mutation B (raw_is_power_of_two returns 2)  rc=$RC  $G"; fi
 grep -q 'verification failed for `trust_bits::is_power_of_two`' "$LOG" \
   || fail "mutation B: is_power_of_two did not lose its bound — the composition is not carrying it"
 for f in is_mask_low parity bit nibble_ones clamp_width clamp_index; do
@@ -284,6 +412,7 @@ for f in is_mask_low parity bit nibble_ones clamp_width clamp_index; do
     && fail "mutation B: $f was refuted by an is_power_of_two-only break — the tier-1 bounds are not independent"
 done
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 5. MUTATION C — the underflow guard deleted.
@@ -294,20 +423,30 @@ rm -f "$LOG"; restore
 #    engine can exhibit. Both halves of the attribution are asserted: the
 #    helper's own rows fail, AND the caller stops being able to bundle it.
 # ---------------------------------------------------------------------------
+STEP="mutation C"; mut_begin
 mutate '    if x == 0 {
         return 0;
     }
     if x & (x - 1) == 0 {' '    if x & (x - 1) == 0 {'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation C: an unguarded x - 1 still passed  $G"; else echo "  ok   mutation C (raw_is_power_of_two's x == 0 guard deleted)  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation C: an unguarded x - 1 still passed  $G"; else mut_ok "mutation C (raw_is_power_of_two's x == 0 guard deleted)  rc=$RC  $G"; fi
 grep -qE 'Summary: [0-9]+ proved, [1-9][0-9]* failed' "$LOG" \
   || fail "mutation C: no row went FAILED — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 grep -q 'verification failed for `trust_bits::raw_is_power_of_two`' "$LOG" \
   || fail "mutation C: raw_is_power_of_two did not lose a row"
 grep -q 'refused Assert-bearing member `trust_bits::raw_is_power_of_two`' "$LOG" \
   || fail "mutation C: the unproven helper was still bundled by its caller"
+# SPECIFICITY. `raw_is_power_of_two`'s callers are `is_power_of_two`, and above
+# it `round_up_pow2` and `round_down_pow2`; all three are EXCLUDED here because
+# a cascade into them is the correct behaviour. Everything below is on an
+# independent chain and must stay green.
+for f in is_mask_low parity bit nibble_ones clamp_width clamp_index; do
+  grep -q "verification failed for \`trust_bits::$f\`" "$LOG" \
+    && fail "mutation C: $f was refuted by a raw_is_power_of_two-only break — it is not downstream of that guard, so this run is a general regression and says nothing about the guard"
+done
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 6. MUTATION D — the ENTRY-PREFIX BUNDLING RULE, and its ATTRIBUTION.
@@ -322,13 +461,14 @@ rm -f "$LOG"; restore
 #    would be the §11.5 mistake; the gate asserts its ABSENCE instead, so a
 #    change in the attribution direction is a red gate.
 # ---------------------------------------------------------------------------
+STEP="mutation D"; mut_begin
 mutate 'fn sum8(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8) -> u32 {
     (b0 as u32)' 'fn sum8(b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8) -> u32 {
     let _p: u32 = weight(b0 as u32);
     (b0 as u32)'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation D: an Assert behind a CALL bundled — §9.1 is stale and must be re-measured  $G"; else echo "  ok   mutation D (weight() call folded into sum8's entry prefix)  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation D: an Assert behind a CALL bundled — §9.1 is stale and must be re-measured  $G"; else mut_ok "mutation D (weight() call folded into sum8's entry prefix)  rc=$RC  $G"; fi
 grep -q 'member has a guarded or non-entry-prefix Assert' "$LOG" \
   || fail "mutation D: the bundle did not refuse a non-entry-prefix Assert — $(grep -oE 'native TrustIr bundle for .*' "$LOG" | head -1)"
 grep -q 'refused Assert-bearing member `trust_bits::sum8`' "$LOG" \
@@ -338,6 +478,7 @@ grep -q 'verification failed for `trust_bits::ones_u32`' "$LOG" \
 grep -q 'verification failed for `trust_bits::sum8`' "$LOG" \
   && fail "mutation D: the mutated function was named directly — §11.5's attribution direction changed and this gate's note is stale"
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 7. MUTATION E — the NINE-TERM SUM WALL (§12.1).
@@ -354,18 +495,20 @@ rm -f "$LOG"; restore
 #    this crate is unnecessary, and this gate says so rather than the map entry
 #    going quietly wrong.
 # ---------------------------------------------------------------------------
+STEP="mutation E"; mut_begin
 mutate '    (b0 as u32) + (b1 as u32) + (b2 as u32) + (b3 as u32)
 }' '    (b0 as u32) + (b1 as u32) + (b2 as u32) + (b3 as u32) + (b0 as u32) + (b1 as u32)
         + (b2 as u32) + (b3 as u32) + (b0 as u32) + (b1 as u32)
 }'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation E: a TEN-term widened sum PROVED — §12.1 is stale; re-measure the wall and simplify this crate  $G"; else echo "  ok   mutation E (sum4 widened from 4 terms to 10)  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation E: a TEN-term widened sum PROVED — §12.1 is stale; re-measure the wall and simplify this crate  $G"; else mut_ok "mutation E (sum4 widened from 4 terms to 10)  rc=$RC  $G"; fi
 grep -qE 'trust_bits::sum4 \[INCONCLUSIVE\] \(18 obligations: 16 proved, 1 runtime-checked, 0 failed, 1 unknown' "$LOG" \
   || fail "mutation E: the wall did not land at the ninth add — $(grep -oE 'trust_bits::sum4 \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
 grep -q 'refused Assert-bearing member `trust_bits::sum4`' "$LOG" \
   || fail "mutation E: sum4's unproven rows did not stop it being bundled"
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 8. MUTATION F — `/` IS OPAQUE TO BUNDLING (§2.4, §7.2), at a new site.
@@ -375,15 +518,17 @@ rm -f "$LOG"; restore
 #    lower. If it ever succeeds, the tier-2 shape of `field`/`deposit` is
 #    unnecessary and a composition API becomes available.
 # ---------------------------------------------------------------------------
+STEP="mutation F"; mut_begin
 mutate '    if rank_u8(b, 1) > n {' '    if field(b as u32, 0, 1) > n {'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation F: a caller of a '/'-bearing callee lowered — §2.4/§7.2 is stale  $G"; else echo "  ok   mutation F (select_u8 made to call the dividing 'field')  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation F: a caller of a '/'-bearing callee lowered — §2.4/§7.2 is stale  $G"; else mut_ok "mutation F (select_u8 made to call the dividing 'field')  rc=$RC  $G"; fi
 grep -q 'refused Assert-bearing member `trust_bits::field`' "$LOG" \
   || fail "mutation F: field was not the refused member — $(grep -oE 'refused Assert-bearing member .*' "$LOG" | head -1)"
 grep -q 'verification failed for `trust_bits::select_u8`' "$LOG" \
   || fail "mutation F: the refusal was not raised against the caller"
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 9. MUTATION G — the WIDENING deleted in `deposit`.
@@ -393,14 +538,23 @@ rm -f "$LOG"; restore
 #    Per §4.7 a `u32` defect is fail-closed as UNKNOWN rather than FAILED, which
 #    is what must be asserted; never `[FAILED]` on `u32` arithmetic.
 # ---------------------------------------------------------------------------
+STEP="mutation G"; mut_begin
 mutate '    let placed: u64 = ((value & m) as u64) * (d as u64);' \
        '    let placed: u64 = ((value & m) * d) as u64;'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation G: an unwidened field placement still passed  $G"; else echo "  ok   mutation G (deposit multiplies at u32 before widening)  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation G: an unwidened field placement still passed  $G"; else mut_ok "mutation G (deposit multiplies at u32 before widening)  rc=$RC  $G"; fi
 grep -qE '\[(FAILED|UNKNOWN)\] \[overflow:mul\]|arithmetic overflow \(Mul\) (FAILED|UNKNOWN|RUNTIME CHECKED)' "$LOG" \
   || fail "mutation G: no mul row went FAILED, UNKNOWN or RUNTIME CHECKED — $(grep -oE 'arithmetic overflow \([A-Za-z]+\) [A-Z ]+' "$LOG" | head -3 | tr '\n' ' ')"
+# SPECIFICITY. "a mul row went UNKNOWN" is what EVERY row does when the crate
+# stops verifying, so name what must stay VERIFIED. `deposit` is a LEAF that
+# nothing in this crate calls, so no other row is downstream of this mutation.
+for f in ones_u32 rank_u32 is_power_of_two parity; do
+  grep -q "verification failed for \`trust_bits::$f\`" "$LOG" \
+    && fail "mutation G: $f was refuted by a deposit-only break — nothing calls deposit, so this run is a general regression and says nothing about the widening"
+done
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 10. MUTATION J — PINNING DOES NOT COMPOSE THROUGH A CALL (§12.4).
@@ -410,6 +564,7 @@ rm -f "$LOG"; restore
 #    discharging and not — it cost this crate its only failing row on first
 #    submission. Restoring the delegating form must refute.
 # ---------------------------------------------------------------------------
+STEP="mutation J"; mut_begin
 mutate '    if x & weight(k) == 0 {
         return 0;
     }
@@ -422,10 +577,11 @@ mutate '    if x & weight(k) == 0 {
 // ---'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation J: a bare-call helper PINNED its return — §12.4 is stale and raw_bit can be simplified  $G"; else echo "  ok   mutation J (raw_bit delegates instead of pinning)  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation J: a bare-call helper PINNED its return — §12.4 is stale and raw_bit can be simplified  $G"; else mut_ok "mutation J (raw_bit delegates instead of pinning)  rc=$RC  $G"; fi
 grep -qE 'trust_bits::bit \[INCONCLUSIVE\] \(2 obligations: 0 proved, 0 runtime-checked, 0 failed, 2 unknown' "$LOG" \
   || fail "mutation J: bit did not go UNKNOWN x2 — $(grep -oE 'trust_bits::bit \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 11. MUTATION K — A GUARD MUST BE AN INEQUALITY (§12.3).
@@ -436,6 +592,7 @@ rm -f "$LOG"; restore
 #    learns the equality form, this goes red rather than the map entry going
 #    stale.
 # ---------------------------------------------------------------------------
+STEP="mutation K"; mut_begin
 mutate '    if x > 4294967294 {
         return 1;
     }
@@ -445,12 +602,13 @@ mutate '    if x > 4294967294 {
     let y: u32 = x + 1;'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation K: an EQUALITY guard bounded the add — §12.3 is stale, respell the guard  $G"; else echo "  ok   mutation K (x > 4294967294 respelled as x == 4294967295)  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation K: an EQUALITY guard bounded the add — §12.3 is stale, respell the guard  $G"; else mut_ok "mutation K (x > 4294967294 respelled as x == 4294967295)  rc=$RC  $G"; fi
 grep -qE 'trust_bits::raw_is_mask_low \[INCONCLUSIVE\] \(2 obligations: 0 proved, 0 runtime-checked, 0 failed, 2 unknown' "$LOG" \
   || fail "mutation K: raw_is_mask_low did not go UNKNOWN x2 — $(grep -oE 'trust_bits::raw_is_mask_low \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
 grep -q 'verification failed for `trust_bits::is_mask_low`' "$LOG" \
   || fail "mutation K: the refusal was not raised against the caller"
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 12. MUTATION L — the PEAK, recomputed for THIS crate and not transplanted.
@@ -468,27 +626,32 @@ rm -f "$LOG"; restore
 #    A coefficient copied from another crate's gate would have been a silently
 #    dead control that never fired, twice over.
 # ---------------------------------------------------------------------------
+STEP="mutation L"; mut_begin
 mutate '    let hole: u64 = (m as u64) * (d as u64);' \
        '    let hole: u64 = (m as u64) * (d as u64) + 9223372039002259456;'
 run
 G="$(gate_line)"
-if [ "$RC" -eq 0 ]; then fail "mutation L: one past the measured peak still proved — §12.2's range source is stale  $G"; else echo "  ok   mutation L (deposit peak + 9223372039002259456, one past u64::MAX)  rc=$RC  $G"; fi
+if [ "$RC" -eq 0 ]; then fail "mutation L: one past the measured peak still proved — §12.2's range source is stale  $G"; else mut_ok "mutation L (deposit peak + 9223372039002259456, one past u64::MAX)  rc=$RC  $G"; fi
 grep -qE 'trust_bits::deposit \[INCONCLUSIVE\] \(6 obligations: 4 proved, 0 runtime-checked, 0 failed, 2 unknown' "$LOG" \
   || fail "mutation L: deposit did not lose exactly the add row and its twin — $(grep -oE 'trust_bits::deposit \[[A-Z]+\] \([^;]*' "$LOG" | head -1)"
 rm -f "$LOG"; restore
+mut_end
 
 # ---------------------------------------------------------------------------
 # 13. THE TESTS, AND THE TWO MUTATIONS THEY ALONE CAN CATCH.
 # ---------------------------------------------------------------------------
+STEP="tests"; mut_begin
 runtests
 if [ "$RC" -ne 0 ]; then fail "pristine: unit tests failed (rc=$RC)  $(grep -oE '^test result: .*' "$LOG" | head -1)"; else
   grep -qE '^test result: ok\. 17 passed; 0 failed' "$LOG" \
     || fail "pristine tests: expected 17 passed — $(grep -oE '^test result: .*' "$LOG" | head -1)"
-  echo "  ok   tests     $(grep -oE '^test result: ok\. [0-9]+ passed[^;]*; [0-9]+ failed' "$LOG" | head -1)"
+  mut_ok "tests     $(grep -oE '^test result: ok\. [0-9]+ passed[^;]*; [0-9]+ failed' "$LOG" | head -1)"
 fi
 rm -f "$LOG"
+mut_end
 
 # --- MUTATION H — wrong value, the KIND SPLIT CANNOT SEE IT -----------------
+STEP="mutation H"; mut_begin
 mutate '    (b0 as u32) * 128
         + (b1 as u32) * 64' '    (b0 as u32) * 64
         + (b1 as u32) * 128'
@@ -505,7 +668,7 @@ fi
 rm -f "$LOG"
 runtests
 if [ "$RC" -eq 0 ]; then fail "mutation H: a swapped bit weight passed the unit tests"; else
-  echo "  ok   mutation H (rev8 swaps the 128 and 64 weights; the coefficient MULTISET, so the peak, is unchanged)  tests rc=$RC, strict lane rc=$VRC"
+  mut_ok "mutation H (rev8 swaps the 128 and 64 weights; the coefficient MULTISET, so the peak, is unchanged)  tests rc=$RC, strict lane rc=$VRC"
 fi
 # Assert WHICH tests fail, by name. A bare rc would be satisfied by a broken
 # doctest stage or a compile error, and the control would silently stop testing.
@@ -528,8 +691,10 @@ done
 grep -q 'the_byte_and_word_lanes_agree_consistency_only ... ok' "$LOG" \
   || fail "mutation H: the consistency test now catches this too — it did not when written, and the gate's demonstration of oracle-derivation is stale"
 rm -f "$LOG"; restore
+mut_end
 
 # --- MUTATION I — wrong value, TIER-1 POSTCONDITION SURVIVES ----------------
+STEP="mutation I"; mut_begin
 mutate '    if b < 16 {
         return 4;
     }' '    if b < 16 {
@@ -548,7 +713,7 @@ fi
 rm -f "$LOG"
 runtests
 if [ "$RC" -eq 0 ]; then fail "mutation I: a wrong leading-zero count passed the unit tests"; else
-  echo "  ok   mutation I (leading_zeros_u8 returns 3 for b in 16..=31; 'ensures result <= 8' still TRUE)  tests rc=$RC, strict lane rc=$VRC"
+  mut_ok "mutation I (leading_zeros_u8 returns 3 for b in 16..=31; 'ensures result <= 8' still TRUE)  tests rc=$RC, strict lane rc=$VRC"
 fi
 for t in zero_runs_agree_with_core \
          the_byte_and_word_zero_runs_are_two_independent_chains; do
@@ -559,6 +724,7 @@ done
 # which is the entire point of this control.
 grep -q 'every_tier1_bound_holds_and_every_clamp_can_fire ... ok' "$LOG" \
   || fail "mutation I: the tier-1 bound test also went red — I no longer isolates 'proved contract over a wrong answer'"
+mut_end
 if [ "$VRC" -eq 0 ]; then
   echo "       (note: the strict lane still PASSED this mutation, as expected — the"
   echo "        clause is 'result <= 8' and 3 is inside it, so all nine of"

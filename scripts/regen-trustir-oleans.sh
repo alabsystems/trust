@@ -100,7 +100,21 @@ SHIP_LIB="$WORK/trust_ir-semantics/.lake/build/lib"
 # --- Compute the minimal closure with the in-tree clean-olean --------------
 echo "computing closure of the bridge root module ..."
 CLOSURE="$WORK/closure_modules.txt"
-TARGO="$ROOT/build/host/stage2/bin/targo"
+# Trust: resolve the build tool instead of hardcoding one stage layout. The stage2 path is
+# what a fully-bootstrapped mac has; a Linux clone that builds `--stage 1` has only the
+# stage1 tree, and the hardcoded path made the regen fail there with "No such file or
+# directory" — which then wedged a pin bump between fast.bridge-pin (manifest must be
+# regenerated with the pin) and the preflight's pin_behind_history (holding the pin walks
+# it backward). First existing candidate wins; the --unverified probe below still decides
+# how to invoke whichever one is found.
+TARGO=""
+for cand in     "$ROOT/build/host/stage2/bin/targo"     "$ROOT/build/host/stage1/bin/targo"     "$ROOT"/build/*/stage1/bin/targo; do
+  if [ -x "$cand" ]; then TARGO="$cand"; break; fi
+done
+if [ -z "$TARGO" ]; then
+  echo "regen-trustir-oleans: no targo found under build/*/stage{1,2}/bin — build one first" >&2
+  exit 1
+fi
 # `--unverified` is a TARGO flag, and a stage2 that predates the targo rebrand ships a plain
 # cargo under that name — it rejects the flag as an unknown argument and the regen dies with a
 # cargo usage message that says nothing about oleans. Probe instead of assuming. Passing it when

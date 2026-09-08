@@ -524,9 +524,7 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
     };
     assert_eq!(super::enum_variant_tag_set(&dt), Some(vec![0, 1, 2]));
     // #[repr] enum with explicit non-contiguous discriminants: tags are {5, 10}.
-    let adt = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let adt = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "Repr".into(),
         fields: vec![],
         variants: vec![
@@ -546,9 +544,7 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
     // A struct (no variants), a by-name datatype reference (empty variants), and a
     // scalar are NOT enums — no tag set, so no (potentially-vacuous) bound.
     assert_eq!(
-        super::enum_variant_tag_set(&Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        super::enum_variant_tag_set(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
             name: "S".into(),
             fields: vec![("x".into(), Ty::Bool)],
             variants: vec![],
@@ -571,9 +567,7 @@ fn enum_variant_tag_set_uses_actual_discriminants() {
 /// a phantom tag outside the variant range.
 fn func_reading_enum_discriminant() -> VerifiableFunction {
     use trust_types::VariantDef;
-    let e = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let e = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "clean_kernel::Expr".into(),
         variants: vec![
             VariantDef { name: "App".into(), discriminant: 0, fields: vec![] },
@@ -637,9 +631,7 @@ fn discriminant_range_facts_skip_non_enum_source() {
             // A struct ADT (variants: []) — its discriminant has no variant range.
             LocalDecl {
                 index: 1,
-                ty: Ty::Adt {
-                    adt_kind: None,
-                    layout: None,
+                ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                     name: "S".into(),
                     fields: vec![("x".into(), Ty::Bool)],
                     variants: vec![],
@@ -673,9 +665,7 @@ fn discriminant_range_facts_skip_non_enum_source() {
 #[test]
 fn discriminant_range_facts_fold_tags_across_narrowing_cast() {
     use trust_types::VariantDef;
-    let e = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let e = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "t::E".into(),
         variants: vec![
             VariantDef { name: "A".into(), discriminant: 0, fields: vec![] },
@@ -743,6 +733,140 @@ fn discriminant_range_facts_fold_tags_across_narrowing_cast() {
     assert!(
         ds.contains("Int(260)") && ds.contains("Int(512)"),
         "discriminant-temp fact must keep the raw declared tags: {ds}"
+    );
+}
+
+/// `_2 = Discriminant(_1); _3 = _2 as usize` over an enum with the given RAW tag
+/// patterns, discriminant-temp type, and optional `#[repr]` hint — the
+/// `arr[e as usize]` shape the cast-destination fact keys on.
+fn func_casting_enum_discriminant(
+    raw_tags: &[i128],
+    disc_ty: Ty,
+    repr_hint: Option<trust_types::EnumReprHint>,
+) -> VerifiableFunction {
+    use trust_types::VariantDef;
+    let e = Ty::Adt {
+        arbitrary_precision: None,
+        adt_kind: None,
+        layout: None,
+        name: "t::E".into(),
+        variants: raw_tags
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| VariantDef {
+                name: format!("V{i}"),
+                discriminant: t,
+                fields: vec![],
+            })
+            .collect(),
+        fields: vec![],
+        disc_index_safe: true,
+        faithful_enum_repr: repr_hint.map(Some),
+        enum_layout: None,
+    };
+    let mut func = func_with_locals(
+        "casts_discr",
+        vec![
+            LocalDecl { index: 0, ty: Ty::u8(), name: None },
+            LocalDecl { index: 1, ty: e, name: Some("e".into()) },
+            LocalDecl { index: 2, ty: disc_ty, name: Some("dtemp".into()) },
+            LocalDecl { index: 3, ty: Ty::usize(), name: Some("idx".into()) },
+        ],
+        Ty::u8(),
+    );
+    func.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(2),
+        rvalue: Rvalue::Discriminant(Place::local(1)),
+        span: SourceSpan::default(),
+    });
+    func.body.blocks[0].stmts.push(Statement::Assign {
+        place: Place::local(3),
+        rvalue: Rvalue::Cast(Operand::Copy(Place::local(2)), Ty::usize()),
+        span: SourceSpan::default(),
+    });
+    func
+}
+
+/// Whether a cast-destination (`_3`) tag-set fact was emitted.
+fn has_cast_dest_tag_fact(func: &VerifiableFunction, facts: &[Formula]) -> bool {
+    let cast_name = crate::place_to_var_name(func, &Place::local(3));
+    facts.iter().any(|f| f.free_variables().contains(&cast_name))
+}
+
+/// Trust (P0 raw-vs-NORMALIZED discriminant FALSE PROOF — second consumer, GLOBAL fact):
+/// `VariantDef::discriminant` holds the extractor's RAW BIT PATTERN, always non-negative
+/// in its `i128` carrier, so the old `tags.iter().all(|&t| t >= 0)` gate was VACUOUS for
+/// every signed repr. WITNESS:
+///
+/// ```ignore
+/// #[repr(i8)] enum E { A = 0, B = -1 }        // patterns {0, 255}
+/// fn f(e: E, arr: &[u8; 256]) -> u8 { arr[e as usize] }
+/// ```
+///
+/// The raw gate passed, the cast-destination fact `_3 ∈ {0, 255}` was conjoined onto
+/// EVERY VC, and `_3 < 256` PROVED — while `E::B as usize` really is
+/// `0xFFFF_FFFF_FFFF_FFFF`. Normalizing per the discriminant's own repr makes the set
+/// `{0, -1}`, so the gate declines and NO cast fact is emitted (fail-closed).
+#[test]
+fn discriminant_cast_fact_fails_closed_for_negative_repr_i8_tag() {
+    let func =
+        func_casting_enum_discriminant(&[0, 255], Ty::Int { width: 8, signed: true }, None);
+    let facts = super::build_discriminant_variant_range_facts(&func);
+    assert!(
+        !has_cast_dest_tag_fact(&func, &facts),
+        "a repr(i8) tag pattern 255 IS the value -1: the `as usize` cast destination must \
+         get NO tag-set fact (its real value is 0xFFFF_FFFF_FFFF_FFFF): {facts:?}"
+    );
+    // The RAW-pattern facts on the discriminant temp itself are unaffected: they compare
+    // against a tag variable that carries the raw pattern (the guards.rs split).
+    let disc_name = crate::place_to_var_name(&func, &Place::local(2));
+    assert!(
+        facts.iter().any(|f| f.free_variables().contains(&disc_name)),
+        "the raw tag-set fact on the discriminant temp is unchanged: {facts:?}"
+    );
+}
+
+/// The widened-carrier variant of the SAME hole: an `i64` discriminant temp
+/// sign-extends the pattern `255` at 64 bits, so it still looks non-negative. The
+/// enum's own `#[repr(i8)]` hint reports `-1`, the signals disagree, and the fact is
+/// declined — which is why the gate consults EVERY repr signal, not just the first.
+#[test]
+fn discriminant_cast_fact_fails_closed_when_repr_hint_contradicts_widened_temp() {
+    let func = func_casting_enum_discriminant(
+        &[0, 255],
+        Ty::Int { width: 64, signed: true },
+        Some(trust_types::EnumReprHint::I8),
+    );
+    let facts = super::build_discriminant_variant_range_facts(&func);
+    assert!(
+        !has_cast_dest_tag_fact(&func, &facts),
+        "a repr(i8) hint contradicting a widened i64 disc temp must decline: {facts:?}"
+    );
+}
+
+/// Known-true companion: an ordinary NON-NEGATIVE tag set still gets its
+/// cast-destination fact, so the fix is not a blanket disable of the lane (without it
+/// the always-safe `arr[e as usize]` false-REFUTES, the bug this arm was written for).
+#[test]
+fn discriminant_cast_fact_still_emitted_for_nonnegative_tags() {
+    let func = func_casting_enum_discriminant(
+        &[0, 1, 2],
+        Ty::Int { width: 8, signed: true },
+        Some(trust_types::EnumReprHint::I8),
+    );
+    let facts = super::build_discriminant_variant_range_facts(&func);
+    assert!(
+        has_cast_dest_tag_fact(&func, &facts),
+        "a non-negative repr(i8) tag set {{0,1,2}} keeps its `as usize` cast fact: {facts:?}"
+    );
+    let cast_name = crate::place_to_var_name(&func, &Place::local(3));
+    let cast_fact = facts
+        .iter()
+        .find(|f| f.free_variables().contains(&cast_name))
+        .expect("checked above");
+    assert!(
+        matches!(cast_fact, Formula::Or(cases) if cases.len() == 3),
+        "expected the 3-way membership `_3 ∈ {{0,1,2}}`: {cast_fact:?}"
     );
 }
 

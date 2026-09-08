@@ -1,0 +1,52 @@
+error: the initializer of `A` can wait on `A` itself: a `std::sync::OnceLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/two_cell_cycle.rs:17:8
+   |
+LL |     *A.get_or_init(|| b() + 1)
+   |        ^^^^^^^^^^^^^^^---^^^^^
+   |        |              |
+   |        |              the initializer reaches the re-entrant wait through this call
+   |        the initializer of `A` reaches this call, which waits on `A` again
+...
+LL |     *B.get_or_init(|| a() + 1)
+   |                    ----------
+   |                    |  |
+   |                    |  the initializer reaches the re-entrant wait through this call
+   |                    the initializer reaches the re-entrant wait through this call
+   |
+   = note: call path: `a::{closure#0}` -> `b` -> `b::{closure#0}` -> `a` -> `A.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `a` — read the input it needs directly instead of asking `A` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `A.get_or_init(|| v)` (or `A.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `A`, read `A.get()` there — it never waits
+note: `A` is declared here
+  --> $DIR/two_cell_cycle.rs:13:1
+   |
+LL | static A: OnceLock<u32> = OnceLock::new();
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: the initializer of `B` can wait on `B` itself: a `std::sync::OnceLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/two_cell_cycle.rs:22:8
+   |
+LL |     *A.get_or_init(|| b() + 1)
+   |                    ----------
+   |                    |  |
+   |                    |  the initializer reaches the re-entrant wait through this call
+   |                    the initializer reaches the re-entrant wait through this call
+...
+LL |     *B.get_or_init(|| a() + 1)
+   |        ^^^^^^^^^^^^^^^---^^^^^
+   |        |              |
+   |        |              the initializer reaches the re-entrant wait through this call
+   |        the initializer of `B` reaches this call, which waits on `B` again
+   |
+   = note: call path: `b::{closure#0}` -> `a` -> `a::{closure#0}` -> `b` -> `B.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `b` — read the input it needs directly instead of asking `B` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `B.get_or_init(|| v)` (or `B.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `B`, read `B.get()` there — it never waits
+note: `B` is declared here
+  --> $DIR/two_cell_cycle.rs:14:1
+   |
+LL | static B: OnceLock<u32> = OnceLock::new();
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

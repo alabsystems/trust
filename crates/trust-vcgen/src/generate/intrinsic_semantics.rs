@@ -39,16 +39,61 @@
 // | `ctpop`       | `fn(T) -> u32`     | EXACT: `Σ_{i<W} bit_i`, plus `0<=r<=W`  |
 // | `bswap`       | `fn(T) -> T`       | EXACT: byte cascade (W=8 is IDENTITY)   |
 // | `bitreverse`  | `fn(T) -> T`       | EXACT: bit cascade                      |
-// | `ctlz`        | `fn(T) -> u32`     | `0<=r<=W` and `r == W  <->  x == 0`     |
-// | `cttz`        | `fn(T) -> u32`     | `0<=r<=W` and `r == W  <->  x == 0`     |
+// | `cttz`        | `fn(T) -> u32`     | `0<=r<=W`, `r == W <-> x == 0`, and     |
+// |               |                    | EXACT `ctpop(!x & (x-1))` for a         |
+// |               |                    | CONSTANT argument                       |
+// | `ctlz`        | `fn(T) -> u32`     | same, exact term over the bit-reversed  |
+// |               |                    | word, same constant-argument gate       |
 //
-// `ctlz`/`cttz` ARE exactly definable (a W-deep `Ite` chain over the bit
-// extracts), and that is deliberately NOT done: a 64-deep term-`Ite` is pruned
-// by trust-mc and blows past `ITE_ELIM_CASE_CAP` in the lifting pass, so the
-// "exact" model would be strictly worse than the bound for every consumer while
-// carrying all of the definitional risk. The two facts emitted instead are the
-// ones consumers actually need (`leading_zeros(x) < W` for a nonzero `x` is what
-// makes `1 << (W - 1 - lz)` a defined shift).
+// An earlier revision left `ctlz`/`cttz` at the bound + iff only, on the ground
+// that the obvious exact form — a W-deep `Ite` chain over the bit extracts — is
+// pruned by trust-mc and blows past `ITE_ELIM_CASE_CAP` in the lifting pass.
+// That objection was to the ENCODING, not to exactness: `cttz(x)` is also
+// `ctpop(!x & (x - 1))` — the mask of trailing zeros has a 1 exactly below the
+// lowest set bit (and is all-ones at `x == 0`, giving the required `W`) — which
+// is Ite-free, linear in `W` (`12W - 1` nodes, see the cost table), and made of
+// operators the BV theory already carries (`BvNot`/`BvSub`/`BvAnd`); `ctlz` is
+// the same composition over `bitreverse(x)`.
+//
+// # WHY THE EXACT COUNTING TERM IS GATED ON A CONSTANT ARGUMENT
+//
+// Measured (2026-08-30, realmir harness, in-process ay, debug build): with the
+// exact `cttz`/`ctlz` equation in the hypothesis set for a FREE argument, the
+// load-bearing clause family this model exists to serve — `x >= 1 ensures
+// result <= W-1`, the fact that makes `1 << (W - 1 - r)` a defined shift —
+// DEGRADES CATASTROPHICALLY, even though its cheap iff+range proof is still
+// present in the same hypothesis set:
+//
+// | free-argument row               | W  | without exact | with exact        |
+// |---------------------------------|----|---------------|-------------------|
+// | `x>=1 -> cttz(x) <= W-1` (TRUE) |  8 |       —       | Proved, 7.8 s     |
+// | `x>=1 -> ctlz(x) <= W-1` (TRUE) |  8 |       —       | Proved, 8.3 s     |
+// | `x>=1 -> cttz(x) <= 15`  (TRUE) | 16 |       —       | TIMEOUT at 120 s  |
+// | `x>=1 -> ctlz(x) <= 15`  (TRUE) | 16 |       —       | TIMEOUT at 120 s  |
+// | `x>=1 -> cttz(x) <= 31`  (TRUE) | 32 | Proved, 8 ms  | TIMEOUT at 120 s  |
+//
+// ("—" = not measured; the without-exact path is width-independent — the same
+// three-step iff+range derivation the measured 8 ms row takes.)
+//
+// The equation is not wrong — the width-8 differential is exhaustive — but its
+// presence sends the solver into Int<->BV saturation it does not return from.
+// (`ctpop` does not hit this: its own free-argument bound row `<= W` is decided
+// by the range fact alone, which the solver does find.) So the exact equation
+// is emitted ONLY when the argument operand is a compile-time CONSTANT
+// (`Operand::Constant`, e.g. `cttz(8u32)` — dumps confirm literals arrive so):
+// the term is then fully concrete, the solver folds it (measured 2-18 ms
+// across widths 8-32, BOTH verdict directions, realmir literal rows), and
+// there is no free-variable search
+// for it to pollute. A parameter pinned by `requires x == 8` is NOT a constant
+// operand and deliberately stays on the iff+range facts — fail-closed on
+// completeness, never on soundness; `tests/intrinsic_semantics_realmir.rs`
+// pins both sides of the gate AND the 8 ms free-row proof as a regression
+// guard against re-widening.
+//
+// The bound + iff facts are emitted at EVERY width — they are Int-lane facts
+// the BV-declining consumers (trust-wp) can still use, and outside the
+// constant gate they are all there is, exactly as before this module learned
+// the counting definitions.
 //
 // THE `_nonzero` SIBLINGS ARE EXCLUDED BY NAME. `ctlz_nonzero`/`cttz_nonzero`
 // are `unsafe` and UB at zero; they carry a precondition a caller can violate,
@@ -100,6 +145,12 @@ pub(crate) enum ValueModeledIntrinsic {
 /// | `ctpop`      |  39 |   79 |  159 |  319 |   639 | `5W - 1`      |
 /// | `bitreverse` |  31 |   63 |  127 |  255 |   511 | `4W - 1`      |
 /// | `bswap`      |   3 |    7 |   15 |   31 |    63 | `4·(W/8) - 1` |
+/// | `cttz`       |  95 |  191 |  383 |   —  |    —  | `12W - 1`     |
+/// | `ctlz`       | 559 | 2143 | 8383 |   —  |    —  | `8W² + 6W - 1`|
+///
+/// (`cttz` duplicates its 9-node trailing-zeros mask once per extracted bit;
+/// `ctlz` duplicates the whole `4W - 1`-node reversal cascade the same way —
+/// quadratic, but only ever emitted over a constant argument, where it folds.)
 ///
 /// TERM DEPTH is bounded separately and is the number that actually bit: the
 /// combine is a BALANCED fold ([`balanced_fold`]), so depth is logarithmic, and
@@ -110,6 +161,8 @@ pub(crate) enum ValueModeledIntrinsic {
 /// | `ctpop`      |   7 |    8 |    9 |   10 |    11 |
 /// | `bitreverse` |   6 |    7 |    8 |    9 |    10 |
 /// | `bswap`      |   3 |    4 |    5 |    6 |     7 |
+/// | `cttz`       |   9 |   10 |   11 |    — |     — |
+/// | `ctlz`       |  13 |   15 |   17 |    — |     — |
 ///
 /// # WHY THE CAP IS 32 AND NOT 64
 ///
@@ -152,6 +205,24 @@ pub(crate) enum ValueModeledIntrinsic {
 /// rejects anything past i64 in the trust-wp lane), which is why every other
 /// range/value builder in this crate gates on `width < 128`.
 const MAX_EXACT_INTRINSIC_WIDTH: u32 = 32;
+
+/// Is this operand a compile-time constant — the gate on the exact `cttz`/
+/// `ctlz` equation?
+///
+/// The module header carries the full measured table; the short version: the
+/// counting equations are CORRECT at every emitted width (exhaustive width-8
+/// differential, edge patterns at 16/32), but for a FREE argument their
+/// presence sends ay into Int<->BV saturation that turns the 8 ms iff+range
+/// proof of `x >= 1 -> r <= W-1` into a 120 s timeout. For a CONSTANT argument
+/// there is nothing to search — the term folds — and the solve is 2-18 ms at
+/// widths 8-32 in BOTH verdict directions (measured, `tests/
+/// intrinsic_semantics_realmir.rs`). So constants get the definition and free
+/// arguments keep the iff+range model that already serves the shift-
+/// definedness clause family. `argument_is_stable` has already admitted the
+/// operand; this narrows WHICH admitted operands get the exact equation.
+fn argument_is_compile_time_constant(operand: &Operand) -> bool {
+    matches!(operand, Operand::Constant(_))
+}
 
 /// STRICT, fail-closed classification of a `Terminator::Call` callee path into
 /// the value-modeled intrinsic set.
@@ -245,17 +316,26 @@ fn as_bits(x: &Formula, width: u32) -> Formula {
     Formula::IntToBv(Box::new(x.clone()), width)
 }
 
-/// Bit `i` of `x` (LSB is bit 0) as an Int-sorted `0`/`1`.
+/// Bit `i` of the BV-sorted `xb` (LSB is bit 0) as an Int-sorted `0`/`1`.
 ///
 /// `BvToInt(_, 1, /*signed=*/false)` is load-bearing: the SIGNED reading of a
 /// 1-bit vector is `{0, -1}`, which would make the population count a count of
 /// zeros minus ones. `ctpop_exhaustive_width8_matches_rust` catches that.
-fn bit_as_int(x: &Formula, width: u32, i: u32) -> Formula {
+fn bv_bit_as_int(xb: &Formula, i: u32) -> Formula {
     Formula::BvToInt(
-        Box::new(Formula::BvExtract { inner: Box::new(as_bits(x, width)), high: i, low: i }),
+        Box::new(Formula::BvExtract { inner: Box::new(xb.clone()), high: i, low: i }),
         1,
         false,
     )
+}
+
+/// Population count of an ALREADY-BV-SORTED term, as the sum of its extracted
+/// bits. Shared by `ctpop_value` (over `int2bv(x)`), `cttz_value` (over the
+/// trailing-zeros mask) and `ctlz_value` (over the reversed word's mask).
+fn ctpop_of_bits(xb: &Formula, width: u32) -> Formula {
+    balanced_fold((0..width).map(|i| bv_bit_as_int(xb, i)).collect(), |a, b| {
+        Formula::Add(Box::new(a), Box::new(b))
+    })
 }
 
 /// `ctpop(x)` as the SUM OF THE EXTRACTED BITS — the definition, not a bound.
@@ -268,9 +348,46 @@ fn bit_as_int(x: &Formula, width: u32, i: u32) -> Formula {
 /// terms instead of ~3W but is far easier to get subtly wrong and would need a
 /// per-width magic-constant table — a second place to get it wrong.
 pub(super) fn ctpop_value(x: &Formula, width: u32) -> Formula {
-    balanced_fold((0..width).map(|i| bit_as_int(x, width, i)).collect(), |a, b| {
-        Formula::Add(Box::new(a), Box::new(b))
-    })
+    ctpop_of_bits(&as_bits(x, width), width)
+}
+
+/// The TRAILING-ZEROS MASK of a BV-sorted word: `!xb & (xb - 1)`.
+///
+/// For a nonzero word with `t` trailing zeros, `xb - 1` flips exactly the low
+/// `t` zeros to ones and the lowest set bit to zero, and `!xb` has ones exactly
+/// where `xb` has zeros — so the conjunction keeps the low `t` bits (both
+/// factors are 1 there), clears bit `t` (`!xb` is 0 there), and clears every
+/// higher bit (`xb - 1` equals `xb` there, so the factors are complementary).
+/// At `xb == 0` the subtraction WRAPS to all-ones and `!xb` is all-ones, so the
+/// mask is all-ones — population count `W`, which is exactly `cttz(0)`. The
+/// zero case therefore needs no special arm; the wrap IS the definition.
+fn trailing_zeros_mask(xb: Formula, width: u32) -> Formula {
+    let one = as_bits(&Formula::Int(1), width);
+    Formula::BvAnd(
+        Box::new(Formula::BvNot(Box::new(xb.clone()), width)),
+        Box::new(Formula::BvSub(Box::new(xb), Box::new(one), width)),
+        width,
+    )
+}
+
+/// `cttz(x)` EXACTLY, as `ctpop(!x & (x - 1))` — Ite-free and linear in `W`.
+///
+/// Exact for both signednesses for the same reason `ctpop` is: `int2bv`
+/// recovers the bit pattern, and trailing-zero count is a function of the bit
+/// pattern alone. The width-8 differential checks all 256 inputs of each.
+pub(super) fn cttz_value(x: &Formula, width: u32) -> Formula {
+    ctpop_of_bits(&trailing_zeros_mask(as_bits(x, width), width), width)
+}
+
+/// `ctlz(x)` EXACTLY, as `cttz` of the BIT-REVERSED word: the reversal maps
+/// leading zeros to trailing zeros, and [`bitreverse_bits`] is the already-
+/// tested cascade (its own exhaustive differential runs at widths 8-64).
+///
+/// The reversal cascade is duplicated once per extracted bit of the outer
+/// popcount, so this term is QUADRATIC in `W` (`8W² + 6W - 1` nodes) — benign
+/// under the constant-argument gate, where the whole term folds.
+pub(super) fn ctlz_value(x: &Formula, width: u32) -> Formula {
+    ctpop_of_bits(&trailing_zeros_mask(bitreverse_bits(x, width), width), width)
 }
 
 /// `bswap(x)` as the byte cascade: the result's HIGH byte is `x`'s LOW byte.
@@ -444,10 +561,12 @@ pub(crate) fn value_modeled_intrinsic_facts<'a>(
         }
         // `ctlz(x) == W  <->  x == 0`, and the same for `cttz`. Both directions
         // are definitional: a zero word has W leading (and W trailing) zeros,
-        // and a word with ANY bit set has at most W-1 of either. Emitted instead
-        // of the exact W-deep `Ite` chain — see the module header. The reverse
-        // direction is the useful one: it turns the bound into `x != 0 -> r < W`,
-        // which is what makes a shift by `W - 1 - r` defined.
+        // and a word with ANY bit set has at most W-1 of either. Emitted at
+        // EVERY width — they are pure Int-lane facts a BV-declining consumer
+        // (trust-wp fail-closes on every `Bv*` node) can still use, they are
+        // what decides the free-argument shift-definedness clause family
+        // (`x != 0 -> r < W`), and outside the constant gate below they are
+        // all there is.
         ValueModeledIntrinsic::Ctlz | ValueModeledIntrinsic::Cttz => {
             let is_w = || {
                 Formula::Eq(Box::new(subject.clone()), Box::new(Formula::Int(i128::from(width))))
@@ -455,6 +574,21 @@ pub(crate) fn value_modeled_intrinsic_facts<'a>(
             let is_zero = || Formula::Eq(Box::new(x.clone()), Box::new(Formula::Int(0)));
             facts.push(Formula::Implies(Box::new(is_w()), Box::new(is_zero())));
             facts.push(Formula::Implies(Box::new(is_zero()), Box::new(is_w())));
+            // The EXACT definitions (verified-sysroot §5 step 1 remainder,
+            // 2026-08-30): `cttz` as `ctpop(!x & (x-1))`, `ctlz` as the same
+            // mask over the bit-reversed word — emitted ONLY for a
+            // compile-time-constant argument, under the shared width cap. The
+            // gate is a MEASURED interference boundary, not a soundness one:
+            // see `argument_is_compile_time_constant` and the module header
+            // table. Outside it the arm keeps exactly the facts it emitted
+            // before — fail-closed on completeness, never a guess.
+            if argument_is_compile_time_constant(&args[0]) && width <= MAX_EXACT_INTRINSIC_WIDTH {
+                let def = match kind {
+                    ValueModeledIntrinsic::Cttz => cttz_value(&x, width),
+                    _ => ctlz_value(&x, width),
+                };
+                facts.push(Formula::Eq(Box::new(subject.clone()), Box::new(def)));
+            }
         }
         ValueModeledIntrinsic::Bswap if width <= MAX_EXACT_INTRINSIC_WIDTH => {
             if let Some(bits) = bswap_bits(&x, width) {
@@ -507,11 +641,12 @@ fn argument_is_stable(func: &VerifiableFunction, operand: &Operand) -> bool {
 /// A local with NO def anywhere in the body — an ENTRY PARAMETER, written once
 /// by the ABI before the first block and never again.
 ///
-/// `is_single_static_assignment` requires EXACTLY one visible def and therefore
-/// answers `false` for such a local: the ABI write is not a `Statement::Assign`.
-/// That is the shape the compiler actually emits for `ctpop(x)` on a parameter
-/// (`args: [Copy(_1)]`, measured on the stage2 dump), so without this arm the
-/// whole lane would decline the common case.
+/// This is the shape the compiler actually emits for `ctpop(x)` on a parameter
+/// (`args: [Copy(_1)]`, measured on the stage2 dump). Since the parameter-entry-def
+/// budget landed, `is_single_static_assignment` answers `true` for such a local too
+/// and this arm no longer decides anything on its own; it is kept because it is
+/// STRICTER on one shape the other is not — a `Deref`-first store `*x = …` spends no
+/// budget there and is refused here.
 ///
 /// SOUND for the same reason single-assignment is: the symbol has ONE meaning at
 /// every program point. The `local_mut_escapes` conjunct closes the write

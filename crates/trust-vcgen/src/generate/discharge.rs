@@ -488,7 +488,7 @@ pub(super) fn sigma_actual_formula(
 /// Returns `Some(root_place)` only when:
 ///   * `actual` is a whole-local `Copy`/`Move` (no projections — a plain value pass),
 ///   * every hop of the chain is a UNIQUE whole-local `Use(Copy|Move)` def
-///     (`unique_whole_local_def`) — or a UNIQUE whole-local `Rvalue::Cast` whose
+///     (`unique_value_def`) — or a UNIQUE whole-local `Rvalue::Cast` whose
 ///     int→int cast is PROVABLY value-preserving over the FULL source domain
 ///     (`is_modeled_identity_cast` on `Ty::Int` → `Ty::Int`: same width and
 ///     signedness, or a widening that is not signed→unsigned) — so the temp is
@@ -522,7 +522,7 @@ pub(super) fn sigma_actual_stable_copy_root(
         if seen > 16 {
             return None;
         }
-        match crate::unique_whole_local_def(func, local) {
+        match crate::local_defs::unique_value_def(func, local) {
             // Follow a whole-local value copy to its source.
             Some(Rvalue::Use(Operand::Copy(src) | Operand::Move(src)))
                 if src.projections.is_empty() =>
@@ -690,7 +690,7 @@ pub(super) fn sigma_actual_array_cast_len(
     if !p.projections.is_empty() {
         return None;
     }
-    match crate::unique_whole_local_def(func, p.local)? {
+    match crate::local_defs::unique_value_def(func, p.local)? {
         // The array→slice unsize (convert.rs lowers `&[T; N] -> &[T]` as this Cast).
         Rvalue::Cast(src, to_ty) if crate::cast_target_is_slice_ref(to_ty) => {
             // `slice_len_formula` on the SOURCE operand reads the array length off

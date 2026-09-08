@@ -1,0 +1,52 @@
+; TrustIr text format v1
+module "m1bounds"
+target "aarch64-unknown-linux-gnu" 8 little structpass=unclassified
+file 0 "m1bounds.rs"
+
+functy.0 = ([ty.0 x 7], usize) -> (i32)
+
+functy.1 = () -> (usize)
+
+type ty.0 = i32
+
+rustcc fn @pick(functy.0) {
+    ; #producer: trust
+    ; #names: %0="a", %1="i"
+bb0(%0: [ty.0 x 7], %1: usize):
+    %2 = const usize 7  ; #loc: 0 2 44
+    %3 = icmp ult usize %1, %2  ; #loc: 0 2 44
+    assert %3  ; #proof: in_bounds  ; #loc: 0 2 44
+    %4 = extractelement i32 %0, %1  ; #loc: 0 2 44
+    ret %4  ; #loc: 0 2 50
+}
+
+rustcc fn @pick::{constant#0}::{const-init}(functy.1) {
+    ; #producer: trust
+bb0:
+    %0 = const usize 7  ; #loc: 0 2 21
+    ret %0  ; #loc: 0 2 22
+}
+
+rustcc fn @pick_safe(functy.0) {
+    ; #producer: trust
+    ; #names: %0="a", %1="i"
+bb0(%0: [ty.0 x 7], %1: usize):
+    %2 = const usize 3  ; #loc: 0 3 55
+    %3 = and usize %1, %2  ; #loc: 0 3 51
+    %4 = const usize 7  ; #loc: 0 3 49
+    %5 = icmp ult usize %3, %4  ; #loc: 0 3 49
+    assert %5  ; #proof: in_bounds  ; #loc: 0 3 49
+    %6 = extractelement i32 %0, %3  ; #loc: 0 3 49
+    ret %6  ; #loc: 0 3 59
+}
+
+rustcc fn @pick_safe::{constant#0}::{const-init}(functy.1) {
+    ; #producer: trust
+bb0:
+    %0 = const usize 7  ; #loc: 0 3 26
+    ret %0  ; #loc: 0 3 27
+}
+
+obligation 0 bounds_check pending "direct THIR Assert (bounds_check) at L2C44 of `m1bounds::pick`: index is in bounds. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "m1bounds::pick#L2C44#bounds_check#o0" range 0 2 44 2 48 site f0/bb0#2
+
+obligation 1 bounds_check pending "direct THIR Assert (bounds_check) at L3C49 of `m1bounds::pick_safe`: index is in bounds. RECORDED BY THE LOWERING, NOT PROVED." function 2 source "trust-thir-lower/direct-assert@1" assertion "m1bounds::pick_safe#L3C49#bounds_check#o0" range 0 3 49 3 57 site f2/bb0#4

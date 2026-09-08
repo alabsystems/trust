@@ -20,9 +20,7 @@ fn enter_bool_pred_summaries(
 /// `Result<u64, ()>` in the flattened `lower_enum_adt` shape: the explicit
 /// `__tag` slot plus per-variant defs carrying the REAL discriminant tags.
 fn std_result_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -49,9 +47,7 @@ fn std_result_ty() -> Ty {
 
 /// `Option<u64>` in the same flattened shape (`None` = 0, `Some` = 1).
 fn std_option_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "core::option::Option".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),
@@ -673,9 +669,7 @@ fn infers_bool_pred_from_field_probe() {
     const OPTION_IS_SOME: &str = "core::option::Option::<T>::is_some";
     let widget_ref = |mutable: bool| Ty::Ref {
         mutable,
-        inner: Box::new(Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
             name: "mycrate::Widget".into(),
             fields: vec![("slot".into(), std_option_ty())],
             variants: vec![],
@@ -847,9 +841,7 @@ fn field_guarded_field_unwrap_connects_via_inferred_contract() {
     const IS_READY: &str = "mycrate::Widget::is_ready";
     let widget_ref = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
             name: "mycrate::Widget".into(),
             fields: vec![("slot".into(), std_option_ty())],
             variants: vec![],
@@ -955,9 +947,7 @@ fn unguarded_field_unwrap_refutes_with_witness() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt {
-                        adt_kind: None,
-                        layout: None,
+                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                         name: "mycrate::Widget".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
@@ -1194,9 +1184,7 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt {
-                        adt_kind: None,
-                        layout: None,
+                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                         name: "mycrate::Foo".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
@@ -1211,9 +1199,7 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 2,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt {
-                        adt_kind: None,
-                        layout: None,
+                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                         name: "mycrate::Foo".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
@@ -1228,9 +1214,7 @@ fn field_observer_gate_follows_multihop_base_copy() {
                 index: 3,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt {
-                        adt_kind: None,
-                        layout: None,
+                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                         name: "mycrate::Foo".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],
@@ -1922,7 +1906,7 @@ fn whole_pointee_guard_through_reseat_does_not_connect() {
                         span: SourceSpan::default(),
                     },
                     // reseat: (*m) = &o2  — rooted at _4, invisible to
-                    // unique_whole_local_def(_3).
+                    // crate::local_defs::unique_value_def(_3).
                     Statement::Assign {
                         place: Place { local: 4, projections: vec![Projection::Deref] },
                         rvalue: Rvalue::Ref { mutable: false, place: Place::local(2) },
@@ -1986,9 +1970,7 @@ fn whole_pointee_guard_through_reseat_does_not_connect() {
 fn raw_pointer_field_base_is_not_pinned() {
     const OPTION_UNWRAP: &str = "core::option::Option::<T>::unwrap";
     const IS_READY: &str = "mycrate::S::is_ready";
-    let s_adt = || Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let s_adt = || Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "mycrate::S".into(),
         fields: vec![("f".into(), std_option_ty())],
         variants: vec![],
@@ -2089,9 +2071,7 @@ fn raw_pointer_field_base_is_not_pinned() {
 fn field_guard_through_aliased_reseat_does_not_connect() {
     const OPTION_UNWRAP: &str = "core::option::Option::<T>::unwrap";
     const CHECK: &str = "mycrate::S::check";
-    let s_adt = || Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let s_adt = || Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "mycrate::S".into(),
         fields: vec![("slot".into(), std_option_ty())],
         variants: vec![],
@@ -2213,9 +2193,7 @@ fn unwrap_field_place_rejects_aliased_reseated_temp() {
                 index: 1,
                 ty: Ty::Ref {
                     mutable: false,
-                    inner: Box::new(Ty::Adt {
-                        adt_kind: None,
-                        layout: None,
+                    inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                         name: "mycrate::S".into(),
                         fields: vec![("slot".into(), std_option_ty())],
                         variants: vec![],

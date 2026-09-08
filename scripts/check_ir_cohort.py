@@ -395,6 +395,45 @@ def main() -> int:
             code_gl, gl_out = run(["git", "ls-tree", "HEAD", store_rel], cwd=root)
             gl_rev = gl_out.split()[2] if code_gl == 0 and len(gl_out.split()) >= 3 else None
             if gl_rev:
+                # THE ANCHOR IS SUBJECT TO THE FORK RULE TOO.
+                #
+                # Every consumer-declared revision above is refused, never
+                # waivably, when it is not contained in the dependency's
+                # origin/main. The gitlink was exempt from that same test while
+                # being the thing all of them are judged AGAINST — the strictest
+                # position in the gate had the weakest check. A superproject that
+                # pins the cohort head to a feature branch then gets a ratified
+                # semantics that no release can reproduce, and if every consumer
+                # happens to match it the gate prints COHERENT.
+                #
+                # Found 2026-08-31, not hypothetically: `d24c671211` ("Land
+                # b62-merge-redo") pinned first-party/trust-ir to 0f56107f, which
+                # lives only on origin/b62-merge-redo — 18 behind main and 7
+                # ahead of it, i.e. genuinely divergent, not merely stale. The
+                # gate did report a problem, but it named trust-mc, whose
+                # revision IS on main and which was therefore the one repository
+                # in the cohort that had done nothing wrong. Diagnosis pointed
+                # away from the cause, and the obvious repair — waive trust-mc —
+                # would have been keyed on the correct repo's schema to
+                # accommodate an unreproducible anchor.
+                gl_main = on_main(store, gl_rev)
+                if gl_main is None:
+                    problems.append(
+                        f"{repo}@{gl_rev[:8]}: RATIFIED ANCHOR UNRESOLVABLE in {store_rel} "
+                        f"(the superproject gitlink). Never waivable: the cohort head must "
+                        f"be fetchable for the pin to mean anything."
+                    )
+                elif not gl_main:
+                    problems.append(
+                        f"{repo}@{gl_rev[:8]}: RATIFIED ANCHOR IS OFF-MAIN --- the "
+                        f"superproject gitlink is not contained in {repo}'s origin/main, so "
+                        f"the semantics the whole cohort is judged against is a branch. "
+                        f"Never waivable, for the same reason a consumer on a branch is not: "
+                        f"nothing reproduces it from the dependency's published history. Fix "
+                        f"the ANCHOR — merge that branch to {repo}'s main, or move the "
+                        f"gitlink to a main revision. Waiving a consumer here would be "
+                        f"keying a waiver on a repository that is correctly on main."
+                    )
                 gl_digest = semantic_digest(store, gl_rev, surface)
                 if gl_digest is not None:
                     centre = gl_digest

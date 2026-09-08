@@ -194,14 +194,15 @@ pub(super) fn is_internal_char_range_fact(
 }
 
 /// Resolve a MIR `Terminator::Call` callee string against the certified-callee
-/// registry: EXACT def-path match, else a UNIQUE `::`-suffix match (mirroring
-/// `trust_vcgen::build_call_graph`'s resolution), else — Trust: Item 2 — a UNIQUE
+/// registry: EXACT def-path match, else — Trust: Item 2 — a UNIQUE
 /// TRAIT-IMPL CANONICAL-TUPLE match ([`trust_types::call_graph::canonical_trait_method`],
 /// bridging the `<SELF as TRAIT>::M` call spelling to the `<impl TRAIT for
 /// SELF>::M` dump spelling — the SAME canonicalization `CalleeResolver` uses to
-/// order the callee FIRST). AMBIGUITY FAILS CLOSED at every tier: two registry
-/// keys sharing the suffix, or two keys canonicalizing to the same tuple, ⇒ `None`
-/// (never guess which certified function is being called). Returns `(resolved_key,
+/// order the callee FIRST). AMBIGUITY FAILS CLOSED: two keys canonicalizing to
+/// the same tuple ⇒ `None` (never guess which certified function is being
+/// called). There is NO `::`-suffix tier — deleted 2026-08-30 after a proven
+/// false verify (see the comment in the body); resolution is exact def-path
+/// equality or the canonical trait-method tuple, nothing weaker. Returns `(resolved_key,
 /// fact, registry_index)`.
 // Trust: W2 INC2 — `pub(crate)` so the iterator-for-loop recognizer's G2-REQUIRES gate
 // can consult the resolved header-`next()` `CalleeFact` (fail-closed unless it declares no
@@ -240,14 +241,19 @@ pub(crate) fn resolve_certified_callee<'a>(
     if let Some((k, f)) = callees.get_key_value(callee) {
         return Some((k.as_str(), f, stable_callee_id(k)));
     }
-    let suffix = format!("::{callee}");
-    let mut hits = callees.iter().filter(|(k, _)| k.ends_with(&suffix));
-    if let Some((k, f)) = hits.next() {
-        if hits.next().is_some() {
-            return None; // ambiguous suffix — never guess (fail-closed).
-        }
-        return Some((k.as_str(), f, stable_callee_id(k)));
-    }
+    // Trust: SOUNDNESS (2026-08-30) — the `::`-suffix tier is DELETED. Its uniqueness
+    // check could only see REGISTRY keys, never the uncertified true callee: a caller
+    // whose MIR names `probe::is_empty` (uncertified, returns `false` always) resolved
+    // to the certified path cousin `a::probe::is_empty` and CERTIFIED with the cousin's
+    // transported `Len`-model — a false verify, found by an adversarial round against
+    // EFHT-D (fixture `efht_d_adv2_suffix_resolution_must_not_borrow_a_path_cousins_model`,
+    // which now pins the refusal). "Unique among keys" is not "unique among callees",
+    // and the resolver cannot enumerate non-keys, so no guard can repair the tier —
+    // the W6 closure lane reached the same verdict on 2026-07-18 and went exact-only
+    // (`resolve_certified_callee_exact`); the value-transporting lanes now follow it.
+    // Exact-miss means "not certified", NEVER "less qualified". The canonical
+    // trait-tuple tier below survives: it is EXACT tuple equality over a parse both
+    // sides share, not a substring heuristic.
     // Trust: Item 2 — TRAIT-IMPL CANONICAL-TUPLE match. Only when the callee parses
     // as a trait method (else `canonical_trait_method` returns `None` and we decline,
     // exactly as before). EXACT tuple equality — never substring/fuzzy.

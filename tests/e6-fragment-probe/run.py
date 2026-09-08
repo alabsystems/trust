@@ -36,10 +36,12 @@ to update the expectation deliberately — a widening should never land silently
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -88,6 +90,39 @@ E9_OK_RE = re.compile(r"TRUST_E9_DEBUG (?:DEFEQ-|POST-WALK-)?DISCHARGED fn=(?P<f
 # direction, so the detail is captured separately and optionally.
 E9_NO_RE = re.compile(r"TRUST_E9_DEBUG DEFEQ-NOT-CERTIFIED fn=(?P<fn>\S+)(?P<rest>[^\n]*)")
 E9_DETAIL_RE = re.compile(r"detail: \"(?P<detail>[^\"]*)\"")
+
+
+# The ATTRIBUTE contract surface (`#[trust::ensures(...)]`) needs the `trust`
+# crate in scope: tRustc owns the two attributes, but the PATH still has to
+# resolve. `tests/ui/contracts/auxiliary/trust.rs` is the in-tree passthrough
+# stand-in the ui suite already uses, so probes reuse it rather than inventing a
+# second one. Built once per run, on demand — a probe corpus that could only
+# spell the signature form measured half the surface, and it was the half that
+# worked.
+_TRUST_SHIM_DIR: Path | None = None
+
+
+def trust_shim() -> str:
+    global _TRUST_SHIM_DIR
+    if _TRUST_SHIM_DIR is None:
+        out = Path(tempfile.mkdtemp(prefix="e6-probe-trust-shim-"))
+        src = REPO_ROOT / "tests" / "ui" / "contracts" / "auxiliary" / "trust.rs"
+        p = subprocess.run(
+            [
+                *_trustc_cmd(), str(src),
+                "--crate-type=proc-macro", "--crate-name", "trust",
+                "-Ztrust-verify=off", "--out-dir", str(out),
+            ],
+            capture_output=True, text=True, timeout=300, cwd=REPO_ROOT,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(f"could not build the trust attribute shim:\n{p.stderr}")
+        atexit.register(shutil.rmtree, out, True)
+        _TRUST_SHIM_DIR = out
+    built = sorted(_TRUST_SHIM_DIR.glob("libtrust*"))
+    if not built:
+        raise RuntimeError("the trust attribute shim produced no artifact")
+    return str(built[0])
 
 
 def parse_directives(text: str) -> dict:
@@ -184,11 +219,14 @@ def run_probe(path: Path, timeout: int) -> dict:
     env["TRUST_E9_DEBUG"] = "1"
     env["PATH"] = str(Path.home() / ".cargo" / "bin") + os.pathsep + env.get("PATH", "")
 
+    # `#[trust::ensures]` is the ATTRIBUTE surface; the path needs the crate.
+    surface_flags = ["--extern", f"trust={trust_shim()}"] if "#[trust::" in text else []
+
     with tempfile.TemporaryDirectory(prefix="e6-probe-") as td:
         cmd = [
             *_trustc_cmd(), str(path),
             "--crate-type=lib", "--edition", "2021", "--crate-name", "probe",
-            "-Ztrust-verify=on", *extra_flags, "--out-dir", td,
+            "-Ztrust-verify=on", *extra_flags, *surface_flags, "--out-dir", td,
         ]
         try:
             p = subprocess.run(

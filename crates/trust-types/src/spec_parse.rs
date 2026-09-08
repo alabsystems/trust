@@ -245,26 +245,50 @@ pub(crate) fn tokenize(input: &str) -> Result<Vec<Token>, SpecParseError> {
                 continue;
             }
 
-            if field_index_context {
-                let spelling = &input[start..index];
-                let value =
-                    spelling.parse::<u128>().map_err(|_| SpecParseError::UnexpectedToken {
-                        position: start,
-                        expected: "canonical tuple-field index".into(),
-                    })?;
-                if value.to_string() != spelling {
-                    return Err(SpecParseError::UnexpectedToken {
-                        position: start,
-                        expected: "canonical tuple-field index".into(),
-                    });
-                }
+            // Trust: the run consumed above is DECIMAL DIGITS ONLY, which was
+            // the whole integer-literal language of this parser until
+            // 2026-08-29 — `requires x <= 1_000` stopped at the `1` and died
+            // as "trailing tokens after expression", and the same grammar in
+            // the `ensures` lane died with no diagnostic at all (§13.1,
+            // docs/STRICT_VERIFICATION_FRAGMENT.md). Extend it over the rest
+            // of Rust's integer-literal token shape so a separator, a
+            // `0x`/`0b`/`0o` prefix or a type suffix is part of ONE literal
+            // instead of a number followed by a stray identifier.
+            //
+            // This runs AFTER the float rules above and only when they did not
+            // fire, so `1.5` and `1e30` are still floats and never reach the
+            // integer reader; and it consumes no `.`, so `s.0.0` is still two
+            // nested field segments.
+            index += crate::int_literal::int_literal_tail_len(&input[index..]);
+            let spelling = &input[start..index];
+
+            let value = crate::int_literal::read_contract_int_literal(spelling).map_err(
+                |refusal| SpecParseError::UnsupportedIntegerLiteral {
+                    literal: refusal.literal,
+                    reason: refusal.reason,
+                    fix: refusal.fix,
+                },
+            )?;
+
+            if field_index_context && value.to_string() != spelling {
+                // A tuple-field index is the CANONICAL bare-decimal spelling
+                // and nothing else. `0_0` and `0x0` denote field 0, but they
+                // are not the name `place_to_var_name` mints for it, so
+                // admitting them here would build a place nothing downstream
+                // resolves.
+                return Err(SpecParseError::UnexpectedToken {
+                    position: start,
+                    expected: "canonical tuple-field index".into(),
+                });
             }
 
-            let value = input[start..index].parse::<i128>().map_err(|_| {
-                SpecParseError::UnexpectedToken {
-                    position: start,
-                    expected: "valid integer literal".into(),
-                }
+            // `read_contract_int_literal` already refuses anything above
+            // `i128::MAX`, so this conversion cannot narrow a value; it is
+            // written fallibly rather than as a cast so that a future widening
+            // of that ceiling cannot silently wrap here.
+            let value = i128::try_from(value).map_err(|_| SpecParseError::UnexpectedToken {
+                position: start,
+                expected: "integer literal within `i128`".into(),
             })?;
             tokens.push(Token::Int(value));
             continue;

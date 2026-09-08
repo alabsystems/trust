@@ -122,6 +122,61 @@ fn bootstrap_allows_only_the_exact_off_switch() {
     assert!(rustflags_request_bootstrap_verification("-Z trust-policy=advisory"));
 }
 
+/// `-Z` option names accept `_` for `-` (the driver normalizes before lookup),
+/// so the underscore spellings are the SAME controls and both walker questions
+/// must answer the same about them. Before the normalization in
+/// `is_trust_verifier_unstable_option`, `-Ztrust_policy=advisory` walked past
+/// the self-proof refusal — and on a unit named by the library opt-in, whose
+/// shim replaces only the on/off switch, the policy downgrade would have
+/// survived into the one verifying compile.
+#[test]
+fn underscore_spellings_are_the_same_verifier_controls() {
+    // Requests, in the underscore spelling, still refused.
+    assert!(rustflags_request_bootstrap_verification("-Ztrust_verify=on"));
+    assert!(rustflags_request_bootstrap_verification("-Z trust_policy=advisory"));
+    assert!(rustflags_request_bootstrap_verification("-Ztrust_verify_session=x"));
+    assert!(rustflags_request_bootstrap_verification("-Ztrust-verify_session=x"));
+    // The off-switch, in the underscore spelling, is still the off-switch:
+    // not a request, and it suppresses the default so exactly one off-switch
+    // (in whichever spelling the caller authored) reaches the driver.
+    assert!(!rustflags_request_bootstrap_verification("-Ztrust_verify=off"));
+    assert!(!bootstrap_disables_default_trust_verification(1, "-Ztrust_verify=off"));
+    // An underscored VALUE cannot alias the off-switch's name+value identity.
+    assert!(rustflags_request_bootstrap_verification("-Ztrust-verify=o_ff"));
+}
+
+/// STEP 4 falsification, direction one: the library lane's own channel — the
+/// env opt-in — never reaches the self-proof refusal, because it never rides
+/// rustflags. An authorized `Mode::Std` invocation still composes rustflags
+/// that carry only the off-switch, and the refusal sees nothing to refuse.
+#[test]
+fn the_library_lane_env_channel_never_trips_the_self_proof_refusal() {
+    let units = parse_trust_verify_library_request(Some(OsStr::new("core")))
+        .expect("`core` is an allowed library unit")
+        .expect("a set value parses to a unit list");
+    assert_eq!(units, vec!["core".to_string()]);
+    assert!(trust_verify_library_units_authorized(Mode::Std, 1));
+    // The composed rustflags of that same invocation, off-switch included.
+    let (_, rustflags) = bootstrap_rustflags_env(1, &[]);
+    assert!(
+        bootstrap_verification_request_refusal(Mode::Std, &rustflags).is_none(),
+        "the lane's rustflags must not read as a self-proof request: {rustflags:?}"
+    );
+}
+
+/// STEP 4 falsification, direction two: the protected path still panics, and
+/// it panics even for a spelling that names the library lane's own controls.
+/// The lane is separately NAMED precisely so the refusal never needs a carve-out;
+/// this pins that nobody narrows the panic "for the std lane" later.
+#[test]
+#[should_panic(expected = "bootstrap compiler verification flags are unsupported")]
+fn the_library_lane_name_cannot_enter_through_rustflags() {
+    refuse_bootstrap_verification_request(
+        Mode::Std,
+        "-Ztrust-verify-session=bootstrap-library-core",
+    );
+}
+
 /// Reproduce `Cargo::from`'s composition: bootstrap's own flags, then the
 /// verification default, then the env pair Cargo is handed.
 fn bootstrap_rustflags_env(

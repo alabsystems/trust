@@ -1,0 +1,8 @@
+error: expected a predicate expression after the contract clause keyword
+  --> $DIR/trust-spec-attribute-citation-no-predicate.rs:15:18
+   |
+LL | #[trust::ensures(by self_le)]
+   |                  ^^
+
+error: aborting due to 1 previous error
+

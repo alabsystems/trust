@@ -157,10 +157,10 @@
 //!     Normal, fn_span }` — MIR requires a destination even for `()`, while TrustIR does not invent
 //!     a unit SSA value. The call splits the MIR chain exactly like an assert.
 //!     CALLEE IDENTITY is resolved through the producer's `Lowered::callees` ledger (threaded
-//!     in by both callers): the per-body `FuncId` is DefIndex-derived, so the ledger entry —
-//!     unique, tripwire-checked (`def_id.index == func_id`) — is the ONLY honest way back to a
-//!     `DefId`; zero or multiple entries for one `FuncId` fail closed (the crate assembler's
-//!     ambiguity rule, `crate_module::resolve_callee`). The func operand is spelled EXACTLY as
+//!     in by both callers): the per-body `FuncId` is a dense exact-instance intern id, and the
+//!     unique ledger entry — tripwire-checked against its stable definition identity — is the
+//!     ONLY honest way back to a `DefId`; zero or multiple entries fail closed. The func operand
+//!     is spelled EXACTLY as
 //!     built MIR spells it (`Ty::FnDef(def_id, [])` via `Operand::function_handle`) — which is
 //!     only PROVABLY the built spelling when the site's THIR callee type was that same
 //!     `FnDef`: a free `DefKind::Fn`, or an INHERENT-impl `DefKind::AssocFn`, with
@@ -6420,11 +6420,11 @@ const SCALAR_CANDS: [Ty; 16] = [
 /// honest way to do that — the alternative is an `unwrap` on a value that came from an encoder in
 /// a different crate. `None` declines the site (the caller returns `unsup`), which is the same
 /// outcome the encoder's own `None` produces: miss a flip, never make a wrong one.
-fn rebuild_site_args<'tcx>(tcx: TyCtxt<'tcx>, enc: &[SiteArg]) -> Option<ty::GenericArgsRef<'tcx>> {
+pub(crate) fn rebuild_site_args<'tcx>(tcx: TyCtxt<'tcx>, enc: &[SiteArg]) -> Option<ty::GenericArgsRef<'tcx>> {
     let mut out = Vec::with_capacity(enc.len());
     for a in enc {
         out.push(match a {
-            SiteArg::Ty(t) => ty::GenericArg::from(rebuild_site_ty(tcx, t)),
+            SiteArg::Ty(t) => ty::GenericArg::from(rebuild_site_ty(tcx, t)?),
             SiteArg::ErasedRegion => ty::GenericArg::from(tcx.lifetimes.re_erased),
             SiteArg::Const(c) => ty::GenericArg::from(rebuild_site_const(tcx, c)?),
         });
@@ -6439,7 +6439,7 @@ fn rebuild_site_args<'tcx>(tcx: TyCtxt<'tcx>, enc: &[SiteArg]) -> Option<ty::Gen
 /// spelled. That is what lets the comparator's raw-call channel pin callee identity on it.
 fn rebuild_site_const<'tcx>(tcx: TyCtxt<'tcx>, c: &SiteConst) -> Option<ty::Const<'tcx>> {
     let SiteConst::Value(sty, vt) = c;
-    let ty = rebuild_site_ty(tcx, sty);
+    let ty = rebuild_site_ty(tcx, sty)?;
     let valtree = rebuild_site_valtree(tcx, vt)?;
     Some(ty::Const::new_value(tcx, valtree, ty))
 }
@@ -6466,8 +6466,28 @@ fn rebuild_site_valtree<'tcx>(tcx: TyCtxt<'tcx>, vt: &SiteValTree) -> Option<ty:
     })
 }
 
-fn rebuild_site_ty<'tcx>(tcx: TyCtxt<'tcx>, t: &SiteTy) -> RustcTy<'tcx> {
-    match t {
+/// Trust (wave-AA/FD): rebuild one positional args list — the three-way map
+/// `rebuild_site_args` performs at the top level, shared by the `Adt` and `FnDef` arms.
+fn rebuild_positional_args<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    args: &[SiteArg],
+) -> Option<ty::GenericArgsRef<'tcx>> {
+    let mut v = Vec::with_capacity(args.len());
+    for a in args {
+        v.push(match a {
+            SiteArg::Ty(t) => ty::GenericArg::from(rebuild_site_ty(tcx, t)?),
+            SiteArg::ErasedRegion => ty::GenericArg::from(tcx.lifetimes.re_erased),
+            SiteArg::Const(c) => ty::GenericArg::from(rebuild_site_const(tcx, c)?),
+        });
+    }
+    Some(tcx.mk_args_from_iter(v.into_iter()))
+}
+
+/// Trust (wave-AA): FALLIBLE, because an ADT arg may now be a CONST whose valtree rebuild can
+/// decline (`rebuild_site_const`). Every other arm is total; `None` propagates to the caller's
+/// existing fail-closed path, which is the same answer the encoder would have given.
+fn rebuild_site_ty<'tcx>(tcx: TyCtxt<'tcx>, t: &SiteTy) -> Option<RustcTy<'tcx>> {
+    Some(match t {
         SiteTy::Bool => tcx.types.bool,
         SiteTy::Char => tcx.types.char,
         SiteTy::Str => tcx.types.str_,
@@ -6475,10 +6495,14 @@ fn rebuild_site_ty<'tcx>(tcx: TyCtxt<'tcx>, t: &SiteTy) -> RustcTy<'tcx> {
         SiteTy::Uint(u) => RustcTy::new_uint(tcx, *u),
         SiteTy::Float(f) => RustcTy::new_float(tcx, *f),
         SiteTy::Tuple(ts) => {
-            RustcTy::new_tup_from_iter(tcx, ts.iter().map(|e| rebuild_site_ty(tcx, e)))
+            let mut v = Vec::with_capacity(ts.len());
+            for e in ts {
+                v.push(rebuild_site_ty(tcx, e)?);
+            }
+            RustcTy::new_tup_from_iter(tcx, v.into_iter())
         }
-        SiteTy::Slice(el) => RustcTy::new_slice(tcx, rebuild_site_ty(tcx, el)),
-        SiteTy::Array(el, n) => RustcTy::new_array(tcx, rebuild_site_ty(tcx, el), *n),
+        SiteTy::Slice(el) => RustcTy::new_slice(tcx, rebuild_site_ty(tcx, el)?),
+        SiteTy::Array(el, n) => RustcTy::new_array(tcx, rebuild_site_ty(tcx, el)?, *n),
         // Trust (wave-CRT): rebuild a reference at `ReErased`. The encoder dropped the region
         // (`SiteTy::Ref`); the differential erases regions on BOTH sides before pinning callee
         // identity, so this is intern-equal MODULO regions, which is the equality the comparator
@@ -6486,17 +6510,104 @@ fn rebuild_site_ty<'tcx>(tcx: TyCtxt<'tcx>, t: &SiteTy) -> RustcTy<'tcx> {
         SiteTy::Ref(pointee, mutbl) => RustcTy::new_ref(
             tcx,
             tcx.lifetimes.re_erased,
-            rebuild_site_ty(tcx, pointee),
+            rebuild_site_ty(tcx, pointee)?,
             *mutbl,
         ),
+        // Trust (wave-RP): exact — a raw pointer carries no region to lose.
+        SiteTy::RawPtr(pointee, mutbl) => {
+            RustcTy::new_ptr(tcx, rebuild_site_ty(tcx, pointee)?, *mutbl)
+        }
+        // Trust (wave-AA): each arg is rebuilt AT ITS OWN KIND and its own position — the
+        // same three-way map `rebuild_site_args` performs at the top level, which is what
+        // makes the reconstructed args list intern-equal modulo the regions the comparator
+        // erases on both sides.
         SiteTy::Adt(did, args) => {
             let adt = tcx.adt_def(*did);
-            let ga = tcx.mk_args_from_iter(
-                args.iter().map(|e| ty::GenericArg::from(rebuild_site_ty(tcx, e))),
-            );
-            RustcTy::new_adt(tcx, adt, ga)
+            RustcTy::new_adt(tcx, adt, rebuild_positional_args(tcx, args)?)
         }
-    }
+        // Trust (wave-FD): the fn-item twin, same positional rebuild.
+        SiteTy::FnDef(did, args) => {
+            RustcTy::new_fn_def(tcx, *did, rebuild_positional_args(tcx, args)?)
+        }
+        // Trust (wave-DY): rebuild a trait object from its predicate list at a DUMMY binder and
+        // an ERASED region — both were erased at encode for the standing reason, and the
+        // comparator erases regions on both sides before pinning identity. Each predicate goes
+        // back through its own rustc constructor; an unrebuildable term declines.
+        SiteTy::Dynamic(preds) => {
+            let mut v = Vec::with_capacity(preds.len());
+            for p in preds {
+                let pred = match p {
+                    crate::SiteExistentialPredicate::Trait(did, args) => {
+                        ty::ExistentialPredicate::Trait(ty::ExistentialTraitRef::new_from_args(
+                            tcx,
+                            *did,
+                            rebuild_positional_args(tcx, args)?,
+                        ))
+                    }
+                    crate::SiteExistentialPredicate::Projection(did, args, term) => {
+                        let t: ty::Term<'tcx> = match &**term {
+                            crate::SiteTerm::Ty(t) => rebuild_site_ty(tcx, t)?.into(),
+                            crate::SiteTerm::Const(c) => rebuild_site_const(tcx, c)?.into(),
+                        };
+                        ty::ExistentialPredicate::Projection(
+                            ty::ExistentialProjection::new_from_args(
+                                tcx,
+                                *did,
+                                rebuild_positional_args(tcx, args)?,
+                                t,
+                            ),
+                        )
+                    }
+                    crate::SiteExistentialPredicate::AutoTrait(did) => {
+                        ty::ExistentialPredicate::AutoTrait(*did)
+                    }
+                };
+                v.push(ty::Binder::dummy(pred));
+            }
+            RustcTy::new_dynamic(
+                tcx,
+                tcx.mk_poly_existential_predicates(&v),
+                tcx.lifetimes.re_erased,
+            )
+        }
+        // Trust (wave-CL): each closure-family kind rebuilds through its own constructor,
+        // over the same positional args. The kind is read off the encoding, never guessed
+        // from the DefId.
+        SiteTy::ClosureLike(kind, did, args) => {
+            let ga = rebuild_positional_args(tcx, args)?;
+            match kind {
+                crate::SiteClosureKind::Closure => RustcTy::new_closure(tcx, *did, ga),
+                crate::SiteClosureKind::CoroutineClosure => {
+                    RustcTy::new_coroutine_closure(tcx, *did, ga)
+                }
+                crate::SiteClosureKind::Coroutine => RustcTy::new_coroutine(tcx, *did, ga),
+                crate::SiteClosureKind::CoroutineWitness => {
+                    RustcTy::new_coroutine_witness(tcx, *did, ga)
+                }
+            }
+        }
+        // Trust (wave-FP): rebuild a fn pointer at a DUMMY binder — the encoder erased the
+        // real one (`instantiate_bound_regions_with_erased`), so there is nothing left to
+        // bind, and the comparator erases regions on both sides anyway. The header is
+        // reconstructed from its observable facts; an ABI token that does not parse, or a
+        // splatted index the arity rejects, declines the rebuild rather than guessing.
+        SiteTy::FnPtr { inputs_and_output, abi, safe, c_variadic, splatted } => {
+            let mut v = Vec::with_capacity(inputs_and_output.len());
+            for t in inputs_and_output {
+                v.push(rebuild_site_ty(tcx, t)?);
+            }
+            let abi: rustc_abi::ExternAbi = abi.parse().ok()?;
+            let safety = if *safe {
+                rustc_hir::Safety::Safe
+            } else {
+                rustc_hir::Safety::Unsafe
+            };
+            let args_len = v.len().checked_sub(1)?;
+            let kind = ty::FnSigKind::new(abi, safety, *c_variadic, *splatted, args_len).ok()?;
+            let sig = ty::FnSig { inputs_and_output: tcx.mk_type_list(&v), fn_sig_kind: kind };
+            RustcTy::new_fn_ptr(tcx, ty::Binder::dummy(sig))
+        }
+    })
 }
 
 fn int_width(ty: &Ty) -> Option<u32> {
@@ -19513,22 +19624,22 @@ pub(crate) fn lower_ir_to_mir<'tcx>(
                         &[r] => Some(r),
                         _ => return unsup("Call with more than one result"),
                     };
-                    // CALLEE IDENTITY: the ledger is the ONLY honest FuncId -> DefId map (the
-                    // per-body FuncId is DefIndex-derived). Zero or multiple entries for one
-                    // FuncId fail closed — the crate assembler's exact ambiguity rule
-                    // (`crate_module::resolve_callee`).
+                    // CALLEE IDENTITY: the ledger is the ONLY honest body-local FuncId -> DefId
+                    // map. Dense ids deliberately carry no DefIndex information. Zero or
+                    // multiple entries fail closed.
                     let idents: Vec<&CalleeRef> =
                         callees.iter().filter(|c| c.func_id == *callee).collect();
                     let cref = match idents.as_slice() {
                         [c] => *c,
                         [] => return unsup("Call(unledgered callee FuncId)"),
-                        _ => return unsup("Call(ambiguous callee FuncId: index collision)"),
+                        _ => return unsup("Call(ambiguous callee FuncId: non-singleton ledger)"),
                     };
                     let def_id = cref.def_id;
                     // Ledger-invariant tripwires (admit_callee's construction), never assumed.
                     if def_id.index.as_u32() != cref.def_index
-                        || def_id.index.as_u32() != callee.index()
                         || def_id.is_local() != cref.is_local
+                        || crate::lineage::DefinitionIdentity::from_def_id(tcx, def_id)
+                            != cref.definition
                     {
                         return unsup("Call(ledger identity tripwire)");
                     }
@@ -31178,11 +31289,14 @@ mod unit_chain_tests {
             krate: rustc_span::def_id::CrateNum::from_u32(1),
             index: rustc_span::def_id::DefIndex::from_u32(id),
         };
+        let definition = crate::lineage::DefinitionIdentity::test_only(0xC0DE, id as u64);
         crate::CalleeRef {
             func_id: FuncId::new(id),
             is_local: false,
             def_index: id,
             def_id: did,
+            definition,
+            concrete_key: None,
             def_path: format!("decl{id}"),
             force_havoc: false,
             site_def_id: did,

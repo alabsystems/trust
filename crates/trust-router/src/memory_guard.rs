@@ -181,10 +181,11 @@ fn default_limit_mb() -> u64 {
         // disabling the guard entirely.
         return 1024;
     }
-    let budget_mb = budget / (1024 * 1024);
-    // Floor at 2 GB so a single legitimate solve is never throttled by the
-    // per-process guard; the aggregate cap is the jobserver's job.
-    budget_mb.max(2048)
+    // Trust: both steps are strict-lane VERIFIED (`trust-budget`). The floor's
+    // clause pair — `result >= budget_mb` and `result >= 2048` — is the whole
+    // stated intent above: "never trips spuriously on a small solve" is the
+    // literal bound, "never fails open on a huge host" is the variable one.
+    trust_budget::process_ceiling_mb(trust_budget::megabytes_of(budget))
 }
 
 // ---------------------------------------------------------------------------

@@ -179,7 +179,11 @@ pub fn reverse() -> Term {
                 is_nil(),
                 Var(1),
                 abs(Var(3)),
-                abs(app!(Var(4), app!(cons(), app(head(), Var(2)), Var(3)), app(tail(), Var(2)))),
+                abs(app!(
+                    Var(4),
+                    app!(cons(), app(head(), Var(2)), Var(3)),
+                    app(tail(), Var(2))
+                )),
                 I()
             )
         ),
@@ -203,7 +207,12 @@ pub fn reverse() -> Term {
 /// );
 /// ```
 pub fn list() -> Term {
-    abs(app!(Var(1), abs!(3, app(Var(3), app!(cons(), Var(1), Var(2)))), reverse(), nil()))
+    abs(app!(
+        Var(1),
+        abs!(3, app(Var(3), app!(cons(), Var(1), Var(2)))),
+        reverse(),
+        nil()
+    ))
 }
 
 /// Applied to two pair-encoded lists it concatenates them.
@@ -233,7 +242,11 @@ pub fn append() -> Term {
                 is_nil(),
                 Var(2),
                 abs(Var(2)),
-                abs(app!(cons(), app(head(), Var(3)), app!(Var(4), app(tail(), Var(3)), Var(2)))),
+                abs(app!(
+                    cons(),
+                    app(head(), Var(3)),
+                    app!(Var(4), app(tail(), Var(3)), Var(2))
+                )),
                 I()
             )
         ),
@@ -346,7 +359,11 @@ pub fn foldr() -> Term {
                     is_nil(),
                     Var(1),
                     abs(Var(5)),
-                    abs(app!(Var(6), app(head(), Var(2)), app!(Var(3), app(tail(), Var(2))))),
+                    abs(app!(
+                        Var(6),
+                        app(head(), Var(2)),
+                        app!(Var(3), app(tail(), Var(2)))
+                    )),
                     I()
                 )
             ),
@@ -464,7 +481,11 @@ pub fn init() -> Term {
                     is_nil(),
                     app(tail(), Var(2)),
                     nil(),
-                    app!(cons(), app(head(), Var(2)), app(Var(3), app(tail(), Var(2))))
+                    app!(
+                        cons(),
+                        app(head(), Var(2)),
+                        app(Var(3), app(tail(), Var(2)))
+                    )
                 )),
                 I()
             )
@@ -628,7 +649,11 @@ pub fn take_while() -> Term {
                 abs(app!(
                     Var(3),
                     app(head(), Var(2)),
-                    app!(cons(), app(head(), Var(2)), app!(Var(4), Var(3), app(tail(), Var(2)))),
+                    app!(
+                        cons(),
+                        app(head(), Var(2)),
+                        app!(Var(4), Var(3), app(tail(), Var(2)))
+                    ),
                     nil()
                 )),
                 I()
@@ -740,7 +765,11 @@ pub fn replicate() -> Term {
                 is_zero(),
                 Var(2),
                 abs(nil()),
-                abs(app!(pair(), Var(2), app!(Var(4), app(pred(), Var(3)), Var(2)))),
+                abs(app!(
+                    pair(),
+                    Var(2),
+                    app!(Var(4), app(pred(), Var(3)), Var(2))
+                )),
                 I()
             )
         ),

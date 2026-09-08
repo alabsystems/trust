@@ -7,9 +7,9 @@ LL | | /// \__________pkt->size___________/          \_result->size_/ \__pkt->si
 LL | | /// ```
    | |_______^
    |
-   = note: error from rustc: unknown start of token: \
-   = note: error from rustc: unknown start of token: \
-   = note: error from rustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
    = note: `#[warn(rustdoc::invalid_rust_codeblocks)]` on by default
 help: mark blocks that do not contain Rust code as text
    |
@@ -27,8 +27,8 @@ LL | | ///    |     ^^^^^^ did you mean `baz::foobar`?
 LL | | /// ```
    | |_______^
    |
-   = note: error from rustc: unknown start of token: `
-   = note: error from rustc: unknown start of token: `
+   = note: error from trustc: unknown start of token: `
+   = note: error from trustc: unknown start of token: `
 help: mark blocks that do not contain Rust code as text
    |
 LL | /// ```text
@@ -43,7 +43,7 @@ LL | | /// \_
 LL | | /// ```
    | |_______^
    |
-   = note: error from rustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
 help: mark blocks that do not contain Rust code as text
    |
 LL | /// ```text
@@ -58,7 +58,7 @@ LL | | /// \_
 LL | | /// ```
    | |_______^
    |
-   = note: error from rustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
 
 warning: could not parse code block as Rust code
   --> $DIR/invalid-syntax.rs:45:9
@@ -68,7 +68,7 @@ LL |   ///     code with bad syntax
 LL | | ///     \_
    | |__________^
    |
-   = note: error from rustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
 
 warning: could not parse code block as Rust code
   --> $DIR/invalid-syntax.rs:60:9
@@ -76,7 +76,7 @@ warning: could not parse code block as Rust code
 LL | ///     ```
    |         ^^^
    |
-   = note: error from rustc: unknown start of token: `
+   = note: error from trustc: unknown start of token: `
 
 warning: could not parse code block as Rust code
   --> $DIR/invalid-syntax.rs:64:5
@@ -87,7 +87,7 @@ LL | | /// \_
 LL | | /// ```
    | |_______^
    |
-   = note: error from rustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
 
 warning: could not parse code block as Rust code
   --> $DIR/invalid-syntax.rs:70:9
@@ -99,7 +99,7 @@ LL | | #[doc = "```"]
    | |_____________^
    |
    = help: mark blocks that do not contain Rust code as text: ```text
-   = note: error from rustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
 
 warning: Rust code block is empty
   --> $DIR/invalid-syntax.rs:76:5
@@ -132,7 +132,7 @@ LL |   ///     \____/
 LL | | ///
    | |_^
    |
-   = note: error from rustc: unknown start of token: \
+   = note: error from trustc: unknown start of token: \
 
 warning: could not parse code block as Rust code
   --> $DIR/invalid-syntax.rs:97:5
@@ -143,7 +143,7 @@ LL | | /// "invalid
 LL | | /// ```
    | |_______^
    |
-   = note: error from rustc: unterminated double quote string
+   = note: error from trustc: unterminated double quote string
 help: mark blocks that do not contain Rust code as text
    |
 LL | /// ```text
@@ -158,7 +158,7 @@ LL | | /// fn wook_at_my_beautifuw_bwaces_plz() {);
 LL | | /// ```
    | |_______^
    |
-   = note: error from rustc: mismatched closing delimiter: `)`
+   = note: error from trustc: mismatched closing delimiter: `)`
 help: mark blocks that do not contain Rust code as text
    |
 LL | /// ```text

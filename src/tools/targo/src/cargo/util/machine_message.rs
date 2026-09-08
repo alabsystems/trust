@@ -29,6 +29,25 @@ pub const TRUST_EXCLUSION_BUILD_SCRIPT_EXECUTION: &str = "build-script-execution
 pub const TRUST_EXCLUSION_DEFERRED_DOCTEST: &str = "deferred-doctest-execution";
 pub const TRUST_EXCLUSION_COMPILE_TIME_DEPS_FILTERED: &str = "compile-time-deps-filtered";
 pub const TRUST_EXCLUSION_DOCUMENTATION: &str = "documentation-generation";
+/// A Unit that exists only to support the build: a build-script target, a
+/// `[build-dependencies]` library, or anything in their transitive closure. No
+/// requested root reaches such a Unit without crossing a build script, so it
+/// contributes no code to any artifact this proof is about. Its obligations are
+/// trusted rather than discharged, on the same ground the toolchain already
+/// concedes for `TRUST_EXCLUSION_BUILD_SCRIPT_EXECUTION`.
+pub const TRUST_EXCLUSION_BUILD_SUPPORT_ONLY: &str = "build-support-only";
+/// A Unit that IS the audited Trust spec proc macro: a `proc-macro` target named
+/// `trust`, matched by exact package/version against the audited allowlist in
+/// `compiler::AUDITED_TRUST_SPEC_SOURCES` and re-hashed (manifest + `src/lib.rs`)
+/// at every decision point.
+///
+/// This reason is deliberately NOT spelled `build-support-only`: a proc macro
+/// does shape the tokens of the units it annotates, so it is not "code that
+/// never reaches the artifact". It is trusted on the strictly different ground
+/// that its exact source bytes are pinned and audited. Keeping the two spellings
+/// apart is what lets a reader of the exclusion ledger see which argument was
+/// used to trust each Unit.
+pub const TRUST_EXCLUSION_AUDITED_TRUST_SPEC: &str = "audited-trust-spec";
 
 /// Cargo-owned identity for one exact compiler unit admitted to Targo's proof
 /// subject. This is omitted by ordinary Cargo and by verified Targo units that

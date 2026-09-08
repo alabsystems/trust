@@ -472,6 +472,9 @@ fn subst_get_reads_rvalue(rv: &mut Rvalue, get_roots: &BTreeMap<usize, Place>) -
 struct Fx {
     blocks: Vec<BasicBlock>,
     locals: Vec<LocalDecl>,
+    /// Argument count of the body being rewritten. Locals `1..=arg_count` are
+    /// PARAMETERS, defined at ENTRY — a definition no scan of `blocks` can see.
+    arg_count: usize,
     /// get-destination local -> the cell-value place captured at get time.
     get_roots: BTreeMap<usize, Place>,
     fuel_dt: Ty,
@@ -558,6 +561,7 @@ fn transform_member(
     let mut fx = Fx {
         blocks: f.body.blocks.clone(),
         locals: f.body.locals.clone(),
+        arg_count: f.body.arg_count,
         get_roots: BTreeMap::new(),
         fuel_dt: fuel_dt.clone(),
         payload_dt: payload_dt.clone(),
@@ -696,9 +700,12 @@ fn transform_member(
                     if !vplace.projections.is_empty() {
                         return None;
                     }
-                    // The written local must be assigned exactly once in the
-                    // whole body (its value is re-read later at threading
-                    // sites).
+                    // The written local must hold exactly ONE value in the whole
+                    // body (its value is re-read later at threading sites). A
+                    // PARAMETER is defined at ENTRY, invisibly to the scan below,
+                    // so one store to a parameter is already its second value —
+                    // the `trust_vcgen::local_defs` rule, spelled here because
+                    // `Fx` is a rewrite buffer and not a `VerifiableBody`.
                     let vassigns = fx
                         .blocks
                         .iter()
@@ -707,7 +714,8 @@ fn transform_member(
                             matches!(s, Statement::Assign { place, .. }
                             if place.local == vplace.local && place.projections.is_empty())
                         })
-                        .count();
+                        .count()
+                        + usize::from((1..=fx.arg_count).contains(&vplace.local));
                     if vassigns != 1 {
                         return None;
                     }

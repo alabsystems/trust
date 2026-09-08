@@ -1,5 +1,5 @@
 //@ needs-trust-verify
-//@ compile-flags: -Ztrust-verify=on -Ztrust-policy=advisory -Ztrust-verify-function-budget-steps=1 --crate-type=lib
+//@ compile-flags: -Ztrust-verify=on -Ztrust-policy=strict -Ztrust-verify-function-budget-steps=1 --crate-type=lib
 //! Regression gate for the verifier preprocessing-termination guarantee
 //! (reports/2026-07-18-verifier-termination-hang.md).
 //!
@@ -8,8 +8,8 @@
 //! every instrumented pre-dispatch loop calls `budget_exhausted()` once per
 //! iteration, which strictly decrements a `nat` step counter, so each loop runs
 //! at most `remaining` iterations (well-founded descent — the provable
-//! termination bound). Reaching a phase checkpoint over budget is a hard,
-//! located compiler error.
+//! termination bound). Reaching a phase checkpoint over budget in a FAIL-CLOSED
+//! lane (strict/certify/memory-safe) is a hard, located compiler error.
 //!
 //! Under a deliberately tiny step budget the loop-bearing function below trips
 //! the counter and the build fails with that error — proving the guarantee
@@ -18,6 +18,11 @@
 //! non-flaky. Reintroduce an unbudgeted preprocessing loop and it either trips
 //! the counter (this error) or, escaping it, hangs past compiletest's timeout —
 //! either way CI goes red.
+//!
+//! This gate pins the FAIL-CLOSED lane. The advisory lane deliberately does
+//! not hard-error on the same overrun — it degrades to an honest per-function
+//! `Unknown` budget verdict — and that behavior is pinned by the sibling
+//! `verifier_budget_advisory_verdict.rs`.
 
 pub fn stepped(mut n: u32) { //~ ERROR exceeded its per-function budget
     while n > 0 invariant n <= 100 {

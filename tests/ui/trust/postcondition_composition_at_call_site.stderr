@@ -11,6 +11,8 @@ LL | |     if x < 0 {
 ...  |
 LL | | }
    | |_^
+   |
+   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
 
 note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
   --> $DIR/postcondition_composition_at_call_site.rs:32:1

@@ -22,7 +22,7 @@ fn double_square(x: u64) -> u64
     //~| ERROR Trust strict verification failed
     //~| NOTE unsupported contract predicate expression `result == battery_sqr(x)`
     //~| NOTE unsupported MIR `SpecEnsuresUnparseable`
-    ensures result == battery_sqr(x)
+    ensures result == battery_sqr(x) //~ ERROR uncited `ensures` naming the Clean island definition `battery_sqr`
 {
     x
 }

@@ -1403,6 +1403,7 @@ pub struct VerifiedModuleObject {
 pub fn emit_module_object_verified_reported_with_backend(
     funcs: &[VerifiableFunction],
     linkage: &[crate::codegen_backend::FunctionLinkage],
+    statics: &[trust_cg_codegen::pipeline::ObjectGlobal],
     policy: EmitPolicy,
     backend: &TrustCgCodegenBackend,
 ) -> Result<(VerifiedModuleObject, CertificationReport), VerifyError> {
@@ -1425,7 +1426,7 @@ pub fn emit_module_object_verified_reported_with_backend(
 
     // PHASE 3a — MERGE. Lower every function and emit ONE object for the CGU,
     // with each function's real symbol binding.
-    let module = build_merged_module(funcs, linkage, backend)?;
+    let module = build_merged_module(funcs, linkage, statics, backend)?;
     let emitted = backend.emit_module_object(&module).map_err(|e| {
         VerifyError::ModuleEmitFailed { reason: format!("emit_module_object failed: {e:?}") }
     })?;
@@ -1443,6 +1444,7 @@ pub fn emit_module_object_verified_reported_with_backend(
 fn build_merged_module(
     funcs: &[VerifiableFunction],
     linkage: &[crate::codegen_backend::FunctionLinkage],
+    statics: &[trust_cg_codegen::pipeline::ObjectGlobal],
     backend: &TrustCgCodegenBackend,
 ) -> Result<crate::codegen_backend::CompiledModule, VerifyError> {
     let mut lir_functions = Vec::with_capacity(funcs.len());
@@ -1465,6 +1467,7 @@ fn build_merged_module(
         function_count,
         source_functions: Some(funcs.to_vec()),
         linkage: linkage.to_vec(),
+        statics: statics.to_vec(),
     })
 }
 
@@ -2001,7 +2004,7 @@ struct SymState {
 
 /// The shared symbolic memory array variable: `MEM : BitVec(64) -> BitVec(8)`,
 /// matching `MachineState::symbolic()`'s memory model exactly.
-fn mem_array_var() -> Formula {
+pub(crate) fn mem_array_var() -> Formula {
     Formula::Var("MEM".into(), Sort::Array(Box::new(Sort::BitVec(64)), Box::new(Sort::BitVec(8))))
 }
 
@@ -2817,7 +2820,11 @@ fn store_bytes_le_formula(
 
 /// Load `width_bytes` little-endian bytes from `memory` at `address`, returning
 /// a `width_bytes*8`-bit value (byte concat, mirroring a machine LDR reduction).
-fn load_bytes_le_formula(memory: &Formula, address: &Formula, width_bytes: u32) -> Formula {
+pub(crate) fn load_bytes_le_formula(
+    memory: &Formula,
+    address: &Formula,
+    width_bytes: u32,
+) -> Formula {
     // Concatenate high byte ... low byte: result = byte[n-1] :: ... :: byte[0].
     let mut acc: Option<Formula> = None;
     for i in 0..width_bytes {
@@ -4238,6 +4245,35 @@ fn formula_has_fp(f: &Formula) -> bool {
     found
 }
 
+/// Per-query wall-clock budget for the gate's ay discharges, in milliseconds.
+///
+/// WHY: the callee seam inflates whole-function obligations (an inlined call
+/// chain is one big byte-equality), and a single `check_sat` was MEASURED
+/// grinding >20 minutes at 100% CPU on one trust-timearith function — with no
+/// bound, `allow-unknown` still waits on every proof ATTEMPT, so one hard
+/// obligation stalls a whole crate's compile. A budget converts the grind
+/// into a fast, counted `Unknown` — a COMPLETENESS cost, never soundness
+/// (Unknown refuses under strict and emits-uncertified under allow-unknown),
+/// the same posture as the verifier's own `-Ztrust-verify-function-budget-ms`.
+///
+/// `TCG_TRUST_IR_GATE_TIMEOUT_MS` overrides; `0` disables the budget. Read
+/// fresh per solver construction (no OnceLock) so tests can vary it.
+fn gate_solver_config() -> ay::SolverConfig {
+    const DEFAULT_MS: u64 = 120_000;
+    let ms = std::env::var("TCG_TRUST_IR_GATE_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MS);
+    let config = ay::SolverConfig::default();
+    if ms == 0 { config } else { config.with_timeout(std::time::Duration::from_millis(ms)) }
+}
+
+/// Construct the gate's solver with the per-query budget applied.
+fn gate_solver(logic: Logic) -> Result<Solver, String> {
+    Solver::try_new_with_config(logic, gate_solver_config())
+        .map_err(|e| format!("ay Solver::try_new_with_config failed: {e:?}"))
+}
+
 /// Discharge the VALIDITY of a boolean formula `f`: assert `NOT(f)` and check.
 /// UNSAT => Proven (f is valid), SAT => CounterExample, unknown => Unknown.
 /// FP-aware logic selection, mirroring [`discharge_equal_pre`]. Used in
@@ -4245,9 +4281,9 @@ fn formula_has_fp(f: &Formula) -> bool {
 /// machine_reach` obligation, which are predicates rather than equalities.
 pub(crate) fn discharge_valid(f: &Formula) -> Discharge {
     let logic = if formula_has_fp(f) { Logic::QfAbvfp } else { Logic::QfAbv };
-    let mut solver = match Solver::try_new(logic) {
+    let mut solver = match gate_solver(logic) {
         Ok(s) => s,
-        Err(e) => return Discharge::Unknown(format!("ay Solver::try_new failed: {e:?}")),
+        Err(e) => return Discharge::Unknown(e),
     };
     let term = formula_to_term(&mut solver, f);
     // Fail CLOSED to Unknown on a solver error, exactly as `Solver::try_new`
@@ -4286,9 +4322,9 @@ pub(crate) fn discharge_equal_pre(a: &Formula, c: &Formula, pre: Option<&Formula
     } else {
         Logic::QfAbv
     };
-    let mut solver = match Solver::try_new(logic) {
+    let mut solver = match gate_solver(logic) {
         Ok(s) => s,
-        Err(e) => return Discharge::Unknown(format!("ay Solver::try_new failed: {e:?}")),
+        Err(e) => return Discharge::Unknown(e),
     };
     let lhs = formula_to_term(&mut solver, a);
     let rhs = formula_to_term(&mut solver, c);
@@ -8877,6 +8913,7 @@ mod tests {
         let (module_object, _report) = emit_module_object_verified_reported_with_backend(
             &funcs,
             &[FunctionLinkage::External; 2],
+            &[],
             EmitPolicy::AllowUnknown,
             &backend,
         )
@@ -8912,6 +8949,7 @@ mod tests {
         let (module_object, _report) = emit_module_object_verified_reported_with_backend(
             &funcs,
             &[FunctionLinkage::Internal, FunctionLinkage::External],
+            &[],
             EmitPolicy::AllowUnknown,
             &backend,
         )
@@ -8943,6 +8981,7 @@ mod tests {
             function_count: 1,
             source_functions: Some(vec![funcs[0].clone()]),
             linkage: vec![FunctionLinkage::External],
+            statics: Vec::new(),
         };
         let partial =
             backend.emit_module_object(&only_first).expect("single-function module emits");
@@ -8977,7 +9016,7 @@ mod tests {
             emit_objects_verified_reported_with_backend(&funcs, EmitPolicy::AllowUnknown, &backend)
                 .expect("both functions are provable");
 
-        let module = build_merged_module(&funcs, &[FunctionLinkage::External; 2], &backend)
+        let module = build_merged_module(&funcs, &[FunctionLinkage::External; 2], &[], &backend)
             .expect("module lowers");
         let mut emitted = backend.emit_module_object(&module).expect("module emits");
         assert_merged_object_preserves_verified_text(&emitted, &verified)

@@ -94,11 +94,89 @@ const PANICKING: &[&str] = &[
     // lookup the iter-ctor entry must
     // never be confused with
     "core::mem::maybe_uninit::MaybeUninit::<u32>::assume_init", // the UNWRAP direction:
-                                                                // init-validity is the unsafe
-                                                                // caller's obligation (and
-                                                                // assert_inhabited panics for
-                                                                // uninhabited T); a total summary
-                                                                // would silently drop it
+    // init-validity is the unsafe
+    // caller's obligation (and
+    // assert_inhabited panics for
+    // uninhabited T); a total summary
+    // would silently drop it
+    // ==================================================================
+    // CALLER-SUPPLIED-DISPATCH (FRONT B, R13). Every entry below used to sit in
+    // `SHOULD_BE_TOTAL` — i.e. this oracle's own GROUND TRUTH asserted they were
+    // "genuinely total (no user code, cannot panic)" and the completeness test
+    // printed them as "precision GAPS — rung-1 target", which is a written
+    // instruction to re-grant them. Three of the four had ALREADY been retired as
+    // false proofs (`4178c86097`) and are pinned must-fail-closed in
+    // `lower.rs::callbacks_traits_growth_and_broad_families_fail_closed`, so the
+    // two lists in this crate directly contradicted each other. They are moved
+    // here, where the SOUNDNESS test makes a re-grant a hard failure.
+    //
+    // Each is backed by an EXECUTED panic witness (deployed driver
+    // sha256:18e5a9a90a1697f6, `-Z trust-policy=advisory`), with an isolating
+    // control that does NOT panic on the same call shape:
+    //
+    //   K1-a  Vec::<u8, PanicAlloc>::push            -> PANICKED
+    //   K2-a  Vec::<u8, Global>::push                -> no panic
+    //   K1-b  Vec::<u8, ShrinkPanicAlloc>::shrink_to_fit (len 1 < cap 64) -> PANICKED
+    //   K2-b  same allocator, push only (no shrink)  -> no panic
+    //   K2-b' Vec::<u8, Global>::shrink_to_fit       -> no panic
+    //   K1-c  <Y as From<X>>::from with a panicking user impl -> PANICKED
+    //   K2-c  u32::from(7u8)                         -> no panic
+    //   K1-d  X.into() through the same user impl    -> PANICKED
+    //   K1-e  CELL.try_with(|_| panic!())            -> PANICKED
+    //   K2-e  CELL.try_with(|c| c.get())             -> no panic
+    "alloc::vec::Vec::<u8, my_crate::MyAlloc>::push", // `Vec<T, A>` is generic over
+    // `A: Allocator`; the growth path calls
+    // `A::allocate`, which is CALLER-SELECTED
+    // user code. `strip_generics` erases `A`,
+    // so a summary keyed on the rendered path
+    // cannot tell the two apart. Retired in
+    // `4178c86097` with a measured false proof.
+    "alloc::vec::Vec::<u32>::push", // the exact spelling this oracle used to assert TOTAL
+    "alloc::vec::Vec::<u32>::shrink_to_fit", // SAME allocator-generic defect as `push`, one
+    // step further along: `shrink_to_fit` calls
+    // `A::shrink`. The old justification here
+    // ("realloc-shrink with no element drops") is
+    // true about DROPS and silent about the
+    // allocator. K1-b isolates it: delegate
+    // `allocate` to `Global` and panic only in
+    // `shrink`, and the panic still fires.
+    "core::convert::From::from", // `From` is an ORDINARY user-implementable trait.
+    // `impl From<X> for Y { fn from(_) -> Y { panic!() } }`
+    // is safe, stable code. "Infallible conversion" is a
+    // CONVENTION, not a guarantee — `TryFrom` is about the
+    // RESULT TYPE, not about panic-freedom. A `From::from`
+    // total grant discharges every `.into()` in the crate.
+    "core::convert::Into::into", // the blanket `impl<T, U: From<T>> Into<U> for T` forwards
+    // to exactly the `From::from` above, so it inherits the
+    // whole defect and is reachable from bare `.into()`.
+    "std::thread::local::LocalKey::<core::cell::Cell<u32>>::try_with::<{closure@a.rs:1:1}, u32>",
+    // `LocalKey::try_with` RUNS THE CALLER'S CLOSURE. Its `Result` return
+    // totalizes only the TLS-access failure (destroyed thread-local), never the
+    // closure body. Retired as a false proof in an earlier Front B round (see the
+    // long note at `lower.rs`'s `total_no_panic_call_summary`, which records
+    // `S4::c_try_with -> 1 PROVED` for `CELL.try_with(|_| panic!()).unwrap_or(0)`).
+    // Pinned here because R13's brief named `rational::{ensure_healthy,poisoned,val}`
+    // — 37 of the 160 ny-cert absent-callee rows — as a "registry coverage" target,
+    // and the single callee that would clear all 37 at once is this one.
+    "std::thread::local::LocalKey::<core::cell::Cell<u32>>::with::<{closure@a.rs:1:1}, u32>",
+    // the sibling: `with` ALSO runs the closure AND panics itself
+    // (`panic_access_error`) when the thread-local is touched during its own
+    // destruction. Strictly worse than `try_with`; kept adjacent so a widening
+    // that reasons "the `Result` return makes it total" cannot reach either.
+    "std::sys::thread_local::native::lazy::Storage::<core::cell::Cell<u32>, ()>::get_or_init::<fn() -> core::cell::Cell<u32> {P13B::LAZYX::__rust_std_internal_init_fn}>",
+    // FALSE PROOF #13 (R13 integrator) — the INNER half of the same TLS access that
+    // `try_with`/`with` above are the OUTER half of. The native-TLS lazy `Storage`
+    // state machine has no panic path of its own, but it DRIVES the `thread_local!`
+    // initializer, and that initializer expression is USER-WRITTEN. The retired grant
+    // argued the init fn `__rust_std_internal_init_fn` "carries its OWN obligation, so
+    // a panicking initializer is REFUTED there, never masked here" — the identical
+    // argument `lower.rs` rejects for `try_with` forty lines later. MEASURED on
+    // sha256:a6fff08aa20b2f23: with `Cell::new(panic!("boom"))` as the initializer,
+    // `__rust_std_internal_init_fn` is FAILED while its sole caller
+    // `LAZYX::{constant#0}::{closure#0}` is PROVED 1/1. Pinned here so any future
+    // "the state machine cannot panic" widening is a hard test failure.
+    // The const-init (eager) sibling `native::eager::Storage::get` drives no callable
+    // and is NOT pinned — it is a legitimate future completeness target.
 ];
 
 /// Adversarial USER types whose path merely ENDS in a genuine total suffix — the HOLE-6C
@@ -122,8 +200,24 @@ const ADVERSARIAL: &[&str] = &[
 /// GENUINELY-TOTAL std callees (no user code, cannot panic). Recognition rate = the
 /// bridge's call-summary COMPLETENESS. Entries marked `// GAP` are total but currently
 /// unrecognized — the precision rung-1 must reclaim.
+///
+/// FRONT B (R13) — THIS LIST IS AN ASSERTION, NOT A WISHLIST. Every entry claims the
+/// callee cannot panic on ANY input, and `call_summary_oracle_completeness` prints the
+/// unrecognized ones as "rung-1 targets", which reads as an authorization to grant
+/// them. Four entries were WRONG and are now pinned in `PANICKING` with executed
+/// witnesses (`Vec::push`, `Vec::shrink_to_fit`, `From::from`, `Into::into`); three of
+/// the four had already been retired as measured false proofs in `4178c86097` and were
+/// simultaneously pinned must-fail-closed in `lower.rs`, so this file was contradicting
+/// its own crate. A printed GAP is a hypothesis to audit, never a decision.
 const SHOULD_BE_TOTAL: &[&str] = &[
     "alloc::vec::Vec::<u32>::new",
+    // MERGE (b62 <- origin/main): BOTH sides independently derived that `Vec::push`
+    // is not total. Upstream's eae43893f9 ("Vec::push is not total — it panics on
+    // capacity overflow") deleted the entry; our FRONT B / R13 moved it to PANICKING
+    // with an executed witness. The resulting TOTAL list is identical either way; only
+    // this tombstone differs, and it is kept because it names where the entry went.
+    // `Vec::push` REMOVED (FRONT B, R13) — it is in `PANICKING` now. See the
+    // caller-supplied-dispatch block there for the executed witness.
     "alloc::vec::Vec::<u32>::len",
     "alloc::vec::Vec::<u32>::is_empty",
     "alloc::vec::Vec::<u32>::capacity",
@@ -162,6 +256,16 @@ const SHOULD_BE_TOTAL: &[&str] = &[
     // GAP candidates — genuinely total (return Option, move out, run NO user code and
     // NO element Drop, cannot panic), currently NOT in the allowlist. The precision
     // rung-1 reclaims by adding them.
+    //
+    // FRONT B (R13) — READ THIS BEFORE RECLAIMING ANY GAP. A `// GAP` line here is a
+    // claim that the callee is total on ALL inputs, and the completeness test prints
+    // every unrecognized entry as a "rung-1 target". Four entries were removed from
+    // this list in R13 because the claim was FALSE (`Vec::push`, `Vec::shrink_to_fit`,
+    // `From::from`, `Into::into` — all caller-supplied dispatch, all now pinned in
+    // `PANICKING` with executed witnesses). The test's output is a suggestion, not an
+    // authorization: before adding any entry, check that no `A: Allocator`, no user
+    // trait impl, no closure, and no `Pattern`/`Hash`/`Ord`/`Drop` of a caller-chosen
+    // type is reachable from the body.
     "alloc::vec::Vec::<u32>::pop",
     "alloc::string::String::pop",
     // rung-1 recovery: the `&mut` structural-accessor twins of already-recognized total
@@ -179,11 +283,43 @@ const SHOULD_BE_TOTAL: &[&str] = &[
     // Copy scalars (or the `(value, overflowed)` pair), no user code, no panic
     // — the checked_/saturating_ soundness class. The DIVISION members are in
     // PANICKING above (zero divisor still panics).
+    // Inherent saturating/checked add/sub/mul: total by clamp / Option-return;
+    // div/rem stay in PANICKING (zero-divisor panic).
+    "core::num::<impl usize>::saturating_add",
+    "core::num::<impl i64>::saturating_sub",
+    "core::num::<impl u32>::saturating_mul",
+    "core::num::<impl usize>::checked_add",
+    "core::num::<impl i128>::checked_sub",
+    "core::num::<impl i128>::checked_mul",
+    // checked div/rem/pow/neg — TOTAL by Option-return (None on zero divisor / overflow
+    // / MIN), the non-panicking twins of the PANICKING plain div/rem. Recognized via the
+    // `core::num::checked_{div,rem,pow,neg}` EXACT_TOTAL entries.
+    "core::num::<impl usize>::checked_div",
+    "core::num::<impl u128>::checked_rem",
+    "core::num::<impl i128>::checked_pow",
+    "core::num::<impl i128>::checked_neg",
     "core::num::<impl i128>::wrapping_neg",
+    // FRONT B (R13) — the `wrapping_*` entries below are GENUINELY TOTAL (the claim
+    // is correct) but they are NOT a completeness gap to close in this list, and
+    // `lower.rs` pins `core::num::<impl u64>::wrapping_add` must-fail-closed on
+    // purpose. Reason: `translate_chc`'s `wrapping_arith_binop` arm models these
+    // PRECISELY (an exact modular value), and the extractor stamps the u8/u16/u32/u64
+    // add/sub/mul trio with the tcx-authenticated
+    // `@trust-rustc-total-primitive-method::` marker
+    // (`trust-mir-extract::tcx_marked_unsigned_wrapping_primitive_path`: crate-of-
+    // `Sized`-lang-item + inherent primitive impl + exact `(U,U) -> U` signature), so
+    // the bridge lowers `a.wrapping_add(1)` to a `BinOp Add` with
+    // `proofs: ["Wrapping"]` and emits NO call at all. MEASURED on driver
+    // sha256:18e5a9a90a1697f6 with `-Z trust-dump=native-bundle`. Moving them into the
+    // flat summary would REPLACE that exact value with an unconstrained `Undef` —
+    // a precision LOSS wearing a completeness-gain label. They stay listed here only
+    // as ground truth about their totality.
     "core::num::<impl u32>::wrapping_add",
     "core::num::<impl u64>::wrapping_sub",
     "core::num::<impl i64>::wrapping_mul",
     "core::num::<impl u32>::wrapping_shl",
+    // wrapping shift — TOTAL: masks the shift amount mod BITS (never a wide-shift panic).
+    "core::num::<impl u64>::wrapping_shr",
     "core::num::<impl i32>::overflowing_add",
     "core::num::<impl u64>::overflowing_mul",
     "core::num::<impl u32>::from_le_bytes",
@@ -202,23 +338,171 @@ const SHOULD_BE_TOTAL: &[&str] = &[
     "core::num::<impl u64>::rotate_right",
     "core::num::<impl u32>::swap_bytes",
     "core::num::<impl usize>::is_multiple_of",
-    // Orca autoformalization rung: the infallible conversion trait methods. TOTAL by
-    // the `From`/`Into` contract (fallible conversion is `TryFrom`/`TryInto`); the
-    // single largest native-incomplete cluster (`.into()`, `String::from`, integer
-    // widening, struct-field conversions).
-    "core::convert::From::from",
-    "core::convert::Into::into",
-    // T3 rung-1 recovery (aterm-scrollback batch): realloc-shrink with no element
-    // drops (`shrink_to_fit`), the zero-comparison in-order iterator ctor
-    // (`BTreeMap::iter`), the const union wrap (`MaybeUninit::new`), and the const
-    // struct ctor (`RangeInclusive::new`) — see the allowlist entries' per-entry
-    // justifications; their panicking/parameterized near-neighbors are pinned in
-    // PANICKING above.
-    "alloc::vec::Vec::<u32>::shrink_to_fit",
+    // `core::convert::From::from` / `Into::into` REMOVED (FRONT B, R13). The old
+    // rationale — "TOTAL by the `From`/`Into` contract (fallible conversion is
+    // `TryFrom`/`TryInto`)" — confuses the RESULT TYPE with panic-freedom. `From` is
+    // an ordinary user-implementable trait; `impl From<X> for Y { fn from(_) -> Y {
+    // panic!() } }` is safe stable code, and the executed K1-c/K1-d witnesses panic.
+    // Both are in `PANICKING` now, matching `lower.rs`'s long-standing fail-closed pin.
+    // T3 rung-1 recovery (aterm-scrollback batch): the zero-comparison in-order
+    // iterator ctor (`BTreeMap::iter`), the const union wrap (`MaybeUninit::new`),
+    // and the const struct ctor (`RangeInclusive::new`) — see the allowlist entries'
+    // per-entry justifications; their panicking/parameterized near-neighbors are
+    // pinned in PANICKING above. (`Vec::shrink_to_fit` was in this batch and is
+    // REMOVED in R13: it is allocator-generic, exactly like the retired `Vec::push`,
+    // and the K1-b witness isolates the `A::shrink` panic.)
     "alloc::collections::btree::map::BTreeMap::<alloc::string::String, u32>::iter",
     "core::mem::maybe_uninit::MaybeUninit::<u32>::new",
     "core::ops::range::RangeInclusive::<usize>::new",
 ];
+
+// ===========================================================================
+// FRONT B (R13) — CROSS-LIST CONTRADICTION DETECTOR
+//
+// This crate holds TWO independent statements about the same callees, and until
+// R13 they disagreed. `lower.rs`'s soundness pins assert a set of callees must
+// FAIL CLOSED; this file's `SHOULD_BE_TOTAL` asserted several of the SAME callees
+// are "genuinely total (no user code, cannot panic)" and the completeness test
+// advertised them as "rung-1 targets" to reclaim. Nothing compared the two.
+//
+// The detector below does. It normalizes both sides to a generic-erased FAMILY
+// KEY (`alloc::vec::Vec::<u8, MyAlloc>::push` and `alloc::vec::Vec::<u32>::push`
+// both key to `alloc::vec::Vec::push`), because generic erasure is exactly the
+// step that let the two spellings drift apart in the first place.
+// ===========================================================================
+
+/// The identities `lower.rs`'s `callbacks_traits_growth_and_broad_families_fail_closed`
+/// pins as must-fail-closed. Mirrored here BY VALUE on purpose: if that pin list is
+/// edited, this copy goes stale and the mirror-liveness assertion below fires.
+const LOWER_RS_FAIL_CLOSED_PINS: &[&str] = &[
+    "alloc::vec::Vec::<u8>::with_capacity",
+    "alloc::vec::Vec::<u8>::shrink_to_fit",
+    "alloc::vec::Vec::<u8>::push",
+    "alloc::vec::Vec::<u8, my_crate::MyAlloc>::push",
+    "alloc::string::String::with_capacity",
+    "core::str::<impl str>::to_ascii_lowercase",
+    "std::ffi::OsStr::to_string_lossy",
+    "core::sync::atomic::AtomicU64::load",
+    "core::hash::Hasher::write_u64",
+    "std::fs::read",
+    "std::io::Read::read_to_end",
+    "core::convert::From::from",
+    "core::convert::Into::into",
+    "core::num::<impl u64>::wrapping_add",
+    "std::sync::Mutex::<T>::lock",
+    "core::mem::zeroed::<T>",
+    "core::fmt::Formatter::debug_struct",
+    "core::fmt::Display::fmt",
+    "core::iter::Iterator::next",
+    "core::option::Option::<T>::unwrap_or",
+    "core::result::Result::<T, E>::ok",
+    "my_crate::core::mem::size_of",
+];
+
+/// The ONLY family a `SHOULD_BE_TOTAL` entry may share with a fail-closed pin, and
+/// why. `wrapping_add`/`sub`/`mul` genuinely cannot panic — the two lists do not
+/// disagree about the FACT. They disagree about the MECHANISM, deliberately: the
+/// extractor stamps these with the tcx-authenticated
+/// `@trust-rustc-total-primitive-method::` marker and `translate_chc` models them as
+/// an exact modular `BinOp`, so admitting them to the FLAT summary would replace a
+/// precise value with an unconstrained `Undef`. Fail-closed there is a precision
+/// choice, not a totality claim.
+const DOCUMENTED_MECHANISM_EXEMPTIONS: &[&str] = &["core::num::wrapping_add"];
+
+/// Erase generic argument groups and `<impl T>` / `<T as Trait>` segments, keeping
+/// the plain identifier spine. `::` inside a `<…>` group is NOT a segment break.
+fn family_key(callee: &str) -> String {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    let mut chars = callee.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => {
+                depth += 1;
+                current.push(c);
+            }
+            '>' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ':' if depth == 0 && chars.peek() == Some(&':') => {
+                chars.next();
+                segments.push(std::mem::take(&mut current));
+            }
+            _ => current.push(c),
+        }
+    }
+    segments.push(current);
+    segments.retain(|s| !s.is_empty() && !s.contains('<'));
+    segments.join("::")
+}
+
+/// Families claimed total by `should_be_total` that the crate ALSO pins must-fail-closed.
+fn ground_truth_contradictions(should_be_total: &[&str]) -> Vec<String> {
+    let pinned: Vec<String> = LOWER_RS_FAIL_CLOSED_PINS.iter().map(|c| family_key(c)).collect();
+    let exempt: Vec<String> =
+        DOCUMENTED_MECHANISM_EXEMPTIONS.iter().map(|c| (*c).to_string()).collect();
+    let mut hits: Vec<String> = Vec::new();
+    for &callee in should_be_total {
+        let key = family_key(callee);
+        // A single-segment key (a bare trait-qualified method) is too weak to
+        // attribute; skip rather than risk a false collision.
+        if key.split("::").count() < 2 {
+            continue;
+        }
+        if pinned.contains(&key) && !exempt.contains(&key) {
+            hits.push(format!("{callee}  (family `{key}`)"));
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+/// The exact `SHOULD_BE_TOTAL` membership as it stood BEFORE R13, for the four
+/// entries that were wrong. Kept as data so the detector's ability to fire is
+/// demonstrated on every run, without reverting anything.
+const PRE_R13_FALSIFIED_ENTRIES: &[&str] = &[
+    "alloc::vec::Vec::<u32>::push",
+    "alloc::vec::Vec::<u32>::shrink_to_fit",
+    "core::convert::From::from",
+    "core::convert::Into::into",
+];
+
+#[test]
+fn oracle_ground_truth_does_not_contradict_the_fail_closed_pins() {
+    // (1) THE DETECTOR FIRES ON UNFIXED INPUT. Feed it the pre-R13 list; all four
+    // falsified entries must be reported. Without this the test could pass because
+    // the check is vacuous rather than because the tree is consistent.
+    let on_unfixed = ground_truth_contradictions(PRE_R13_FALSIFIED_ENTRIES);
+    assert_eq!(
+        on_unfixed.len(),
+        PRE_R13_FALSIFIED_ENTRIES.len(),
+        "the contradiction detector must flag every pre-R13 falsified entry; got {on_unfixed:?}"
+    );
+
+    // (2) THE MIRROR IS LIVE. Every pinned identity must still fail closed in the
+    // real predicate — otherwise `LOWER_RS_FAIL_CLOSED_PINS` has gone stale against
+    // `lower.rs` and (1) is measuring a fossil.
+    let mirror_broken: Vec<&str> =
+        LOWER_RS_FAIL_CLOSED_PINS.iter().copied().filter(|c| total_no_panic_call_summary(c)).collect();
+    assert!(
+        mirror_broken.is_empty(),
+        "these are mirrored from `lower.rs`'s fail-closed pin but are now classified \
+         TOTAL — either a false proof landed or the mirror is stale: {mirror_broken:?}"
+    );
+
+    // (3) THE TREE IS CONSISTENT.
+    let contradictions = ground_truth_contradictions(SHOULD_BE_TOTAL);
+    assert!(
+        contradictions.is_empty(),
+        "`SHOULD_BE_TOTAL` claims these callees cannot panic on any input, while this \
+         crate simultaneously pins their family must-fail-closed. One of the two is a \
+         false proof waiting to be reclaimed — resolve it, do not silence it:\n  {}",
+        contradictions.join("\n  ")
+    );
+}
 
 #[test]
 fn call_summary_oracle_soundness() {

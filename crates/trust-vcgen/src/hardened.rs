@@ -246,6 +246,10 @@ fn formula_mentions_pred(f: &Formula) -> bool {
     found
 }
 
+    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+    // the other line's caller; kept for the lane that owns it. `expect` is
+    // self-expiring — this warns the moment a caller lands.
+#[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 pub(crate) fn generate_hardened_vcs_for_profile(
     func: &VerifiableFunction,
 ) -> Vec<VerificationCondition> {
@@ -705,6 +709,30 @@ fn append_assert_panic_vcs(
         // yield facts the per-statement lane conjoins, so it would over-refute a
         // provably-safe guarded index; a constant index needs no such fact.
 
+        // Trust (FIX A — trusted-std pointer-deref assert suppression, hardened
+        // twin): mirror the per-statement (generate.rs) skip for a rustc-inserted
+        // Null/Misaligned pointer-dereference UB assert whose OWN source span
+        // resolves under a CANONICAL sysroot std root (the non-forgeable
+        // `sep_engine::is_trusted_std_span` gate). This is the `vec!` macro's
+        // inlined `Box::new_uninit` allocation pointer (non-null via
+        // `handle_alloc_error`, aligned to `Layout::align()`); the discharge rests
+        // on allocation-provenance + trusted-std inlining (F5-trusted), NOT the
+        // `&T` invariant. Skipping the hardened `PanicBoundary` twin here is what
+        // prevents the un-modeled pointer formula from being minted as a
+        // partial-schema (`trust-types.Formula@1`) panic-boundary obligation the
+        // spec-predicate lane then rejects. FAIL CLOSED: the SAME assert with an
+        // empty / `binary:` / synthetic / USER-CRATE span (`is_trusted_std_span`
+        // == false) keeps its twin, so a genuine user `*raw_ptr` deref stays
+        // refutable — identical soundness discipline to the Div/Rem and bounds
+        // skips above.
+        if matches!(
+            msg,
+            AssertMessage::NullPointerDereference | AssertMessage::MisalignedPointerDereference
+        ) && crate::sep_engine::is_trusted_std_span(span)
+        {
+            continue;
+        }
+
         // Trust: signed >= 128-bit arithmetic-overflow asserts (`Overflow(Add|Sub)`
         // and `OverflowNeg`) route to a SELF-CONTAINED BV violation instead of the
         // Int-path `extract_assert_passed_semantics` encoding below. The Int path's
@@ -836,16 +864,33 @@ fn append_assert_panic_vcs(
         // downstream guard (`width <= 127`) connects through the threaded
         // `_N.0 == lhs OP rhs` to the asserted shift amount.
         //
-        // Trust #soundness: filter these by `killed` like the path guards and
-        // preconditions. A reaching def `c == (hi <= K)` relates `c` to the SMT
-        // var `hi`, but `c` was defined with the OLD `hi`; after `hi = big` the
-        // def is STALE and — combined with a surviving bool path guard `c == 1` —
-        // reconstructs the stale `hi <= K`, false-PROVING a boundary that needs
-        // `hi > K`. Dropping a stale def is monotone-sound.
+        // Trust #soundness: filter these by the BLOCK-LOCAL kill (this block's
+        // own statement writes — extracted def names + raw destinations +
+        // derived twins + deref havoc). A reaching def `c == (hi <= K)` relates
+        // `c` to the SMT var `hi`, but `c` was defined with the OLD `hi`; after
+        // an in-block `hi = big` the def is STALE and — combined with a
+        // surviving bool path guard `c == 1` — reconstructs the stale
+        // `hi <= K`, false-PROVING a boundary that needs `hi > K`. The map's
+        // facts are ENTRY facts of this block, and every obligation here is the
+        // block's own Assert terminator, so a whole-block kill is exact.
+        //
+        // The ANCESTOR half of the staleness kill lives in the fixpoint that
+        // builds `reaching_defs` (`v2_path_def_fixpoint`): it kills threaded
+        // facts flow-sensitively at every block along the path — extracted
+        // defs, raw statement destinations (`extend_with_assigned_place_dests`),
+        // terminator defs, deref havoc. Filtering here by the CUMULATIVE
+        // `killed` instead would re-kill facts ESTABLISHED BY an ancestor write
+        // (a flow-insensitive set cannot tell "established by that write" from
+        // "stale across it") — with raw destinations in the gen-sets that
+        // dropped every threaded CheckedBinaryOp result def (`_7.0 == width-1`
+        // travels with its tuple dest `_7` in the may-set), demoting safe
+        // checked-op chains. Keeping only the intra-block half is still
+        // drop-only relative to the fixpoint's own guarantees.
         if let Some(defs) = reaching_defs.get(&block.id) {
+            let own_writes = crate::generate::block_entry_fact_kill_names(func, block);
             let live: Vec<Formula> = defs
                 .iter()
-                .filter(|d| crate::generate::formula_survives_redefs(d, killed))
+                .filter(|d| crate::generate::formula_survives_redefs(d, &own_writes))
                 .cloned()
                 .collect();
             if !live.is_empty() {
@@ -1805,6 +1850,83 @@ mod tests {
         );
     }
 
+    /// Trust (cross-crate value composition, row 4): the same channel, for the
+    /// GUARDED builder — `with_verified_callee_postcondition` on a summary that
+    /// also declares `preconditions`.
+    ///
+    /// The sibling test above pins `with_definitional_postcondition`, whose
+    /// summary is precondition-FREE. The cross-crate postcondition-reuse lane
+    /// mints the OTHER builder, which sets
+    /// `postconditions_guarded_by_own_preconditions` and makes the clause ride
+    /// as `pre[actuals] -> post[actuals, _0:=dest]`. Nothing said the hardened
+    /// twin receives THAT shape: it is a different formula, produced by a
+    /// different branch of `rebind_callee_postconditions`, and admitted by a
+    /// different branch of `definitional_precondition_free_subset`. If it does
+    /// not arrive, a caller's hardened `mir_assert::Overflow` boundary keeps
+    /// refuting on a value the callee's proved `ensures` forbids — the arm
+    /// still fails, and it fails for a reason nobody would attribute to the
+    /// summary channel.
+    ///
+    /// Pinned in both directions, on the SAME body as the sibling, so the two
+    /// tests together say the channel carries both builders and not just one.
+    #[test]
+    fn hardened_panic_boundary_receives_guarded_callee_postcondition() {
+        use crate::modular::{FunctionSummary, SummaryDatabase};
+
+        let func = caller_of_pick_then_boundary();
+        // `_0 == a0` under the callee's own `requires a0 <= 100`. The call site
+        // passes `41`, so the instantiated antecedent is `41 <= 100` — true, and
+        // free of the destination's name, which `rebind_callee_postconditions`
+        // requires before it will build the implication at all.
+        let post = Formula::Eq(
+            Box::new(Formula::var("_0", Sort::Int)),
+            Box::new(Formula::var("a0", Sort::Int)),
+        );
+        let pre =
+            Formula::Le(Box::new(Formula::var("a0", Sort::Int)), Box::new(Formula::Int(100)));
+        let mut db = SummaryDatabase::new();
+        db.insert(
+            FunctionSummary::new("pick")
+                .with_param_names(vec!["a0".to_string(), "a1".to_string()])
+                .with_precondition(pre)
+                .with_verified_callee_postcondition(post),
+        );
+
+        let with_smt = hardened_vc_for_category(
+            &generate_hardened_vcs_for_profile_with_summaries(&func, Some(&db)),
+            HardenedVcCategory::PanicBoundary,
+        )
+        .formula
+        .to_smtlib();
+
+        assert!(
+            with_smt.contains("41"),
+            "the hardened panic-boundary twin must carry the GUARDED rebound \
+             postcondition (`41 <= 100 -> dest == 41`); got {with_smt}"
+        );
+
+        // The same summary must ALSO survive the L0 admission filter, which is
+        // the gate a plain (contract-less) caller's VC generation applies. A
+        // clause admitted to the injector but withheld from the L0 database
+        // reaches nothing on the lane real callers are on.
+        let subset = db.definitional_precondition_free_subset();
+        assert!(
+            subset.get("pick").is_some(),
+            "a guarded preconditioned summary must be ADMITTED to the L0 subset, \
+             not withheld"
+        );
+
+        let without = generate_hardened_vcs_for_profile(&func);
+        let without_smt = hardened_vc_for_category(&without, HardenedVcCategory::PanicBoundary)
+            .formula
+            .to_smtlib();
+        assert!(
+            !without_smt.contains("41"),
+            "control: with no summary database the twin must NOT carry the \
+             postcondition fact; got {without_smt}"
+        );
+    }
+
     #[test]
     fn hardened_panic_boundary_conjoins_parameter_type_ranges() {
         // Regression for the panic_boundary OVER-REFUTATION: the hardened MIR-assert
@@ -1862,9 +1984,7 @@ mod tests {
                 },
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let unwrap_call = |target: usize| Terminator::Call {
             unwind: UnwindEdge::Unreachable,
             func: "core::result::Result::<T, E>::unwrap".into(),
@@ -2659,6 +2779,13 @@ mod tests {
     /// provably-safe guarded index. Uses the REAL extracted MIR of `for i in
     /// 0..s.len()` (the same fixture the per-statement `for_range_index_yield` test
     /// proves), whose BoundsCheck assert is bb5.
+    ///
+    /// THE YIELD BOUND IS RESOLVED THROUGH `local_defs::unique_value_def`, whose
+    /// `Escape` arm still admits the `&mut`-borrow the `Iterator::next` desugar takes
+    /// of the range local. That admission is the seam's open defect, and this row is
+    /// one of the reasons it has not simply been closed: refusing the alias there
+    /// empties this skip set and the twin is emitted for every `for` loop in the
+    /// language. See `body_unique_value_def`'s `Escape` arm.
     #[test]
     fn hardened_boundscheck_twin_skipped_for_loop_yielded_index() {
         let func: VerifiableFunction =

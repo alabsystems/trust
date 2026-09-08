@@ -396,6 +396,7 @@ impl FullVerificationEngine {
             bundle,
             obligations,
             Some(native_bundle),
+            None,
             context,
         )
     }
@@ -414,6 +415,7 @@ impl FullVerificationEngine {
         bundle: &TrustContractBundle,
         obligations: &[TrustObligation],
         native_bundle: Option<&NativeVerificationBundle>,
+        authority: Option<&SourceGenerationAuthority>,
         context: &VerifierExecutionContext,
     ) -> FullVerificationRunWithFreshReceipts {
         self.verify_with_context_and_native_trust_ir_bundle_with_fresh_receipts(

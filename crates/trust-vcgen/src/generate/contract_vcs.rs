@@ -15,9 +15,9 @@ pub(super) fn generate_v2_contract_vcs_impl(
     // Len-witness debug context: tag every `LENWITNESS:` line emitted while this
     // function's contract VCs are generated (env-gated; no-op when unset).
     lenwitness_dbg_set_fn(&func.def_path);
-    let guard_paths_map = v2_build_path_guard_map(func);
+    let guard_paths_map = super::guard_map_for(func);
     // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let path_definition_map = v2_build_path_definition_map(func);
     let semantic_guards = match summaries {
         Some(s) => build_semantic_guard_map_with_summaries(func, s),
@@ -1509,20 +1509,43 @@ pub(super) fn formula_references_return_slot(formula: &Formula) -> bool {
 }
 
 /// The UNIQUE return-slot version (`_0` / `_0#<tok>`) appearing as the LHS of an
-/// `Eq` — i.e. the return-value pin `Eq(_0#<v>, <retval>)` the postcondition lane
-/// conjoined for this Return-block VC. `None` when there is no such pin, or more
-/// than one distinct version (ambiguous — leave the formula untouched rather than
-/// risk unifying to a non-final version, so we never over-unify unsoundly).
+/// `Eq` conjunct on the formula's positive `And` SPINE — i.e. the return-value
+/// pin `Eq(_0#<v>, <retval>)` the postcondition lane conjoined for this
+/// Return-block VC. `None` when there is no such pin, or more than one distinct
+/// version (ambiguous — leave the formula untouched rather than risk unifying to
+/// a non-final version, so we never over-unify unsoundly).
+///
+/// SPINE-ONLY is load-bearing, exactly as in [`formula_has_return_slot_pin`]:
+/// an equality inside the negated clause is the OBLIGATION, not a pin. The
+/// previous everywhere-walk counted the clause's own `Not(Eq(_0#<merged>, …))`
+/// as a second pin whenever the ensures was Eq-SHAPED (`result == …`), so on a
+/// multi-write body (the `&&`-lowering diamond of probe f53: `ensures result ==
+/// (x >= -128 && x <= 127)`) the pin set looked ambiguous, the unifier bailed,
+/// the clause's merged join name (`_0#s1_0_s2_0`) stayed FREE, and the row
+/// FALSE-REFUTED a tautology with `verified_counterexample = true`. An Eq under
+/// `Not`/`Or`/`Implies` is conditional or negated and is never the pin this
+/// lane conjoined; a nested Eq below the spine likewise must not become a
+/// rename target (mirrors `dedup_identical_return_slot_pin`'s walk).
 pub(super) fn return_slot_pin_version(formula: &Formula) -> Option<String> {
-    let mut pins: FxHashSet<String> = FxHashSet::default();
-    formula.visit(&mut |f| {
-        if let Formula::Eq(l, _) = f
-            && let Formula::Var(n, _) = &**l
-            && is_return_slot_name(n)
-        {
-            pins.insert(n.clone());
+    fn collect_spine_pins(formula: &Formula, pins: &mut FxHashSet<String>) {
+        match formula {
+            Formula::And(conjuncts) => {
+                for conjunct in conjuncts {
+                    collect_spine_pins(conjunct, pins);
+                }
+            }
+            Formula::Eq(l, _) => {
+                if let Formula::Var(n, _) = &**l
+                    && is_return_slot_name(n)
+                {
+                    pins.insert(n.clone());
+                }
+            }
+            _ => {}
         }
-    });
+    }
+    let mut pins: FxHashSet<String> = FxHashSet::default();
+    collect_spine_pins(formula, &mut pins);
     if pins.len() == 1 { pins.into_iter().next() } else { None }
 }
 

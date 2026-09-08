@@ -383,3 +383,39 @@ pub(crate) struct ForceInlineJustification {
     pub sym: Symbol,
     pub callee: String,
 }
+
+// Trust: the once-initializer re-entrancy check (`trust_once_reentrancy`). A HARD
+// error on purpose — not a lint: no `#[allow]`, no `#[expect]`, no error code (the
+// tree's precedent for Trust errors). A `Once` initializer that waits on its own cell
+// has no legitimate instance; the three helps are the repairs
+// (docs/design/2026-08-30-once-initializer-reentrancy.md).
+#[derive(Diagnostic)]
+#[diag(
+    "the initializer of `{$cell}` can wait on `{$cell}` itself: a `{$kind}` initializer that re-enters its own cell {$failure}"
+)]
+#[note("call path: {$path}")]
+#[help(
+    "compute the value inside the initializer without {$reentry} — read the input it needs directly instead of asking `{$cell}` for it"
+)]
+#[help("or hoist the computation out of the initializer: `let v = ...;` then {$hoist}")]
+#[help(
+    "or, if the initializer can legitimately observe an uninitialized `{$cell}`, read `{$peek}` there — it never waits"
+)]
+pub(crate) struct TrustOnceInitializerReentrancy {
+    #[primary_span]
+    #[label("the initializer of `{$cell}` reaches this call, which waits on `{$cell}` again")]
+    pub(crate) wait_span: Span,
+    #[label("this call starts the initializer of `{$cell}`")]
+    pub(crate) start_span: Option<Span>,
+    #[label("the initializer reaches the re-entrant wait through this call")]
+    pub(crate) hops: Vec<Span>,
+    #[note("`{$cell}` is declared here")]
+    pub(crate) cell_span: Span,
+    pub(crate) cell: String,
+    pub(crate) kind: String,
+    pub(crate) failure: String,
+    pub(crate) path: String,
+    pub(crate) reentry: String,
+    pub(crate) hoist: String,
+    pub(crate) peek: String,
+}

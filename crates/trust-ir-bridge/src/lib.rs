@@ -47,10 +47,53 @@ mod cache_key;
 // L0 safety obligations, verdict-identically (see `flip.rs`).
 mod flip;
 mod layout_evidence;
+/// The bridge's def-counting seam — nothing else may scan `body.blocks` for a
+/// local's definitions (see the module doc).
+mod local_defs;
+
+/// The bridge seam's single-value question, exposed for the PARITY row that measures
+/// it against `trust_vcgen::local_defs` (`tests/local_defs_parity.rs`). The bridge
+/// cannot depend on trust-vcgen at build time, so the two seams are two functions and
+/// the implication between them has to be measured rather than assumed.
+#[doc(hidden)]
+pub fn local_defs_holds_one_value_for_test(
+    func: &trust_types::VerifiableFunction,
+    local: usize,
+) -> bool {
+    local_defs::holds_one_value(func, local)
+}
+
+/// The bridge seam's RESOLVER, exposed for the same parity row. The resolver is the
+/// more dangerous of the two faces — its answer is INLINED into a formula, so a wrong
+/// one cannot be rebound by version renaming afterwards — so the two seams have to be
+/// measured against each other here too, not only on the count.
+#[doc(hidden)]
+pub fn local_defs_unique_value_def_is_some_for_test(
+    func: &trust_types::VerifiableFunction,
+    local: usize,
+) -> bool {
+    local_defs::unique_value_def(func, local).is_some()
+}
 mod lower;
+// Obligation-birth cutover SCORECARD (Stage C/D entry instrument): per-class
+// aggregation of the flip's NativeGenOutcome into a measured artifact. The
+// corpus walk lives in examples/ (it needs the trust-vcgen dev-dependency).
+pub mod native_gen_scorecard;
 mod native_request;
+mod native_shadow_request;
 mod parity;
 mod provenance;
+// STEP 6 (docs/design/DIRECT-LANE-PROOF-AUTHORITY.md, increment 1): the
+// direct-lane typed L0 safety-formula mint — single source of truth,
+// delegating to lower.rs's own reconstruct_* builders — plus its byte-or-
+// decline parity oracle (#[cfg(test)]).
+pub mod safety_formulas;
+// STEP 6 increment 2: the production-dump schema/writer/fail-closed parser
+// shared by the installer seam (trust-thir-lower) and the grader below, and
+// the hoisted grading core both the model oracle and grade_real_records use.
+pub mod direct_formula_dump;
+pub mod direct_record_grading;
+pub mod direct_set_parity;
 pub mod trust_wp_claim;
 // Phase-2 prototype: trust-ir-native VC generation, shadow mode. See
 // `vcgen_proto.rs` and `docs/TRUST_IR_SPINE.md` Phase 2.
@@ -69,6 +112,7 @@ pub use flip::{
     flip_contract_verdicts_to_spine, flip_contract_verdicts_with_module,
     flip_safety_verdicts_to_spine, flip_safety_verdicts_with_module,
     generate_native_or_flip_safety_vcs, generate_native_or_flip_safety_vcs_with_discharged,
+    generate_native_or_flip_safety_vcs_with_reachability,
     l0_obligation_set_diff, l0_obligation_set_diff_with_discharged,
 };
 pub use layout_evidence::{
@@ -76,6 +120,7 @@ pub use layout_evidence::{
     TRUST_IR_LAYOUT_EVIDENCE_COMMIT, TrustIrLayoutSensitiveCastBlocker,
     collect_layout_sensitive_cast_blockers, ensure_layout_sensitive_cast_evidence,
 };
+pub use lower::CoroutineUpvarFramesGuard;
 #[cfg(feature = "compiler-context")]
 pub use lower::lower_to_trust_ir_functions_with_compiler_context;
 // Trust (bundled-member derived preconditions — the bundled-Assert remedy):
@@ -92,10 +137,20 @@ pub use lower::{
     SYMBOLIC_FORMULA_ATTR_DEBUG, SYMBOLIC_FORMULA_ATTR_JSON, SYMBOLIC_FORMULA_ATTR_SCHEMA,
     SYMBOLIC_FORMULA_ATTR_SMTLIB, SYMBOLIC_FORMULA_ATTR_SORT, SYMBOLIC_FORMULA_DIALECT,
     SYMBOLIC_FORMULA_OP, SYMBOLIC_MEMORY_STATE_OP, TRUST_OBLIGATION_SOURCE_SCHEMA,
-    coroutine_resume_contract_module_evidence, generate_native_safety_vcs,
-    is_diverging_panic_site_obligation_description, is_panicking_primitive_int_div_method,
-    lower_functions_to_trust_ir, lower_to_trust_ir, lower_to_trust_ir_function,
-    lower_to_trust_ir_functions, lower_to_trust_ir_functions_with_abi_total_context,
+    callee_is_recognized_total_no_panic,
+    callee_is_slice_sort_comparator_family,
+    closure_body_is_total_ord_key_comparator,
+    coroutine_resume_contract_module_evidence,
+    fmt_format_call_is_total,
+    generate_native_safety_vcs,
+    generate_native_safety_vcs_with_reachability,
+    is_diverging_panic_site_obligation_description,
+    is_panicking_primitive_int_div_method,
+    lower_functions_to_trust_ir,
+    lower_to_trust_ir,
+    lower_to_trust_ir_function,
+    lower_to_trust_ir_functions,
+    lower_to_trust_ir_functions_with_abi_total_context,
     lower_to_trust_ir_functions_with_assumed_total_context,
     lower_to_trust_ir_functions_with_context, lower_to_trust_ir_functions_with_expected_absent,
     map_binop, map_type, map_unop, pin_enum_tag_lane, verifiable_function_lowers_in_module_context,
@@ -112,6 +167,12 @@ pub use native_request::{
     NativeBundleOwner, NativeVerificationBundleBuildError,
     TRUST_NATIVE_REQUEST_TRANSFORM_VERSION, native_verification_bundle_from_module,
     native_verification_bundle_from_module_owners,
+};
+pub use native_shadow_request::{
+    DIRECT_SHADOW_ADMITTED_SOURCE_ID, DIRECT_SHADOW_NON_APPLYING_CHECKS,
+    DIRECT_SHADOW_PUBLIC_ID_PREFIX, DIRECT_SHADOW_WIRE_DISCLOSURE, DirectOwnerIneligibility,
+    DirectShadowBundle, DirectShadowBundleBuildError, DirectShadowLineageDisclosure,
+    TRUST_DIRECT_SHADOW_TRANSFORM_VERSION, direct_shadow_verification_bundle_from_module,
 };
 pub use parity::{
     ObligationKindSummary, lowered_obligation_summary, obligation_count, obligation_kind_summary,
@@ -166,3 +227,11 @@ mod flat_tax_measure;
 // (rung-1 precision frontier + false-proof regression guard).
 #[cfg(test)]
 mod call_summary_oracle;
+
+// Trust: STEP-4 coverage ratchet (docs/design/2026-08-19-verified-sysroot-scoping.md
+// §5 step 4 — "a coverage ratchet so the number can only go up"): pins the
+// verified core::num function count N and its discharged-L0-obligation count
+// against the committed floor + snapshot pair under fixtures/std-coverage/.
+// Test-only measurement plumbing; grants no verification authority.
+#[cfg(test)]
+mod std_core_num_coverage_ratchet;

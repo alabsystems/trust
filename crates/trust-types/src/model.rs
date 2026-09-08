@@ -59,6 +59,15 @@ fn smallest_free_block_id(occupied: &BTreeSet<usize>) -> usize {
 /// member from hash material. `disc_index_safe` predates these pins and remains
 /// hash-visible. JSON string contents cannot collide with this member fragment:
 /// embedded quotes are escaped, and the name is reserved to `Ty::Adt`.
+///
+/// `Ty::Adt::arbitrary_precision` (F6) needs NO stripping: it is `#[serde(skip)]`,
+/// so it never appears in `value`'s serialization at all. A freshly-extracted
+/// (stamped) `num_bigint::BigInt` therefore hashes BYTE-IDENTICALLY to a decoded
+/// (unstamped) one — the transient authentication stamp is invisible to the
+/// shape hash by construction, which is exactly the intended invariant (the
+/// stamp is not structural type identity). The defensive `.replace` below keeps
+/// the hash stable even if that attribute were ever relaxed to a serializing
+/// form; with `#[serde(skip)]` it is a no-op.
 fn stable_model_json<T>(value: &T) -> Result<String, serde_json::Error>
 where
     T: Serialize + ?Sized,
@@ -115,7 +124,14 @@ where
         .replace(",\"adt_kind\":null", "")
         .replace(",\"args\":null", "")
         .replace(",\"obligation\":null", "")
-        .replace(",\"datatype_defs\":{}", ""))
+        .replace(",\"datatype_defs\":{}", "")
+        // Trust (F6): the arbitrary-precision provenance stamp is FULL
+        // `#[serde(skip)]` (never serialized), so these strips are normally
+        // inert belt-and-braces — kept so that if a future edit downgrades the
+        // skip to `skip_serializing_if`, audited pins still hold. Embedded
+        // quotes in JSON strings are escaped, so content cannot forge them.
+        .replace(",\"arbitrary_precision\":\"Signed\"", "")
+        .replace(",\"arbitrary_precision\":\"Unsigned\"", ""))
 }
 
 /// Canonical JSON hash material, as bytes, for any Trust model value.
@@ -5489,6 +5505,171 @@ pub enum EnumReprHint {
     I64,
 }
 
+/// Trust (F6): the ARBITRARY-PRECISION provenance stamp carried by a
+/// [`Ty::Adt`]. It marks a type that a *rustc-authenticated* extractor has
+/// POSITIVELY identified as the real `num_bigint::BigInt`/`BigUint` or a
+/// `num_rational::Ratio` over such an element — via the defining crate's
+/// [`StableCrateId`], NOT its spoofable printed def-path. Only the extractor
+/// (`trust_mir_extract::ty_convert::authenticate_arbitrary_precision`) ever
+/// sets it, and it does so ONLY after the crate-identity check passes.
+///
+/// The F6 discharge gates in `trust-ir-bridge` read THIS stamp — never the ADT
+/// `name` — so a dependency that re-exports a same-named type with panicking
+/// arithmetic can never inherit the trusted-total absent-callee discharge.
+///
+/// The INTEGER bignums are DISTINGUISHED from the RATIONALS (RC-C soundness split):
+///   * `Signed` = `num_bigint::BigInt`; `Unsigned` = `num_bigint::BigUint`. Integer
+///     `Add`/`Sub`/`Mul`/`Neg` GROW the representation and cannot panic (`Signed`
+///     additionally closes `Sub`/`Neg`; `Unsigned` subtraction can underflow-panic,
+///     so it fails closed at the signed gate).
+///   * `RatioSigned` = `num_rational::Ratio<BigInt>`; `RatioUnsigned` =
+///     `num_rational::Ratio<BigUint>`. Ratio ARITHMETIC is NOT total — it normalizes
+///     through `Ratio::new -> reduce`, which PANICS on a zero denominator
+///     (safe-constructible via `Ratio::new_raw(_, 0)`). The bridge arith gates
+///     (`is_integer_arbitrary_precision_ty` / `is_signed_integer_arbitrary_precision_ty`)
+///     therefore accept ONLY the integer kinds and REJECT the Ratio kinds, while the
+///     non-arith recognizers (numer/denom/sign/cmp/Zero/One, which never `reduce`)
+///     still treat all four as arbitrary-precision.
+///
+/// SERDE: this stamp is `#[serde(skip)]` on [`Ty::Adt`] — it is a transient,
+/// this-compilation-only authentication signal, never structural type identity,
+/// so it neither serializes nor deserializes. A decoded/round-tripped bundle
+/// therefore ALWAYS reads the `Default` (`None`), so a deserialized (shadow)
+/// `Ty::Adt` is NEVER authenticated — the fail-closed direction. It is likewise
+/// invisible to [`stable_model_json`]'s shape hash by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArbPrecKind {
+    /// `num_bigint::BigInt` — signed integer bignum; `Add`/`Sub`/`Mul`/`Neg` are all
+    /// closed over the represented domain (no overflow, no division).
+    Signed,
+    /// `num_bigint::BigUint` — unsigned integer bignum; `Add`/`Mul` are total,
+    /// `Sub`/`Neg` are NOT (unsigned underflow panics).
+    Unsigned,
+    /// `num_rational::Ratio<BigInt>` — signed RATIONAL. Arithmetic can PANIC on a
+    /// zero denominator (`Ratio::new -> reduce`), so it is EXCLUDED from the integer
+    /// arith gates; the non-`reduce` recognizers still treat it as arbitrary-precision.
+    RatioSigned,
+    /// `num_rational::Ratio<BigUint>` — unsigned RATIONAL. Same zero-denominator
+    /// panic exclusion as `RatioSigned`.
+    RatioUnsigned,
+}
+
+impl ArbPrecKind {
+    /// P8 (RC-C, extraction half) — does an authenticated stamp of THIS kind license
+    /// the BLANKET "every impl in the auto-derive trait family
+    /// (`PartialEq`/`PartialOrd`/`Ord`/`Hash`/`Debug`/`Default`) on this type is
+    /// panic-free" clear that `trust_mir_extract::convert::tcx_derived_trait_is_total`
+    /// grants at its `(a0)` arm?
+    ///
+    /// ONLY the INTEGER bignums. `<BigInt|BigUint as Ord>::cmp` is a sign + limb-slice
+    /// comparison (num-bigint 0.4.6 `cmp_slice`): no division, no user code, total.
+    ///
+    /// The RATIONAL kinds are REFUSED. `impl<T: Clone + Integer> Ord for Ratio<T>`
+    /// (num-rational 0.4.2 `src/lib.rs:341-391`) falls through — whenever the
+    /// denominators AND the numerators differ — to
+    /// `self.numer.div_mod_floor(&self.denom)`, a DIVISION BY THE DENOMINATOR that
+    /// PANICS when the denominator is zero, and `Ratio::new_raw(n, 0)` is a public
+    /// `const fn` performing no reduction (`src/lib.rs:80`; its own rustdoc warns
+    /// "**There are several methods that will panic if used on a `Ratio` with
+    /// `denom == 0`**"). `PartialOrd::{partial_cmp,lt,le,gt,ge}` is `Some(self.cmp(..))`
+    /// plus the provided defaults, so the whole comparison family inherits that panic.
+    /// This is verbatim the zero-denominator argument RC-C already uses to exclude the
+    /// `Ratio*` stamps from the F6 ARITH gates
+    /// (`trust_ir_bridge::lower::is_integer_arbitrary_precision_ty`) and that
+    /// `8960f1ae70` applied to the bridge's bucket-E `Ord::cmp` recognizer — the
+    /// EXTRACTION-side sentinel is the second, independent path that argument must also
+    /// close.
+    ///
+    /// Refusing the rational kinds for the WHOLE family (rather than only for the
+    /// comparison traits) is deliberate: it is fail-CLOSED by default, so a trait later
+    /// added to the sentinel family cannot silently inherit a rational clear that nobody
+    /// audited. The cost is completeness only (a `Ratio<Big…>` `eq`/`hash`/`Debug` keeps
+    /// its honest obligation), never soundness.
+    #[must_use]
+    pub const fn clears_total_derived_trait_family(self) -> bool {
+        // An EXHAUSTIVE match, not a `matches!`: a future `ArbPrecKind` variant must
+        // make this decision explicitly rather than inherit a default.
+        match self {
+            ArbPrecKind::Signed | ArbPrecKind::Unsigned => true,
+            ArbPrecKind::RatioSigned | ArbPrecKind::RatioUnsigned => false,
+        }
+    }
+}
+
+/// Trust (C2): the STANDARD-MAP totality provenance carried inside a
+/// [`TotalMapKind`] stamp. It marks that a `HashMap`/`BTreeMap` ADT was
+/// rustc-authenticated by its extractor as (a) using the STD DEFAULT hasher /
+/// allocator (identified by the RESERVED crate name `std`/`alloc` — un-spoofable
+/// — plus the exact defining def-path, never a same-named user lookalike) AND
+/// (b) having a total-`Hash`+`Eq` (resp. total-`Ord`) key `K` (BAKED IN at
+/// extraction — a user key with a panicking `Borrow<Q>::borrow`, erased at the
+/// `get::<Q>` call site, therefore cannot inherit this stamp). See
+/// `trust_mir_extract::ty_convert::authenticate_total_std_map`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TotalMapKind {
+    /// `std::collections::HashMap<K, V, std::hash::random::RandomState>` with a
+    /// total-`Hash`+`Eq` key: `S` is the std default `RandomState` (SipHash,
+    /// never panics) and `K`'s `Hash`/`Eq` run no user code.
+    HashDefault,
+    /// `std::collections::BTreeMap<K, V, alloc::alloc::Global>` with a
+    /// total-`Ord` key: `A` is the std `Global` allocator and `K`'s `Ord::cmp`
+    /// runs no user code.
+    OrdGlobal,
+}
+
+/// Trust (Build D): which authenticated serde_json ADT this stamp marks. Written
+/// ONLY by `trust_mir_extract::ty_convert::authenticate_serde_json` after a
+/// `StableCrateId` match against `SERDE_JSON_TCB_ALLOWLIST`; it rides the same
+/// `#[serde(skip)]` [`AdtAuth`] carrier as the sibling stamps (a decoded/shadow
+/// bundle reads `None`, the fail-closed direction). `Value` is the enum
+/// (`Null|Bool|Number|String|Array|Object`); `Map` is the object struct
+/// `Map<String, Value>`. The two kinds let each bridge recognizer require the
+/// correct receiver kind, mirroring [`TotalMapKind`]'s `HashDefault`/`OrdGlobal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SerdeJsonKind {
+    /// `serde_json::value::Value` — the JSON value enum.
+    Value,
+    /// `serde_json::map::Map` — the JSON object struct (`Map<String, Value>`).
+    Map,
+}
+
+/// Trust: the discriminated PROVENANCE stamp carried by a [`Ty::Adt`] in the
+/// (widened) `arbitrary_precision` carrier field. Only the rustc-driven
+/// extractor writes it, and ONLY after the relevant un-spoofable crate-identity
+/// / key-totality authentication passes. It is `#[serde(skip)]`, so a
+/// decoded/shadow bundle always reads `None` (never authenticated — the
+/// fail-closed direction). See [`ArbPrecKind`] and [`TotalMapKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AdtAuth {
+    /// F6: an authenticated arbitrary-precision `num_bigint`/`num_rational` type.
+    ArbPrec(ArbPrecKind),
+    /// C2: an authenticated std default-hasher/allocator total-key map.
+    TotalStdMap(TotalMapKind),
+    /// ROOT2: an EXTRACTION-CERTIFIED whole-owned-tree DROP-total ADT. Every node
+    /// in its owned tree is a primitive / non-owning reference / audited std owning
+    /// container (dealloc only) / authenticated bignum, and NONE carries a user
+    /// `Drop` impl (`trust_mir_extract::convert::tcx_drop_is_total`), so its drop
+    /// glue runs no user code (alloc-abort is out of the modeled panic set) and the
+    /// bridge admits it FIELD-FREE. The optional payload carries the C2 total-map
+    /// kind WHEN the same ADT is ALSO an authenticated total-key std map (`Some(k)`
+    /// -- a strict SUPERSET of a plain `TotalStdMap(k)`, still read by the map-key
+    /// gate so the `insert`/`get` discharge does not regress); `None` for any other
+    /// drop-total ADT (a wrapper struct/enum, or a map whose key is NOT total-`Ord`
+    /// /`Hash`, which the key gate must still decline). Like the sibling stamps it is
+    /// written ONLY by the rustc-driven extractor and is `#[serde(skip)]`, so a
+    /// decoded/shadow bundle reads `None` (never certified -- the fail-closed
+    /// direction). C2 reservation honored: a plain `TotalStdMap` (key-total but its
+    /// value `V` may own a panicking `Drop`) is NEVER admitted field-free for drop.
+    TotalDrop(Option<TotalMapKind>),
+    /// Build D: an authenticated `serde_json` `Value`/`Map`
+    /// (`StableCrateId`-gated by `authenticate_serde_json`, the SOLE writer). Its
+    /// immutable/total operations discharge in the bridge; its `Drop` is
+    /// recursive-total (owned tree is `String`/`Vec<Value>`/`Map<String,Value>`/
+    /// number/bool, no user `Drop`), so the drop reader admits it FIELD-FREE. Like
+    /// the sibling stamps it is `#[serde(skip)]` (a decoded bundle reads `None`).
+    SerdeJson(SerdeJsonKind),
+}
+
 /// Lossless Serde boundary for the B3-1 faithful-enum marker.
 ///
 /// `Option<Option<EnumReprHint>>` has three meaningful in-memory states, but a
@@ -5786,6 +5967,25 @@ pub enum Ty {
     Slice {
         elem: Box<Ty>,
     },
+    /// Trust: an OWNED sequence -- `alloc::vec::Vec<T>` carried with its
+    /// element type intact.
+    ///
+    /// ADDITIVE, in the `PtrSizedInt`/`Char` tradition: every existing
+    /// consumer matches `Ty::Adt` or falls through a `_` arm, so an
+    /// unfamiliar variant can only make a lane MORE conservative, never
+    /// admit something it refused before.
+    ///
+    /// Why it exists. Before this variant, `Vec<T>` lowered to the
+    /// structural `Ty::Adt` expansion of its RawVec internals, which
+    /// mentions `T` NOWHERE: measured, `Vec<Term>` and `Vec<Lit>` produced
+    /// byte-identical extracted types (sha `a0444cf9482c5ef5`, 1987 bytes,
+    /// zero occurrences of either element name) while the slice forms
+    /// `&[Term]` and `&[Lit]` differed correctly. Any identity check on a
+    /// `Vec`-typed field was therefore vacuous -- it could not tell a vector
+    /// of coefficients from a vector of literals.
+    Seq {
+        elem: Box<Ty>,
+    },
     /// Trust (B2-2, RFC TRUST_IR_V2): the `str` DST, DISTINCT from `[u8]`. Emitted by
     /// `trust-mir-extract`'s ty_convert ONLY on the FAITHFUL-extraction lane (the B1
     /// `PtrSizedInt`/`Char` precedent) so the trust-ir bridge can spell `&str` as the
@@ -5908,6 +6108,26 @@ pub enum Ty {
         // IS hash-visible (it asserts the ADT kind and belongs in identity).
         #[serde(default)]
         adt_kind: Option<AdtKind>,
+        // Trust (F6): ARBITRARY-PRECISION provenance stamp. `Some(kind)` ONLY
+        // when the rustc-driven extractor authenticated this ADT as the REAL
+        // `num_bigint`/`num_rational` type by its defining crate's
+        // `StableCrateId` (see `ArbPrecKind`). The F6 bridge gates
+        // (`is_arbitrary_precision_ty`, `is_signed_arbitrary_precision_ty`) read
+        // THIS field, never the spoofable `name`.
+        //
+        // `#[serde(skip)]` (FULL skip, both directions — the SOUNDNESS keystone):
+        // the stamp is a transient THIS-COMPILATION authentication signal that
+        // must NEVER round-trip. Skipping serialization AND deserialization means
+        // (a) every decoded/shadow bundle reads the `Default` (`None`) — so a
+        // deserialized `Ty::Adt` is NEVER authenticated, the fail-closed
+        // direction; (b) the serialized wire (incl. the sequence-based `bincode`
+        // format the caches/proof-certs use) is BYTE-IDENTICAL to before this
+        // field existed — no field is written or read, so old data still decodes
+        // and the semantic shape hash is unchanged. Contrast `skip_serializing_if`,
+        // which would (i) let a `Some` stamp survive a round-trip — authenticating
+        // decoded data — and (ii) desync `bincode`'s fixed field sequence.
+        #[serde(skip)]
+        arbitrary_precision: Option<AdtAuth>,
     },
     /// A recursive algebraic datatype, modeled with the SMT-LIB datatype theory
     /// (Lever A). This is the lowering target for a *recursive* enum/struct
@@ -6073,6 +6293,9 @@ impl Ty {
     #[must_use]
     pub fn adt(name: impl Into<String>, fields: Vec<(String, Ty)>) -> Ty {
         // Trust: enum-disc-full-native — a struct is never discriminant-index-safe.
+        // Trust (F6): the ARBITRARY-PRECISION stamp is set ONLY by the
+        // rustc-authenticating extractor; abstract constructors default it to
+        // `None` (fail-closed: no discharge).
         Ty::Adt {
             name: name.into(),
             fields,
@@ -6087,6 +6310,7 @@ impl Ty {
             // existing synthetic construction fail-closed (declines G-STRUCT-KIND)
             // and hash-stable (a `None` is stripped from the content hash).
             adt_kind: None,
+            arbitrary_precision: None,
         }
     }
 
@@ -6119,6 +6343,8 @@ impl Ty {
             enum_layout: None,
             // Trust: W19 — kind-agnostic synthetic constructor (see `Ty::adt`).
             adt_kind: None,
+            // Trust (F6): only the authenticating extractor stamps this.
+            arbitrary_precision: None,
         }
     }
 
@@ -6150,6 +6376,8 @@ impl Ty {
             faithful_enum_repr: None,
             enum_layout: None,
             adt_kind: None,
+            // Trust (F6): only the authenticating extractor stamps this.
+            arbitrary_precision: None,
         }
     }
 
@@ -6191,6 +6419,9 @@ impl Ty {
                     // Trust: W19 — a representation-level discriminator (like
                     // disc_index_safe/layout), ignored by this modulo-flag equality.
                     adt_kind: _,
+                    // Trust (F6): the provenance stamp is not structural identity
+                    // (it is transient + serde-skipped), so it is ignored here.
+                    arbitrary_precision: _,
                 },
                 Ty::Adt {
                     layout: _,
@@ -6201,6 +6432,7 @@ impl Ty {
                     disc_index_safe: _,
                     faithful_enum_repr: _,
                     adt_kind: _,
+                    arbitrary_precision: _,
                 },
             ) => {
                 n1 == n2
@@ -6856,6 +7088,233 @@ impl Statement {
             }
         }
     }
+
+    /// [`WriteEffect`] resolved onto ONE local: the channel by which this statement
+    /// can change what `local` holds. EXHAUSTIVE (no wildcard) for the same reason
+    /// [`Statement::write_effect`] is, and in the same crate so that it CAN be —
+    /// `Statement` is `#[non_exhaustive]`, so a downstream classifier is forced to
+    /// carry a wildcard and cannot fail to compile on a new variant.
+    ///
+    /// The ESCAPE channel is orthogonal (an `Assign` both writes its destination and
+    /// may hand out an alias of a *different* local) and is asked separately by
+    /// [`Statement::escapes_local`].
+    pub fn local_write(&self, local: usize) -> LocalWrite<'_> {
+        match self {
+            Statement::Assign { place, rvalue, .. } => {
+                LocalWrite::of_place(place, local, Some(rvalue))
+            }
+            // A discriminant write changes the value without defining all of it, and
+            // the new value has no `Rvalue` to name.
+            Statement::SetDiscriminant { place, .. } => {
+                LocalWrite::of_place(place, local, None).demote_to_partial()
+            }
+            // `Deinit` makes the place uninitialized: a value change with nothing to
+            // name.
+            Statement::Deinit { place } => {
+                LocalWrite::of_place(place, local, None).demote_to_partial()
+            }
+            // Write through a POINTER operand, not a place — the reason
+            // `write_effect` calls these `FailClosedOrBackstopped`. No place to key
+            // on, so no local can be ruled out.
+            Statement::Intrinsic { .. }
+            | Statement::CopyNonOverlapping { .. }
+            | Statement::Unsupported { .. } => LocalWrite::Unlocatable,
+            Statement::Retag { .. }
+            | Statement::PlaceMention(_)
+            | Statement::StorageLive(_)
+            | Statement::StorageDead(_)
+            | Statement::Coverage
+            | Statement::ConstEvalCounter
+            | Statement::Nop => LocalWrite::Untouched,
+        }
+    }
+
+    /// True iff this statement hands out a MUTABLE ALIAS of `local` — the
+    /// [`LocalWrite::Escape`] channel.
+    ///
+    /// `&mut local` / `&raw [const|mut] local` (`Rvalue::Ref { mutable: true }` /
+    /// `Rvalue::AddressOf`) of either raw mutability qualifies: a `*const` is a valid
+    /// `*const -> *mut` cast root. A shared `&local` cannot mutate and its cast to
+    /// `*mut` is rejected by `invalid_reference_casting`, so it does not.
+    pub fn escapes_local(&self, local: usize) -> bool {
+        let Statement::Assign { rvalue, .. } = self else { return false };
+        matches!(
+            rvalue,
+            Rvalue::Ref { mutable: true, place: borrowed } | Rvalue::AddressOf(_, borrowed)
+                if borrowed.local == local
+        )
+    }
+}
+
+/// [`WriteEffect`] resolved onto ONE local: EVERY channel by which a single statement
+/// or terminator can change what that local holds.
+///
+/// This exists because the recurring soundness bug in the verifier is a scan that
+/// enumerates a PROPER SUBSET of the channels — an `Assign`-only definition tally that
+/// reads a local also written by a `Call` destination as single-valued, and then keys
+/// a fact (or, worse, INLINES a resolved value) on its bare name. `Statement` and
+/// `Terminator` are `#[non_exhaustive]`, so only this crate can classify them without
+/// a wildcard; [`Statement::local_write`] and [`Terminator::local_write`] therefore
+/// live here, beside [`Statement::write_effect`], and a new MIR variant fails to
+/// compile until it is classified.
+///
+/// `LocalWrite` itself is deliberately NOT `#[non_exhaustive]`: a consumer's match
+/// over it must break when a channel is added, which is the point.
+#[derive(Debug, Clone, Copy)]
+pub enum LocalWrite<'a> {
+    /// Cannot change `local`.
+    Untouched,
+    /// Replaces the WHOLE of `local` with the value of this `Rvalue` — the ONE
+    /// channel whose value is nameable, and so the only one a value RESOLVER may
+    /// hand back.
+    WholeNamed(&'a Rvalue),
+    /// Replaces the WHOLE of `local` with a value that has no `Rvalue`: a `Call`
+    /// destination, or a `TailCall` writing the return place.
+    WholeOpaque,
+    /// Changes PART of `local` — a field/index store, a discriminant write, a
+    /// `Deinit`, or a `Drop` whose glue takes `&mut local`. The local's value after
+    /// it is not its value before, and the new value cannot be named.
+    Partial,
+    /// Hands out a MUTABLE ALIAS of `local`. Nothing changes at this statement, but a
+    /// later store through the alias names a DIFFERENT place (`*p = v`, whose
+    /// `place.local` is `p`), so no scan keyed on `local` can see it.
+    Escape,
+    /// A write whose destination is not a `Place` at all — pointer writes
+    /// (`copy_nonoverlapping`, raw intrinsics), inline asm, and the sentinels for MIR
+    /// the model does not represent. No local can be ruled out, so this FAILS CLOSED
+    /// and is reported for every local.
+    Unlocatable,
+}
+
+impl<'a> LocalWrite<'a> {
+    /// How a whole-place write to `place` reaches `local`.
+    ///
+    /// A write THROUGH the local (`*local = v` — a `Deref`-first projection) changes
+    /// the POINTEE, not what `local` holds, so it does not reach `local` at all.
+    pub fn of_place(place: &Place, local: usize, rvalue: Option<&'a Rvalue>) -> Self {
+        if place.local != local || place.projections.first() == Some(&Projection::Deref) {
+            return LocalWrite::Untouched;
+        }
+        if !place.projections.is_empty() {
+            return LocalWrite::Partial;
+        }
+        match rvalue {
+            Some(rv) => LocalWrite::WholeNamed(rv),
+            None => LocalWrite::WholeOpaque,
+        }
+    }
+
+    /// The same channel, weakened to [`LocalWrite::Partial`] when it touches the local
+    /// at all — for a write that changes the value without defining the whole of it.
+    #[must_use]
+    pub fn demote_to_partial(self) -> Self {
+        match self {
+            LocalWrite::Untouched => LocalWrite::Untouched,
+            LocalWrite::WholeNamed(_)
+            | LocalWrite::WholeOpaque
+            | LocalWrite::Partial
+            | LocalWrite::Escape
+            | LocalWrite::Unlocatable => LocalWrite::Partial,
+        }
+    }
+
+    /// True iff this channel is consistent with the [`WriteEffect`] of the statement
+    /// or terminator it came from: something the taxonomy says changes NO place value
+    /// must be [`LocalWrite::Untouched`] for every local.
+    ///
+    /// Adding a `Statement`/`Terminator` variant is already a compile error in the two
+    /// classifiers. RE-classifying an existing variant's `WriteEffect` is not, and
+    /// this is what catches that: it is asserted on every statement and terminator the
+    /// verifier's definition seam walks, and variant-by-variant in
+    /// `model_write_channel_tests`.
+    #[must_use]
+    pub fn agrees_with(self, effect: WriteEffect) -> bool {
+        match effect {
+            WriteEffect::NoValueWrite => matches!(self, LocalWrite::Untouched),
+            WriteEffect::Captured | WriteEffect::FailClosedOrBackstopped => true,
+        }
+    }
+}
+
+/// How many values a local can hold, WITH the case where the seam could not count
+/// them at all — the answer type of the definition seam's counting question.
+///
+/// A bare `usize` cannot answer this conservatively, and that is arithmetic rather
+/// than taste: the count is consumed in BOTH directions. `count <= 1` is a LICENSE (a
+/// fact keyed on the local's bare name means one thing everywhere), while `count > 1`
+/// is a DISQUALIFICATION (the caller drops a hypothesis). A write the seam cannot
+/// locate — [`LocalWrite::Unlocatable`], a pointer write or inline asm with no
+/// destination `Place` — must fail BOTH: it must not license, and it must disqualify.
+/// No integer does that. `0` licenses and does not disqualify; `1` licenses; any
+/// `n >= 2` disqualifies but also claims values that may not exist, and reads as a
+/// definite count at an `== n` call site. So "I could not see" is a VARIANT, and every
+/// consumer asks a predicate rather than comparing.
+///
+/// Like [`LocalWrite`], this is deliberately NOT `#[non_exhaustive]`: a consumer's
+/// match over it must break when a case is added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValueCount {
+    /// The seam located every write that can reach the local: it holds exactly this
+    /// many values.
+    Exactly(usize),
+    /// The seam located this many writes AND at least one write it could not locate,
+    /// which may have added more. Every AFFIRMATIVE question answers `false`.
+    AtLeast(usize),
+}
+
+impl ValueCount {
+    /// No values, and nothing unlocated — the starting point of a count.
+    pub const ZERO: ValueCount = ValueCount::Exactly(0);
+
+    /// `n` more LOCATED values. Exactness is unchanged: locating more writes neither
+    /// creates nor resolves an unlocated one.
+    #[must_use]
+    pub fn plus(self, n: usize) -> Self {
+        match self {
+            ValueCount::Exactly(k) => ValueCount::Exactly(k.saturating_add(n)),
+            ValueCount::AtLeast(k) => ValueCount::AtLeast(k.saturating_add(n)),
+        }
+    }
+
+    /// One more write the seam could NOT locate. The located total does not move —
+    /// the write may have replaced the local's value or may not have touched it — but
+    /// the count stops being exact, which is the whole of what is known.
+    #[must_use]
+    pub fn plus_unlocatable(self) -> Self {
+        match self {
+            ValueCount::Exactly(k) | ValueCount::AtLeast(k) => ValueCount::AtLeast(k),
+        }
+    }
+
+    /// True iff the local PROVABLY holds at most `n` values — the LICENSE direction,
+    /// which an inexact count can never take.
+    #[must_use]
+    pub fn is_at_most(self, n: usize) -> bool {
+        match self {
+            ValueCount::Exactly(k) => k <= n,
+            ValueCount::AtLeast(_) => false,
+        }
+    }
+
+    /// True iff the local PROVABLY holds exactly `n` values — the other affirmative
+    /// direction, taken by callers that recognise a two-definition shape.
+    #[must_use]
+    pub fn is_exactly(self, n: usize) -> bool {
+        match self {
+            ValueCount::Exactly(k) => k == n,
+            ValueCount::AtLeast(_) => false,
+        }
+    }
+
+    /// True iff the local MAY hold more than `n` values — the DISQUALIFYING direction.
+    ///
+    /// Defined as the negation of [`ValueCount::is_at_most`] rather than as a second
+    /// match, so a gate written either way answers the same way about an inexact
+    /// count: it is refused a license AND it is disqualified.
+    #[must_use]
+    pub fn may_exceed(self, n: usize) -> bool {
+        !self.is_at_most(n)
+    }
 }
 
 /// A place (lvalue) in MIR — a local variable possibly with projections.
@@ -7101,9 +7560,52 @@ pub enum ConstValue {
         kind: CallableKind,
         def_path_hash: CallableDefPathHash,
     },
+    /// Trust: EFHT-P (2026-08-30) — a SHARED reference to an all-scalar STRUCT promoted
+    /// constant, with its field values in declaration order. Emitted ONLY from the
+    /// valtree path (`mir::Const::Unevaluated`/`Const::Ty` through
+    /// `const_operand_value` -> `destructure_adt_const` -> `scalar_valtree_to_const_value`),
+    /// never from a `Const::Val` scalar pointer and never for a static — valtree
+    /// construction itself refuses statics, `UnsafeCell` and raw pointers.
+    ///
+    /// Each `fields[i]` is `ConstValue::Int(_)` or `ConstValue::Uint(_, _)` ONLY: a
+    /// `bool`/`char`/float/nested-ADT/`NonZero` field makes the extractor return `None`
+    /// and the constant stays [`ConstValue::OpaqueConst`] (`scalar_valtree_to_const_value`
+    /// has no `Bool` arm, so the reach for bool-field structs is zero by construction —
+    /// stated here so nobody sizes it from this comment).
+    ///
+    /// Value-lowering everywhere is IDENTICAL to `OpaqueConst` (a fresh symbolic
+    /// reference; length/contents never asserted; equality UNKNOWN, never
+    /// `Some(false)`); the fields are consumed SYNTACTICALLY by the EFHT-P transport
+    /// lane only, exactly as [`ConstValue::UnitVariantRef`]'s doc says of its variant
+    /// info. Appended LAST so positional Serde formats retain every historical
+    /// discriminant (serde-JSON is externally tagged by NAME, so old dumps
+    /// deserialize unchanged regardless — the append-last discipline is kept anyway).
+    StructScalarFieldsRef {
+        adt_name: String,
+        fields: Vec<ConstValue>,
+    },
 }
 
 impl ConstValue {
+    /// Trust: EFHT-P (2026-08-30) — is this constant an OPAQUE REFERENCE carrier: a
+    /// reference-typed constant whose VALUE every consumer must model as a fresh
+    /// symbolic reference (contents never asserted, equality unknown)? `true` for
+    /// exactly [`ConstValue::OpaqueConst`], [`ConstValue::UnitVariantRef`] and
+    /// [`ConstValue::StructScalarFieldsRef`] — the syntactic payload the latter two
+    /// carry is evidence for the eq-guard/transport channels, never a value claim.
+    /// Consumers that treat `OpaqueConst` as an opaque ref should treat every variant
+    /// this returns `true` for identically; the classifier pin in this file's test
+    /// module keeps the partition total with no wildcard.
+    #[must_use]
+    pub fn is_opaque_reference(&self) -> bool {
+        matches!(
+            self,
+            ConstValue::OpaqueConst
+                | ConstValue::UnitVariantRef { .. }
+                | ConstValue::StructScalarFieldsRef { .. }
+        )
+    }
+
     /// Injective SMT identifier for a callable item's extraction identity.
     ///
     /// The callable kind has a distinct fixed prefix, both collision-checked
@@ -8181,6 +8683,25 @@ declare_model_variant_census!(
 );
 
 declare_model_variant_census!(
+    STATEMENT_VARIANT_NAMES,
+    statement_variant_name_for_census,
+    Statement,
+    Statement::Assign { .. } => "Statement::Assign",
+    Statement::StorageLive(..) => "Statement::StorageLive",
+    Statement::StorageDead(..) => "Statement::StorageDead",
+    Statement::SetDiscriminant { .. } => "Statement::SetDiscriminant",
+    Statement::Deinit { .. } => "Statement::Deinit",
+    Statement::Retag { .. } => "Statement::Retag",
+    Statement::PlaceMention(..) => "Statement::PlaceMention",
+    Statement::Intrinsic { .. } => "Statement::Intrinsic",
+    Statement::CopyNonOverlapping { .. } => "Statement::CopyNonOverlapping",
+    Statement::Unsupported { .. } => "Statement::Unsupported",
+    Statement::Coverage => "Statement::Coverage",
+    Statement::ConstEvalCounter => "Statement::ConstEvalCounter",
+    Statement::Nop => "Statement::Nop",
+);
+
+declare_model_variant_census!(
     TERMINATOR_VARIANT_NAMES,
     terminator_variant_name_for_census,
     Terminator,
@@ -8244,6 +8765,41 @@ impl Terminator {
             | Terminator::Assert { .. }
             | Terminator::Unreachable
             | Terminator::Resume => WriteEffect::NoValueWrite,
+        }
+    }
+
+    /// [`WriteEffect`] resolved onto ONE local — see [`LocalWrite`] and
+    /// [`Statement::local_write`]. EXHAUSTIVE (no wildcard); `Terminator` is
+    /// `#[non_exhaustive]`, so this classifier can only live in this crate.
+    ///
+    /// A `Call` destination does not REPLACE the local's earlier values: on the UNWIND
+    /// edge the call never wrote it, so the pre-call value is still live in the cleanup
+    /// region. Counting the destination as one MORE value is the sound reading.
+    pub fn local_write(&self, local: usize) -> LocalWrite<'_> {
+        match self {
+            Terminator::Call { dest, .. } => LocalWrite::of_place(dest, local, None),
+            // `become f(..)` writes the implicit return place and returns to OUR
+            // caller, so it has no destination `Place` of its own.
+            Terminator::TailCall { .. } => {
+                if local == 0 {
+                    LocalWrite::WholeOpaque
+                } else {
+                    LocalWrite::Untouched
+                }
+            }
+            // A custom `Drop::drop` takes `&mut self`; "needs a &mut escape" is the
+            // reason `write_effect` calls this `FailClosedOrBackstopped`.
+            Terminator::Drop { place, .. } => {
+                LocalWrite::of_place(place, local, None).demote_to_partial()
+            }
+            // Inline asm and unmodelled control flow: no destination place to key on.
+            Terminator::Opaque { .. } => LocalWrite::Unlocatable,
+            Terminator::Goto(_)
+            | Terminator::SwitchInt { .. }
+            | Terminator::Return
+            | Terminator::Assert { .. }
+            | Terminator::Unreachable
+            | Terminator::Resume => LocalWrite::Untouched,
         }
     }
 
@@ -8523,6 +9079,10 @@ pub fn principal_arg_refusal_tag_for(shape: RefusalShape) -> &'static str {
         RefusalShape::SymbolicArrayLen => "Ty(dyn principal arg: symbolic array len)",
         RefusalShape::TooDeep => "Ty(dyn principal arg: nesting too deep)",
         RefusalShape::Ambiguous => "Ty(dyn principal arg: ambiguous rendering)",
+        RefusalShape::SelfReferential => "Ty(dyn principal arg: self-referential key)",
+        RefusalShape::ReentryBoundExceeded => {
+            "Ty(dyn principal arg: key re-entrancy bound exceeded)"
+        }
     }
 }
 
@@ -8544,6 +9104,10 @@ pub fn assoc_binding_refusal_tag_for(shape: RefusalShape) -> &'static str {
         RefusalShape::SymbolicArrayLen => "Ty(dyn assoc binding: symbolic array len)",
         RefusalShape::TooDeep => "Ty(dyn assoc binding: nesting too deep)",
         RefusalShape::Ambiguous => "Ty(dyn assoc binding: ambiguous rendering)",
+        RefusalShape::SelfReferential => "Ty(dyn assoc binding: self-referential key)",
+        RefusalShape::ReentryBoundExceeded => {
+            "Ty(dyn assoc binding: key re-entrancy bound exceeded)"
+        }
     }
 }
 
@@ -8569,6 +9133,26 @@ pub enum RefusalShape {
     /// Trust (vtable slice 18): a rendered component that is not unambiguously
     /// delimited — see [`key_component_is_unambiguous`]. Asserted, never assumed.
     Ambiguous,
+    /// The key rendering RE-ENTERED its own type: rendering a component runs the full
+    /// type lowering to decide whether the closed grammar admits it, and that lowering
+    /// walked back to a trait object whose key is the one being rendered. The smallest
+    /// instance is an enum `V` holding an `Arc<dyn Fn(&[V]) -> _>`; `clean-runtime` is
+    /// the shipped one.
+    ///
+    /// A genuine REFUSAL, not a truncation: the chain resets the renderer's depth on
+    /// every trip, so there is no finite rendering to stop short of. Before this shape
+    /// existed the same input took `trustc` down with a SIGBUS.
+    /// See `trust_mir_extract::KeySkeletonFrame`.
+    SelfReferential,
+    /// The renderer's RE-ENTRANCY BOUND was hit — it STOPPED, and that is deliberately
+    /// not the same statement as [`RefusalShape::SelfReferential`].
+    ///
+    /// The self-referential detector catches a REPEATED type; a generic family can
+    /// re-enter with a NEW type every trip (`struct S<T>(Box<dyn Fn(&S<Box<T>>)>)`) and
+    /// never repeat one, so a well-founded frame bound is what actually makes the
+    /// renderer terminate. Keeping it a distinct shape is the point: a bound that was
+    /// hit must be countable as a bound, never as "this type has no key".
+    ReentryBoundExceeded,
 }
 
 /// Walk the closed grammar's COMPOSITE arms to the first leaf that refuses, so the tag
@@ -11605,6 +12189,7 @@ mod tests {
             layout: None,
             enum_layout: None,
             adt_kind: None,
+            arbitrary_precision: None,
         };
 
         // 1. An ADT definition resolves, and to EXACTLY itself — no projection,
@@ -11647,6 +12232,7 @@ mod tests {
                 layout: None,
                 enum_layout: None,
                 adt_kind: None,
+                arbitrary_precision: None,
             },
         ));
         assert!(junk.is_empty(), "nothing malformed may reach the table");
@@ -12158,6 +12744,7 @@ mod tests {
             disc_index_safe: true,
             faithful_enum_repr: repr,
             enum_layout: None,
+            arbitrary_precision: None,
         }
     }
 
@@ -12336,6 +12923,7 @@ mod tests {
             disc_index_safe: false,
             faithful_enum_repr: Some(None),
             enum_layout: None,
+            arbitrary_precision: None,
         };
         let marked_bytes = bincode::serialize(&marked).expect("serialize marked ADT");
         let marked_back: Ty = bincode::deserialize(&marked_bytes).expect("deserialize marked ADT");
@@ -12352,6 +12940,7 @@ mod tests {
         // round-trips the binary wire.
         let laid = Ty::Adt {
             adt_kind: None,
+            arbitrary_precision: None,
             layout: None,
             name: "Legacy".into(),
             fields: Vec::new(),
@@ -12387,6 +12976,152 @@ mod tests {
         assert!(!Ty::Bool.disc_index_safe());
         assert!(!Ty::u32().disc_index_safe());
         assert!(!Ty::Array { elem: Box::new(Ty::u8()), len: 4 }.disc_index_safe());
+    }
+
+    /// F6 SOUNDNESS PIN: the arbitrary-precision provenance stamp is
+    /// `#[serde(skip)]`, so a serialized→deserialized (shadow) bundle is NEVER
+    /// authenticated — the decoded value reads `None` regardless of what was
+    /// stamped in memory. This is the keystone that a decoded bundle cannot
+    /// inherit F6 discharge authority.
+    #[test]
+    fn f6_arbitrary_precision_stamp_never_survives_roundtrip() {
+        // A stamped `BigInt`-shaped ADT, as only the authenticating extractor
+        // would build it.
+        let stamped = Ty::Adt {
+            name: "num_bigint::BigInt".into(),
+            fields: vec![("data".into(), Ty::u64())],
+            variants: Vec::new(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+            arbitrary_precision: Some(AdtAuth::ArbPrec(ArbPrecKind::Signed)),
+        };
+        assert!(
+            matches!(
+                stamped,
+                Ty::Adt { arbitrary_precision: Some(AdtAuth::ArbPrec(ArbPrecKind::Signed)), .. }
+            ),
+            "in-memory stamp must be present before serialization"
+        );
+
+        // JSON round-trip: the stamp must NOT survive (skip-serialized).
+        let json = serde_json::to_string(&stamped).expect("serialize stamped ADT (json)");
+        assert!(
+            !json.contains("arbitrary_precision"),
+            "the stamp must never appear in the serialized wire, got: {json}"
+        );
+        let json_back: Ty = serde_json::from_str(&json).expect("deserialize stamped ADT (json)");
+        assert!(
+            matches!(json_back, Ty::Adt { arbitrary_precision: None, .. }),
+            "a JSON-decoded bundle must read None — never authenticated"
+        );
+
+        // bincode round-trip: same soundness pin, and the sequence-based wire is
+        // unaffected by the skipped field (no desync).
+        let bytes = bincode::serialize(&stamped).expect("serialize stamped ADT (bincode)");
+        let bin_back: Ty = bincode::deserialize(&bytes).expect("deserialize stamped ADT (bincode)");
+        assert!(
+            matches!(bin_back, Ty::Adt { arbitrary_precision: None, .. }),
+            "a bincode-decoded bundle must read None — never authenticated"
+        );
+
+        // The stamp is not structural identity: a stamped ADT and its otherwise
+        // identical unstamped twin share the same semantic shape hash.
+        let unstamped = Ty::Adt {
+            name: "num_bigint::BigInt".into(),
+            fields: vec![("data".into(), Ty::u64())],
+            variants: Vec::new(),
+            disc_index_safe: false,
+            faithful_enum_repr: None,
+            layout: None,
+            enum_layout: None,
+            adt_kind: None,
+            arbitrary_precision: None,
+        };
+        assert_eq!(
+            stamped.try_stable_shape_hash().expect("hash stamped"),
+            unstamped.try_stable_shape_hash().expect("hash unstamped"),
+            "the transient stamp must not perturb the semantic shape hash"
+        );
+    }
+
+    // ==== P8 — a `Ratio<Big…>` comparison is NOT total ======================
+    //
+    // THE HOLE this pins (a LIVE false proof before this commit).
+    // `trust_mir_extract::convert::tcx_derived_trait_is_total`'s `(a0)` arm cleared
+    // the WHOLE auto-derive trait family — `PartialEq`/`PartialOrd`/`Ord`/`Hash`/
+    // `Debug`/`Default` — for ANY type carrying an authenticated `ArbPrec` stamp,
+    // gated on a bare `authenticate_arbitrary_precision(..).is_some()`. That accepts
+    // all FOUR kinds, the two RATIONAL ones included. But
+    // `impl<T: Clone + Integer> Ord for Ratio<T>` (num-rational 0.4.2
+    // src/lib.rs:341-391) falls through — whenever the denominators AND the
+    // numerators differ — to `self.numer.div_mod_floor(&self.denom)`: a DIVISION BY
+    // THE DENOMINATOR, which PANICS for a zero denominator. That denominator is
+    // reachable from safe stable code, because `Ratio::new_raw(n, 0)` is a public
+    // `const fn` that performs no reduction (src/lib.rs:80) — its own rustdoc says
+    // so. `PartialOrd for Ratio<T>` is `Some(self.cmp(other))`, so `partial_cmp` and
+    // the provided `lt`/`le`/`gt`/`ge` inherit the same panic.
+    //
+    // Consequence of the blanket clear: `apply_total_partial_ord_sentinel` rewrote
+    // `<Ratio<Big…> as Ord>::cmp` / `<Ratio<Big…> as PartialOrd>::{lt,le,gt,ge,
+    // partial_cmp}` to `TRUST_TOTAL_CLONE_SENTINEL`, which the bridge models as a
+    // panic-free no-op — so a caller comparing two `Ratio<Big…>` values emitted ZERO
+    // panic obligations and was reported "trivially panic-free" while the program
+    // really panics. MEASURED on the toolchain deployed at ~/.trust-tc-recon on
+    // 2026-08-15 (canary P8a/P8b/P8c: `total == 0`, no obligation row; the unstamped
+    // `Ratio<i64>` twin P8d correctly kept its `[trust-absent-callee-assumption]`
+    // row).
+    //
+    // DO NOT "unify the kinds" here. Authentication is not the question: a
+    // `Ratio<BigInt>` is fully authenticated and its `cmp` still divides. The split
+    // is exactly RC-C's, already applied on the bridge side by
+    // `is_integer_arbitrary_precision_ty`.
+    #[test]
+    fn arbprec_derived_trait_family_clear_admits_only_the_integer_bignums() {
+        // FAILS on the unfixed code (which had no gate at all — every authenticated
+        // kind cleared the family): a RATIONAL kind must NOT clear it.
+        assert!(
+            !ArbPrecKind::RatioSigned.clears_total_derived_trait_family(),
+            "`Ratio<BigInt>`'s Ord::cmp divides by the denominator (num-rational 0.4.2 \
+             src/lib.rs:341-391) and `Ratio::new_raw(n, 0)` is safe stable code — it must \
+             never blanket-clear the derived-trait family"
+        );
+        assert!(
+            !ArbPrecKind::RatioUnsigned.clears_total_derived_trait_family(),
+            "the RatioUnsigned half rides the SAME div_mod_floor fallthrough; a narrowing \
+             that only excluded RatioSigned would still ship the false proof"
+        );
+        // NO REGRESSION — the INTEGER bignums keep the clear. `<BigInt as Ord>::cmp` /
+        // `<BigUint as Ord>::cmp` compare a sign and then two limb slices (num-bigint
+        // 0.4.6 `cmp_slice`); there is no division anywhere in them, so they ARE total
+        // and over-tightening them would be a regression this suite must also catch.
+        assert!(
+            ArbPrecKind::Signed.clears_total_derived_trait_family(),
+            "`BigInt`'s cmp/eq/hash are limb-slice walks with no division — still total"
+        );
+        assert!(
+            ArbPrecKind::Unsigned.clears_total_derived_trait_family(),
+            "`BigUint`'s cmp/eq/hash are limb-slice walks with no division — still total"
+        );
+        // EXHAUSTIVENESS: the decision is a real `match`, so a future kind cannot
+        // inherit a default. This assertion re-states the complete partition so that
+        // adding a variant breaks HERE (compile error on the match below) rather than
+        // silently widening the clear.
+        for kind in
+            [ArbPrecKind::Signed, ArbPrecKind::Unsigned, ArbPrecKind::RatioSigned, ArbPrecKind::RatioUnsigned]
+        {
+            let expected = match kind {
+                ArbPrecKind::Signed | ArbPrecKind::Unsigned => true,
+                ArbPrecKind::RatioSigned | ArbPrecKind::RatioUnsigned => false,
+            };
+            assert_eq!(
+                kind.clears_total_derived_trait_family(),
+                expected,
+                "the integer/rational partition must stay exactly this, for {kind:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -12935,6 +13670,59 @@ mod tests {
         );
     }
 
+    /// The re-entrancy shapes are REPORTED, and reported APART.
+    ///
+    /// `SelfReferential` says "this key requires itself" — a fact about the type.
+    /// `ReentryBoundExceeded` says "the renderer stopped" — a fact about the renderer.
+    /// Collapsing them, or folding either into an existing bucket, would encode "I
+    /// stopped looking" as "I found nothing", which is the exact failure this bound was
+    /// added to avoid.
+    #[test]
+    fn key_reentrancy_refusals_are_reported_and_distinct() {
+        let all = [
+            principal_arg_refusal_tag_for(RefusalShape::SelfReferential),
+            principal_arg_refusal_tag_for(RefusalShape::ReentryBoundExceeded),
+            assoc_binding_refusal_tag_for(RefusalShape::SelfReferential),
+            assoc_binding_refusal_tag_for(RefusalShape::ReentryBoundExceeded),
+        ];
+        let mut seen: Vec<&str> = Vec::new();
+        for tag in all {
+            assert!(!seen.contains(&tag), "re-entrancy tags must not collapse: {tag}");
+            seen.push(tag);
+        }
+
+        // And apart from every OTHER shape, in both populations: a bound that was hit
+        // must not be countable as one of the ordinary grammar refusals.
+        for other in [
+            RefusalShape::Nominal,
+            RefusalShape::Unsized,
+            RefusalShape::FnLike,
+            RefusalShape::Opaque,
+            RefusalShape::Other,
+            RefusalShape::NominalConstArg,
+            RefusalShape::UnkeyablePath,
+            RefusalShape::SymbolicArrayLen,
+            RefusalShape::TooDeep,
+            RefusalShape::Ambiguous,
+        ] {
+            assert!(!seen.contains(&principal_arg_refusal_tag_for(other)));
+            assert!(!seen.contains(&assoc_binding_refusal_tag_for(other)));
+        }
+
+        // A STOP is not a REFUSAL, and the strings have to say so on their face — these
+        // land in operator-facing histograms where the distinction is the whole point.
+        assert!(
+            principal_arg_refusal_tag_for(RefusalShape::ReentryBoundExceeded)
+                .contains("bound exceeded"),
+            "the frame-bound tag must name the bound it hit"
+        );
+        assert!(
+            principal_arg_refusal_tag_for(RefusalShape::SelfReferential)
+                .contains("self-referential"),
+            "the cycle tag must name the cycle"
+        );
+    }
+
     // ---------------------------------------------------------------------------------
     // Trust (vtable slice 18): the NOMINAL key. The obligation is INJECTIVITY OVER THE
     // TYPE, so it is proven here per shape rather than asserted in prose.
@@ -13433,5 +14221,323 @@ mod callee_identity_forgery_tests {
         // Round-trip: what we write, we read back unchanged.
         let back: Terminator = serde_json::from_str(&with).expect("round-trips");
         assert_eq!(identity_of(&back), Some(honest(5)));
+    }
+}
+
+/// The write-channel classifier, checked VARIANT BY VARIANT against the
+/// write-completeness taxonomy it refines.
+///
+/// [`Statement::local_write`] and [`Terminator::local_write`] are wildcard-free, so a
+/// NEW variant is a compile error there. Re-classifying an EXISTING variant's
+/// [`WriteEffect`] is not, and these rows are what catch it: every variant is
+/// constructed once and its channel is required to agree with its effect.
+#[cfg(test)]
+mod model_write_channel_tests {
+    use super::*;
+
+    fn span() -> SourceSpan {
+        SourceSpan {
+            file: "f.rs".to_string(),
+            line_start: 1,
+            col_start: 1,
+            line_end: 1,
+            col_end: 1,
+        }
+    }
+
+    fn whole(local: usize) -> Place {
+        Place::local(local)
+    }
+
+    /// One value of EVERY `Statement` variant. The list is checked against
+    /// `Statement::write_effect`'s own arms by the row below, so a new variant that
+    /// this list forgets is visible as soon as the classifier is updated for it.
+    fn every_statement() -> Vec<Statement> {
+        vec![
+            Statement::Assign {
+                place: whole(1),
+                rvalue: Rvalue::Use(Operand::Copy(whole(2))),
+                span: span(),
+            },
+            Statement::StorageLive(1),
+            Statement::StorageDead(1),
+            Statement::SetDiscriminant { place: whole(1), variant_index: 0 },
+            Statement::Deinit { place: whole(1) },
+            Statement::Retag { place: whole(1) },
+            Statement::PlaceMention(whole(1)),
+            Statement::Intrinsic { name: "assume".to_string(), args: vec![] },
+            Statement::CopyNonOverlapping {
+                src: Operand::Copy(whole(2)),
+                dst: Operand::Copy(whole(3)),
+                count: Operand::Copy(whole(4)),
+                elem_ty: Ty::Bool,
+                span: span(),
+            },
+            Statement::Unsupported {
+                kind: "k".to_string(),
+                detail: "d".to_string(),
+                operands: vec![],
+                span: span(),
+            },
+            Statement::Coverage,
+            Statement::ConstEvalCounter,
+            Statement::Nop,
+        ]
+    }
+
+    fn every_terminator() -> Vec<Terminator> {
+        vec![
+            Terminator::Goto(BlockId(1)),
+            Terminator::SwitchInt {
+                discr: Operand::Copy(whole(1)),
+                targets: vec![],
+                otherwise: BlockId(1),
+                exhaustive_enum_unreachable: false,
+                span: span(),
+            },
+            Terminator::Return,
+            Terminator::Call {
+                func: "g".to_string(),
+                args: vec![],
+                dest: whole(1),
+                target: Some(BlockId(1)),
+                span: span(),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+                unwind: UnwindEdge::default(),
+                callee_identity: None,
+            },
+            Terminator::TailCall {
+                func: "g".to_string(),
+                args: vec![],
+                span: span(),
+                atomic: None,
+                is_foreign: false,
+                is_unsafe_sig: false,
+                callee_identity: None,
+            },
+            Terminator::Assert {
+                cond: Operand::Copy(whole(1)),
+                expected: true,
+                msg: AssertMessage::BoundsCheck,
+                target: BlockId(1),
+                span: span(),
+                unwind: UnwindEdge::default(),
+            },
+            Terminator::Drop {
+                place: whole(1),
+                target: BlockId(1),
+                span: span(),
+                unwind: UnwindEdge::default(),
+            },
+            Terminator::Opaque { kind: "asm".to_string(), targets: vec![], span: span() },
+            Terminator::Unreachable,
+            Terminator::Resume,
+        ]
+    }
+
+    #[test]
+    fn every_statement_variant_channel_agrees_with_its_write_effect() {
+        for stmt in every_statement() {
+            for local in 0..6 {
+                let channel = stmt.local_write(local);
+                assert!(
+                    channel.agrees_with(stmt.write_effect()),
+                    "{stmt:?} (local {local}): channel {channel:?} contradicts {:?}",
+                    stmt.write_effect()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_terminator_variant_channel_agrees_with_its_write_effect() {
+        for term in every_terminator() {
+            for local in 0..6 {
+                let channel = term.local_write(local);
+                assert!(
+                    channel.agrees_with(term.write_effect()),
+                    "{term:?} (local {local}): channel {channel:?} contradicts {:?}",
+                    term.write_effect()
+                );
+            }
+        }
+    }
+
+    /// The statement list above is COMPLETE against the crate's own variant census, so
+    /// a new statement variant cannot slip past the agreement row by being absent from
+    /// the fixture list. The census is itself a wildcard-free match, so the variant has
+    /// to be added to it before this can be run at all.
+    #[test]
+    fn the_statement_fixture_list_covers_the_variant_census() {
+        let mut seen: Vec<&str> =
+            every_statement().iter().map(statement_variant_name_for_census).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let mut all: Vec<&str> = STATEMENT_VARIANT_NAMES.to_vec();
+        all.sort_unstable();
+        assert_eq!(seen, all, "the fixture list and the variant census must agree");
+    }
+
+    /// The terminator list above is COMPLETE against the crate's own variant census,
+    /// so a new terminator variant cannot slip past the agreement row by being absent
+    /// from the fixture list.
+    #[test]
+    fn the_terminator_fixture_list_covers_the_variant_census() {
+        let mut seen: Vec<&str> =
+            every_terminator().iter().map(terminator_variant_name_for_census).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        let mut all: Vec<&str> = TERMINATOR_VARIANT_NAMES.to_vec();
+        all.sort_unstable();
+        assert_eq!(seen, all, "the fixture list and the variant census must agree");
+    }
+
+    /// A `FailClosedOrBackstopped` write with no destination `Place` must reach EVERY
+    /// local: the seam cannot rule any of them out, so it fails closed.
+    #[test]
+    fn unlocatable_writes_reach_every_local() {
+        let asm = Terminator::Opaque { kind: "asm".to_string(), targets: vec![], span: span() };
+        for local in 0..6 {
+            assert!(matches!(asm.local_write(local), LocalWrite::Unlocatable));
+        }
+    }
+
+    /// A write THROUGH a local (`*p = v`) changes the POINTEE, not `p`.
+    #[test]
+    fn a_deref_store_does_not_write_the_pointer_local() {
+        let stmt = Statement::Assign {
+            place: Place { local: 1, projections: vec![Projection::Deref] },
+            rvalue: Rvalue::Use(Operand::Copy(whole(2))),
+            span: span(),
+        };
+        assert!(matches!(stmt.local_write(1), LocalWrite::Untouched));
+    }
+
+    /// A field store is a `Partial` write, not a whole definition.
+    #[test]
+    fn a_field_store_is_partial() {
+        let stmt = Statement::Assign {
+            place: Place::field(1, 0),
+            rvalue: Rvalue::Use(Operand::Copy(whole(2))),
+            span: span(),
+        };
+        assert!(matches!(stmt.local_write(1), LocalWrite::Partial));
+    }
+
+    /// `&mut local` / `&raw local` is the ESCAPE channel; a shared `&local` is not.
+    #[test]
+    fn only_mutable_aliases_escape() {
+        let mutable = Statement::Assign {
+            place: whole(2),
+            rvalue: Rvalue::Ref { mutable: true, place: whole(1) },
+            span: span(),
+        };
+        assert!(mutable.escapes_local(1));
+        let shared = Statement::Assign {
+            place: whole(2),
+            rvalue: Rvalue::Ref { mutable: false, place: whole(1) },
+            span: span(),
+        };
+        assert!(!shared.escapes_local(1));
+    }
+}
+
+/// Trust: EFHT-P (2026-08-30) — the `ConstValue` classifier partition pin. Every
+/// variant is classified by EXACTLY one bucket, with NO wildcard arm, so adding a
+/// variant breaks this match and forces a classification decision instead of a silent
+/// default.
+#[cfg(test)]
+mod const_value_classifier_pin {
+    use super::{CallableDefPathHash, CallableKind, ConstValue};
+
+    fn classify(v: &ConstValue) -> &'static str {
+        match v {
+            ConstValue::Bool(_)
+            | ConstValue::Int(_)
+            | ConstValue::Uint(..)
+            | ConstValue::Float(_)
+            | ConstValue::FloatBits { .. } => "scalar",
+            ConstValue::Unit => "unit",
+            ConstValue::Str { .. } => "str",
+            ConstValue::OpaqueConst
+            | ConstValue::UnitVariantRef { .. }
+            | ConstValue::StructScalarFieldsRef { .. } => "opaque-reference",
+            ConstValue::OpaqueScalar { .. } | ConstValue::ConstParam { .. } => "opaque-scalar",
+            ConstValue::CallableItem { .. } => "callable",
+        }
+    }
+
+    #[test]
+    fn every_variant_is_classified_and_the_opaque_reference_bucket_matches() {
+        let samples = [
+            (ConstValue::Bool(true), "scalar"),
+            (ConstValue::Int(-1), "scalar"),
+            (ConstValue::Uint(1, 8), "scalar"),
+            (ConstValue::Float(1.0), "scalar"),
+            (ConstValue::FloatBits { bits: 0, width: 32 }, "scalar"),
+            (ConstValue::Unit, "unit"),
+            (ConstValue::Str { bytes: vec![] }, "str"),
+            (ConstValue::OpaqueConst, "opaque-reference"),
+            (
+                ConstValue::UnitVariantRef { enum_name: "e".into(), variant: 0 },
+                "opaque-reference",
+            ),
+            (
+                ConstValue::StructScalarFieldsRef {
+                    adt_name: "s".into(),
+                    fields: vec![ConstValue::Uint(7, 8)],
+                },
+                "opaque-reference",
+            ),
+            (ConstValue::OpaqueScalar { width: 8, signed: false }, "opaque-scalar"),
+            (
+                ConstValue::ConstParam { index: 0, name: "N".into(), width: 64, signed: false },
+                "opaque-scalar",
+            ),
+            (
+                ConstValue::CallableItem {
+                    def_path: "f".into(),
+                    kind: CallableKind::FnDef,
+                    def_path_hash: CallableDefPathHash::new(0, 0),
+                },
+                "callable",
+            ),
+        ];
+        for (v, want) in &samples {
+            assert_eq!(classify(v), *want, "{v:?}");
+            assert_eq!(v.is_opaque_reference(), *want == "opaque-reference", "{v:?}");
+        }
+    }
+
+    /// Serde: the appended variant round-trips, and a dump WITHOUT it (every historical
+    /// dump) still deserializes — externally tagged by name, position-independent.
+    #[test]
+    fn struct_scalar_fields_ref_serde_round_trip_and_old_dumps_unaffected() {
+        let v = ConstValue::StructScalarFieldsRef {
+            adt_name: "icu_properties::props::BidiClass".into(),
+            fields: vec![ConstValue::Uint(5, 8)],
+        };
+        let j = serde_json::to_string(&v).expect("serializes");
+        let back: ConstValue = serde_json::from_str(&j).expect("round-trips");
+        match back {
+            ConstValue::StructScalarFieldsRef { adt_name, fields } => {
+                assert_eq!(adt_name, "icu_properties::props::BidiClass");
+                // Trust: `ConstValue` deliberately has NO `PartialEq` — an opaque
+                // reference carrier's equality is UNKNOWN (never `Some(false)`), so a
+                // derived structural `==` would make `OpaqueConst == OpaqueConst` read
+                // `true` for referents that may differ. Compare by pattern instead.
+                assert_eq!(fields.len(), 1);
+                assert!(
+                    matches!(fields[0], ConstValue::Uint(5, 8)),
+                    "field 0 round-trips as u8 5: {:?}",
+                    fields[0]
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let old: ConstValue = serde_json::from_str("\"OpaqueConst\"").expect("old dumps still read");
+        assert!(matches!(old, ConstValue::OpaqueConst));
     }
 }

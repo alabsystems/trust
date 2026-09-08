@@ -1,0 +1,9 @@
+{
+  "schema": "trust-std-coverage-v1",
+  "lane": "std-core-num-l0",
+  "generated_by": "MEASURED 2026-08-30, first Mode::Std verification-lane build (TRUST_BOOTSTRAP_VERIFY_LIBRARY=core, cold stage1-std, trustc @ tip; log preserved in the step-4 commit message). Crate result: RED \u2014 681 errors (311 L0-incomplete, 226 native-lowering-did-not-complete, 134 strict-failed, 8 skipped, 1 ICE at rustc_middle hir map body_owned_by on core::ops::function::FnOnce::call_once). core::num verified functions: 0 (uint_macros.rs carries 58 errors; wiring B correctly turns would-be assumption records red). Ten core functions OUTSIDE core::num fully discharged 12 L0 obligations (e.g. ub_checks::maybe_is_aligned_and_not_null, slice::<impl [T]>::copy_from_slice) \u2014 real proofs inside core, first ever, not yet counted by this lane's slice. Floors stay 0/0 per the failed-measurement policy: a red core build is a successful measurement of plan \u00a76 question 1, recorded, not reverted.",
+  "assumption_records_excluded": true,
+  "verified_functions": [],
+  "verified_function_count": 0,
+  "discharged_l0_obligation_count": 0
+}

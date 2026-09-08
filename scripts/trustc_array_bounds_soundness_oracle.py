@@ -17,7 +17,7 @@ recovery target — its bounds obligation proves even with N symbolic, so once t
 spurious array-TYPE marker is relaxed the whole function is PROVED.
 
 Usage:  python3 scripts/trustc_array_bounds_soundness_oracle.py [path-to-trustc]
-Skips (exit 0) with a notice if no built trustc is found.
+REFUSES (exit 2) if no built trustc is found — a green with nothing measured is a false green.
 """
 import json
 import os
@@ -69,8 +69,11 @@ def find_trustc(argv):
 def main():
     trustc = find_trustc(sys.argv)
     if not trustc:
-        print("NOTICE: no built trustc found (build/<host>/stage2/bin/trustc) — skipping.")
-        return 0
+        # NOT a skip: a soundness oracle that exits 0 with no compiler present is a
+        # false green (caught 2026-08-30 during a live stage2 rebuild — the lane read
+        # PASS having measured nothing). Same ruling as trust_self_verify.sh.
+        print("REFUSED: no built trustc (build/<host>/stage2/bin/trustc) — nothing was measured")
+        return 2
 
     with tempfile.TemporaryDirectory() as d:
         src = os.path.join(d, "array_bounds_soundness.rs")

@@ -1,0 +1,171 @@
+{
+  "name": "{closure#0}",
+  "def_path": "P::s1_poison::{closure#0}",
+  "span": {
+    "file": "lib.rs",
+    "line_start": 15,
+    "col_start": 30,
+    "line_end": 15,
+    "col_end": 45
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Closure": {
+            "name": "P::s1_poison::{closure#0}",
+            "upvars": [],
+            "call": {
+              "kind": "FnOnce",
+              "params": [
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Adt": {
+                        "name": "core::cell::Cell",
+                        "fields": [
+                          [
+                            "value",
+                            {
+                              "Adt": {
+                                "name": "core::cell::UnsafeCell",
+                                "fields": [
+                                  [
+                                    "value",
+                                    "Bool"
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  }
+                }
+              ],
+              "ret": null
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::cell::Cell",
+                "fields": [
+                  [
+                    "value",
+                    {
+                      "Adt": {
+                        "name": "core::cell::UnsafeCell",
+                        "fields": [
+                          [
+                            "value",
+                            "Bool"
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "p"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "core::cell::Cell::<bool>::set",
+            "args": [
+              {
+                "Move": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Constant": {
+                  "Bool": true
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "lib.rs",
+              "line_start": 15,
+              "col_start": 36,
+              "line_end": 15,
+              "col_end": 36
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

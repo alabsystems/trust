@@ -28,11 +28,11 @@ pub(super) fn generate_unbounded_allocation_vcs(
     // allocation bounded by a DOMINATING runtime guard (`if n <= BOUND { … }`),
     // an assert-passed semantic guard, or a `#[requires]` precondition proves —
     // while a truly unguarded one fails closed with a counterexample.
-    let guard_paths_map = v2_build_path_guard_map(func);
+    let guard_paths_map = super::guard_map_for(func);
     let semantic_guards = build_semantic_guard_map(func);
     let may_reassigned = v2_may_reassigned_per_block(func);
     // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let empty = FxHashSet::default();
     for block in &func.body.blocks {
         let Terminator::Call { func: callee, args, span, .. } = &block.terminator else {
@@ -840,8 +840,21 @@ pub(super) fn operand_local(op: &Operand) -> Option<usize> {
 }
 
 /// Find the defining statement/terminator of `local` within `func` — the
-/// `Rvalue` that assigns it, or the `Call` whose destination it is.
+/// `Rvalue` that assigns it, or the `Call` whose destination it is — when that is
+/// the ONE value `local` can hold.
+///
+/// `local_defs::has_one_explicit_def` is the whole uniqueness question: it counts a
+/// `Call` destination as a definition (this scan returns one), and it charges a
+/// PARAMETER for the implicit ENTRY definition that no statement in `body.blocks`
+/// carries. Both matter here because the caller INLINES the answer: the count
+/// derived from the returned definition BECOMES the `collect` obligation's count
+/// (`iter_collect_count`'s own doc: "an UNDER-count is a false proof"), so a
+/// parameter iterator reassigned once to a short `Range`, or a local whose two
+/// definitions are a short and a long iterator, must not resolve to the short one.
 pub(super) fn local_def(func: &VerifiableFunction, local: usize) -> Option<LocalDef<'_>> {
+    if !crate::local_defs::has_one_explicit_def(func, local) {
+        return None;
+    }
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             if let Statement::Assign { place, rvalue, .. } = stmt
@@ -1289,9 +1302,9 @@ pub(super) fn generate_v2_rvalue_safety_vcs_impl(
     func: &VerifiableFunction,
     summaries: Option<&crate::modular::SummaryDatabase>,
 ) -> Vec<VerificationCondition> {
-    let guard_paths_map = v2_build_path_guard_map(func);
+    let guard_paths_map = super::guard_map_for(func);
     // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let semantic_guards = match summaries {
         Some(s) => build_semantic_guard_map_with_summaries(func, s),
         None => build_semantic_guard_map(func),

@@ -238,7 +238,13 @@ fn body_has_unsupported(func: &VerifiableFunction) -> bool {
 fn call_abi_is_modeled(terminator: &Terminator) -> bool {
     matches!(
         terminator,
-        Terminator::Call { atomic: None, is_foreign: false, is_unsafe_sig: false, .. }
+        Terminator::Call {
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            ..
+        }
     )
 }
 

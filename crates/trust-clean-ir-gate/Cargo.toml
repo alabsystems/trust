@@ -1,0 +1,25 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0 OR MIT
+
+[package]
+name = "trust-clean-ir-gate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+description = "Independent carrier-faithfulness gate for bounded Clean-origin TrustIR bodies."
+
+[lints]
+workspace = true
+
+[dependencies]
+clean-kernel = { workspace = true }
+trust-clean-carrier = { path = "../trust-clean-carrier" }
+trust-clean-origin = { path = "../trust-clean-origin" }
+trust-ir = { workspace = true }
+trust-types = { path = "../trust-types", default-features = false }
+
+[dev-dependencies]
+trust-certify = { path = "../trust-certify" }
+trust-clean-ir = { path = "../trust-clean-ir" }

@@ -29,7 +29,7 @@ crate-type = ["rlib"]
 # passes to produce a `trust_ir::Module` per codegen unit (log-only; no codegen
 # output change).
 default = []
-trust-ir-emission = ["dep:trust-ir-bridge", "dep:serde_json"]
+trust-ir-emission = ["dep:serde_json"]
 # Trust (Step 2): OFF-BY-DEFAULT observational codegen probe. Implies
 # `trust-ir-emission` (so the per-CGU `trust_ir::Module` is built and in hand at
 # the hook). Adds NO new dependency: the `trust_ir::Module` -> LIR converter
@@ -75,6 +75,12 @@ trust-cg-bridge = { path = "../../crates/trust-cg-bridge", features = ["ay-proof
 # it here keeps that lane working unchanged.
 trust-ir = { path = "../../first-party/trust-ir/crates/trust-ir", features = ["serde"] }
 trust-mir-extract = { path = "../../crates/trust-mir-extract" }
+# Trust (F1 callee seam): the producer's session-state handoff type
+# (`AssembledCrateModuleForCodegen`) — the finalize-assembled crate module,
+# where local callee BODIES are present. Session state is keyed by TypeId, so
+# writer and reader must name the SAME type; the producer crate is its home.
+# No new link weight: rustc_mir_build already links trust-thir-lower.
+trust-thir-lower = { path = "../../crates/trust-thir-lower" }
 trust-types = { path = "../../crates/trust-types" }
 # tidy-alphabetical-end
 
@@ -83,4 +89,8 @@ trust-types = { path = "../../crates/trust-types" }
 # part of the builtin backend's link closure, so the default codegen path is
 # unchanged.
 serde_json = { workspace = true, optional = true }
-trust-ir-bridge = { path = "../../crates/trust-ir-bridge", optional = true }
+# Unconditional since the trust-ir frontend's UPSTREAM-INSTANCE lane
+# (-Ztrust-ir-upstream-mir): monomorphized upstream bodies are bridged
+# MIR -> VerifiableFunction -> trust-ir and fed to the same converter and
+# proven-output gate as the source-first artifacts.
+trust-ir-bridge = { path = "../../crates/trust-ir-bridge" }

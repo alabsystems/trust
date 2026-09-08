@@ -124,6 +124,7 @@ members = [
   "crates/trust-spec",
   "crates/trust-strengthen",
   "crates/trust-certify",
+  "crates/trust-clean-ir-gate",
   "crates/trust-symex",
   "crates/trust-temporal",
   "crates/trust-thir-lower",
@@ -354,7 +355,7 @@ warnings = "warn"
 
 # trust: workspace-level package metadata for verification pipeline crates
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alabsystems/trust"
@@ -383,6 +384,9 @@ trust-clean-origin = { path = "crates/trust-clean-origin" }
 # The Clean -> TrustIR producer. Consumes the same sealed `CleanOriginPlan`
 # `clean_origin_mir` does, and emits `trust_ir::Function` instead of `Body`.
 trust-clean-ir = { path = "crates/trust-clean-ir" }
+# Independent actual-Function reflector and digest-bound carrier gate for the
+# bounded Clean-origin TrustIR fragment.
+trust-clean-ir-gate = { path = "crates/trust-clean-ir-gate" }
 trust-clean-carrier = { path = "crates/trust-clean-carrier" }
 clean-kernel = { path = "first-party/clean/crates/clean-kernel", features = ["math-overlays"] }
 # Trust (kernel-tv, docs/design/2026-08-27-two-language-direct-to-trust-ir.md §4):
@@ -566,6 +570,24 @@ trust-cg-regalloc = { path = "first-party/trust-cg/crates/trust-cg-regalloc" }
 trust-cg-verify = { path = "first-party/trust-cg/crates/trust-cg-verify", default-features = false }
 trust-cg-codegen = { path = "first-party/trust-cg/crates/trust-cg-codegen" }
 trust-cg-bridge = { path = "crates/trust-cg-bridge" }
+# Trust: `crates/trust-ir-bridge` is a member of BOTH workspaces and inherits
+# `trust-intbound` with `workspace = true`, so the ROOT workspace must declare
+# the key too. The crate itself is stock-rustc-parseable: its native-grammar
+# contracts live behind a cfg-stripped `include!` that build.rs turns on only
+# under trustc -- see crates/trust-intbound/src/lib.rs. (The attribute contract
+# spelling was tried and REJECTED with a control: it LOSES PROOFS.)
+trust-intbound = { path = "crates/trust-intbound" }
+# Trust: wave three. `crates/trust-vcgen` is a root member too, and its verified
+# dep uses trust-intbound's cfg-stripped `include!` mechanism from the start --
+# no stub, one path for both workspaces. See crates/trust-floatbits/src/lib.rs.
+trust-floatbits = { path = "crates/trust-floatbits" }
+# Trust: trust-widthconv and trust-budget carry native-grammar contracts behind
+# the same cfg-stripped include! mechanism as trust-intbound (see its lib.rs
+# header), so the real crates are stock-rustc-parseable and the root workspace
+# consumes them directly. Do not mint stubs; that remedy fixed one workspace and
+# broke in the next (targo-trust's tool build resolves through crates/).
+trust-widthconv = { path = "crates/trust-widthconv" }
+trust-budget = { path = "crates/trust-budget" }
 trust-ir-bridge = { path = "crates/trust-ir-bridge" }
 trust-wasm-bridge = { path = "crates/trust-wasm-bridge" }
 # Trust: clean-expr = CleanCic kernel-replay proof authority (native TrustVc

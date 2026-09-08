@@ -73,7 +73,14 @@
 set -uo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 SRC="$REPO_ROOT/crates/trust-index/src/lib.rs"
-TARGO="${TARGO:-$REPO_ROOT/build/aarch64-apple-darwin/stage1/bin/targo}"
+# Trust: `build/host` is a symlink to `build/<host-triple>`, so this resolves on
+# every platform. It used to name `aarch64-apple-darwin` literally, which meant
+# that on any non-Apple host this gate could only ever print
+#   REFUSE: no targo at .../build/aarch64-apple-darwin/stage1/bin/targo
+# and exit 2 — measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
+# directory does not exist at all, for all 19 strict gates at once. A soundness
+# gate that cannot run on the host it is invoked from is not a strict gate.
+TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 
 [ -x "$TARGO" ] || { echo "REFUSE: no targo at $TARGO (set TARGO=...)"; exit 2; }
 # Two behavioural discriminators; a stage whose targo was never rebuilt ships
@@ -378,10 +385,22 @@ case "$G" in *"PASS"*) fail "mutation E: Gate still says PASS — $G";; esac
 # an advisory: this run emits NO `error:` line at all and still exits 1. A gate
 # that grepped only for `error:` would read this mutation as a pass. Assert the
 # advisory by name and the inconclusive count, and never `error:` here.
-grep -q 'Trust verification advisory for `trust_index::subslice`' "$LOG" \
-  || fail "mutation E: subslice was not even advised on — $(grep -oE 'Trust [a-zA-Z0-9 ]*for `trust_index::[a-z_]+`' "$LOG" | head -3 | tr '\n' ' ')"
-grep -qE 'Summary: 34 proved, .*[1-9][0-9]* inconclusive \(35 total\)' "$LOG" \
-  || fail "mutation E: no row went inconclusive — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
+# The REFUSAL MUST NAME THE FUNCTION -- that is the assertion. Which SHAPE the
+# refusal takes is not: measured 2026-09-01, this mutation now yields
+#   Trust Level 0 safety verification incomplete for `trust_index::subslice`
+#   Trust strict verification failed  for `trust_index::subslice`
+# where it used to yield an advisory. FAILED is STRICTLY STRONGER evidence than
+# an advisory -- the row is refuted rather than merely not established -- so
+# demanding the weaker word would fail the gate for getting a better answer.
+# The primary controls above (rc != 0, Gate not PASS) are untouched, so a
+# verifier that wrongly PASSED this mutation is still caught.
+grep -qE 'Trust (verification advisory|strict verification failed|Level 0 safety verification incomplete) for `trust_index::subslice`' "$LOG" \
+  || fail "mutation E: subslice was not even named in a refusal — $(grep -oE 'Trust [a-zA-Z0-9 ]*for `trust_index::[a-z_]+`' "$LOG" | head -3 | tr '\n' ' ')"
+# Same reasoning: the row must be REFUSED, in either shape. `1 failed` and
+# `1 inconclusive` are both refusals of the mutated obligation; only `35 proved`
+# would be the bug this asserts against, and that is excluded either way.
+grep -qE 'Summary: 34 proved, ([1-9][0-9]* failed|.*[1-9][0-9]* inconclusive).*\(35 total\)' "$LOG" \
+  || fail "mutation E: no row was refused — $(grep -oE '^Summary: .*' "$LOG" | tail -1)"
 grep -qE '^\s*\[(FAILED|UNKNOWN)\] \[slice\]' "$LOG" \
   || fail "mutation E: no slice row went FAILED or UNKNOWN — $(grep -oE '\[[A-Z]+\] \[slice\]' "$LOG" | head -3 | tr '\n' ' ')"
 rm -f "$LOG"; restore

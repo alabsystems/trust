@@ -6,7 +6,7 @@
 use trust_cg_lower::function::{
     BasicBlock as LirBlock, Function as LirFunction, Signature, StackSlotInfo,
 };
-use trust_cg_lower::instructions::{Block, Instruction, IntCC, Opcode, Value};
+use trust_cg_lower::instructions::{Block, DirectCallBinding, Instruction, IntCC, Opcode, Value};
 use trust_cg_lower::types::Type as LirType;
 use trust_types::fx::{FxHashMap, FxHashSet};
 use trust_types::{
@@ -1643,7 +1643,7 @@ fn return_args(
 
 fn abort_call_instruction() -> Instruction {
     Instruction {
-        opcode: Opcode::Call { name: ABORT_SYMBOL.to_string() },
+        opcode: Opcode::Call { name: ABORT_SYMBOL.to_string(), binding: DirectCallBinding::Interposable },
         args: vec![],
         results: vec![],
     }
@@ -1776,7 +1776,7 @@ fn panic_block_instructions(
             let mut instructions = Vec::new();
             let location = emit_panic_location(ctx, span, &mut instructions);
             instructions.push(Instruction {
-                opcode: Opcode::Call { name: symbol.clone() },
+                opcode: Opcode::Call { name: symbol.clone(), binding: DirectCallBinding::Interposable },
                 args: vec![location],
                 results: vec![],
             });
@@ -3991,7 +3991,7 @@ fn lower_terminator(
             };
 
             instructions.push(Instruction {
-                opcode: Opcode::Call { name: callee.clone() },
+                opcode: Opcode::Call { name: callee.clone(), binding: DirectCallBinding::Interposable },
                 args: arg_vals,
                 results: call_result.into_iter().collect(),
             });
@@ -4361,7 +4361,7 @@ mod terminator_runtime_tests {
                 (*block != Block(0)
                     && *block != Block(1)
                     && bb.instructions.iter().any(|inst| {
-                        matches!(&inst.opcode, Opcode::Call { name } if name == "__trust_panic_add_overflow")
+                        matches!(&inst.opcode, Opcode::Call { name, .. } if name == "__trust_panic_add_overflow")
                     }))
                 .then_some(bb)
             })
@@ -4377,7 +4377,7 @@ mod terminator_runtime_tests {
             .instructions
             .iter()
             .find(|inst| {
-                matches!(&inst.opcode, Opcode::Call { name } if name == "__trust_panic_add_overflow")
+                matches!(&inst.opcode, Opcode::Call { name, .. } if name == "__trust_panic_add_overflow")
             })
             .expect("panic block should call configured lang item");
         assert_eq!(call.args.len(), 1, "panic lang-item call must receive caller location");
@@ -4386,7 +4386,7 @@ mod terminator_runtime_tests {
             !panic_block
                 .instructions
                 .iter()
-                .any(|inst| matches!(&inst.opcode, Opcode::Call { name } if name == "abort")),
+                .any(|inst| matches!(&inst.opcode, Opcode::Call { name, .. } if name == "abort")),
             "configured panic lowering must not fall back to abort"
         );
     }
@@ -4678,9 +4678,7 @@ mod aggregate_projection_tests {
             name: "UnionLike".into(),
             fields: vec![("a".into(), Ty::i32()), ("b".into(), Ty::i64())],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+         faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let func = unit_function(
             "adt_active_field",
             vec![
@@ -4864,9 +4862,7 @@ mod aggregate_projection_tests {
             name: "OptionI32".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+         faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let func = unit_function(
             "fieldless_adt",
             vec![

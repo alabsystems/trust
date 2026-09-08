@@ -290,7 +290,7 @@ pub(super) fn v2_float_contract_magnitude_hypotheses(
                 if !crate::place_source_is_stable(func, cur) {
                     return None;
                 }
-                match crate::unique_whole_local_def(func, cur)? {
+                match crate::local_defs::unique_value_def(func, cur)? {
                     Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) => {
                         if (1..=func.body.arg_count).contains(&q.local) {
                             return contract_range(func, q);
@@ -309,8 +309,10 @@ pub(super) fn v2_float_contract_magnitude_hypotheses(
         let Some((l, u)) = range else { continue };
         let c = l.abs().max(u.abs());
         let width = 64u32;
-        let mag_width = width - 1;
-        let c_bits = (c.to_bits() & ((1u64 << mag_width) - 1)) as i128;
+        // Trust: the magnitude field width and its mask are the VERIFIED
+        // `trust-floatbits` table, not a fourth open-coded `(1 << (w-1)) - 1`.
+        let mag_width = trust_floatbits::magnitude_field_width(width);
+        let c_bits = i128::from(trust_floatbits::binary64_magnitude_bits(c.to_bits()));
         hypotheses.push(Formula::BvULe(
             Box::new(v2_float_magnitude_bits(operand_to_formula(func, operand), width)),
             Box::new(Formula::BitVec { value: c_bits, width: mag_width }),
@@ -330,7 +332,12 @@ pub(super) fn v2_float_contract_magnitude_hypotheses(
 /// [`v2_build_float_overflow_vc`] now prevents.
 #[must_use]
 pub(super) fn float_witness_width_is_supported(width: u32) -> bool {
-    matches!(width, 32 | 64)
+    // Trust: the SAME predicate the field accessors saturate on, so a width this
+    // returns `true` for is exactly a width `trust-floatbits` has a table row
+    // for. Spelled separately (`matches!(width, 32 | 64)`) they could drift, and
+    // the drift direction that matters is a `true` here for a width whose field
+    // accessors all return `0`.
+    trust_floatbits::format_supported(width) == 1
 }
 
 /// The float width of `operand`, or `None` if it is not a float.
@@ -374,19 +381,23 @@ pub(super) fn v2_float_overflow_witness_formula(
         (BinOp::Add | BinOp::Sub, width @ (32 | 64)) => {
             let lhs_value = operand_to_formula(func, lhs);
             let rhs_value = operand_to_formula(func, rhs);
-            let sign_width = 1;
-            let mag_width = width - sign_width;
-            // `width` is bound by this arm's `32 | 64` pattern, so a two-way
-            // choice is TOTAL — there is no third case, hence nothing to panic
-            // on. (Was a three-arm `match` with `_ => unreachable!`, a panic on
-            // a production path in the TCB for a case the type system of the
-            // outer pattern already excludes.)
-            let (exp_width, frac_width, threshold_bits, finite_exponent_value) = if width == 32 {
-                (8, 23, (f32::MAX / 2.0).to_bits() as u128, 0xff)
+            // Trust: the IEEE-754 field table is the VERIFIED `trust-floatbits`
+            // one. It used to be an ad-hoc tuple literal here, a second one in
+            // the Div arm and a third open-coded mask in the Mul arm; a mask
+            // that keeps the SIGN bit makes every negative operand compare as
+            // enormous and silently stops the overflow witness from firing,
+            // which is the under-approximating direction this whole module's
+            // soundness note forbids.
+            let mag_width = trust_floatbits::magnitude_field_width(width);
+            let exp_width = trust_floatbits::exponent_field_width(width);
+            let frac_width = trust_floatbits::fraction_field_width(width);
+            let finite_exponent_value = i128::from(trust_floatbits::nonfinite_exponent(width));
+            let threshold_bits = if width == 32 {
+                (f32::MAX / 2.0).to_bits() as u128
             } else {
-                (11, 52, (f64::MAX / 2.0).to_bits() as u128, 0x7ff)
+                (f64::MAX / 2.0).to_bits() as u128
             };
-            let magnitude_mask = (1u128 << mag_width) - 1;
+            let magnitude_mask = u128::from(trust_floatbits::magnitude_mask(width));
             let threshold = Formula::BitVec {
                 value: (threshold_bits & magnitude_mask) as i128,
                 width: mag_width,
@@ -446,14 +457,14 @@ pub(super) fn v2_float_overflow_witness_formula(
         // ONE operand above sqrt(MAX) (not both: `2 · MAX` overflows with one
         // small operand).
         (BinOp::Mul, width @ (32 | 64)) => {
-            let mag_width = width - 1;
-            // Total by this arm's `32 | 64` binding — see the Add/Sub arm.
+            // Trust: verified field table — see the Add/Sub arm.
+            let mag_width = trust_floatbits::magnitude_field_width(width);
             let threshold_bits = if width == 32 {
                 f32::MAX.sqrt().to_bits() as u128
             } else {
                 f64::MAX.sqrt().to_bits() as u128
             };
-            let magnitude_mask = (1u128 << mag_width) - 1;
+            let magnitude_mask = u128::from(trust_floatbits::magnitude_mask(width));
             let threshold = Formula::BitVec {
                 value: (threshold_bits & magnitude_mask) as i128,
                 width: mag_width,
@@ -481,14 +492,17 @@ pub(super) fn v2_float_overflow_witness_formula(
         // `|b| >= 1` with finite `a` bounds the quotient by `|a| <= MAX` —
         // never an overflow — so the shape over-approximates exactly.
         (BinOp::Div, width @ (32 | 64)) => {
-            let mag_width = width - 1;
-            // Total by this arm's `32 | 64` binding — see the Add/Sub arm.
-            let (exp_width, frac_width, one_bits, finite_exponent_value) = if width == 32 {
-                (8, 23, 1.0f32.to_bits() as u128, 0xff)
+            // Trust: verified field table — see the Add/Sub arm.
+            let mag_width = trust_floatbits::magnitude_field_width(width);
+            let exp_width = trust_floatbits::exponent_field_width(width);
+            let frac_width = trust_floatbits::fraction_field_width(width);
+            let finite_exponent_value = i128::from(trust_floatbits::nonfinite_exponent(width));
+            let one_bits = if width == 32 {
+                1.0f32.to_bits() as u128
             } else {
-                (11, 52, 1.0f64.to_bits() as u128, 0x7ff)
+                1.0f64.to_bits() as u128
             };
-            let magnitude_mask = (1u128 << mag_width) - 1;
+            let magnitude_mask = u128::from(trust_floatbits::magnitude_mask(width));
             let divisor_threshold =
                 Formula::BitVec { value: (one_bits & magnitude_mask) as i128, width: mag_width };
             let finite_exponent =

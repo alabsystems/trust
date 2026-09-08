@@ -247,6 +247,17 @@ pub const TRUSTIR_OPERAND_CAST_F: &str = "Trust.TrustIr.Operand.CastF";
 /// conversion, and widening its arity would renumber every later minor premise —
 /// the exact thing its own doc forbids.
 pub const TRUSTIR_OPERAND_CAST_FF: &str = "Trust.TrustIr.Operand.CastFF";
+
+/// Trust: EFHT-P (2026-08-30) — `Field2 : Nat → Nat → Nat → Operand` — a DEPTH-2 field
+/// PATH `(p, f, g)`: "field `g` of the aggregate designated by field `f` of the entry
+/// parameter `p`". Denoted by REUSE of the opaque total `idxElem` applied twice —
+/// `idxElem (idxElem (e p) f) g` — no new opaque, no new axiom. NON-recursive (three
+/// `Nat` payloads), APPENDED LAST after `CastFF` so every existing minor-premise
+/// position is unchanged. CONSUMER-ONLY: `prove::ret_model_slot` has no `PathBase`
+/// reading, so no minter can ever produce this constructor; it exists solely so the
+/// EFHT-P transport consumer can re-point a callee's depth-1 `Field(j, g)` selector at
+/// a caller path base (`prove::transport_caller_slot`).
+pub const TRUSTIR_OPERAND_FIELD2: &str = "Trust.TrustIr.Operand.Field2";
 /// Trust: DELTA-2 — `bnotAt : Int → Int → Int`, the OPAQUE total bitwise-NOT-at-width.
 /// `Declaration::Opaque`, so a term naming it gains NO axiom dependency (the
 /// `idxElem`/`sliceLen` precedent). Deliberately UNINTERPRETED: `!x` is a bitvector
@@ -1347,6 +1358,17 @@ pub enum IrOperand {
     /// never collide: a body reading both `(*self).0` and `discriminant(self)` keeps
     /// them provably distinct BY CONSTRUCTION.
     Discr(u64),
+    /// Trust: EFHT-P (2026-08-30) — `Field2 paramIdx fld fld2` — a DEPTH-2 FIELD PATH
+    /// "field `fld2` of the aggregate designated by `(paramIdx, fld)`": the caller-side
+    /// re-pointing of a callee's depth-1 `Field(j, fld2)` selector when the actual is a
+    /// by-value-struct field reborrow `&(_p.f)` or a shared-`&Closure` upvar handle
+    /// `Copy((*_p).f)`. Denoted by the SAME opaque total `idxElem` applied twice (see
+    /// [`TRUSTIR_OPERAND_FIELD2`]) — asserts NOTHING about any value, only that it
+    /// denotes SOME Int stably determined by `(paramIdx, fld, fld2)`. NOT
+    /// grounder-connected (same reason as `Field`). CONSUMER-ONLY: no minter path
+    /// constructs it (`ret_model_slots` never yields a `PathBase` slot), pinned by
+    /// `ret_model_leaves_respect_slots`' Field2 arm.
+    Field2(u64, u64, u64),
 }
 
 impl IrOperand {
@@ -1402,6 +1424,11 @@ impl IrOperand {
             ),
             // Trust: DELTA-4 — non-recursive, one Nat payload (the parameter index).
             IrOperand::Discr(p) => Expr::app(cst(TRUSTIR_OPERAND_DISCR), Expr::nat_lit(*p)),
+            // Trust: EFHT-P — non-recursive, three Nat payloads, in path order.
+            IrOperand::Field2(p, fld, fld2) => Expr::apps(
+                cst(TRUSTIR_OPERAND_FIELD2),
+                [Expr::nat_lit(*p), Expr::nat_lit(*fld), Expr::nat_lit(*fld2)],
+            ),
         }
     }
 
@@ -1474,6 +1501,16 @@ impl IrOperand {
                 Box::new(F::Var(param_name(*p), Sort::Int)),
                 Box::new(F::Int(i128::from(*fld))),
             ),
+            // Trust: EFHT-P — `Field`'s treatment one `Select` deeper: documentation
+            // parity only, never live-groundable to a MATCHING term (gated by
+            // `is_grounder_connected` at every call site that matters).
+            IrOperand::Field2(p, fld, fld2) => F::Select(
+                Box::new(F::Select(
+                    Box::new(F::Var(param_name(*p), Sort::Int)),
+                    Box::new(F::Int(i128::from(*fld))),
+                )),
+                Box::new(F::Int(i128::from(*fld2))),
+            ),
             // Trust: ptr-spine call-arg leaf — documentation parity with
             // `mirsem::SemOperand::Index`/`Len::to_formula` — but (like `Field`) NEVER
             // live-groundable to a MATCHING term: every call site that might reach it is
@@ -1494,7 +1531,12 @@ impl IrOperand {
         match self {
             // Trust: DELTA-4 — `Discr p` contributes `p` for the same reason `Field`'s
             // base does: the reserved key is a fixed payload, not a bound index.
-            IrOperand::Var(i) | IrOperand::Field(i, _) | IrOperand::Discr(i) => {
+            IrOperand::Var(i)
+            | IrOperand::Field(i, _)
+            | IrOperand::Discr(i)
+            // Trust: EFHT-P — the path BASE is the bound index; both field keys are
+            // fixed payloads (the same treatment `Field`'s key gets).
+            | IrOperand::Field2(i, _, _) => {
                 if !out.contains(i) {
                     out.push(*i);
                 }
@@ -1861,9 +1903,14 @@ fn inline_operand_formula(
         // ever over a PARAMETER, and this LIVE-grounder fold is gated by
         // `is_grounder_connected` before any live kernel check regardless — both carry
         // the SAME never-live-matching treatment.
-        IrOperand::Const(_) | IrOperand::Field(..) | IrOperand::Index(..) | IrOperand::Len(_) => {
-            Some(op.to_formula())
-        }
+        // Trust: EFHT-P — `Field2` takes `Field`'s treatment (a live `Select` head
+        // exists; the reflection is never live-matching and every live kernel check is
+        // gated by `is_grounder_connected` first).
+        IrOperand::Const(_)
+        | IrOperand::Field(..)
+        | IrOperand::Field2(..)
+        | IrOperand::Index(..)
+        | IrOperand::Len(_) => Some(op.to_formula()),
         IrOperand::Var(i) => match defs.get(i) {
             // A read of an assigned temp: inline its definition.
             Some(rv) => inline_rvalue_formula(rv, defs, depth + 1),
@@ -2183,6 +2230,20 @@ fn operand_denotation(op: &IrOperand, e_ref: &Expr) -> Expr {
         IrOperand::Field(p, fld) => Expr::apps(
             cst(TRUSTIR_IDX_ELEM),
             [Expr::app(e_ref.clone(), Expr::nat_lit(*p)), int_lit(i128::from(*fld))],
+        ),
+        // Trust: EFHT-P — the exact reduct of the `Field2` minor: `idxElem (idxElem
+        // (e p) fld) fld2` — the SAME shape `Index(Index(Var p, Const fld), Const
+        // fld2)` denotes to, byte-for-byte (the F-O1 value oracle pins the equality).
+        // Must stay byte-identical to that minor.
+        IrOperand::Field2(p, fld, fld2) => Expr::apps(
+            cst(TRUSTIR_IDX_ELEM),
+            [
+                Expr::apps(
+                    cst(TRUSTIR_IDX_ELEM),
+                    [Expr::app(e_ref.clone(), Expr::nat_lit(*p)), int_lit(i128::from(*fld))],
+                ),
+                int_lit(i128::from(*fld2)),
+            ],
         ),
         IrOperand::Index(s, i) => Expr::apps(
             cst(TRUSTIR_IDX_ELEM),
@@ -3257,6 +3318,18 @@ fn register_operand_inductive(env: &mut Environment) -> Result<(), String> {
             Expr::pi(bd(), nat_ty(), Expr::pi(bd(), nat_ty(), operand_ty())),
         ),
     };
+    // Trust: EFHT-P (2026-08-30) — `Field2 : Nat → Nat → Nat → Operand`
+    // (paramIdx, fld, fld2). NON-recursive: three `Nat` payloads, no recursive field.
+    // APPENDED LAST, after `CastFF`, so every existing minor-premise position is
+    // unchanged and every existing reduction is byte-for-byte preserved.
+    let field2_ctor = Constructor {
+        name: Name::from_string(TRUSTIR_OPERAND_FIELD2),
+        type_: Expr::pi(
+            bd(),
+            nat_ty(),
+            Expr::pi(bd(), nat_ty(), Expr::pi(bd(), nat_ty(), operand_ty())),
+        ),
+    };
     let decl = InductiveDecl {
         level_params: vec![],
         num_params: 0,
@@ -3275,6 +3348,7 @@ fn register_operand_inductive(env: &mut Environment) -> Result<(), String> {
                 discr_ctor,
                 cast_f_ctor,
                 cast_ff_ctor,
+                field2_ctor,
             ],
         }],
     };
@@ -3454,6 +3528,29 @@ fn register_eval_operand(env: &mut Environment) -> Result<(), String> {
             ),
         )
     };
+    // Trust: EFHT-P (2026-08-30) — `Field2 p fld fld2 ↦ idxElem (idxElem (e p)
+    // (Int.ofNat fld)) (Int.ofNat fld2)`. NON-recursive with THREE `Nat` binders, so
+    // the minor binds only the payloads: λ(p:Nat). λ(fld:Nat). λ(fld2:Nat). <body>.
+    // de-Bruijn at the body: fld2 = bvar(0), fld = bvar(1), p = bvar(2), op = bvar(3),
+    // e = bvar(4) — one binder deeper than `field_case` reads it from (bvar(3)),
+    // exactly as `discr_case` sits one binder SHALLOWER (bvar(2)). The same opaque
+    // `idxElem` applied twice; no new opaque, no new axiom.
+    let field2_case = {
+        let body = Expr::apps(
+            cst(TRUSTIR_IDX_ELEM),
+            [
+                Expr::apps(
+                    cst(TRUSTIR_IDX_ELEM),
+                    [
+                        Expr::app(Expr::bvar(4), Expr::bvar(2)),
+                        Expr::app(cst("Int.ofNat"), Expr::bvar(1)),
+                    ],
+                ),
+                Expr::app(cst("Int.ofNat"), Expr::bvar(0)),
+            ],
+        );
+        Expr::lam(bd(), nat_ty(), Expr::lam(bd(), nat_ty(), Expr::lam(bd(), nat_ty(), body)))
+    };
     let rec_app = Expr::apps(
         operand_rec,
         [
@@ -3469,6 +3566,8 @@ fn register_eval_operand(env: &mut Environment) -> Result<(), String> {
             discr_case,
             cast_f_case,
             cast_ff_case,
+            // Trust: EFHT-P — appended LAST, matching the constructor order above.
+            field2_case,
             Expr::bvar(0),
         ],
     );
@@ -12170,6 +12269,57 @@ mod exact_cast_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// Trust: EFHT-P (2026-08-30, F-O1/F-O2) — the `Field2` value oracle. The
+    /// constructor registers APPENDED LAST (both float siblings still reduce, which IS
+    /// the minor-order pin — a renumbered minor breaks their reduction), `evalOperand`'s
+    /// minor ι-reduces to `operand_denotation`'s reduct, that reduct is BYTE-IDENTICAL
+    /// to the nested `Index(Index(Var p, Const f), Const g)` denotation (`idxElem`
+    /// twice — no new opaque, no new axiom), the base is the one bound index, the
+    /// carrier is MODEL-ONLY, and `Cmp(Eq, Field2(0,0,0), Const(7))` closes at the
+    /// MODEL tier while the GROUNDER tier refuses it.
+    #[test]
+    fn efht_p_field2_operand_denotes_and_stays_modulo_3() {
+        let env = trustir_env().expect("anchor env builds with Field2");
+        assert!(env.get_inductive(&Name::from_string(TRUSTIR_OPERAND)).is_some());
+        let op = IrOperand::Field2(0, 1, 2);
+        let e = refinement_env(&[0]);
+        let lhs = Expr::apps(cst(TRUSTIR_EVAL_OPERAND), [e.clone(), op.to_operand_expr()]);
+        let rhs = operand_denotation(&op, &e);
+        let tc = TypeChecker::new(&env);
+        assert!(tc.is_def_eq(&lhs, &rhs), "evalOperand's Field2 minor must reduce to operand_denotation's term");
+        // The reduct is EXACTLY the nested-Index denotation, byte for byte.
+        let nested = IrOperand::Index(
+            Box::new(IrOperand::Index(Box::new(IrOperand::Var(0)), Box::new(IrOperand::Const(1)))),
+            Box::new(IrOperand::Const(2)),
+        );
+        assert_eq!(rhs, operand_denotation(&nested, &e), "idxElem twice — the same shape Index(Index(..)) denotes");
+        // Appending LAST disturbed nothing: both float siblings still reduce.
+        for sib in [
+            IrOperand::CastF { base: Box::new(IrOperand::Var(0)), src_signed: false, src_width: 32, dst_width: 64 },
+            IrOperand::CastFF { base: Box::new(IrOperand::Var(0)), src_width: 32, dst_width: 64 },
+        ] {
+            let l = Expr::apps(cst(TRUSTIR_EVAL_OPERAND), [e.clone(), sib.to_operand_expr()]);
+            assert!(tc.is_def_eq(&l, &operand_denotation(&sib, &e)), "{sib:?} still reduces after the append");
+        }
+        // Carrier facts.
+        assert!(!op.is_grounder_connected(), "Field2 is MODEL-ONLY");
+        assert_eq!(
+            check_operand_refinement_model(&op),
+            RefinementVerdict::ProvenModulo3,
+            "the model-tier operand check accepts Field2"
+        );
+        let body = IrBody {
+            stmts: vec![IrStmt {
+                idx: 1,
+                rvalue: IrRvalue::Cmp(TrustIrCmpOp::Eq, IrOperand::Field2(0, 0, 0), IrOperand::Const(7)),
+            }],
+            ret: 1,
+        };
+        assert_eq!(body.param_indices(), vec![0], "the path BASE is the one bound index");
+        assert_eq!(check_body_refinement_model(&body), RefinementVerdict::ProvenModulo3, "F-O2: model tier accepts");
+        assert_ne!(check_body_refinement(&body), RefinementVerdict::ProvenModulo3, "the grounder tier refuses a Field2 term");
+    }
 
     /// Trust: FLOAT-WIDEN leaf (2026-08-24) — the `CastFF` operand denotes through the
     /// opaque `floatWiden` head, the two mirrors agree, and the axiom residue stays

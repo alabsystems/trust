@@ -330,18 +330,28 @@ fn production_linkage_policy_never_strengthens_weak_definitions() {
 }
 
 #[test]
-fn admitted_linkages_map_onto_the_two_emittable_bindings() {
+fn admitted_linkages_map_onto_the_three_emittable_bindings() {
+    use rustc_middle::mono::Visibility;
     assert_eq!(
-        bridge_function_linkage(Linkage::External),
+        bridge_function_linkage(Linkage::External, Visibility::Default),
         Ok(bridge_backend::FunctionLinkage::External)
     );
     assert_eq!(
-        bridge_function_linkage(Linkage::Internal),
+        bridge_function_linkage(Linkage::Internal, Visibility::Default),
         Ok(bridge_backend::FunctionLinkage::Internal)
     );
+    // External + Hidden = the pub(crate)-promoted-for-cross-CGU quadrant: a
+    // private extern (N_EXT | N_PEXT) on the Mach-O path.
+    assert_eq!(
+        bridge_function_linkage(Linkage::External, Visibility::Hidden),
+        Ok(bridge_backend::FunctionLinkage::Hidden)
+    );
     // A linkage the gate never admits must fail closed here rather than be
-    // silently exported as a strong definition.
-    assert!(bridge_function_linkage(Linkage::WeakODR).is_err());
+    // silently exported as a strong definition — and so must a
+    // visibility/linkage pair outside the admitted quadrants.
+    assert!(bridge_function_linkage(Linkage::WeakODR, Visibility::Default).is_err());
+    assert!(bridge_function_linkage(Linkage::Internal, Visibility::Hidden).is_err());
+    assert!(bridge_function_linkage(Linkage::External, Visibility::Protected).is_err());
 }
 
 #[test]

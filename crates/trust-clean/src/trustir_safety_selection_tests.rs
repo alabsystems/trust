@@ -565,16 +565,27 @@ fn a_precondition_can_never_supply_the_certified_divisor() {
 // ---------------------------------------------------------------------------
 
 /// `v2_formula_with_path_guards` FLATTENS the VC body's `And` into the guard
-/// conjunction (`Formula::And(inner) => conj.extend(inner)`, safety.rs:1110-1115), so
+/// conjunction (`Formula::And(inner) => conj.extend(inner)`, `generate/safety.rs`), so
 /// on a guarded block the emitter's own `And([range(a), range(b), out_of_range])`
-/// group arrives as `[guard…, range(a), range(b), out_of_range]`. Requiring the
-/// siblings to be EXACTLY a 3-element `And` therefore declined a violation that IS at
-/// the body position — a real capability loss, not a forgery being closed.
+/// group arrives as a SIBLING of the dominating guards rather than as one nested
+/// child. Requiring the siblings to be EXACTLY a 3-element `And` therefore declined a
+/// violation that IS at the body position — a real capability loss, not a forgery
+/// being closed.
 ///
 /// MEASURED over the 2326-function fixture corpus: 2 rows, both here. Both were
 /// certified `UAddOverflow(W64)` PRE-EVERYTHING off exactly this node (the emitter's
 /// own `Or([Lt(g+1,0), Gt(g+1,u64::MAX)])`), and the first tightening dropped them;
 /// arith located 453 -> 455, certified 582 -> 584, function gate 237 -> 238.
+///
+/// THE ORIGINAL SUBJECT WAS RETIRED WITH THE PEEL, and this test's job changed with
+/// it. `e029ec8b392` (2026-08-01, "DELETE the peel — the forgery-audit locators are
+/// gone") removed the sibling-arity matcher after `13df5c0fcd3` made every safety arm
+/// authenticate a RECORDED obligation, so there is no arity left in production that
+/// could withdraw a certificate this way. What the test guards NOW is that these rows
+/// keep certifying through the record lane while a dominating path guard is flattened
+/// over them — which is why its premise is stated over the `ObligationRecord` (see the
+/// note in the body). The tail assertions were unaffected by the 2026-08-31 breakage
+/// and were measured green throughout.
 #[test]
 fn a_flattened_path_guard_may_not_cost_the_emitters_own_violation() {
     let func = load(
@@ -582,40 +593,159 @@ fn a_flattened_path_guard_may_not_cost_the_emitters_own_violation() {
         "lib__arrayvec__ArrayVec__<T, CAP>__retain__process_one.json",
     );
     // The fixture must really exercise the FLATTENED case — otherwise this test
-    // measures nothing and must say so rather than pass. At least one arithmetic
-    // violation has to sit at the LAST position of a conjunction WIDER than the
-    // emitter's own `And([range(a), range(b), out_of_range])` triple: that is the
-    // path-guard flatten, and a fixed-arity matcher misses exactly it. Checked
-    // against the raw emitter output, with no help from the locator under test.
-    fn widened_groups(f: &Formula, out: &mut usize) {
-        if let Formula::And(v) = f
-            && v.len() > 3
-            && let Some(Formula::Or(d)) = v.last()
-            && matches!(
-                d.as_slice(),
+    // measures nothing and must say so rather than pass.
+    //
+    // PREMISE RE-POINTED 2026-08-31. The old premise was a test-private structural
+    // matcher over the emitted formula: count `And`s WIDER than the emitter's own
+    // triple whose LAST element is the violation `Or`. It counted 0 on this tree and
+    // reported "this test's subject is gone". The subject is NOT gone — the premise
+    // pinned a shape no production code owns, and a sound conjoin moved it.
+    //
+    // WHAT MOVED: `4f9a485248e` (2026-08-28, "fix(vcgen): range-bound versioned
+    // datatype fields") changed one lookup in `conjoin_datatype_field_ranges_excluding`
+    // (`generate/type_ranges.rs`) from `ranges.get(name)` to `ranges.get(base)`.
+    // `datatype_field_range_map` is keyed on the UNVERSIONED place spelling (`g*.1`)
+    // while the VC reads the versioned reaching-definition spelling (`g*.1#e_s2_t`), so
+    // before that commit every versioned field read silently got NO type bound — an
+    // unbounded `Sort::Int` symbol the solver could send out of type range, i.e. a
+    // false REFUTATION of safe code. The battery is applied at CONSTRUCTION time inside
+    // the overflow builder (`generate/overflow_vc.rs`), so it sits BETWEEN the emitter's
+    // triple and the path-guard splice. Read straight off this row's own
+    // `ObligationRecord` (measured 2026-08-31, not inferred), the wrappers are now:
+    //
+    //   ConjoinFactsLast [range(g), range(1)]  -> And([range, range, body])  the TRIPLE
+    //   ConjoinFactsLast [range(g*.1#e_s2_t)]  -> And([R4, TRIPLE])          the new fact
+    //   PathGuardOr      [Guarded [Not(_6)]]   -> And([Not(_6), R4, TRIPLE]) the FLATTEN
+    //
+    // The flatten (`safety.rs`'s `Formula::And(inner) => conj.extend(inner)`) is
+    // UNCHANGED and still fires — it just splices `[R4, TRIPLE]` now instead of
+    // `[range, range, body]`, so the violation `Or` is one level down and the group is
+    // length 3, and the old matcher's two clauses (`len > 3`, `last` is the `Or`) both
+    // miss. Drop R4 from that record and the splice yields `And([Not(_6), range, range,
+    // Or(..)])` — exactly the shape the old matcher named, and exactly the "2 rows,
+    // both here" its comment records. The conjoin is sound: R4 is `0 <= (*g).1 <=
+    // u64::MAX` on a `usize`-typed field read, a Rust type invariant true on every
+    // execution, conjoined into a VIOLATION formula where it can only SHRINK the SAT
+    // set — the same DROP-ONLY treatment this file already applies to parameters and
+    // locals, from which field reads were excluded only by the lookup bug.
+    //
+    // SO THE PREMISE IS RESTATED OVER WHAT THE CERTIFIER ACTUALLY READS. The sibling-
+    // arity matcher the original pin was written against was DELETED on 2026-08-01 in
+    // `e029ec8b392` ("DELETE the peel"); every safety arm now certifies off the
+    // emitter's RECORDED obligation, admitted only when `reconstruct_obligation(rec) ==
+    // vc.formula` bit-for-bit, and the builder mirrors every construction-time conjoin
+    // into that record. A premise stated over the record therefore cannot go stale
+    // behind a formula-shape change the way this one did — and it says the subject more
+    // exactly than the old one could: the row's obligation IS the emitter's own
+    // violation, and the record's own dominating guards land as SIBLINGS of the
+    // emitter's group in the authenticated formula. That sibling test is what
+    // distinguishes a flatten from no flatten: without the splice the body would be one
+    // nested child (`And([guard, And([R4, TRIPLE])])`) and no DIRECT child of the guard
+    // conjunction would be a violation group.
+    //
+    // MEASURED on this tree 2026-08-31: 3 such rows (@508:16, @509:16, @519:12), all
+    // three authenticated, all three certifying `UAddOverflow(W64)`. The threshold stays
+    // at the historical loss the pin defends (2), not at 3, so a sound change to the
+    // guard-path count cannot re-break it the way the last one did.
+
+    /// The emitter's own violation: `Or([Lt(t, _), Gt(t, _)])` over one `Add` term.
+    fn is_emitter_violation(f: &Formula) -> bool {
+        matches!(f, Formula::Or(d)
+            if matches!(d.as_slice(),
                 [Formula::Lt(l, _), Formula::Gt(r, _)]
-                    if matches!(&**l, Formula::Add(..)) && l == r
-            )
+                    if matches!(&**l, Formula::Add(..)) && l == r))
+    }
+    /// The emitter's own group: the violation conjoined LAST after its operand ranges.
+    fn is_violation_group(f: &Formula) -> bool {
+        matches!(f, Formula::And(v) if v.last().is_some_and(is_emitter_violation))
+    }
+    /// Does some `And` carry EVERY one of `guards` and a violation group as DIRECT
+    /// children? That is the flatten: guard terms and the VC body's own conjuncts
+    /// standing as siblings in one conjunction.
+    fn guards_and_group_are_siblings(f: &Formula, guards: &[Formula]) -> bool {
+        if let Formula::And(v) = f
+            && guards.iter().all(|g| v.contains(g))
+            && v.iter().any(is_violation_group)
         {
-            *out += 1;
+            return true;
         }
         match f {
-            Formula::And(v) | Formula::Or(v) => v.iter().for_each(|x| widened_groups(x, out)),
-            Formula::Not(a) => widened_groups(a, out),
-            _ => {}
+            Formula::And(v) | Formula::Or(v) => {
+                v.iter().any(|x| guards_and_group_are_siblings(x, guards))
+            }
+            Formula::Not(a) => guards_and_group_are_siblings(a, guards),
+            _ => false,
         }
     }
-    let mut widened = 0usize;
+
+    // NEGATIVE CONTROL for the premise itself, because a premise that cannot fail
+    // measures nothing — which is exactly how the old one came to report "subject is
+    // gone" on a tree where the subject was intact. Same guard, same group: SIBLINGS
+    // must match, NESTED (what the splice would build if it pushed the body whole
+    // instead of `extend`ing it) must not.
+    {
+        let guard = Formula::Not(Box::new(Formula::Var("g".into(), Sort::Bool)));
+        let extra =
+            Formula::And(vec![Formula::Le(int(0), var("f")), Formula::Le(var("f"), int(9))]);
+        let group = Formula::And(vec![
+            Formula::And(vec![Formula::Le(int(0), var("t")), Formula::Le(var("t"), int(9))]),
+            Formula::Or(vec![
+                Formula::Lt(Box::new(Formula::Add(var("t"), int(1))), int(0)),
+                Formula::Gt(Box::new(Formula::Add(var("t"), int(1))), int(9)),
+            ]),
+        ]);
+        let guards = std::slice::from_ref(&guard);
+        assert!(
+            guards_and_group_are_siblings(
+                &Formula::And(vec![guard.clone(), extra.clone(), group.clone()]),
+                guards
+            ),
+            "the flattened shape MUST match, or the premise below is vacuous"
+        );
+        assert!(
+            !guards_and_group_are_siblings(
+                &Formula::And(vec![
+                    guard.clone(),
+                    Formula::And(vec![extra.clone(), group.clone()])
+                ]),
+                guards
+            ),
+            "the UNFLATTENED shape must NOT match, or the premise below cannot tell a \
+             splice from a nested push and is not measuring the flatten at all"
+        );
+    }
+
+    let mut flattened = 0usize;
     for vc in trust_vcgen::generate_vcs(&func) {
-        if matches!(vc.kind, VcKind::ArithmeticOverflow { .. }) {
-            widened_groups(&vc.formula, &mut widened);
+        if !matches!(vc.kind, VcKind::ArithmeticOverflow { .. }) {
+            continue;
+        }
+        // The record must AUTHENTICATE — `reconstruct_obligation(rec) == vc.formula`
+        // bit-for-bit — or it is not the thing the certifier reads.
+        let Some(rec) = authenticated_record(&vc) else { continue };
+        if !is_emitter_violation(&rec.body) {
+            continue;
+        }
+        let spliced = rec.wrappers.iter().any(|w| match w {
+            trust_types::ObligationWrapper::PathGuardOr { paths } => paths.iter().any(|p| {
+                matches!(p, trust_types::PathGuardTerm::Guarded { guards }
+                    if !guards.is_empty()
+                        && guards_and_group_are_siblings(&vc.formula, guards))
+            }),
+            trust_types::ObligationWrapper::ConjoinFactsLast { .. } => false,
+        });
+        if spliced {
+            flattened += 1;
         }
     }
     assert!(
-        widened >= 2,
-        "process_one no longer carries an arithmetic violation whose emitter group was \
-         flattened together with a dominating guard ({widened} found); this test's \
-         subject is gone"
+        flattened >= 2,
+        "process_one no longer carries an arithmetic row whose AUTHENTICATED obligation \
+         body is the emitter's own violation and whose recorded dominating guards land \
+         as siblings of that violation's group ({flattened} found, 3 measured \
+         2026-08-31); this test's subject is gone — before re-pointing it AGAIN, check \
+         whether the flatten at `safety.rs`'s `Formula::And(inner) => conj.extend(inner)` \
+         still fires, since that, not any formula shape, is what this premise is about"
     );
     let certified_w64 = minted(&func, |k| {
         matches!(k, VcKind::ArithmeticOverflow { op: trust_types::BinOp::Add, .. })

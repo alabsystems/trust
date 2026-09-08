@@ -28,6 +28,7 @@ prototype-infoflow = []
 elf = ["trust-lift/elf"]
 macho = ["trust-lift/macho"]
 [dependencies]
+trust-floatbits = { workspace = true }
 # trust-types is consumed as a pure data layer here (VerifiableFunction,
 # VerificationCondition, Formula, ...). We deliberately do NOT pull its
 # default `try-sugar` feature (which enables the nightly `try_trait_v2`
@@ -39,6 +40,21 @@ macho = ["trust-lift/macho"]
 # enables it on the crate that actually uses `?` (trust-types itself / any
 # real consumer via `features = ["try-sugar"]`).
 trust-types = { path = "../trust-types", default-features = false }
+# Trust: `trust-widthconv` is a strict-lane VERIFIED crate (`Gate: PASS`,
+# `docs/STRICT_VERIFICATION_FRAGMENT.md` §17). It owns the Rust machine-integer
+# width set and the value-preserving conversion rule table that `machine_domain`
+# used to decide inline — the table whose row 7 the module header calls "this
+# tree's canonical false-proof bug".
+#
+# COST OF THE EDGE (§16.8): a crate carrying the native `ensures` grammar is not
+# compilable by stock rustc, so this dependency makes trust-vcgen
+# Trust-toolchain-only, which contradicts the stable-channel intent recorded on
+# the `trust-types` line above. That intent was measured UNEXERCISED on
+# 2026-08-30 before the edge was taken: no gate in
+# `tests/run_trust_comprehensive_harness.sh` builds trust-vcgen on stable, and
+# no manifest under `first-party/clean` references it. If `clean` ever does
+# consume this crate on stable, THIS dependency is the thing to make optional.
+trust-widthconv = { workspace = true }
 # trust #513: Binary verification bridge — lift adapter converts LiftedFunction to VCs.
 trust-lift = { workspace = true }
 serde = { workspace = true }

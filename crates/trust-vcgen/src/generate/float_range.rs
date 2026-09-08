@@ -807,8 +807,17 @@ pub(super) fn intersect_float_range(
 }
 
 /// `2^w` as an exact f64 (`w <= 1023`), the int→f64 cast magnitude bound.
+///
+/// Trust: the bit assembly is the VERIFIED `trust-floatbits` one. This value is
+/// conjoined onto float-overflow obligations as a FACT, so a bound below the
+/// true `2^w` discharges a real overflow — the exponent bias, the shift distance
+/// and the representable-exponent limit used to be three unchecked literals in
+/// this one line. The supported-predicate call comes FIRST because
+/// `exp2_binary64_bits` saturates to `+inf`'s pattern, which is a legitimate
+/// pattern and cannot be told apart from a refusal by its value alone.
 pub(super) fn exp2i(w: u32) -> Option<f64> {
-    (w <= 1023).then(|| f64::from_bits((u64::from(w) + 1023) << 52))
+    (trust_floatbits::exp2_binary64_supported(w) == 1)
+        .then(|| f64::from_bits(trust_floatbits::exp2_binary64_bits(w)))
 }
 
 /// Interval arithmetic in round-to-nearest with OUTWARD one-ulp bumps
@@ -2073,6 +2082,16 @@ pub(super) fn float_abs_guard_magnitude_bounds(
     // so temp and source provably hold the same value at every read.
     let resolve_to_source = |p: &Place| -> Option<Place> {
         if !p.projections.is_empty() {
+            return None;
+        }
+        // A PARAMETER's ENTRY value is a def no block scan carries, so its one
+        // visible `Use(copy src)` does NOT pin its value at the abs call — the call
+        // can read it BEFORE the store. `stable_base` states the same rule for the
+        // divisor place (`base_is_param => defs.is_empty()`); this closure is also
+        // reached on the abs ARGUMENT, which `stable_base` has not vetted. For a
+        // NON-parameter this changes nothing: the match below already demands
+        // exactly one def, which is what `stable_base` asks of a non-parameter.
+        if p.local >= 1 && p.local <= ctx.func.body.arg_count {
             return None;
         }
         let defs = float_whole_local_defs(ctx.func, p.local)?;

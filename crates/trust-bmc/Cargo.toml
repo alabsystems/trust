@@ -92,3 +92,12 @@ trust-mc-trust-bmc = { workspace = true, optional = true }
 [dev-dependencies]
 trust-ir-build = { workspace = true }
 toml = { workspace = true }
+# M1 differential harness (src/direct_shadow_differential.rs): the direct
+# lane's shadow bundle planner plus the MIR-compatibility planner, so both
+# lanes can be solved through the same native trust-mc entry in one test.
+# Dev-only and acyclic: trust-ir-bridge's normal-dep closure never reaches
+# trust-bmc. The `binary` feature is the ratified module codec the checked-in
+# direct-lane fixture is decoded with; feature unification scopes it to test
+# builds of this crate only.
+trust-ir-bridge = { workspace = true }
+trust-ir = { workspace = true, features = ["binary"] }

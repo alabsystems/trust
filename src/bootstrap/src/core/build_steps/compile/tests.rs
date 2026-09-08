@@ -142,43 +142,72 @@ fn trust_cg_builtin_selector_considers_every_configured_host() {
 }
 
 #[test]
-fn preserve_metadata_mode_prunes_stale_metadata_when_rlib_is_installed() {
+fn installing_an_rlib_prunes_metadata_left_by_an_earlier_build() {
     let temp = tempfile::TempDir::new().unwrap();
     let sysroot = temp.path();
+    // Neither is recorded as installed by this run, so both are leftovers.
     fs::write(sysroot.join("libfoo-old.rmeta"), b"stale metadata").unwrap();
     fs::write(sysroot.join("libfoo-new.rmeta"), b"active metadata").unwrap();
 
     let active_rlib =
         RustArtifact { crate_name: "foo", stem: "libfoo-new", kind: RustArtifactKind::Rlib };
+    prune_superseded_sysroot_artifacts(sysroot, active_rlib);
 
-    assert!(prepare_sysroot_artifact_for_copy(
-        Path::new("libfoo-new.rlib"),
-        sysroot,
-        active_rlib,
-        SysrootMetadataMode::PreserveMetadataOnlyDeps,
-        &HashSet::new(),
-    ));
+    assert!(sysroot.join("libfoo-new.rmeta").exists(), "the active stem's own metadata must stay");
+    assert!(!sysroot.join("libfoo-old.rmeta").exists(), "a superseded stem must be pruned");
+}
 
-    assert!(sysroot.join("libfoo-new.rmeta").exists());
-    assert!(!sysroot.join("libfoo-old.rmeta").exists());
+/// Regression test for a sysroot that built successfully and could not be used.
+///
+/// `lib/rustlib/<target>/lib` is filled from TWO stamps — std's and rustc's —
+/// and they legitimately carry the same external crates at different versions
+/// (`hashbrown`, `libc`, `object`, `memchr`, `gimli`, `miniz_oxide`, ...).
+/// Pruning by crate NAME made whichever population was copied second delete the
+/// other's artifacts. Measured on a clean stage2 (2026-08-30), 12 artifacts
+/// across 9 crate names went missing and `extern crate rustc_public;` — with no
+/// other code at all — failed with E0460 `found possibly newer version of crate
+/// hashbrown which rustc_public depends on`, i.e. every out-of-tree
+/// `rustc_private` consumer, including this repo's own `trust-mir-extract`.
+#[test]
+fn two_versions_of_one_external_crate_survive_the_same_build() {
+    let temp = tempfile::TempDir::new().unwrap();
+    let sysroot = temp.path();
+
+    // std's copy lands first and is recorded, exactly as add_to_sysroot does.
+    fs::write(sysroot.join("libhashbrown-aaaa.rmeta"), b"std's metadata").unwrap();
+    record_sysroot_install(sysroot, "libhashbrown-aaaa.rmeta");
+
+    // rustc's copy of the same crate at a different version follows.
+    let rustc_copy = RustArtifact {
+        crate_name: "hashbrown",
+        stem: "libhashbrown-bbbb",
+        kind: RustArtifactKind::Rlib,
+    };
+    prune_superseded_sysroot_artifacts(sysroot, rustc_copy);
+
+    assert!(
+        sysroot.join("libhashbrown-aaaa.rmeta").exists(),
+        "the other population's artifact is not stale — deleting it is the E0460 bug"
+    );
 }
 
 #[test]
-fn preserve_metadata_mode_keeps_metadata_only_deps_with_existing_rlib() {
+fn a_rustc_private_crate_still_admits_only_one_version() {
     let temp = tempfile::TempDir::new().unwrap();
     let sysroot = temp.path();
-    fs::write(sysroot.join("libbar-old.rlib"), b"existing rlib").unwrap();
+    // Even recorded-this-run, rustc_* crates are single-version by construction,
+    // so a different hash under the same name is unambiguously a leftover.
+    fs::write(sysroot.join("librustc_middle-old.rmeta"), b"leftover").unwrap();
+    record_sysroot_install(sysroot, "librustc_middle-old.rmeta");
 
-    let metadata_only_dep =
-        RustArtifact { crate_name: "bar", stem: "libbar-new", kind: RustArtifactKind::Rmeta };
+    let active = RustArtifact {
+        crate_name: "rustc_middle",
+        stem: "librustc_middle-new",
+        kind: RustArtifactKind::Rmeta,
+    };
+    prune_superseded_sysroot_artifacts(sysroot, active);
 
-    assert!(prepare_sysroot_artifact_for_copy(
-        Path::new("libbar-new.rmeta"),
-        sysroot,
-        metadata_only_dep,
-        SysrootMetadataMode::PreserveMetadataOnlyDeps,
-        &HashSet::new(),
-    ));
+    assert!(!sysroot.join("librustc_middle-old.rmeta").exists());
 }
 
 #[test]

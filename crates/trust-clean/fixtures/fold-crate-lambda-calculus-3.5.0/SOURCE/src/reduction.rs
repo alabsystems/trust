@@ -1,10 +1,9 @@
 //! [β-reduction](https://en.wikipedia.org/wiki/Beta_normal_form) for lambda `Term`s
 
-use std::{cmp, fmt, mem};
-
 pub use self::Order::*;
 use crate::term::Term::*;
 use crate::term::{Term, TermError};
+use std::{cmp, fmt, mem};
 
 /// The [evaluation order](http://www.cs.cornell.edu/courses/cs6110/2014sp/Handouts/Sestoft.pdf) of
 /// β-reductions.

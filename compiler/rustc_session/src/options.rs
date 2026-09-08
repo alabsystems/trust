@@ -1015,6 +1015,8 @@ mod desc {
     pub(crate) const parse_trust_nonempty_path: &str = "a non-empty path";
     pub(crate) const parse_trust_dump: &str = "`mir:<dir>`, `mir-only:<dir>`, `native-bundle:<dir>`, `ir:<dir>`, or `spec-clean:<dir>` \
          (repeat the option for more than one sink)";
+    pub(crate) const parse_trust_bundle_foreign_crate: &str =
+        "a non-empty comma-separated list of crate names";
     pub(crate) const parse_trust_verify_crate_role: &str =
         "one of `unscoped`, `primary`, `dependency`, or `build-script`";
     pub(crate) const parse_trust_verify_output: &str = "one of `human`, `json`, or `both`";
@@ -1742,6 +1744,41 @@ pub mod parse {
             return false;
         };
         *slot = Some(value.to_string());
+        true
+    }
+
+    // Trust (cross-crate composition): the build-declared foreign bundling
+    // scope, as ONE comma-separated occurrence. It is a single option rather
+    // than a repeated one because Targo's own verified-policy audit rejects a
+    // duplicated `-Ztrust-*` authority by name, so a repeat-per-crate spelling
+    // would refuse every build with two workspace-internal dependencies.
+    //
+    // Order-insensitive and deduplicated, so the value cannot perturb the crate
+    // hash by dependency-iteration order. An EMPTY value is rejected rather than
+    // ignored: a shell that ate the value would otherwise read as "declare
+    // nothing", which is silently the pre-change behavior.
+    pub(crate) fn parse_trust_bundle_foreign_crate(
+        slot: &mut Vec<String>,
+        v: Option<&str>,
+    ) -> bool {
+        let Some(value) = v.map(str::trim).filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        for name in value.split(',').map(str::trim) {
+            // A crate name is an identifier; anything else cannot name a crate
+            // this compilation loaded, so refuse it instead of carrying a value
+            // no comparison can ever match.
+            if name.is_empty()
+                || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                || name.starts_with(|c: char| c.is_ascii_digit())
+            {
+                return false;
+            }
+            if !slot.iter().any(|existing| existing == name) {
+                slot.push(name.to_string());
+            }
+        }
+        slot.sort();
         true
     }
 
@@ -3302,6 +3339,31 @@ written to standard error output)"),
     // frontend-authority inventory is built from, so it lives at the
     // declaration and not in a second list somewhere else: a `-Ztrust-*` option
     // without one fails to compile (`trust_authority_classification`).
+    // Trust (cross-crate composition): the BUILD-DECLARED foreign bundling
+    // scope. Names a crate whose already-compiled bodies the verifier may pull
+    // into a caller's lowered bundle and RE-DERIVE obligations from, exactly as
+    // it already does for `std`/`core`/`alloc`.
+    //
+    // This declares a SCOPE, never a verdict. No foreign proof result is
+    // readable in this compilation — `trust_proof_results` is `arena_cache`
+    // only, with no `separate_provide_extern` and no `cache_on_disk` — so a
+    // crate named here gets its MIR read and every obligation over it minted and
+    // discharged by THIS compilation's verifier. Admitting a body can therefore
+    // only ADD obligations the caller must discharge; a body that fails to lower
+    // falls back to the pre-existing fail-closed absent-callee row.
+    //
+    // It is a CALLER-side declaration on purpose. The 2026-08-25 cross-crate
+    // admission hole keyed on `#[automatically_derived]`, a callee SELF-CLAIM
+    // that is stable, ungated and user-writable. A scope named by the invoking
+    // build (Targo injects the workspace-internal dependency units it compiled
+    // itself) is not a claim the callee makes about itself.
+    trust_bundle_foreign_crate: Vec<String> = (Vec::<String>::new(), parse_trust_bundle_foreign_crate, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "declare, as one comma-separated list, the crates whose foreign bodies may be bundled \
+         into a caller's lowered verification bundle and re-derived there, on the same footing as \
+         `std`/`core`/`alloc`. This carries no foreign verdict: every obligation over an admitted \
+         body is minted and discharged by this compilation. Only fully non-generic callees are \
+         admitted"),
     // Trust (F1): WHICH PRODUCER supplies the trust-cg backend's per-function
     // input. This is a `-Z` option and not a cargo feature (the two earlier
     // trust-ir probes were cargo features) for three reasons that all matter to
@@ -3329,6 +3391,16 @@ written to standard error output)"),
          whole crate. It IS verified by the proven-output gate (the spec is derived from the \
          trust-ir module rather than from MIR) and needs no gate relaxation: it emits under the \
          default `strict`"),
+    trust_ir_upstream_mir: bool = (false, parse_bool, [TRACKED]
+        { TRUST_AUTHORITY: EvidenceControl },
+        "with -Ztrust-cg-frontend=trust-ir, additionally admit UPSTREAM-CRATE instances by \
+         bridging their monomorphized MIR into trust-ir (MIR -> VerifiableFunction -> \
+         trust_ir::Module) and feeding the SAME converter and proven-output gate as the \
+         source-first artifacts. Off by default: the default trust-ir lane refuses every \
+         upstream body by name. This is not a fallback for local items — a local body still \
+         comes only from `trust_ir_of`, and a refused item still refuses the crate; only the \
+         IR's recorded provenance differs (MIR-derived rather than source-first) for bodies \
+         that HAVE no source-first artifact"),
     trust_cg_output_gate: String = ("strict".to_string(), parse_trust_cg_output_gate, [TRACKED]
         { TRUST_AUTHORITY: EvidenceControl },
         "set the trust-cg output-preservation gate: `strict` (the default) rejects an unknown \

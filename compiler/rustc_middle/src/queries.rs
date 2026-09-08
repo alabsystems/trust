@@ -686,6 +686,21 @@ rustc_queries! {
         cache_on_disk
     }
 
+    /// Trust: per-body facts for the once-initializer re-entrancy check
+    /// (`rustc_mir_transform::trust_once_reentrancy`): every call in the body that
+    /// WAITS on a local Once-family cell `static` (with the initializer it starts, if
+    /// any), the local fn items the body passes as call ARGUMENTS (synchronous HOF
+    /// edges), and the closure/fn values it hands to a `std::thread` spawn entry point
+    /// (NOT synchronous edges). Like `trust_mir_direct_local_callees`, the provider
+    /// borrows the elaborated MIR unguarded, so the query must only be demanded for
+    /// bodies that pass the same node filter (`trust_once_reentrancy::is_eligible_body`).
+    /// Retains no MIR; disk-cached so an incremental green replay never re-elaborates.
+    query trust_mir_once_body_facts(key: LocalDefId) -> &'tcx mir::trust_once::TrustOnceBodyFacts {
+        desc { "collecting Once-family wait sites of `{}`", tcx.def_path_str(key) }
+        arena_cache
+        cache_on_disk
+    }
+
     query mir_for_ctfe(
         key: DefId
     ) -> &'tcx mir::Body<'tcx> {

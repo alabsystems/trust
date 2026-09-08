@@ -64,6 +64,62 @@ Do not "deduplicate" a pair by deleting the plain variant. The pair is a
 differential: the plain one shows the obligation refutes on its own merits, the
 sibling one shows the whole-function solve cannot launder it.
 
+## Folded-to-`false` asserts, and the reason the naive spellings are not vectors
+
+`x << 64` and `a[4]` are COMPILE ERRORS: `arithmetic_overflow` and
+`unconditional_panic` are deny-by-default, so neither spelling ever reaches the
+verifier and neither is a vector. A statically-false `Assert` condition arrives
+by a route those lints do not evaluate — they run pre-monomorphization, and they
+do not fold a `const fn` call at its use site. Three such routes are known and
+each has a row; nothing here claims the list is exhaustive:
+
+| route | fixture |
+|---|---|
+| const generic, shift amount | `mutant/sd_shl_const_generic_overflow.rs` |
+| const generic, array index | `mutant/sd_array_index_const_generic_oob.rs` |
+| `const fn` folded by MIR const-prop, not by the use-site lint | `mutant/sd_shl_constfn_overflow.rs` |
+
+Measured under stock rustc 1.96.0, all three compile with ZERO warnings and
+panic on 100% of their swept domains (64/64 runs each). Their point is that a
+const evaluator must compare the folded condition against the terminator's
+`expected` rather than merely observe that it IS constant: the two const-generic
+bodies carry `Lt(const N, const 64_u32)` / `Lt(const I, const 4_usize)`, which at
+`N = 64` and `I = 4` fold to `false` against an `expected` of `true`, and the
+`const fn` row reaches the back end as a literal
+`assert(const false, "attempt to shift left by `{}`, which would overflow", …)`.
+Discharging on constancy alone certifies all three.
+
+Three completeness twins stop that comparison from degenerating into "refuse
+every constant assert": `proved/sd_shl_const_in_range.rs` (`x << 32`),
+`proved/sd_shl_const_boundary.rs` (`x << 63`, the last in-range shift for a
+`u64`: an evaluator using `Le` where rustc's lowering uses `Lt` agrees with a
+correct one on `x << 32` and on `x << 64`, and separates from it here) and
+`proved/sd_array_index_const_in_range.rs` (`a[2]` on a
+`[i32; 4]`, the twin of the const-generic index mutant).
+
+Two def-count rows sit beside them. `mutant/sd_shl_two_def_branch.rs` and
+`mutant/sd_array_index_two_def_branch.rs` give the shift amount / index TWO
+constant defs on opposite branches, one safe and one faulting: a resolver that
+folds to ONE of them certifies a function that panics on half its input space
+(64 panics / 128 runs, all on the same branch). `mutant/sd_shl_param_unbounded.rs`
+is the ZERO-def end of the same spectrum — a parameter's entry definition is not
+a statement in `body.blocks`, so a def-counter walking blocks sees no defs at
+all. The single-operand form of that last shape was already covered by
+`mutant/left_shift_guarded.rs`; the row is here for adjacency to the other two.
+
+## Hidden non-prefix obligations
+
+`mutant/ep_hidden_obligation_divzero.rs` and
+`mutant/ep_hidden_obligation_bounds.rs` each give a callee TWO asserts: one in
+the ENTRY PREFIX, chargeable to the caller, and one behind a branch. The caller
+passes an argument that DISCHARGES the prefix obligation and says nothing about
+the second, which fails (32 panics / 64 runs each, every panic on the branch).
+
+They exist so that any relaxation of the all-or-nothing entry-prefix rule has to
+CHARGE the non-prefix assert rather than drop it. Dropping it certifies a caller
+whose callee panics on half its inputs — the hidden-obligation class the
+all-or-nothing rule exists to prevent.
+
 ## What this gate CANNOT see: declined rows in the trust-clean certification tiers
 
 There is a false-proof class this corpus is structurally unable to cover, and

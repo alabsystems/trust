@@ -888,11 +888,14 @@ impl InProcessAyBackend {
     /// (an unbounded caller) stays unbounded. See
     /// [`Self::try_disjoint_component_refutation`] for why multiplying the budget
     /// would change OTHER rows' verdicts.
+    // Trust: the split is `trust_budget::split_budget_ms`, a strict-lane
+    // VERIFIED function whose clause `ensures result <= total_ms` is exactly
+    // the neutrality condition the doc comment above states and this code never
+    // checked. `0` still means UNBOUNDED, which the verified function preserves
+    // and its own doc calls out as the one place in that crate where `0` is the
+    // WIDE end.
     fn retry_component_timeout_ms(total_ms: u64, components: usize) -> u64 {
-        if total_ms == 0 {
-            return 0;
-        }
-        (total_ms / components.max(1) as u64).max(1)
+        trust_budget::split_budget_ms(total_ms, components as u64)
     }
 
     /// Retry a whole-query `Unknown` as a component-wise REFUTATION. Returns

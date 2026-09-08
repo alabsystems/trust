@@ -2347,7 +2347,15 @@ fn report_malformed_generics(
                 MalformedGenerics::UnbalancedAngleBrackets => "unbalanced angle brackets",
                 MalformedGenerics::MissingType => "missing type for generic parameters",
                 MalformedGenerics::HasFullyQualifiedSyntax => {
-                    diag.note("see issue #74563 for more information");
+                    // Trust: keep upstream's URL form verbatim. The initial-commit rewrite to
+                    // `see issue #74563 for more information` dropped the URL — a fork defect,
+                    // not a rebrand; the URL-strip policy was retired 2026-07-01 (patches.toml
+                    // `trust.naming.issue-112792-url-policy`), and compiletest's `see issue #N`
+                    // re-add rule yields the feature-gate shape, which is not upstream's shape
+                    // here. Pinned by tests/rustdoc-ui/intra-doc/malformed-generics.stderr.
+                    diag.note(
+                        "see https://github.com/rust-lang/rust/issues/74563 for more information",
+                    );
                     "fully-qualified syntax is unsupported"
                 }
                 MalformedGenerics::InvalidPathSeparator => "invalid path separator",

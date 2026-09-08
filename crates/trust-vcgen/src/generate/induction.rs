@@ -109,7 +109,7 @@ pub(super) fn downward_guard_lower_k(
             continue;
         };
         let Some(g) = operand_root_local(func, discr, FUEL) else { continue };
-        let (op, a, b) = match crate::unique_whole_local_def(func, g) {
+        let (op, a, b) = match crate::local_defs::unique_value_def(func, g) {
             Some(Rvalue::BinaryOp(
                 op @ (trust_types::BinOp::Gt | trust_types::BinOp::Lt),
                 a,
@@ -212,6 +212,15 @@ pub(super) fn build_downward_induction_facts(func: &VerifiableFunction) -> Vec<F
         });
 
         for (t, c) in dv.decrements {
+            // The fact is keyed on the TUPLE local's field, `_t.0`. That name denotes
+            // ONE value only while `_t` itself has ONE definition — the def scan above
+            // constrains the CURSOR `cand`, never the `CheckedSub` destination it reads
+            // from. Fail closed on a two-valued `_t` (rustc-built MIR gives each
+            // `CheckedBinaryOp` its own temp, so this declines nothing it reaches today;
+            // `downward_induction_declines_a_merged_decrement_tuple` is the row).
+            if !is_single_static_assignment(func, t) {
+                continue;
+            }
             let result_place =
                 Place { local: t, projections: vec![trust_types::Projection::Field(0)] };
             let result_name = crate::place_to_var_name(func, &result_place);
@@ -395,7 +404,7 @@ pub(super) fn countdown_resolve_const(
     if let Some(v) = expect_consts.get(&p.local) {
         return Some(*v);
     }
-    match crate::unique_whole_local_def(func, p.local) {
+    match crate::local_defs::unique_value_def(func, p.local) {
         Some(Rvalue::Use(inner)) => countdown_resolve_const(func, inner, expect_consts, fuel - 1),
         _ => None,
     }
@@ -474,7 +483,7 @@ pub(super) fn countdown_guard_true_edge_lower_bound(
             return false;
         }
         if !matches!(
-            crate::unique_whole_local_def(func, p.local),
+            crate::local_defs::unique_value_def(func, p.local),
             Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q)))
                 if q.local == x && q.projections.is_empty()
         ) {
@@ -558,7 +567,7 @@ pub(super) fn countdown_zero_trip_eq(
         return None;
     }
     let Some(Rvalue::BinaryOp(trust_types::BinOp::Eq, a, b)) =
-        crate::unique_whole_local_def(func, gp.local)
+        crate::local_defs::unique_value_def(func, gp.local)
     else {
         return None;
     };
@@ -573,7 +582,7 @@ pub(super) fn countdown_zero_trip_eq(
             p.local
         } else if is_single_static_assignment(func, p.local)
             && let Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q))) =
-                crate::unique_whole_local_def(func, p.local)
+                crate::local_defs::unique_value_def(func, p.local)
             && q.projections.is_empty()
             && (1..=func.body.arg_count).contains(&q.local)
         {
@@ -869,7 +878,10 @@ pub(super) fn countdown_trip_analysis(func: &VerifiableFunction) -> CountdownFac
                 .iter()
                 .any(|s| matches!(s, Statement::Assign { place, .. } if place.local == dv.local))
         };
-        if loop_lower >= 0 {
+        // `_t_loop.0` names one value only if `_t_loop` has one def — the cursor def
+        // scan never constrains the decrement tuple. Fail closed, as in
+        // `build_downward_induction_facts`.
+        if loop_lower >= 0 && is_single_static_assignment(func, t_loop) {
             let result_place =
                 Place { local: t_loop, projections: vec![trust_types::Projection::Field(0)] };
             facts.global.push(Formula::Ge(
@@ -1046,8 +1058,11 @@ pub(super) fn countdown_trip_analysis(func: &VerifiableFunction) -> CountdownFac
                 }
                 site_min = Some(site_min.map_or(best, |sm: i128| sm.min(best)));
             }
+            // Same fail-closed tuple gate as the loop site: `_t_s.0` is one value only
+            // if `_t_s` has one def.
             if let Some(bound) = site_min
                 && bound >= 0
+                && is_single_static_assignment(func, t_s)
             {
                 let result_place =
                     Place { local: t_s, projections: vec![trust_types::Projection::Field(0)] };

@@ -78,7 +78,10 @@ pub fn is_some() -> Term {
 /// assert_eq!(beta(app!(map(), succ(), none()), NOR, 0), none());
 /// ```
 pub fn map() -> Term {
-    abs!(2, app!(Var(1), none(), abs(app(some(), app(Var(3), Var(1))))))
+    abs!(
+        2,
+        app!(Var(1), none(), abs(app(some(), app(Var(3), Var(1)))))
+    )
 }
 
 /// Applied to two arguments and a lambda-encoded option it returns the second argument applied to

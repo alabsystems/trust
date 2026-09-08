@@ -899,9 +899,7 @@ fn invalid_discriminant_safe() -> VerifiableFunction {
                         ],
                         disc_index_safe: false,
                         // Trust (B3-1 field completion): pre-existing E0063.
-                        faithful_enum_repr: None,
-                        enum_layout: None,
-                    },
+                        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
                     name: Some("opt".into()),
                 },
                 LocalDecl { index: 2, ty: Ty::u32(), name: None },

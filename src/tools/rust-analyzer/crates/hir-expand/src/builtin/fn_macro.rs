@@ -545,7 +545,7 @@ fn compile_error_expand(
                     lit @ tt::Literal { kind: tt::LitKind::Str | tt::LitKind::StrRaw(_), .. },
                 )),
             ],
-        ) => ExpandError::other(span, Box::from(unescape_str(lit.text()))),
+        ) => ExpandError::other(span, Box::<str>::from(unescape_str(lit.text()))), // Trust: name Box's target type; `impl Into<Box<str>>` leaves the allocator param `A` uninferable (E0283)
         _ => ExpandError::other(span, "`compile_error!` argument must be a string"),
     };
 

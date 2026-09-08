@@ -480,11 +480,7 @@ mod tests {
             name: "Option<u32>".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            layout: None,
-            enum_layout: None,
-            adt_kind: None,
-        };
+         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None };
         let patterns = match_patterns(&ty);
         assert_eq!(patterns.len(), 1);
         assert!(matches!(
@@ -531,11 +527,7 @@ mod tests {
             name: "Vec<i32>".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            layout: None,
-            enum_layout: None,
-            adt_kind: None,
-        };
+         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None };
         let patterns = match_patterns(&ty);
         assert_eq!(patterns.len(), 1);
         assert!(matches!(
@@ -582,11 +574,7 @@ mod tests {
             name: "Option<String>".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            layout: None,
-            enum_layout: None,
-            adt_kind: None,
-        };
+         faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None };
         let formula = infer_nullability("val", &ty);
         assert!(formula.is_some());
     }
@@ -660,11 +648,7 @@ mod tests {
                     name: "Option<u32>".into(),
                     fields: vec![],
                     disc_index_safe: false,
-                    faithful_enum_repr: None,
-                    layout: None,
-                    enum_layout: None,
-                    adt_kind: None,
-                },
+                 faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None },
             )],
             Ty::Unit,
         );
@@ -713,11 +697,7 @@ mod tests {
                         name: "Option<u8>".into(),
                         fields: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None,
-                        layout: None,
-                        enum_layout: None,
-                        adt_kind: None,
-                    },
+                     faithful_enum_repr: None, layout: None, enum_layout: None, adt_kind: None, arbitrary_precision: None },
                 ),
             ],
             Ty::Int { width: 8, signed: false },

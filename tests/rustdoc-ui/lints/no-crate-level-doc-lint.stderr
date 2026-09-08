@@ -7,7 +7,7 @@ LL | | pub fn foo() {}
    | |_______________^
    |
    = help: The following guide may be of use:
-           https://doc.rust-lang.org/$CHANNEL/rustdoc/how-to-write-documentation.html
+           the Trust rustdoc book's how to write documentation chapter
 note: the lint level is defined here
   --> $DIR/no-crate-level-doc-lint.rs:2:9
    |

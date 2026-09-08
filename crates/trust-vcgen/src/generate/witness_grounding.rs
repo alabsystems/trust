@@ -6,6 +6,184 @@
 
 use super::*;
 
+/// How far [`return_producer_ancestors`] will walk. Drop elaboration splices at
+/// most a handful of join blocks; the bound stops a pathological chain, and
+/// exhausting it simply yields a shorter search list (today's behaviour).
+const RETURN_PRODUCER_WALK_FUEL: u32 = 8;
+
+/// Whether `block`'s STATEMENTS provably leave the return slot `_0` UNTOUCHED.
+///
+/// FAIL-CLOSED BY CONSTRUCTION: only statements that cannot write a place are
+/// allowed through; every other statement kind — including
+/// `Retag`/`Intrinsic`/`CopyNonOverlapping`/`Unsupported`, whose write sets this
+/// function does not model — returns `false`. A `false` answer only stops the
+/// walk early, which is today's behaviour; a wrong `true` would let a STALE `_0`
+/// definition be attributed to a return path, so the asymmetry is deliberate.
+///
+/// Projected writes count: `_0.f = ..` mutates the return value just as `_0 = ..`
+/// does, so the test is on `place.local`, never on `projections.is_empty()`.
+fn statements_preserve_return_place(block: &trust_types::BasicBlock) -> bool {
+    for statement in &block.stmts {
+        match statement {
+            Statement::Assign { place, .. }
+            | Statement::SetDiscriminant { place, .. }
+            | Statement::Deinit { place } => {
+                if place.local == 0 {
+                    return false;
+                }
+            }
+            // Storage markers carry no value, but a marker naming local 0 means
+            // the return slot's storage is changing under us — refuse.
+            Statement::StorageLive(local) | Statement::StorageDead(local) => {
+                if *local == 0 {
+                    return false;
+                }
+            }
+            Statement::PlaceMention(_)
+            | Statement::Coverage
+            | Statement::ConstEvalCounter
+            | Statement::Nop => {}
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether `terminator` provably leaves the return slot `_0` UNTOUCHED.
+///
+/// ALLOW-LIST, symmetric with [`statements_preserve_return_place`]. This was a
+/// two-entry DENY-LIST (`Call{dest:_0}`, `Drop{place:_0}`) under a doc that
+/// promised the opposite asymmetry, and `Terminator::Opaque` walked straight
+/// through the hole: `opaque_terminator(kind, targets, span)`
+/// (`trust-mir-extract/src/convert.rs:1976`) has NO destination parameter, so
+/// every one of its call sites DISCARDS the MIR terminator's destination place
+/// while keeping the normal successor. `_0 = <indirect>()` (convert.rs:1704),
+/// `_0 = <atomic>()` when the intrinsic's metadata does not parse
+/// (convert.rs:1752), and an `InlineAsm` `out(reg) _0` / a coroutine `Yield`
+/// (the `_ =>` arm, convert.rs:1943) all arrive here as a block whose whole
+/// effect is a write to `_0` and whose model records only "some successor".
+/// `Terminator::TailCall` is the same class by a different route: its
+/// destination is the return place IMPLICITLY (`convert.rs:1838`,
+/// `let implicit_return = Place::local(0)`), so it has no `dest` field to test.
+/// Under the old deny-list both answered `true` and the walk stepped past a
+/// real `_0` write to attribute an earlier, STALE definition to the return
+/// path — verbatim the direction [`statements_preserve_return_place`]'s doc
+/// names.
+///
+/// The default arm delegates to [`trust_types::Terminator::write_effect`],
+/// which is WILDCARD-FREE in the crate that owns the `#[non_exhaustive]` enum:
+/// a new terminator variant cannot reach `true` here by accident, because it
+/// must first be classified `NoValueWrite` there, and that classification does
+/// not compile until someone writes it. `Opaque` is `FailClosedOrBackstopped`
+/// and `TailCall` is `Captured`, so both now refuse — which is also what
+/// `path_defs.rs:297` already concluded about `Opaque` ("can run arbitrary code
+/// — same conservative havoc as a Call, MINUS A DEST, WHICH OPAQUE DOES NOT
+/// MODEL") from the same fact.
+pub(super) fn terminator_preserves_return_place(terminator: &Terminator) -> bool {
+    terminator_preserves_local(terminator, 0)
+}
+
+/// The same allow-list, resolved onto ANY local — `_0` is just the caller that
+/// needed it first.
+///
+/// Trust: 2026-09-01 — generalized so the forwarded-call path-region check can
+/// reuse ONE rule instead of spelling a second, weaker one. That check protects
+/// "`discriminant(call_dest)` at the switch equals its discriminant at `Return`"
+/// and used to scan for `Statement::Assign` and a `Call` dest only, so a
+/// `SetDiscriminant` on `call_dest` — the statement whose entire job is to change
+/// a discriminant — passed straight through the guard that exists to protect one.
+/// `Deinit`, `Drop` glue and the dest-discarding `Opaque` were missed with it.
+pub(super) fn terminator_preserves_local(terminator: &Terminator, local: usize) -> bool {
+    match terminator {
+        // The two place-BEARING writes the model spells out. Admitted exactly
+        // when the place they name is not this local.
+        Terminator::Call { dest, .. } => dest.local != local,
+        Terminator::Drop { place, .. } => place.local != local,
+        // Everything else is admitted ONLY on the owning crate's own testimony
+        // that it writes no value at all.
+        other => matches!(other.write_effect(), trust_types::WriteEffect::NoValueWrite),
+    }
+}
+
+/// Whether `block` provably leaves the return slot `_0` UNTOUCHED — statements
+/// AND terminator. See the two halves for the fail-closed argument each makes.
+fn block_preserves_return_place(block: &trust_types::BasicBlock) -> bool {
+    statements_preserve_return_place(block) && terminator_preserves_return_place(&block.terminator)
+}
+
+/// The `_0`-preserving ancestors of `from`, nearest first.
+///
+/// WHY. Drop elaboration can splice a join block between the block that actually
+/// builds the returned value and the `Return`. The return path's predecessor
+/// then assigns nothing, the aggregate resolvers find no definition, and the
+/// WHOLE function's witness is refused. These ancestors let the resolvers keep
+/// looking past such blocks.
+///
+/// SOUNDNESS. A step is taken only when the current block provably does not
+/// touch `_0` ([`block_preserves_return_place`]) AND has EXACTLY ONE
+/// predecessor — so every execution reaching the return through `from` passed
+/// through that predecessor, and the `_0` it defined is the `_0` observed at
+/// `Return`. Multiple predecessors, a back edge, exhausted fuel, or any
+/// unmodeled statement all end the walk.
+///
+/// AND the candidate's OWN TERMINATOR is checked BEFORE it is pushed. That
+/// order is load-bearing and used to be wrong: the loop pushed the sole
+/// predecessor and only then made it `current`, so the block that HOLDS the
+/// definition — the one whose `_0` statement ends the walk on the next
+/// iteration — never reached the terminator test at all. `bb = { _0 = Ok(5);
+/// Call { dest: _0, target: .. } }` was therefore admitted, and the stale
+/// `Ok(5)` was attributed to a return path its own terminator had already
+/// overwritten, using the very shape [`terminator_preserves_return_place`]
+/// names. A pushed block's STATEMENTS still only need checking when the walk
+/// steps FURTHER past it, which is exactly where the next iteration's
+/// [`block_preserves_return_place`] looks.
+///
+/// CALLERS MUST APPEND, NEVER PREPEND. These blocks extend the resolver's
+/// search window BACKWARDS, and that window is read LATEST-FIRST, so they
+/// belong at its far end: an ancestor is by construction older than the
+/// `vc_block` it was reached from. Prepending them would hand the resolver a
+/// definition the return path has already overwritten — the same class of
+/// mistake the window's own ordering used to make; see
+/// `resolve_enum_return_aggregate_with_block`.
+///
+/// This does NOT change any caller's `vc_block`: the per-predecessor VC
+/// quantification domain and every `version_token_at` derivation stay exactly as
+/// they are (see `contract_vcs.rs`, "Both facts are PER-PREDECESSOR").
+fn return_producer_ancestors<'a>(
+    func: &'a VerifiableFunction,
+    from: &'a trust_types::BasicBlock,
+) -> Vec<&'a trust_types::BasicBlock> {
+    let mut chain = Vec::new();
+    let mut current = from;
+    let mut visited: FxHashSet<BlockId> = FxHashSet::default();
+    visited.insert(from.id);
+    for _ in 0..RETURN_PRODUCER_WALK_FUEL {
+        if !block_preserves_return_place(current) {
+            break;
+        }
+        let preds: Vec<&'a trust_types::BasicBlock> = func
+            .body
+            .blocks
+            .iter()
+            .filter(|pred| v2_terminator_targets(&pred.terminator).contains(&current.id))
+            .collect();
+        // Sole predecessor only: a join would need ALL of its predecessors.
+        let [only] = preds.as_slice() else { break };
+        if !visited.insert(only.id) {
+            break;
+        }
+        // Whatever `only` defines for `_0` must survive `only`'s OWN exit into
+        // `current`. Checked here, before the push, because a chain tail is
+        // never re-examined: see this function's SOUNDNESS note.
+        if !terminator_preserves_return_place(&only.terminator) {
+            break;
+        }
+        chain.push(*only);
+        current = only;
+    }
+    chain
+}
+
 /// Whether `name` is EXACTLY the std/core `Option` ADT path — never a substring
 /// match. A substring gate (`name.contains("Option")`) is a FALSE-PROVE hole: a
 /// user enum whose path merely contains "Option" (`ConfigOption`, `Optional`, a
@@ -215,7 +393,7 @@ pub(super) fn resolve_forwarded_call_return_variant(
         }
         // (2a) the switch discriminant is `discriminant(call_dest)`.
         let Some(d) = operand_root_local(func, discr, FUEL) else { continue };
-        let Some(Rvalue::Discriminant(p)) = crate::unique_whole_local_def(func, d) else {
+        let Some(Rvalue::Discriminant(p)) = crate::local_defs::unique_value_def(func, d) else {
             continue;
         };
         if p.local != call_dest || !p.projections.is_empty() {
@@ -301,13 +479,22 @@ pub(super) fn resolve_forwarded_call_return_variant(
             if !region.contains(&b.id.0) {
                 return false;
             }
+            // Trust: SOUNDNESS (2026-09-01) — ask the owning crate's EXHAUSTIVE
+            // per-local classifier, not a two-case deny-list. The fact under
+            // protection is discriminant stability, and the old spelling matched
+            // `Statement::Assign` + a `Call` dest only: `SetDiscriminant` on
+            // `call_dest` (a discriminant write with no `Rvalue` to name),
+            // `Deinit`, a `Drop` whose glue takes `&mut call_dest`, and the
+            // dest-discarding `Opaque` all passed the guard. `local_write` and
+            // `write_effect` are wildcard-free in `trust-types`, so a new MIR
+            // write channel cannot reach `false` here without being classified
+            // there first.
             let stmt_write = b
                 .stmts
                 .iter()
-                .any(|s| matches!(s, Statement::Assign { place, .. } if place.local == call_dest));
-            let call_write = matches!(&b.terminator, Terminator::Call { dest, .. }
-                if dest.local == call_dest);
-            stmt_write || call_write
+                .any(|s| !matches!(s.local_write(call_dest), trust_types::LocalWrite::Untouched));
+            let term_write = !terminator_preserves_local(&b.terminator, call_dest);
+            stmt_write || term_write
         });
         if region_writes {
             continue;
@@ -346,13 +533,56 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
     vc_block: &'a trust_types::BasicBlock,
     block: &'a trust_types::BasicBlock,
 ) -> Option<(StdEnumReturn, usize, &'a [trust_types::Operand], BlockId)> {
-    // The unique whole-local definition of `local` (no field projection),
-    // searched across the predecessor then the return block — the two blocks the
-    // pin loop threads. The aggregate lives in `vc_block`, the `_0 = _k` move in
-    // `block`; searching both, nearest-def-wins per block, recovers the chain.
+    // The whole-local definition of `local` (no field projection) that REACHES
+    // the return, searched over the window the pin loop threads: the aggregate
+    // lives in `vc_block`, the `_0 = _k` move in `block`; the
+    // `_0`-preserving ancestors extend the window backwards for the
+    // drop-elaboration join case, where the aggregate sits further back.
+    //
+    // LATEST-FIRST, and that order is the whole point. Every caller passes a
+    // `vc_block` drawn from `predecessors(block)` (or `block` itself when it has
+    // none), and each ancestor is the SOLE predecessor of the block before it,
+    // so the window is one linear path:
+    //
+    //     anc_k -> .. -> anc_1 -> vc_block -> block
+    //
+    // The definition observed at `Return` is therefore the LAST one on that
+    // path. This list used to be built EARLIEST-first (`[vc_block, block]` then
+    // the ancestors) and `find_map` took the first hit, statement order
+    // included — so a DEAD store beat the live definition below it. Measured
+    // end to end against the PRE-FIX stage1 driver on 2026-09-01, that was a
+    // live false verify on three lines of ordinary Rust:
+    //
+    //     #[core::contracts::ensures(|r: &Option<i64>| r.is_some())]
+    //     pub fn h(g: fn() -> Option<i64>) -> Option<i64> {
+    //         let mut r = Some(5);   // bb0: `_3 = Some(5)` — rustc itself warns
+    //         r = g();               // bb1: `_3 = move _4`  — the LIVE def
+    //         r                      // bb1: `_0 = move _3`
+    //     }
+    //
+    // `2 proved, 0 failed, 0 unknown`, exit 0 — for a postcondition the compiled
+    // program then violates whenever `g()` returns `None`. The alias hop
+    // `_0 -> _3` read `_3`'s definition out of the PREDECESSOR because the
+    // predecessor came first in this list, even though the return block's
+    // definition of `_3` is the one that runs last. Deleting the dead store made
+    // the same function fail closed (`0 proved, 2 unknown`), and flipping it to
+    // `None` made the SAME body prove the OPPOSITE postcondition.
+    //
+    // The regression pins in `return_walk_preservation_tests` transcribe that
+    // dumped MIR one-for-one, because re-running the end-to-end repro needs a
+    // driver rebuild.
+    //
+    // `block_preserves_return_place` cannot reach this: it guards `place.local
+    // == 0`, and the local being read here is the alias, not the return slot.
+    // Order is the only thing that decides it, so order is what is fixed.
+    // `contract_vcs.rs` already states the intended rule for the pin it feeds —
+    // "Pin at MOST ONE discriminant per return path (last / nearest-to-return
+    // wins)"; this makes the resolver agree with it.
+    let mut search: Vec<&'a trust_types::BasicBlock> = vec![block, vc_block];
+    search.extend(return_producer_ancestors(func, vc_block));
     let whole_def = |local: usize| -> Option<(&'a Rvalue, BlockId)> {
-        [vc_block, block].into_iter().find_map(|b| {
-            b.stmts.iter().find_map(|stmt| match stmt {
+        search.iter().copied().find_map(|b| {
+            b.stmts.iter().rev().find_map(|stmt| match stmt {
                 Statement::Assign { place, rvalue, .. }
                     if place.local == local && place.projections.is_empty() =>
                 {
@@ -419,14 +649,37 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
                         .filter(|b| v2_terminator_targets(&b.terminator).iter().any(|t| t.0 == cur))
                         .collect();
                     let [only] = preds.as_slice() else { break };
-                    let def = only.stmts.iter().find_map(|stmt| match stmt {
-                        Statement::Assign { place, rvalue, .. }
+                    // Trust: SOUNDNESS (2026-09-01) — this walk previously inspected
+                    // ONLY `Assign` statements, so it would hop into, or step through,
+                    // a block whose TERMINATOR writes `local` (`Call { dest: local }`,
+                    // a `Drop` of it, or the dest-discarding `Opaque`) and attribute a
+                    // definition from further up to this path — the same stale-value
+                    // class as the `_0` walk's terminator hole. The terminator runs
+                    // AFTER the statements, so it decides what leaves the block.
+                    if !terminator_preserves_local(&only.terminator, local) {
+                        break;
+                    }
+                    // The write that REACHES the successor is the LAST one in the
+                    // block, over EVERY channel — not the first `Assign` (the same
+                    // earliest-first defect fixed in `whole_def`). Ask the exhaustive
+                    // per-local classifier, then require that last write to be exactly
+                    // the forward-move this hop models; anything else (a partial store,
+                    // a `SetDiscriminant`, a `Deinit`, an unlocatable write) fails
+                    // closed rather than being hopped over.
+                    let last_write = only
+                        .stmts
+                        .iter()
+                        .rev()
+                        .find(|s| !matches!(s.local_write(local), trust_types::LocalWrite::Untouched));
+                    let def = match last_write {
+                        None => None,
+                        Some(Statement::Assign { place, rvalue, .. })
                             if place.local == local && place.projections.is_empty() =>
                         {
                             Some(rvalue)
                         }
-                        _ => None,
-                    });
+                        Some(_) => break,
+                    };
                     if let Some(Rvalue::Use(Operand::Move(p) | Operand::Copy(p))) = def {
                         if p.projections.is_empty() {
                             lenwitness_dbg!(
@@ -535,8 +788,8 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
 /// body-aware contract lane can now GROUND — i.e. connect to the return slot's
 /// real construction — or an EMPTY set (fail-closed) when it cannot.
 ///
-/// Credited ONLY when BOTH hold, so the "no free-and-havocked model term on any
-/// reachable return path" invariant is preserved unconditionally:
+/// Credited ONLY when ALL THREE hold, so the "no free-and-havocked model term
+/// on any reachable return path" invariant is preserved unconditionally:
 ///  (a) the return type is the std/core `Option` or `Result` ADT (exact
 ///      canonical path — see `is_std_option_name` / `is_std_result_name`) whose
 ///      lowered variant defs carry the std machine tags (`None`=0/`Some`=1,
@@ -544,7 +797,10 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
 ///  (b) EVERY `Return`-terminated block's grounding path (its predecessors, or
 ///      the block itself when it has none — the SAME `vc_blocks` reconstruction
 ///      the pin loop uses) assigns `_0` via an IN-BODY
-///      `Rvalue::Aggregate(Adt{the SAME std enum, variant∈{0,1}})`.
+///      `Rvalue::Aggregate(Adt{the SAME std enum, variant∈{0,1}})`, and
+///  (c) there is at least one such path, and no exit this gate cannot inspect
+///      (a `TailCall`, whose destination is the return place implicitly) — see
+///      the guard's own comment for the vacuous credit that closed.
 /// If any return path routes `_0` through a `Call` dest (e.g. `and_then` /
 /// `checked_*` — `index_midpoint` — or the `?`-desugar `from_residual`), a
 /// copy/move of a temp, or a non-wrapper / multi-variant aggregate, the gate
@@ -553,7 +809,7 @@ pub(super) fn resolve_enum_return_aggregate_with_block<'a>(
 /// false-refute) or credited-but-unpinned.
 ///
 /// WHICH names are credited:
-///  * `_0__discr` — always (once (a)+(b) hold): the pin loop pins it on every
+///  * `_0__discr` — always (once (a)+(b)+(c) hold): the pin loop pins it on every
 ///    return path to the PARSER-convention value (`std_enum_model_discr` —
 ///    Result's mapping is INVERTED vs its machine variant order).
 ///  * `_0__value` — only when the payload variant (`Some`/`Ok`) is a single
@@ -666,6 +922,34 @@ pub(super) fn enum_return_grounded_model_vars(func: &VerifiableFunction) -> FxHa
                 }
             }
         }
+    }
+    // (c) FAIL CLOSED ON AN EXIT THIS GATE CANNOT INSPECT. The loop above walks
+    // `Terminator::Return` blocks only, while the pin loop it feeds
+    // (`contract_vcs.rs`) pins over `Return | TailCall` — so a tail-call exit is
+    // pinned without ever being gated, and a body with no `Return` at all is
+    // credited having inspected nothing. Neither can be grounded even in
+    // principle: a `TailCall`'s destination IS the return place, implicitly
+    // (`convert.rs:1838`, `let implicit_return = Place::local(0)`), so every
+    // `_0` definition reaching it is stale by construction — the same fact
+    // [`terminator_preserves_return_place`] refuses on. Measured before this
+    // guard: a body whose only exit was a tail call credited BOTH `_0__discr`
+    // and `_0__value` off `n_return_paths == 0`, and the pin loop then pinned
+    // the pre-tail-call `Ok(5)` into a body-aware `Postcondition` VC that is
+    // UNSAT on its own conjunction — a vacuous PROVE about a value the callee
+    // replaced.
+    if n_return_paths == 0 {
+        lenwitness_dbg!(
+            &func.def_path,
+            "discr-gate: NO `Return` block to ground -> _0__discr UNGROUNDED (nothing was inspected)"
+        );
+        return empty;
+    }
+    if func.body.blocks.iter().any(|b| matches!(b.terminator, Terminator::TailCall { .. })) {
+        lenwitness_dbg!(
+            &func.def_path,
+            "discr-gate: body has a TailCall exit (implicit `_0` dest, ungroundable) -> _0__discr UNGROUNDED"
+        );
+        return empty;
     }
     let mut set = FxHashSet::default();
     set.insert("_0__discr".to_string());
@@ -836,7 +1120,7 @@ pub(super) fn component_candidate_places(
             local,
             projections: path[idx..].iter().map(|&i| trust_types::Projection::Field(i)).collect(),
         });
-        match crate::unique_whole_local_def(func, local) {
+        match crate::local_defs::unique_value_def(func, local) {
             // Positional aggregate: descend into the component's source operand.
             // Only while path components remain — at the leaf (`idx ==
             // path.len()`) there is no field left to index (and `path[idx]`
@@ -925,7 +1209,8 @@ pub(super) fn component_source_leaf(
             );
             return None;
         }
-        let Some(Rvalue::Aggregate(kind, ops)) = crate::unique_whole_local_def(func, local) else {
+        let Some(Rvalue::Aggregate(kind, ops)) = crate::local_defs::unique_value_def(func, local)
+        else {
             lenwitness_dbg!(
                 &func.def_path,
                 "source-leaf: src=_{src} path={path:?} STOP _{local} has no unique-whole-def aggregate (alias/Call-dest/multi-def) -> None"
@@ -1009,7 +1294,8 @@ pub(super) fn dominating_len_equality_guard(
             continue;
         }
         let Some(c) = operand_root_local(func, discr, FUEL) else { continue };
-        let Some(Rvalue::BinaryOp(cmp, opl, opr)) = crate::unique_whole_local_def(func, c) else {
+        let Some(Rvalue::BinaryOp(cmp, opl, opr)) = crate::local_defs::unique_value_def(func, c)
+        else {
             continue;
         };
         if !matches!(cmp, BinOp::Eq | BinOp::Ne) {
@@ -1084,7 +1370,7 @@ pub(super) fn dominating_len_equality_guard(
 pub(super) fn leaf_push_disciplined(func: &VerifiableFunction, leaf: usize) -> bool {
     matches!(crate::local_ty_ref(func, leaf), Some(Ty::Adt { name, .. })
         if is_owned_slice_container_name(name))
-        && guards::whole_local_def_count(func, leaf) == 1
+        && crate::local_defs::has_one_explicit_def(func, leaf)
         && vec_created_empty(func, leaf)
         && !local_has_projected_write(func, leaf)
         && vec_mut_borrows_only_feed_push(func, leaf)
@@ -1652,7 +1938,7 @@ pub(super) fn f4_operand_denotes_candidate(
     if fuel == 0 || !p.projections.is_empty() || !crate::place_source_is_stable(func, p.local) {
         return false;
     }
-    match crate::unique_whole_local_def(func, p.local) {
+    match crate::local_defs::unique_value_def(func, p.local) {
         Some(Rvalue::Ref { mutable: false, place }) => cands.contains(place),
         Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q))) if q.projections.is_empty() => {
             f4_operand_denotes_candidate(func, &Operand::Copy(q.clone()), cands, fuel - 1)
@@ -1708,6 +1994,12 @@ pub(super) fn f4_whole_local_defs<'a>(
     func: &'a VerifiableFunction,
     local: usize,
 ) -> Option<Vec<F4LocalDef<'a>>> {
+    // A PARAMETER is out, defs or no defs: with none its value is no witness, and with
+    // some its implicit ENTRY definition is one this scan cannot carry, so the edge
+    // facts joined over the visible defs would not cover every value a read can see.
+    if local >= 1 && local <= func.body.arg_count {
+        return None;
+    }
     let mut out = Vec::new();
     for block in &func.body.blocks {
         for stmt in &block.stmts {
@@ -1811,7 +2103,7 @@ pub(super) fn f4_switch_root_local(
     for _ in 0..fuel {
         if crate::place_source_is_stable(func, local)
             && let Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q))) =
-                crate::unique_whole_local_def(func, local)
+                crate::local_defs::unique_value_def(func, local)
             && q.projections.is_empty()
         {
             local = q.local;
@@ -1889,18 +2181,39 @@ pub(super) fn ordering_witness_path_pins(
     block: &trust_types::BasicBlock,
     item: &OrdWitnessItem,
 ) -> Option<Vec<Formula>> {
-    let (kind, variant, ops, agg_block) =
-        resolve_enum_return_aggregate_with_block(func, vc_block, block)?;
+    // Read-only, env-gated diagnostics (TRUST_ORDWIT_DEBUG) for the ordering-
+    // witness grounding lane — never alters any verdict path.
+    let dbg = std::env::var_os("TRUST_ORDWIT_DEBUG").is_some()
+        && (func.def_path.contains("check_chain")
+            || func.def_path.contains("check_entailment")
+            || func.def_path.contains("check_branch_tree"));
+    let Some((kind, variant, ops, agg_block)) =
+        resolve_enum_return_aggregate_with_block(func, vc_block, block)
+    else {
+        if dbg {
+            eprintln!("[ORDWIT] {} resolve_enum_return_aggregate=None", func.def_path);
+        }
+        return None;
+    };
     if variant != std_enum_payload_variant(kind) {
         return Some(Vec::new());
     }
     if ops.len() != 1 {
+        if dbg {
+            eprintln!("[ORDWIT] {} ops.len()={} (!=1)", func.def_path, ops.len());
+        }
         return None;
     }
     let (Operand::Copy(sp) | Operand::Move(sp)) = &ops[0] else {
+        if dbg {
+            eprintln!("[ORDWIT] {} payload op is const/symbolic", func.def_path);
+        }
         return None;
     };
     if !sp.projections.is_empty() {
+        if dbg {
+            eprintln!("[ORDWIT] {} payload op _{} carries projection", func.def_path, sp.local);
+        }
         return None;
     }
     let src = sp.local;
@@ -1916,12 +2229,26 @@ pub(super) fn ordering_witness_path_pins(
             }
             let cand_a = component_candidate_places(func, src, &[va.index]);
             let cand_b = component_candidate_places(func, src, &[vb.index]);
+            if dbg {
+                eprintln!(
+                    "[ORDWIT] {} pair({},{}) src=_{} cand_a={} cand_b={}",
+                    func.def_path, va.name, vb.name, src, cand_a.len(), cand_b.len()
+                );
+            }
             if cand_a.is_empty() || cand_b.is_empty() {
                 return None;
             }
             let target =
                 OrdWitnessTarget::Pair { ty_name: &ty_a, cand_a: &cand_a, cand_b: &cand_b };
-            let facts = dominating_ordering_witness_guard(func, agg_block.0, &target)?;
+            let facts = dominating_ordering_witness_guard(func, agg_block.0, &target);
+            if dbg {
+                eprintln!(
+                    "[ORDWIT] {} pair guard_matched={}",
+                    func.def_path,
+                    facts.is_some()
+                );
+            }
+            let facts = facts?;
             let pin = facts.to_formula(
                 Formula::var_owned(va.name.clone(), Sort::Int),
                 Formula::var_owned(vb.name.clone(), Sort::Int),

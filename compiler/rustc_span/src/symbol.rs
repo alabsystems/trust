@@ -2530,6 +2530,46 @@ symbols! {
         // as the native grammar spells it in both the signature and the loop
         // clause position.
         loop_invariant,
+        // Trust: the once-initializer re-entrancy check
+        // (`rustc_mir_transform::trust_once_reentrancy`). Diagnostic items on
+        // the five Once-family cell types, on every method of theirs that WAITS
+        // on the cell (a `set`/`try_insert` included: both wait on `RUNNING`),
+        // on the two `Lazy*::new` constructors (identification only), and on
+        // the `std::thread` spawn entry points, which mark a closure/fn value as
+        // running on ANOTHER thread — not a synchronous edge for that check.
+        OnceLock,
+        LazyLock,
+        Once,
+        OnceCell,
+        LazyCell,
+        once_lock_get_or_init,
+        once_lock_get_mut_or_init,
+        once_lock_get_or_try_init,
+        once_lock_get_mut_or_try_init,
+        once_lock_wait,
+        once_lock_set,
+        once_lock_try_insert,
+        once_call_once,
+        once_call_once_force,
+        once_wait,
+        once_wait_force,
+        lazy_lock_new,
+        lazy_lock_force,
+        lazy_lock_force_mut,
+        once_cell_get_or_init,
+        once_cell_get_mut_or_init,
+        once_cell_get_or_try_init,
+        once_cell_get_mut_or_try_init,
+        once_cell_set,
+        once_cell_try_insert,
+        lazy_cell_new,
+        lazy_cell_force,
+        lazy_cell_force_mut,
+        thread_spawn,
+        thread_builder_spawn,
+        thread_builder_spawn_unchecked,
+        thread_builder_spawn_scoped,
+        thread_scope_spawn,
     }
 }
 

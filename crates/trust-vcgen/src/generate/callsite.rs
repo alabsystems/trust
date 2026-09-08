@@ -27,7 +27,7 @@ pub fn generate_callsite_precondition_vcs(
     // can never be admitted as a callsite premise.
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
     let func = arithmetic_safe_func.as_ref();
-    let guard_paths_map = v2_build_path_guard_map(func);
+    let guard_paths_map = super::guard_map_for(func);
     let semantic_guards = build_semantic_guard_map(func);
     // Cross-block PATH DEFINITIONS (`_7 == 4 * m` computed blocks before the
     // call): without them a callee precondition over a value THREADED from an
@@ -35,7 +35,7 @@ pub fn generate_callsite_precondition_vcs(
     // Same machinery as the postcondition lane; live-filtered per call block.
     let path_definition_map = v2_build_path_definition_map(func);
     // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     // Function-wide invariant facts (min/max result bounds, cast bounds, …):
     // unconditionally true, so sound in every callsite obligation. Without them
     // `f(1, x.max(1))` cannot discharge a callee `requires(lo <= hi)` — the
@@ -319,11 +319,11 @@ pub fn generate_callsite_precondition_vcs_attributed(
     }
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
     let func = arithmetic_safe_func.as_ref();
-    let guard_paths_map = v2_build_path_guard_map(func);
+    let guard_paths_map = super::guard_map_for(func);
     let semantic_guards = build_semantic_guard_map(func);
     // Cross-block path definitions — identical to the non-attributed producer.
     let path_definition_map = v2_build_path_definition_map(func);
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     // Same fact set the non-attributed producer conjoins — the two assemblies
     // must stay IDENTICAL (see the doc above).
     let global_facts = build_global_invariant_facts(func);
@@ -802,19 +802,51 @@ pub(super) fn capture_avoiding_rebind(
 ///   `proved` for precondition CHECKS yet must not have its postcondition
 ///   ASSUMED;
 /// - non-empty `postconditions` — otherwise there is nothing to inject;
-/// - projection-free, single-static-assignment `dest` — the same gate the stdlib
-///   min/max facts use, so a `&mut`-reassigned dest cannot leave a stale bound;
-/// - arity match — otherwise the formal→arg rebinding would be ill-formed.
+/// - projection-free `dest` whose post-call token names ONE value —
+///   `local_defs::dest_fact_is_version_pinnable`, so a `&mut`-reassigned or
+///   twice-written dest cannot leave a stale bound. This is NOT the same question
+///   the stdlib min/max facts ask, and the two were the same predicate until
+///   2026-08-31, when a witness proved one predicate was answering both:
+///   `is_single_static_assignment` licenses a fact keyed on the dest's BARE NAME,
+///   which a PARAMETER's entry definition refutes on every path that skips the
+///   call. Nothing on THIS path is keyed on the bare name — the clause is threaded
+///   through `version_terminator_dest_fact`, which pins every occurrence of the
+///   dest's base name to `{dest}#s{block}_t`, a spelling the entry value is never
+///   read under. The name-disjointness is structural: `normalize_ssa_version_tokens`
+///   would be the one pass that could merge them, and `local_versions_collapse_to_bare`
+///   refuses the collapse for any local with a call-dest write, which every dest
+///   admitted here has by construction. The bare-name sites keep the stricter
+///   question; see `local_defs`' "One predicate cannot answer two questions";
+/// - arity match — otherwise the formal→arg rebinding would be ill-formed;
+/// - THE TIME AXIS: no argument of this call may render to the destination's own
+///   variable name. The rebound clause is threaded through
+///   `version_terminator_dest_fact`, whose blanket base-name rewrite would then
+///   read the argument at the POST-call token — `ensures result > n` injected as
+///   `n#s{b}_t > n#s{b}_t`, an unsatisfiable hypothesis conjoined into every
+///   dominated obligation. The guarded branch of `rebind_callee_postconditions`
+///   has refused this for its ANTECEDENT since slice 2; the consequent — the half
+///   that rides L0, because `definitional_precondition_free_subset` admits
+///   precondition-free definitional summaries and those never take the guarded
+///   branch — had no equivalent check until 2026-08-31. Reaching it needs
+///   `_N = f(.. copy _N ..)`, which rustc does not emit (measured: 0 of 105,703
+///   `Call` terminators in the dependency-closed corpus, and 0 at
+///   `-Zmir-opt-level` 1/2/3/4 for eight self-assigning shapes) — so the gate
+///   costs no measured fact and closes a trap nothing else in the lane refused.
+///   Stated here AND enforced identically in `rebind_callee_postconditions`, on
+///   the ADMIT ≡ EMIT discipline `summary_postconditions_ride_with_their_guard`
+///   already keeps: this is the reason the predicate takes `args` rather than an
+///   `arg_count`.
 pub(crate) fn callee_postcondition_is_injectable(
     func: &VerifiableFunction,
     dest: &Place,
     summary: &crate::modular::FunctionSummary,
-    arg_count: usize,
+    args: &[Operand],
 ) -> bool {
     summary.has_reusable_postcondition_evidence()
         && dest.projections.is_empty()
-        && summary.param_names.len() == arg_count
-        && is_single_static_assignment(func, dest.local)
+        && summary.param_names.len() == args.len()
+        && crate::local_defs::dest_fact_is_version_pinnable(func, dest.local)
+        && !terminator_args_read_name(func, args, &place_to_var_name(func, dest))
         // Trust (postcondition composition, slice 2): a PRECONDITIONED summary
         // is injectable only when its clauses can ride under their own guard —
         // `summary_postconditions_ride_with_their_guard` is the shared ADMIT/EMIT
@@ -941,6 +973,23 @@ pub(crate) fn rebind_callee_postconditions(
     let dest_name = place_to_var_name(func, dest);
     let dest_sort = crate::place_sort(func, dest).unwrap_or(Sort::Int);
 
+    // THE TIME AXIS, EMIT side — the mirror of the conjunct
+    // `callee_postcondition_is_injectable` applies, refusing on exactly the same
+    // condition so ADMIT and EMIT cannot drift (and so `assumptions_injected`
+    // never counts an injection the body VCs did not receive). If any ACTUAL
+    // renders to the destination's own name, then after the `_0 -> dest`
+    // substitution the clause names ONE symbol where the callee proved a relation
+    // between TWO — `result > n` collapses to `n > n` before it is even versioned
+    // — and `version_terminator_dest_fact` then reads the argument at the
+    // post-call token. Refuse the whole injection, all-or-nothing, exactly as the
+    // antecedent check below does.
+    if replacements
+        .iter()
+        .any(|(_, actual)| actual.free_variables().iter().any(|v| *v == dest_name))
+    {
+        return Vec::new();
+    }
+
     // Trust (postcondition composition, slice 2): THE GUARD.
     //
     // What a preconditioned callee proved is `requires -> ensures`, so that is
@@ -985,11 +1034,17 @@ pub(crate) fn rebind_callee_postconditions(
         // that is exactly right — it is what pins the fact to the value this
         // call defined. In the ANTECEDENT it would be a silent time shift: an
         // entry condition re-read against the post-state, dischargeable by
-        // facts the call itself established. Refuse instead. (Reaching this
-        // needs an actual naming the dest local, which the summary's
-        // single-static-assignment gate already makes hard to build; a
-        // fail-closed refusal costs a fact, an unnoticed time shift costs the
-        // soundness argument.)
+        // facts the call itself established. Refuse instead.
+        //
+        // SUBSUMED since 2026-08-31 by the actual-read refusal at the top of
+        // this function: `precondition_rebindable` (checked above, inside
+        // `summary_postconditions_ride_with_their_guard`) already confines the
+        // antecedent's free variables to the formals, so after substitution its
+        // symbols come only from the actuals — and an actual naming the dest is
+        // now refused before we get here. Kept as belt-and-braces, on the same
+        // discipline as every other superseded deny-list in this tree: it is the
+        // check that NAMED the hazard, and the one a future widening of
+        // `precondition_rebindable` would need.
         if antecedent.free_variables().iter().any(|v| *v == dest_name) {
             return Vec::new();
         }

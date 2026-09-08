@@ -119,7 +119,14 @@ pub struct Boom;
 
 impl AsRef<[u8]> for Boom {
     fn as_ref(&self) -> &[u8] { //~ ERROR Trust strict verification failed
-        //~| NOTE [assert] FAILED
+        // Mechanism pin, RE-MEASURED 2026-08-30 on the stamped build: the row
+        // is no longer rendered `[assert] FAILED` — the proof-only Assertion
+        // bridge HOLDS the solver counterexample below proof authority, and
+        // the held-refutation stamp is what makes it fatal. Pinning the held
+        // wording keeps this a mechanism pin: if the bridge ever silently
+        // drops the counterexample instead of holding it, this NOTE vanishes
+        // and the fixture goes red.
+        //~| NOTE [assert] UNKNOWN (trust-full-verifier): a solver counterexample for this assertion was held below proof authority
         panic!("a trait method is user code, and user code panics")
     }
 }
@@ -218,8 +225,22 @@ pub fn probe_slice_index_range(a: &[u8]) -> &[u8] { //~ ERROR Trust strict verif
 // ADMISSION into the proof-authority bundle, so the compile now fails with
 // the full-verification lowering-incomplete refusal instead of a strict-lane
 // refutation. Same fail-closed property, different (earlier) chokepoint.
+// RESTORED 2026-08-30: that re-bless mis-read WHY admission was refused. The
+// 48f24efa5af gate compared the call site's SYNTACTIC identity (the trait
+// method's `DefId` + call args, which is what `Terminator::Call` carries)
+// against a ledger recording the RESOLVED impl method's identity — two
+// different `DefId`s that render identically — so it refused EVERY
+// Assert-bearing trait member, chargeable or not. That is not a moved
+// chokepoint; it is the aggregate-shaped over-refusal
+// `native_bundle_member_derived_requires_per_site.rs` exists to catch (its
+// three controls were refused by the same comparison, never chargeable-vs-not).
+// With the ledger recording the call-form identity the member is admitted
+// again, the derived requires `rhs != 0` is minted per call site, and THIS
+// unguarded site is refuted — the strict-lane refutation the annotation
+// pinned before the 2026-08-28 re-bless, now with its mechanism pinned too.
 // ---------------------------------------------------------------------------
-pub fn probe_bundled_member_div(a: Wrapping<u8>, b: Wrapping<u8>) -> Wrapping<u8> { //~ ERROR Trust full verification failed
+pub fn probe_bundled_member_div(a: Wrapping<u8>, b: Wrapping<u8>) -> Wrapping<u8> { //~ ERROR Trust strict verification failed
+    //~| NOTE [precond] FAILED
     a / b
 }
 

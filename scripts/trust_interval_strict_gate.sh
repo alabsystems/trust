@@ -91,7 +91,14 @@
 set -uo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 SRC="$REPO_ROOT/crates/trust-interval/src/lib.rs"
-TARGO="${TARGO:-$REPO_ROOT/build/aarch64-apple-darwin/stage1/bin/targo}"
+# Trust: `build/host` is a symlink to `build/<host-triple>`, so this resolves on
+# every platform. It used to name `aarch64-apple-darwin` literally, which meant
+# that on any non-Apple host this gate could only ever print
+#   REFUSE: no targo at .../build/aarch64-apple-darwin/stage1/bin/targo
+# and exit 2 — measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
+# directory does not exist at all, for all 19 strict gates at once. A soundness
+# gate that cannot run on the host it is invoked from is not a strict gate.
+TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 
 [ -x "$TARGO" ] || { echo "REFUSE: no targo at $TARGO (set TARGO=...)"; exit 2; }
 # Two behavioural discriminators; a stage whose targo was never rebuilt ships

@@ -283,8 +283,11 @@ reap_tree() {
 }
 
 t_unwrapped_conflicts_seen() {
-  local lock=$1 root rc out sc_pid bs_pid
+  local lock=$1 root rc out sc_pid bs_pid holder adopted
   root=$(fresh_root)
+  # The writers must be unrelated to the named holder: an existing child of
+  # the holder is precisely the work that its new lock already protects.
+  holder=$(spawn_keepalive)
 
   printf '#!/bin/sh\nsleep 600\n' > "$root/trust_ir_producer_scorecard.py"
   chmod +x "$root/trust_ir_producer_scorecard.py"
@@ -292,22 +295,27 @@ t_unwrapped_conflicts_seen() {
   sc_pid=$!; KEEPALIVES+=("$sc_pid")
   sleep 0.7
   out=$(TRUST_REPO="$root" sh "$lock" acquire --kind build --purpose "T9a build" \
-        --pid $$ 2>&1); rc=$?
+        --pid "$holder" 2>&1); rc=$?
+  adopted=$(sed -n 's/^pid=//p' "$root/.trust-build-lock/info" 2>/dev/null)
   reap_tree "$sc_pid"
-  if [ "$rc" -ne 3 ] || ! grep -q "SCORECARD" <<<"$out"; then
+  if [ "$rc" -ne 3 ] || [ "$adopted" != "$sc_pid" ] || ! grep -q "SCORECARD" <<<"$out"; then
+    kill -9 "$holder" 2>/dev/null
     rm -rf "$root/.trust-build-lock"; return 1
   fi
-  [ -d "$root/.trust-build-lock" ] && { rm -rf "$root/.trust-build-lock"; return 1; }
+  # The refusal adopts the writer; after it exits the next acquire must
+  # reclaim this stale record and discover the next live writer.
 
   ln -sf /bin/sleep "$root/bootstrap"
   (cd "$root" && exec ./bootstrap 600) >/dev/null 2>&1 &
   bs_pid=$!; KEEPALIVES+=("$bs_pid")
   sleep 0.7
   out=$(TRUST_REPO="$root" sh "$lock" acquire --kind measurement --purpose "T9b sweep" \
-        --pid $$ 2>&1); rc=$?
+        --pid "$holder" 2>&1); rc=$?
+  adopted=$(sed -n 's/^pid=//p' "$root/.trust-build-lock/info" 2>/dev/null)
   reap_tree "$bs_pid"
+  kill -9 "$holder" 2>/dev/null
   rm -rf "$root/.trust-build-lock"
-  [ "$rc" -eq 3 ] && grep -q "BUILD" <<<"$out"
+  [ "$rc" -eq 3 ] && [ "$adopted" = "$bs_pid" ] && grep -q "BUILD" <<<"$out"
 }
 
 # T10 — THE DEFAULT HOLDER MUST OUTLIVE `acquire`. Deliberately the one case that
@@ -358,9 +366,53 @@ t_takeover_recorded() {
   grep -q "T11 crashed lane" "$root/.trust-build-lock.breaks"
 }
 
+# A sibling checkout sharing the root's prefix has its own build resource.
+t_sibling_writer_is_independent() {
+  local lock=$1 root sibling writer token rc
+  root=$(fresh_root)
+  sibling=$(mktemp -d "$root-sibling.XXXXXX")
+  ln -s /bin/sleep "$sibling/bootstrap"
+  (cd "$sibling" && exec "$sibling/bootstrap" 600) >/dev/null 2>&1 &
+  writer=$!; KEEPALIVES+=("$writer")
+  sleep 0.7
+  token=$(TRUST_REPO="$root" sh "$lock" acquire --kind measurement \
+    --purpose "sibling independence" --pid $$ 2>/dev/null); rc=$?
+  reap_tree "$writer"
+  [ "$rc" -eq 0 ] || return 1
+  TRUST_REPO="$root" sh "$lock" release "$token" >/dev/null 2>&1
+}
+
+# Ending the parent's critical section must retain ownership for its live
+# writer, then permit a new owner once that writer has actually exited.
+t_live_writer_handover() {
+  local lock=$1 root token writer holder rc adopted
+  root=$(fresh_root); holder=$(spawn_keepalive)
+  token=$(TRUST_REPO="$root" sh "$lock" acquire --kind build \
+    --purpose "writer parent" --pid $$ 2>/dev/null) || return 1
+  ln -s /bin/sleep "$root/bootstrap"
+  (cd "$root" && exec "$root/bootstrap" 600) >/dev/null 2>&1 &
+  writer=$!; KEEPALIVES+=("$writer")
+  sleep 0.7
+  TRUST_REPO="$root" sh "$lock" release "$token" >/dev/null 2>&1
+  adopted=$(sed -n 's/^pid=//p' "$root/.trust-build-lock/info" 2>/dev/null)
+  TRUST_REPO="$root" sh "$lock" acquire --kind measurement \
+    --purpose "must wait" --pid "$holder" >/dev/null 2>&1; rc=$?
+  reap_tree "$writer"
+  if [ "$adopted" != "$writer" ] || [ "$rc" -ne 3 ] || \
+      ! grep -q 'ORPHAN-HANDOVER' "$root/.trust-build-lock.breaks"; then
+    kill -9 "$holder" 2>/dev/null
+    return 1
+  fi
+  TRUST_REPO="$root" sh "$lock" acquire --kind measurement \
+    --purpose "writer finished" --pid "$holder" >/dev/null 2>&1; rc=$?
+  kill -9 "$holder" 2>/dev/null
+  [ "$rc" -eq 0 ]
+}
+
 CASES=(refuse_while_held reclaim_stale build_blocks_sweep sweep_blocks_build
        trap_releases race_one_winner foreign_release_refused pid_reuse_detected
-       unwrapped_conflicts_seen default_holder_durable takeover_recorded)
+       unwrapped_conflicts_seen default_holder_durable takeover_recorded
+       sibling_writer_is_independent live_writer_handover)
 
 # Runs every case against $1; echoes the space-separated names that FAILED.
 # Progress goes to stderr as it happens: a suite that prints nothing for minutes

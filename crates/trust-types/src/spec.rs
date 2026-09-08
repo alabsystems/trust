@@ -376,6 +376,21 @@ pub enum SpecParseError {
     #[error("trailing tokens after expression")]
     TrailingTokens,
 
+    /// An integer literal this parser cannot read.
+    ///
+    /// Split out of the generic [`Self::TrailingTokens`] for the same reason
+    /// [`Self::UnsupportedCast`] was: until 2026-08-29 the tokenizer read BARE
+    /// DECIMAL DIGITS and nothing else, so `requires x <= 1_000` stopped at the
+    /// `1` and reported only "trailing tokens after expression" — a message
+    /// that points at everything except the separator that caused it. The
+    /// `ensures` lane had the same grammar and did not even report that much
+    /// (§13.1, `docs/STRICT_VERIFICATION_FRAGMENT.md`).
+    ///
+    /// `fix` is not decoration: standing ruling v7/D3 makes a refusal with no
+    /// next step a defect.
+    #[error("unsupported integer literal `{literal}`: {reason}; {fix}")]
+    UnsupportedIntegerLiteral { literal: String, reason: String, fix: String },
+
     /// An `as` cast in a first-class (native) clause.
     ///
     /// Split out of the generic [`Self::TrailingTokens`] because that message

@@ -182,6 +182,10 @@ fn body_lane_gates_allow_instance_flip(lowered: &Lowered) -> bool {
         && !lowered.enum_param_lane
         && !lowered.fnptr_adapter
         && lowered.thin_reborrows.is_empty()
+        // Trust (wave-MR): the `&mut` twin refuses as a whole class here too — a forwarded
+        // `&mut` is a value someone may WRITE THROUGH, and the shared side's confinement
+        // argument does not transfer. See `flip_registry::mut_reborrows_allow_flip`.
+        && lowered.mut_reborrows.is_empty()
 }
 
 /// Trust: the hook-side record. Called from the `mir_built` hook for every `DerivedAgreed` body,
@@ -710,6 +714,8 @@ mod tests {
             trust_ir::BlockId::new(0),
         ));
         Lowered {
+            coroutine_frame_ptr: false,
+            mut_reborrows: Vec::new(),
             module,
             enum_fold_switch_blocks: std::collections::HashSet::new(),
             body_kind: crate::BodyKind::Fn,

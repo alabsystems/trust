@@ -146,8 +146,8 @@ pub fn coroutine_sentinel_refutation_vcs(func: &VerifiableFunction) -> Vec<Verif
         return Vec::new();
     }
 
-    let sv = StmtVersionCtx::build(func);
-    let guard_paths_map = v2_build_path_guard_map(func);
+    let sv = super::stmt_versions_for(func);
+    let guard_paths_map = super::guard_map_for(func);
 
     // The exported precondition, spelled through the SAME `guard_to_formula`
     // path the dispatch's own path guards go through and versioned at the SAME

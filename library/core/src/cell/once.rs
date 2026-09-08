@@ -32,6 +32,8 @@ use crate::{fmt, mem};
 /// assert!(cell.get().is_some());
 /// ```
 #[stable(feature = "once_cell", since = "1.70.0")]
+// Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+#[rustc_diagnostic_item = "OnceCell"]
 pub struct OnceCell<T> {
     // Invariant: written to at most once.
     inner: UnsafeCell<Option<T>>,
@@ -89,6 +91,8 @@ impl<T> OnceCell<T> {
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "once_cell_set"]
     pub fn set(&self, value: T) -> Result<(), T> {
         match self.try_insert(value) {
             Ok(_) => Ok(()),
@@ -122,6 +126,8 @@ impl<T> OnceCell<T> {
     #[inline]
     #[unstable(feature = "once_cell_try_insert", issue = "116693")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "once_cell_try_insert"]
     pub fn try_insert(&self, value: T) -> Result<&T, (&T, T)> {
         if let Some(old) = self.get() {
             return Err((old, value));
@@ -160,6 +166,8 @@ impl<T> OnceCell<T> {
     #[inline]
     #[stable(feature = "once_cell", since = "1.70.0")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "once_cell_get_or_init"]
     pub fn get_or_init<F>(&self, f: F) -> &T
     where
         F: FnOnce() -> T,
@@ -196,6 +204,8 @@ impl<T> OnceCell<T> {
     /// ```
     #[inline]
     #[unstable(feature = "once_cell_get_mut", issue = "121641")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "once_cell_get_mut_or_init"]
     pub fn get_mut_or_init<F>(&mut self, f: F) -> &mut T
     where
         F: FnOnce() -> T,
@@ -235,6 +245,8 @@ impl<T> OnceCell<T> {
     /// ```
     #[unstable(feature = "once_cell_try", issue = "109737")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "once_cell_get_or_try_init"]
     pub fn get_or_try_init<F, E>(&self, f: F) -> Result<&T, E>
     where
         F: FnOnce() -> Result<T, E>,
@@ -275,6 +287,8 @@ impl<T> OnceCell<T> {
     /// assert_eq!(cell.get(), Some(&1236))
     /// ```
     #[unstable(feature = "once_cell_get_mut", issue = "121641")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "once_cell_get_mut_or_try_init"]
     pub fn get_mut_or_try_init<F, E>(&mut self, f: F) -> Result<&mut T, E>
     where
         F: FnOnce() -> Result<T, E>,

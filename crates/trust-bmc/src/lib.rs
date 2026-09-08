@@ -44,6 +44,13 @@
 //!   BMC, finite acyclic BMC, and CHC/PDR.
 
 mod config;
+// M1 differential harness (docs/design/DIRECT-LANE-PROOF-AUTHORITY.md):
+// solves the direct THIR lane's SHADOW bundle and the MIR lane's bundle for
+// the same bodies through the same native trust-mc entry and grades their
+// per-obligation agreement. Test-only by construction — verdicts here are
+// differential evidence and must never acquire a production call site.
+#[cfg(all(test, feature = "trust-mc-native-trust-ir-bundle"))]
+mod direct_shadow_differential;
 mod error;
 // Sealed-authority S3 (2026-07-17 blueprint): gate-side CHC/PDR invariant
 // replay oracle. Library-only — rides the trust-mc-native-solver feature so it

@@ -330,7 +330,7 @@ pub(super) fn trace_local_to_range_aggregate(
         return None;
     }
     // (a) A statement definition of this whole local.
-    if let Some(rvalue) = crate::unique_whole_local_def(func, local) {
+    if let Some(rvalue) = crate::local_defs::unique_value_def(func, local) {
         return match rvalue {
             Rvalue::Aggregate(
                 trust_types::AggregateKind::Adt { name, variant: 0, .. },
@@ -384,7 +384,7 @@ pub(super) fn trace_local_to_range_family(
     if fuel == 0 {
         return None;
     }
-    if let Some(rvalue) = crate::unique_whole_local_def(func, local) {
+    if let Some(rvalue) = crate::local_defs::unique_value_def(func, local) {
         return match rvalue {
             Rvalue::Aggregate(
                 trust_types::AggregateKind::Adt { name, variant: 0, .. },
@@ -452,7 +452,7 @@ pub(super) fn resolve_range_bound_formula(
         && let Operand::Copy(p) | Operand::Move(p) = operand
         && p.projections.is_empty()
     {
-        match crate::unique_whole_local_def(func, p.local) {
+        match crate::local_defs::unique_value_def(func, p.local) {
             Some(Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)) => {
                 if let crate::PtrMetadataModel::Length(len) = crate::ptr_metadata_model(func, inner)
                 {
@@ -623,7 +623,7 @@ pub(super) fn trace_local_to_enumerated_slice(
     if fuel == 0 {
         return None;
     }
-    if let Some(rvalue) = crate::unique_whole_local_def(func, local) {
+    if let Some(rvalue) = crate::local_defs::unique_value_def(func, local) {
         return match rvalue {
             Rvalue::Ref { place, .. } if place.projections.is_empty() => {
                 trace_local_to_enumerated_slice(func, place.local, fuel - 1)
@@ -784,7 +784,7 @@ pub(super) fn adt_is_char_indices(name: &str) -> bool {
 }
 
 /// True iff `local` is ever written through a projection (`x.f = ..`, `(*x).f = ..`),
-/// `SetDiscriminant`, or deinitialized — writes `whole_local_def_count` does NOT see.
+/// `SetDiscriminant`, or deinitialized — writes `local_defs::value_count` does NOT see.
 pub(super) fn local_has_projected_write(func: &VerifiableFunction, local: usize) -> bool {
     func.body.blocks.iter().any(|b| {
         b.stmts.iter().any(|s| match s {
@@ -801,8 +801,14 @@ pub(super) fn local_has_projected_write(func: &VerifiableFunction, local: usize)
 
 /// Trace a `Copy`/`Move` operand to its projection-free ROOT local through
 /// whole-local Use-copies and `&(*x)` shared reborrows, then gate the root:
-/// `&str`/`&[T]`-typed (shared `Ref` to `Slice`), a parameter or single-def, never
+/// `&str`/`&[T]`-typed (shared `Ref` to `Slice`), single-valued, never
 /// `&mut`/`&raw`-borrowed, never projection-written. Returns the root local.
+///
+/// "Single-valued" is `local_defs::holds_one_value`, not `is_parameter(l) || count == 1`: that
+/// disjunction let a PARAMETER skip the def count entirely, so `fn f(mut s: &str) {
+/// s = t; s.char_indices() }` qualified `s` as a stable root while its bare name means
+/// the ENTRY slice. Same class as the parameter-entry-def budget; found by the caller
+/// audit, unwitnessed (no probe was built for the CharIndices yield lane).
 pub(super) fn charindices_shared_slice_root(
     func: &VerifiableFunction,
     op: &Operand,
@@ -813,7 +819,7 @@ pub(super) fn charindices_shared_slice_root(
     }
     let mut l = p.local;
     for _ in 0..8 {
-        match crate::unique_whole_local_def(func, l) {
+        match crate::local_defs::unique_value_def(func, l) {
             Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q))) if q.projections.is_empty() => {
                 l = q.local;
             }
@@ -830,7 +836,7 @@ pub(super) fn charindices_shared_slice_root(
         Some(Ty::Ref { mutable: false, inner }) if matches!(inner.as_ref(), Ty::Slice { .. })
     );
     if root_is_shared_slice
-        && (is_parameter(func, l) || guards::whole_local_def_count(func, l) == 1)
+        && crate::local_defs::holds_one_value(func, l)
         && !guards::local_is_mutably_borrowed(func, l)
         && !local_has_projected_write(func, l)
     {
@@ -866,7 +872,7 @@ pub(super) fn iter_mut_borrows_only_feed_next(
         }
     }
     for t in conduits {
-        if guards::whole_local_def_count(func, t) != 1 {
+        if !crate::local_defs::has_one_explicit_def(func, t) {
             return false;
         }
         // Every use of the conduit must be arg 0 of an `Iterator::next` call.
@@ -946,7 +952,7 @@ pub(super) fn charindices_iter_string_root(
     func: &VerifiableFunction,
     iter_local: usize,
 ) -> Option<usize> {
-    if guards::whole_local_def_count(func, iter_local) != 1
+    if !crate::local_defs::has_one_explicit_def(func, iter_local)
         || local_has_projected_write(func, iter_local)
         || !iter_mut_borrows_only_feed_next(func, iter_local)
     {
@@ -984,7 +990,7 @@ pub(super) fn operand_is_charindices_yield_of(
     if !p.projections.is_empty() {
         return false;
     }
-    if guards::whole_local_def_count(func, p.local) != 1
+    if !crate::local_defs::has_one_explicit_def(func, p.local)
         || guards::local_is_mutably_borrowed(func, p.local)
         || local_has_projected_write(func, p.local)
     {
@@ -992,7 +998,7 @@ pub(super) fn operand_is_charindices_yield_of(
     }
     // The payload read: `_i = Copy((_opt as Some).0.0)`.
     let Some(Rvalue::Use(Operand::Copy(src) | Operand::Move(src))) =
-        crate::unique_whole_local_def(func, p.local)
+        crate::local_defs::unique_value_def(func, p.local)
     else {
         return false;
     };
@@ -1000,7 +1006,7 @@ pub(super) fn operand_is_charindices_yield_of(
         return false;
     }
     let opt_local = src.local;
-    if guards::whole_local_def_count(func, opt_local) != 1
+    if !crate::local_defs::has_one_explicit_def(func, opt_local)
         || guards::local_is_mutably_borrowed(func, opt_local)
         || local_has_projected_write(func, opt_local)
     {
@@ -1024,11 +1030,11 @@ pub(super) fn operand_is_charindices_yield_of(
                 Some(Ty::Ref { mutable: true, inner })
                     if matches!(inner.as_ref(), Ty::Adt { name, .. } if adt_is_char_indices(name))
             );
-            if !recv_is_char_indices || guards::whole_local_def_count(func, r.local) != 1 {
+            if !recv_is_char_indices || !crate::local_defs::has_one_explicit_def(func, r.local) {
                 return false;
             }
             let Some(Rvalue::Ref { mutable: true, place: it }) =
-                crate::unique_whole_local_def(func, r.local)
+                crate::local_defs::unique_value_def(func, r.local)
             else {
                 return false;
             };

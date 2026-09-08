@@ -83,9 +83,7 @@ fn arb_ty() -> impl Strategy<Value = Ty> {
                         disc_index_safe: false,
                         // Trust (B3-1 field completion): missed by 11598e13fe;
                         // kept the trust-types test suite uncompilable since B3-1.
-                        faithful_enum_repr: None,
-                        enum_layout: None,
-                    }
+                        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
                 ),
             ]
         },

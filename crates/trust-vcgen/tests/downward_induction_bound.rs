@@ -24,8 +24,13 @@ fn reverse_loop_carries_decrement_bound() {
     // shape (the `<= B - c` strengthening applies to CONSTANT bounds only — a
     // symbolic `len - c` can be negative at runtime, colliding with the VC lane's
     // `result >= 0` type range as a phantom `len >= c` premise).
+    // The tuple result may carry its establish token (`_t.0#s{b}_{k}`) since the
+    // write-visibility widening put checked tuple dests in the write domain —
+    // strictly sounder (the bound can no longer leak across a tuple reuse).
     assert!(
-        dbg.contains(".0\"") && dbg.contains("__slice_len") && dbg.contains("Lt(Var(\"_"),
+        (dbg.contains(".0\"") || dbg.contains(".0#"))
+            && dbg.contains("__slice_len")
+            && dbg.contains("Lt(Var(\"_"),
         "reverse-loop bounds VC must carry the `i-1 < s.len()` downward fact: {dbg}"
     );
 }

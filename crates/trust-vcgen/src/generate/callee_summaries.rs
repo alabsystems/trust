@@ -4,7 +4,6 @@
 // interprocedural facts that let a caller's VC avoid re-analysing the callee.
 
 use super::*;
-
 // ======================================================================
 // Loop-invariant min/max facts (`let n = a.min(b); for i in 0..n { … }`)
 // ======================================================================
@@ -30,10 +29,9 @@ use super::*;
 // here). A non-stable argument (anything but a constant / parameter slice length)
 // yields NO fact, never a wrong one. The fact is always TRUE, so it can only help
 // PROVE genuinely-safe code; it can never make a real violation vacuously hold.
-/// True iff `local` is a function PARAMETER (locals `1..=arg_count`).
-pub(super) fn is_parameter(func: &VerifiableFunction, local: usize) -> bool {
-    local >= 1 && local <= func.body.arg_count
-}
+/// True iff `local` is a function PARAMETER (locals `1..=arg_count`) —
+/// [`crate::local_defs::is_parameter`], the one authority on the entry definition.
+pub(super) use crate::local_defs::is_parameter;
 
 /// SOUNDNESS (P0 false proof, 2026-06-17 hunt-6): true when a `#[ensures]` postcondition
 /// references a by-value PARAMETER that the body REASSIGNS. The v2 postcondition VC binds the
@@ -91,76 +89,18 @@ pub(super) fn postcondition_references_mutated_param(
     post_vars.iter().any(|v| reassigned.iter().any(|n| place_names_overlap(v, n)))
 }
 
-/// True iff `local` is assigned EXACTLY ONCE across the whole function (a single
-/// whole-local def, by an `Assign` statement OR a `Call` terminator dest), with no
-/// field/index store, `SetDiscriminant`, or `Deinit` that would make its value
-/// ambiguous. A store THROUGH the local (`*local = …`, a `Deref`-first
-/// projection) mutates the pointee, not the local, so it does not count. Licenses
-/// treating `Var(local)` as a GLOBAL invariant — the symbol has one meaning at
-/// every program point.
+/// True iff `local` holds ONE value for the whole body with no field/index store, no
+/// `SetDiscriminant`/`Deinit`, and no `&mut`/raw mutation channel —
+/// [`crate::local_defs::is_single_static_assignment`], which counts the ENTRY
+/// definition a PARAMETER carries. Re-exported here because this module's
+/// `use super::*` vocabulary is what the fact producers read.
 ///
-/// SOUNDNESS (P0 false-proof fix, 2026-06-17 hunt skeptic #2): `local` must ALSO not be
-/// mutably borrowed or raw-pointed. `let p = &mut i; *p = b;` reassigns `i` through the
-/// borrow, but the store's place is `*p` (place.local = `p`, not `i`), so the def scan
-/// above does NOT see it and would count `i` as single-assignment — then a stale
-/// `Ord::min`/modulo/bitmask/accumulator fact (`i <= 3`) survives and vacuously discharges a
-/// violated VC (`let mut i=a.min(3); let p=&mut i; *p=b; arr[i]` PROVED in-bounds in BOTH
-/// default and kernel-certified -full, yet `i` becomes `b` and the index goes OOB). So any
-/// `&mut local` / `&raw mut local` (`Ref{mutable:true}`/`AddressOf`) of either mutability —
-/// a `*const` is a valid `*const→*mut` cast root — kills SSA. A shared `&local` cannot mutate
-/// and its cast to `*mut` is rejected by `invalid_reference_casting`, so it is allowed.
-pub(super) fn is_single_static_assignment(func: &VerifiableFunction, local: usize) -> bool {
-    let mut count = 0u32;
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            match stmt {
-                Statement::Assign { place, rvalue, .. } => {
-                    if let Rvalue::Ref { mutable: true, place: borrowed }
-                    | Rvalue::AddressOf(_, borrowed) = rvalue
-                        && borrowed.local == local
-                    {
-                        return false;
-                    }
-                    if place.local != local {
-                        continue;
-                    }
-                    if place.projections.first() == Some(&trust_types::Projection::Deref) {
-                        continue;
-                    }
-                    if !place.projections.is_empty() {
-                        return false;
-                    }
-                    count += 1;
-                }
-                // Both statements change the value rooted at `local` without an
-                // `Assign` rvalue. A discriminant rewrite after construction (or
-                // deinitialization) therefore gives the local more than one
-                // meaning and must revoke every global single-assignment fact.
-                // A Deref-first place changes the pointee, not the pointer local
-                // itself, matching the Assign handling above.
-                Statement::SetDiscriminant { place, .. } | Statement::Deinit { place }
-                    if place.local == local
-                        && place.projections.first() != Some(&trust_types::Projection::Deref) =>
-                {
-                    return false;
-                }
-                _ => {}
-            }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.local == local
-        {
-            if !dest.projections.is_empty() {
-                return false;
-            }
-            count += 1;
-        }
-        if matches!(&block.terminator, Terminator::TailCall { .. }) && local == 0 {
-            count += 1;
-        }
-    }
-    count == 1
-}
+/// The discriminant/`Deinit` kill is not restated at the new home: those statements
+/// classify through `LocalWrite::demote_to_partial`, so they arrive as
+/// `LocalWrite::Partial`, which that predicate disqualifies.
+/// `local_defs_tests::discriminant_and_deinit_writes_are_partial` fails when that
+/// stops holding.
+pub(super) use crate::local_defs::is_single_static_assignment;
 
 /// Trust (countdown-loop piece, P0 root-cause fix): `true` iff `local` is ever
 /// MUTABLY borrowed (`&mut local`, `Rvalue::Ref { mutable: true }`) or
@@ -211,7 +151,7 @@ pub(super) fn param_slice_len(
         return Some(len);
     }
     // Indirect: `_t = &(*param)` / `&raw const (*param)` — follow to the root.
-    match crate::unique_whole_local_def(func, p.local)? {
+    match crate::local_defs::unique_value_def(func, p.local)? {
         Rvalue::Ref { place: referent, .. } | Rvalue::AddressOf(_, referent) => {
             let mut root = referent.clone();
             if root.projections.last() == Some(&trust_types::Projection::Deref) {
@@ -279,7 +219,7 @@ pub(super) fn stable_min_arg_formula(
     if !p.projections.is_empty() {
         return None;
     }
-    match crate::unique_whole_local_def(func, p.local) {
+    match crate::local_defs::unique_value_def(func, p.local) {
         Some(Rvalue::Use(inner)) => return stable_min_arg_formula(func, inner, fuel - 1),
         Some(Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)) => {
             return param_slice_len(func, inner, fuel - 1);
@@ -289,7 +229,7 @@ pub(super) fn stable_min_arg_formula(
         }
         // No whole-local Assign def: fall through to the min/max-result case below
         // (the inner result of a chained `.min().min()` is a Call dest, which
-        // `unique_whole_local_def` — Assign-only — does not see).
+        // `unique_value_def` — Assign-only — does not see).
         _ => {}
     }
     // A nested `Ord::min`/`max` RESULT is a single-assignment, stable symbol;
@@ -380,6 +320,78 @@ pub(super) fn build_fp_abs_facts(func: &VerifiableFunction) -> Vec<Formula> {
     facts
 }
 
+/// Trust (P0 const-bit-width FALSE PROOF): the RECEIVER's declared bit width read from
+/// a std numeric inherent's own callee path — the `<impl iN>` / `<impl uN>` impl-self
+/// segment of `core::num::<impl i128>::count_zeros` and its siblings.
+///
+/// This exists because the OPERAND's type is NOT a trustworthy width source for a
+/// bit-count receiver. A width-less `ConstValue::Int` has its width INFERRED FROM ITS
+/// VALUE (`operand_ty`: fits `i64` ⇒ width 64), and `Operand::Symbolic` maps `Sort::Int`
+/// to width 64 unconditionally — so an `i128`/`u128` receiver whose value happens to fit
+/// `i64` reported width 64 while the true bit width is 128.
+///
+/// `None` (⇒ NO fact) whenever the width cannot be established with certainty: a callee
+/// with no decodable impl-self segment, or a receiver type name outside the primitive
+/// integer set. `isize`/`usize` answer 64, the pinned target width (`Ty::int_width`);
+/// on a narrower target the true width is smaller, so 64 stays a sound over-estimate.
+///
+/// Anchored under a `core`/`std` root — a nested user module cannot forge the segment
+/// into a std-rooted path — which additionally hardens the weak
+/// `is_std_num_intrinsic` (`contains("::num::")`) recognizer at every call site: a
+/// `core::hostile::num::count_zeros` forgery carries no `<impl …>` and now yields no
+/// fact at all. Mirrors `fp_abs_call_width`, which likewise takes its width from the
+/// callee path rather than the operand.
+pub(super) fn std_num_impl_receiver_width(callee: &str) -> Option<u32> {
+    if !(callee.starts_with("core::") || callee.starts_with("std::"))
+        || !callee.contains("::num::")
+    {
+        return None;
+    }
+    let at = callee.rfind("<impl ")?;
+    let rest = &callee[at + "<impl ".len()..];
+    let name = rest.split('>').next()?.trim();
+    match name {
+        "i8" | "u8" => Some(8),
+        "i16" | "u16" => Some(16),
+        "i32" | "u32" => Some(32),
+        "i64" | "u64" => Some(64),
+        "i128" | "u128" => Some(128),
+        // Pointer-width integers at the pinned 64-bit target (`Ty::int_width`).
+        "isize" | "usize" => Some(64),
+        _ => None,
+    }
+}
+
+/// The bit width to use for a `[0, bits(T)]` bit-count result bound.
+///
+/// The receiver's DECLARED width (from the callee path — see
+/// [`std_num_impl_receiver_width`]) is authoritative and REQUIRED: without it no fact is
+/// emitted (fail-closed). The operand's resolved integer width is still demanded, both
+/// to keep the pre-existing "receiver must be an integer" gate and so that a path/operand
+/// disagreement resolves to the WIDER — hence WEAKER, hence sound — bound rather than to
+/// the narrower one that produced the false proof.
+///
+/// WITNESS (a live false proof before the path became the width source, no negative
+/// numbers needed):
+/// ```ignore
+/// const K: i128 = 1;
+/// let n = K.count_zeros();          // truly 127
+/// let arr = [0u8; 65];
+/// arr[n as usize]                   // "0 <= n <= 64" PROVED in-bounds; really panics
+/// ```
+fn bitcount_receiver_width(
+    func: &VerifiableFunction,
+    callee: &str,
+    receiver: &Operand,
+) -> Option<u32> {
+    let declared = std_num_impl_receiver_width(callee)?;
+    let operand_width = match crate::operand_ty_cow(func, receiver).as_deref() {
+        Some(Ty::Int { width, .. }) => *width,
+        _ => return None,
+    };
+    Some(declared.max(operand_width))
+}
+
 /// Global result bounds for value-bounded std intrinsics — each is UNCONDITIONALLY
 /// true, so conjoining it everywhere is sound and lets a bounded index discharge:
 ///   * `n.rem_euclid(c)` for a CONSTANT divisor `c`: the Euclidean remainder is
@@ -423,18 +435,76 @@ pub(super) fn build_intrinsic_bound_facts(func: &VerifiableFunction) -> Vec<Form
             "trailing_zeros" | "leading_zeros" | "count_ones" | "count_zeros"
                 if args.len() == 1 =>
             {
-                if let Some(Ty::Int { width, .. }) =
-                    crate::operand_ty_cow(func, &args[0]).as_deref()
-                {
+                if let Some(width) = bitcount_receiver_width(func, callee, &args[0]) {
                     ge0(&mut facts);
                     facts.push(Formula::Le(
                         Box::new(dest_var()),
-                        Box::new(Formula::Int(*width as i128)),
+                        Box::new(Formula::Int(width as i128)),
                     ));
                 }
             }
             _ => {}
         }
+    }
+    facts
+}
+
+/// Global `dest != 0` facts for `NonZero<T>::get` call destinations.
+///
+/// `a / d.get()` on a `d: NonZeroU32` is refuted at `d.get() == 0`: the wrapped
+/// field's `pattern_type!(u32 is 1..)` is lowered to the bare carrier `u32` by
+/// `ty_convert`'s `TyKind::Pat` arm, and `get` is an opaque call, so nothing in
+/// the body constrains the destination. Restoring `dest != 0` discharges the
+/// divzero/remzero obligation.
+///
+/// `!= 0` and NOT `>= 1` — `NonZero<T>` is generic over the SIGNED integers too,
+/// and `NonZeroI32::get()` may legitimately be negative. The unsigned lower
+/// bound needed by e.g. `d.get() - 1` comes from the destination's own declared
+/// type range (`conjoin_local_type_ranges`), not from here.
+///
+/// SOUNDNESS: monotone — a fact true of every DEFINED execution, so it deletes
+/// only infeasible counterexamples. It is the `NonZero<T>` validity invariant
+/// (holding a zero `NonZero` is immediate UB, exactly as
+/// `enum_discriminant_range_preconditions` relies on a validly-constructed
+/// enum's tag). Gated on: the crate-origin-anchored recognizer
+/// [`is_nonzero_get_call`], arity 1, a bare SINGLE-ASSIGNMENT destination, and an
+/// integer-lowered destination (a non-integer dest has no `Sort::Int` var to
+/// bind). Any miss yields NO fact — fail-closed to the current free destination.
+///
+/// THE SINGLE-ASSIGNMENT GATE IS LOAD-BEARING, and NOT because a global fact
+/// would stay unversioned. `generate::safety` conjoins this set into
+/// `vc.formula` FIRST and only then calls `conjoin_preconditions_versioned_recorded`,
+/// which version-renames the WHOLE formula — so the fact is renamed in lockstep
+/// with the body and binds the block's TERMINAL version of `dest` EXACTLY,
+/// including a version this `get` call never produced. (Preconditions are the
+/// contrasting case: they are conjoined bare, AFTER that rename.) On a reassigned
+/// dest that exact binding contradicts the divisor-is-zero path condition, the
+/// path goes UNSAT, and everything on it is proved vacuously — a false PROVE for
+/// a program that faults. `nonzero_get_reassigned_dest_still_refutes` and
+/// `nonzero_get_branch_merged_dest_still_refutes` fail when the gate is deleted.
+pub(super) fn build_nonzero_get_dest_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    let mut facts = Vec::new();
+    for block in &func.body.blocks {
+        let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
+            continue;
+        };
+        if args.len() != 1 || !dest.projections.is_empty() || !is_nonzero_get_call(callee) {
+            continue;
+        }
+        if !is_single_static_assignment(func, dest.local) {
+            continue;
+        }
+        if !matches!(
+            crate::local_ty_ref(func, dest.local),
+            Some(Ty::Int { .. } | Ty::PtrSizedInt { .. })
+        ) {
+            continue;
+        }
+        let dest_var = Formula::Var(crate::place_to_var_name(func, dest), Sort::Int);
+        facts.push(Formula::Not(Box::new(Formula::Eq(
+            Box::new(dest_var),
+            Box::new(Formula::Int(0)),
+        ))));
     }
     facts
 }
@@ -644,10 +714,11 @@ pub(super) fn cast_source_const_upper_nonneg(
             ) && args.len() == 1
                 && is_std_num_intrinsic(callee)
             {
-                return match crate::operand_ty_cow(func, &args[0]).as_deref() {
-                    Some(Ty::Int { width, .. }) => Some(*width as i128),
-                    _ => None,
-                };
+                // Width from the RECEIVER'S DECLARED TYPE via the callee path — see
+                // `bitcount_receiver_width`. This propagates the same bound through the
+                // `as usize` cast, so a value-inferred width here would carry the
+                // identical false proof one hop further.
+                return bitcount_receiver_width(func, callee, &args[0]).map(i128::from);
             }
             return None;
         }
@@ -710,7 +781,7 @@ pub(super) fn function_return_const_upper_bound(func: &VerifiableFunction) -> Op
         if !is_single_static_assignment(func, local) {
             return None;
         }
-        match crate::unique_whole_local_def(func, local) {
+        match crate::local_defs::unique_value_def(func, local) {
             Some(Rvalue::Use(Operand::Move(p) | Operand::Copy(p))) if p.projections.is_empty() => {
                 local = p.local;
             }
@@ -887,7 +958,7 @@ pub(super) fn function_return_const_lower_bound(func: &VerifiableFunction) -> Op
         if !is_single_static_assignment(func, local) {
             return None;
         }
-        match crate::unique_whole_local_def(func, local) {
+        match crate::local_defs::unique_value_def(func, local) {
             Some(Rvalue::Use(Operand::Move(p) | Operand::Copy(p))) if p.projections.is_empty() => {
                 local = p.local;
             }
@@ -1160,7 +1231,7 @@ pub fn compute_trivial_setter_summaries(
 ///   * no `Call` terminator writes `_t` (a call-returned pointer is opaque);
 ///   * `_t` is never itself borrowed (`& _t` / `&mut _t` / `&raw _t` could
 ///     reseat the pointer invisibly);
-///   * exactly one whole-local def ([`crate::unique_whole_local_def`], which
+///   * exactly one whole-local def ([`crate::local_defs::unique_value_def`], which
 ///     also rejects projected stores), and it is `Ref { mutable: true }` of a
 ///     PROJECTION-FREE place (a reborrow `&mut *r` / field borrow `&mut s.f`
 ///     stays fail-closed).
@@ -1183,7 +1254,7 @@ pub(super) fn callsite_unique_mut_borrow_target(
             }
         }
     }
-    match crate::unique_whole_local_def(func, temp)? {
+    match crate::local_defs::unique_value_def(func, temp)? {
         Rvalue::Ref { mutable: true, place } if place.projections.is_empty() => Some(place.local),
         _ => None,
     }
@@ -1258,7 +1329,12 @@ pub(super) fn trivial_setter_callsite_fact(
     };
     let target_name = crate::place_to_var_name(func, &Place::local(target));
     let fact = Formula::Eq(Box::new(Formula::Var(target_name.clone(), Sort::Int)), Box::new(value));
-    Some((target, version_terminator_dest_fact(sv, func, block, &target_name, fact)))
+    // `?`: the versioner answers `None` when an argument of this call reads the
+    // subject's own name. The setter recognizer already refuses the `set(&mut a,
+    // a)` tautology by local (see the value-actual gate above), so this is
+    // belt-and-braces on a lane that cannot reach it — kept because the
+    // precondition belongs to the CHANNEL, not to each caller's own reasoning.
+    Some((target, version_terminator_dest_fact(sv, func, block, &target_name, fact)?))
 }
 
 /// The UNVERSIONED trivial-setter post-call fact `(target_local, Eq(target, value))`
@@ -1432,7 +1508,7 @@ pub(super) fn entry_prefix_switch_ordinal(func: &VerifiableFunction) -> Option<u
 ///     hops: `place_source_is_stable` (no projected store, no `&mut`/`&raw`
 ///     borrow, no `SetDiscriminant`/`Deinit`) PLUS zero whole-local defs — a
 ///     parameter is initialized at entry, so ANY body store (statement or call
-///     dest, counted by `whole_local_def_count`) would make it two-valued;
+///     dest, counted by `local_defs::value_count`) would make it two-valued;
 ///   * a local whose unique stable def is a CONSTANT assignment (`x = const c`
 ///     — re-executing the def in a loop rewrites the SAME value), folded to
 ///     that constant.
@@ -1458,12 +1534,12 @@ pub(super) fn entry_stable_operand_formula(
             return None;
         }
         if (1..=func.body.arg_count).contains(&cur) {
-            if guards::whole_local_def_count(func, cur) > 0 {
+            if !crate::local_defs::never_explicitly_reseated(func, cur) {
                 return None;
             }
             return Some(crate::operand_to_formula(func, &Operand::Copy(Place::local(cur))));
         }
-        match crate::unique_whole_local_def(func, cur) {
+        match crate::local_defs::unique_value_def(func, cur) {
             Some(Rvalue::Use(Operand::Copy(q) | Operand::Move(q)))
                 if q.projections.is_empty() && q.local != cur =>
             {
@@ -1490,7 +1566,7 @@ pub(super) fn stable_unique_def_through_copies<'a>(
         if !crate::place_source_is_stable(func, cur) {
             return None;
         }
-        match crate::unique_whole_local_def(func, cur)? {
+        match crate::local_defs::unique_value_def(func, cur)? {
             Rvalue::Use(Operand::Copy(q) | Operand::Move(q))
                 if q.projections.is_empty() && q.local != cur =>
             {
@@ -1903,13 +1979,13 @@ pub(super) fn find_param_probe(
             }
             // SOUNDNESS (aliased reseat, audit r3): an unpinned intermediate has
             // a stale copy def (a `&mut`-alias reseat is invisible to
-            // `unique_whole_local_def`), so the receiver could actually point
+            // `unique_value_def`), so the receiver could actually point
             // elsewhere and the recorded summary would be WRONG. Require each hop
             // pinned before trusting its def.
             if !unwrap_receiver_local_is_pinned(func, local) {
                 return false;
             }
-            match crate::unique_whole_local_def(func, local) {
+            match crate::local_defs::unique_value_def(func, local) {
                 Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p)))
                     if p.projections.is_empty() =>
                 {
@@ -1930,7 +2006,7 @@ pub(super) fn find_param_probe(
     let receiver_ok = if by_value {
         recv_pinned
             && matches!(
-                crate::unique_whole_local_def(func, recv.local),
+                crate::local_defs::unique_value_def(func, recv.local),
                 Some(Rvalue::Ref { mutable: false, place: referent })
                     if referent.local == pred_local && referent.projections.is_empty()
             )
@@ -1938,7 +2014,7 @@ pub(super) fn find_param_probe(
         chained_to_param(func, recv.local, pred_local)
             || (recv_pinned
                 && matches!(
-                    crate::unique_whole_local_def(func, recv.local),
+                    crate::local_defs::unique_value_def(func, recv.local),
                     Some(Rvalue::Ref { mutable: false, place: referent })
                         if referent.local == pred_local
                             && referent.projections.as_slice()
@@ -2148,7 +2224,7 @@ pub(super) fn find_field_probe(
         if !unwrap_receiver_local_is_pinned(func, cur) {
             return None;
         }
-        match crate::unique_whole_local_def(func, cur) {
+        match crate::local_defs::unique_value_def(func, cur) {
             Some(Rvalue::Ref { mutable: false, place: referent })
                 if referent.local == pred_local =>
             {

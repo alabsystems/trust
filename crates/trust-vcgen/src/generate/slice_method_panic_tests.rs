@@ -187,7 +187,7 @@ fn range_family_defining_module_path_emits_slice_bounds_vc() {
     // production path: operand type recognition, aggregate tracing, and VC
     // construction, including the instantiated ADT-name normalization.
     let range_name = "core::ops::range::RangeTo<usize>";
-    let range_ty = Ty::Adt {
+    let range_ty = Ty::Adt { arbitrary_precision: None,
         adt_kind: None,
         layout: None,
         variants: Vec::new(),

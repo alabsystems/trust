@@ -331,6 +331,16 @@ fn l3_p1_nat_whole_body_numeral_is_refused_with_both_blockers_measured() {
             AdmissibleBody::Composed { .. } => "composed",
             AdmissibleBody::Select { .. } => "select",
             AdmissibleBody::SelectLiteral { .. } => "select-literal",
+            // The merged E6 per-field/checked-arith series, named as
+            // control_12's twin pin does.
+            AdmissibleBody::ConstantInt { .. } => "constant-int",
+            AdmissibleBody::FieldProjection { .. } => "field-projection",
+            AdmissibleBody::ComparisonBool { .. } => "comparison-bool",
+            AdmissibleBody::BoolBinary { .. } => "bool-binary",
+            AdmissibleBody::CheckedArithmetic { .. } => "checked-arithmetic",
+            AdmissibleBody::GuardedNarrow { .. } => "guarded-narrow",
+            AdmissibleBody::WidenedEq { .. } => "widened-eq",
+            AdmissibleBody::AggregateFields { .. } => "aggregate-fields",
         }
     }
     assert_eq!(

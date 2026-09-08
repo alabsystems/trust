@@ -130,6 +130,36 @@ These commands are the evidence bar, not a statement that the current checkout
 has already passed it. The source-build registration points rustup at a mutable
 build tree and is not immutable installed-toolchain or dist evidence.
 
+### Register the toolchain: link rustup at a SEALED artifact (default)
+
+A stage2 under `build/` is a LIVE build directory: every `x.py` run empties
+`bin/` and the stdlib for its duration, so a rustup link pointed there makes
+every repo pinning `channel = "trust"` fail intermittently with
+`error[E0463]` / `'rustc' is not installed` whenever a rebuild is in flight.
+A plain link also loses the `rustc-private-sysroots` pairing that out-of-tree
+`rustc_private` driver tools (trust-wp) resolve beside the compiler's sysroot.
+Seal first, then link:
+
+```bash
+# after the stage2 build above
+scripts/promote-toolchain.sh
+```
+
+`promote-toolchain.sh` copies the finished stage2 into an immutable artifact
+under `$TRUST_TOOLCHAIN_HOME` (default `~/toolchains`), seals the byte-matched
+rustc-private sysroot beside it — fail-closed, using the private wrapper's own
+selection rule (commit-hash equality plus a byte-identical `librustc_driver`) —
+verifies the pair including a replay of that resolution against the sealed
+root, and atomically flips `${RUSTUP_HOME:-~/.rustup}/toolchains/trust` onto
+the artifact. Rebuilds then never tear the channel down, and promoting the
+next build is one command and one atomic symlink flip.
+
+The direct registration (`scripts/rustup-link-trust.sh`, which links rustup at
+the mutable build tree) remains available for throwaway iteration on a machine
+where nothing pins the channel, but the sealed lane above supersedes it as the
+default. Either way the result is local convenience state, not immutable
+installed-toolchain or dist evidence.
+
 ## Optional macOS coordinator companion
 
 After installing Trust, the repository can locally build and atomically publish

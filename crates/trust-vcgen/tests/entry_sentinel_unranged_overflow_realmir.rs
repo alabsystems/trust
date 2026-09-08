@@ -29,14 +29,23 @@
 //! skips `1..=arg_count`). So `n#e` floated free on `Sort::Int`.
 //!
 //! Usually invisible, because the tie `Eq(n#e, n)` transfers the bare name's bound.
-//! The `String` removes it: the cleanup blocks it creates (`bb9 Resume`,
-//! `bb10 Drop unwind=Terminate`) have an EMPTY entry-version map, so
-//! `entry_sentinel_tie_is_sound`'s MINT-SIDE clause refuses the tie for the whole
-//! function. The diamond then weakens the bare-read sibling def away, leaving the
-//! pinned `n#s0_5 == n#e / 3` as the only carrier.
+//! When this was measured (pre 2026-08-29), the `String` removed it: the cleanup
+//! blocks it creates (`bb9 Resume`, `bb10 Drop unwind=Terminate`) have an EMPTY
+//! entry-version map, and the tie's then-mint-side clause — a WHOLE-FUNCTION
+//! `entry_map_covers` quantifier — refused the tie for the whole function. The
+//! diamond then weakens the bare-read sibling def away, leaving the pinned
+//! `n#s0_5 == n#e / 3` as the only carrier.
 //!
 //! MEASURED with the in-process ay, range repair disabled:
 //!   `Failed`, counterexample `n#e = 4294967298` — three above `u32::MAX`.
+//!
+//! RE-DERIVED 2026-08-29: the quantifier is retired. `#e` entry-denotation is now
+//! ENFORCED AT THE MINT SITE (`full_graph_union_is_entry_only` in
+//! `pin_in_place_update_reads` — the mint here is bb0, whose unwind-inclusive
+//! reaching union is the entry seed `{e}`, so `#e` is still minted), and the
+//! cleanup cluster no longer vetoes: this fixture now legitimately TIES. The range
+//! repair this file pins is therefore no longer isolated by tie-absence — the
+//! isolation is the DIRECT bound assertion on the sentinel spelling itself.
 //!
 //! # Honest scope
 //!
@@ -135,8 +144,15 @@ fn the_unranged_entry_sentinel_row_is_no_longer_falsely_refuted() {
 ///
 /// A "fix" that simply DROPPED the pinned def would also silence the refutation and
 /// would be wrong, so `n#e` must still be FREE in the formula. And the bound must sit
-/// on the SENTINEL ITSELF, not be smuggled in through a tie — this MIR is exactly the
-/// drop-bearing shape the mint-side clause refuses, so `tie` must stay false.
+/// on the SENTINEL ITSELF — asserted directly, which is what keeps the range repair
+/// isolated now that the tie is present too.
+///
+/// RE-DERIVED 2026-08-29: this used to assert `!has_entry_tie`, because the
+/// whole-function quantifier refused the tie on every drop-bearing body and the
+/// tie's absence was what isolated the range repair. The quantifier is retired;
+/// the mint (bb0, unwind-inclusive union `{e}`) is gate-admitted and this fixture
+/// now legitimately ties — asserted POSITIVE below so a regression toward the
+/// quantifier (tie vanishing again on drop-bearing bodies) is loud.
 #[test]
 fn the_bound_is_on_the_sentinel_itself_and_the_pinned_fact_survives() {
     let func = load("entry_sentinel_unranged_overflow");
@@ -154,16 +170,20 @@ fn the_bound_is_on_the_sentinel_itself_and_the_pinned_fact_survives() {
             vc.formula
         );
         assert!(
-            !has_entry_tie(&vc.formula),
-            "this fixture's cleanup blocks make the mint-side clause refuse the \
-             tie; if a tie appears the fixture no longer isolates the RANGE, and \
-             the guard is measuring the tie instead"
+            has_entry_tie(&vc.formula),
+            "the mint gate admits `#e` here (bb0's full-graph union is the entry \
+             seed), so the tie must be present; its absence means the mint gate \
+             or the consumer clause regressed toward the retired whole-function \
+             veto. formula: {:?}",
+            vc.formula
         );
     }
 }
 
-/// KNOWN COST, recorded so it is not rediscovered: ranging the sentinel is NECESSARY
-/// BUT NOT SUFFICIENT.
+/// THE RECOVERY, re-derived 2026-08-29 from `the_precondition_side_gap_is_still_open`
+/// — the ledger row that used to assert its own cost (`Failed`, counterexample
+/// `n#e = 30, n = 0`: the authored `requires(n < 30)` constrained a symbol the goal
+/// never used).
 ///
 /// `tests/data/entry_sentinel_precondition_gap.rs` is `join_weakened_entry_sentinel`
 /// plus a droppable local:
@@ -181,40 +201,38 @@ fn the_bound_is_on_the_sentinel_itself_and_the_pinned_fact_survives() {
 /// }
 /// ```
 ///
-/// MEASURED both with and without the range repair: `Failed`, counterexample
-/// `n#e = 30`. That value is INSIDE `u32`, so even a ranged `n#e` is satisfied by it
-/// — this row needs the PRECONDITION `n < 30` to reach `n#e`, and only the tie
-/// carries that. Preconditions, path guards and semantic guards are all conjoined as
-/// `Fact::entry` and are deliberately EXEMPT from the version rename, so all three
-/// name the BARE place only.
+/// The gap: the tie `Eq(n#e, n)` — the only connector between the `Fact::entry`
+/// bucket (preconditions, bare names) and the pinned only-carrier
+/// `n#s0_6 == n#e / 3` — was refused by the whole-function `entry_map_covers`
+/// quantifier because the `String`'s cleanup cluster (bb10/bb11/bb12, reachable only
+/// across unwind edges) has an empty v2 entry map. With entry-denotation ENFORCED AT
+/// THE MINT SITE (bb0's unwind-inclusive union is the entry seed `{e}`), the
+/// cleanup blocks no longer veto, the consumer versions `n` (token `s0_6`), the tie
+/// is conjoined, and the chain closes: `n < 30` and the bare `u32` range reach
+/// `n#e`, the pinned def forces `n#s0_6 <= 9`, and the recorded counterexample
+/// (`n#e = 30`) is killed.
 ///
-/// This must NOT be closed by conjoining `n < 30` onto `n#e`: that is a
-/// point-dependent value fact, exactly the unsound point-to-point assertion the tie's
-/// refusals exist to prevent. A type range is point-INDEPENDENT, which is the whole
-/// reason the repair above needs no refusal of its own.
+/// # Honest ceiling: `Unknown`, NOT `Proved`
 ///
-/// # A SECOND, independent cost this row also records
+/// MEASURED: in-process ay COMPUTES UNSAT but mandatory strict certification
+/// rejects the integer-division step ("step t1 uses unverified trust rule") and
+/// publishes `Unknown { reason: "… incomplete self-check-rejected" }` — the same
+/// ceiling as the tied control and `join_weakened_entry_sentinel`. Calling this row
+/// `Proved` would be a relabel, not a recovery; both directions are pinned below,
+/// and if certification ever improves, re-derive toward `Proved`.
 ///
-/// MEASURED here: on this row bare `n` IS range-bounded but `n#e` is NOT, even with
-/// the repair in place. The versioned pass is FORMULA-DRIVEN — it bounds the
-/// versioned spellings actually present when `conjoin_arg_type_ranges` runs — while
-/// the bare loop is signature-driven and deliberately unconditional, precisely
-/// because "a parameter that reaches the VC only through a cross-block definition is
-/// conjoined onto this formula only later, after this point" (that loop's own
-/// docstring). In this bounds lane the pinned `n#s0_6 == n#e / 3` arrives AFTER, so
-/// the versioned symbol is not yet visible and gets no bound.
+/// # The one remaining cost this row still records
 ///
-/// That is a real limitation of the repair, not a property of this fixture: it fires
-/// where the pinned def is already present (the overflow lane, as in the sibling
-/// fixture) and misses where the def is conjoined later. It was left unfixed rather
-/// than papered over — closing it means running the pass at a later position or at
-/// several, which is a larger change than the one measured here, and the corpus shows
-/// the current repair is verdict-neutral everywhere else.
-///
-/// So this row is `Failed` for TWO independent reasons, and the range repair
-/// addresses NEITHER. If it ever stops being `Failed`, re-derive both.
+/// Bare `n` IS range-bounded while `n#e` is NOT, even post-recovery. MECHANISM
+/// (unchanged): `safety.rs`'s `if bounds_kind && count_back_edges(func) == 0
+/// { continue; }` skips the whole range battery for a bounds VC in a back-edge-free
+/// function, and this fixture is back-edge-free. The skip sits AFTER the
+/// precondition conjoin, so it never starved the tie — and with the tie present the
+/// bare bounds now reach `n#e` SEMANTICALLY, making the missing literal
+/// `rust_type_range_constraint` spelling on `n#e` verdict-irrelevant here. Pinned so
+/// a change to the skip is noticed and re-derived, not rediscovered.
 #[test]
-fn the_precondition_side_gap_is_still_open() {
+fn the_precondition_gap_row_recovers_through_the_tie() {
     let func = load("entry_sentinel_precondition_gap");
     let rows: Vec<_> = trust_vcgen::generate_vcs(&func)
         .into_iter()
@@ -225,26 +243,36 @@ fn the_precondition_side_gap_is_still_open() {
         assert!(
             vc.formula.free_variables().iter().any(|v| v == "n#e"),
             "the pinned entry-sentinel read must be present, or this ledger entry \
-             is recording the wrong row"
+             is recording the wrong row — and a \"fix\" that dropped the pinned def \
+             would silence the refutation by deleting the hypothesis"
         );
-        // The SECOND cost, pinned as a measurement rather than left as prose.
-        // MECHANISM, found by an adversarial re-read and stated exactly because a
-        // plausible-but-wrong reason in a comment is the defect this file exists to
-        // catch: `safety.rs`'s `if bounds_kind && count_back_edges(func) == 0
-        // { continue; }` skips the whole conjoin for a bounds VC in a back-edge-free
-        // function, and this fixture is back-edge-free. It is NOT that the
-        // versioned pass fails to reach `n#e` — given the chance it would.
+        assert!(
+            has_entry_tie(&vc.formula),
+            "the tie is the RECOVERY's mechanism; without it the precondition \
+             cannot reach `n#e` and the false refutation returns. formula: {:?}",
+            vc.formula
+        );
+        // The remaining range-position cost (see the doc comment above).
         assert_eq!(
             (range_bounds_on(&vc.formula, "n"), range_bounds_on(&vc.formula, "n#e")),
             ((true, true), (false, false)),
-            "bare `n` bounded but `n#e` unbounded is the measured state. If `n#e` is \
-             now bounded here, the versioned pass reaches this lane and the \
-             limitation documented above has been closed — re-derive it."
+            "bare `n` bounded, `n#e` literal-unbounded is the measured state (the \
+             back-edge-free bounds-lane range skip). If `n#e` is now bounded here, \
+             the range battery reaches this lane — re-derive this pin."
+        );
+        let result = verdict(vc);
+        assert!(
+            !matches!(result, VerificationResult::Failed { .. }),
+            "safe code must not be REFUTED: with the tie conjoined, `n < 30` \
+             reaches `n#e` and kills the `n#e = 30, n = 0` counterexample. \
+             verdict: {result:?}"
         );
         assert!(
-            matches!(verdict(vc), VerificationResult::Failed { .. }),
-            "this row is the recorded KNOWN COST of the precondition-side gap; if it \
-             now passes, re-derive this test and the scope note in this file's header"
+            !matches!(result, VerificationResult::Proved { .. }),
+            "MEASURED `Unknown` (ay computes UNSAT; strict certification rejects \
+             the division step). If this became `Proved`, the certification \
+             ceiling moved — re-derive this pin and the header's scope note: \
+             {result:?}"
         );
     }
 }

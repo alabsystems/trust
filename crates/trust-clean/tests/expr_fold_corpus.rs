@@ -910,9 +910,7 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
                 fields: vec![("data".into(), expr_backref.clone())],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
         ),
         (
             "UnsafeCell edge",
@@ -923,9 +921,7 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
                 fields: vec![("value".into(), expr_backref.clone())],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
         ),
         (
             "mutable ref edge",
@@ -940,9 +936,7 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
                 fields: vec![("payload".into(), expr_backref.clone())],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
         ),
         (
             "unknown opaque datatype",
@@ -963,15 +957,11 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
                         fields: vec![("value".into(), expr_backref.clone())],
                         variants: vec![],
                         disc_index_safe: false,
-                        faithful_enum_repr: None,
-                        enum_layout: None,
-                    },
+                        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
                 )],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
         ),
     ] {
         let mut bodies = all_bodies();
@@ -997,9 +987,7 @@ fn p_acyc_type_graph_adversaries_decline_by_name() {
             fields: vec![("data".into(), expr_backref)],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        },
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
     ));
     let decline = sem_expr_fold_shape_of(&load(FVS_ROW), &bodies)
         .expect_err("an Arc-shaped type with an extra side channel must fail closed");
@@ -2746,16 +2734,13 @@ fn memo_probe_leaf_shared_container_cell_alias_declines() {
                 fields: vec![("value".into(), trust_types::Ty::Int { width: 64, signed: false })],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
         )],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let hidden_cell_ref = trust_types::Ty::Ref { mutable: false, inner: Box::new(hidden_cell) };
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+    let hidden_cell_ref =
+        trust_types::Ty::Ref { mutable: false, inner: Box::new(hidden_cell) };
     // The alias must be COPIED OUT OF the folder for the detachment rule under
     // test to apply at all, so the folder has to declare a field of exactly
     // that type. Copying the real `FVarId` field into a
@@ -2902,9 +2887,7 @@ fn memo_probe_interior_mutating_clone_declines() {
                 fields: vec![],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
         ),
         (
             "opaque hidden Cell",
@@ -2919,9 +2902,7 @@ fn memo_probe_interior_mutating_clone_declines() {
                 fields: vec![],
                 variants: vec![],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
         ),
     ] {
         let mut bodies = all_bodies();

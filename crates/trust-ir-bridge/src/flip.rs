@@ -132,7 +132,7 @@ use crate::lower::{lower_to_trust_ir, reconstruct_full_safety_formula_candidates
 /// stripped form as the proof formula, that risk cannot arise here. The decision is
 /// label-only and cannot change any verdict.
 #[must_use]
-fn strip_version_tokens_in_formula(formula: &Formula) -> Formula {
+pub(crate) fn strip_version_tokens_in_formula(formula: &Formula) -> Formula {
     /// Strip a `#<token>` suffix from a place name (`in_bounds#s0_0` -> `in_bounds`).
     /// Already-bare names pass through unchanged.
     fn strip_name(name: &str) -> String {
@@ -163,7 +163,7 @@ fn strip_version_tokens_in_formula(formula: &Formula) -> Formula {
 /// soundness argument (the live, versioned formula is always kept as the proof
 /// formula; stripping affects only the provenance decision).
 #[must_use]
-fn formula_eq_modulo_versions(a: &Formula, b: &Formula) -> bool {
+pub(crate) fn formula_eq_modulo_versions(a: &Formula, b: &Formula) -> bool {
     a == b || strip_version_tokens_in_formula(a) == strip_version_tokens_in_formula(b)
 }
 
@@ -638,6 +638,16 @@ pub struct ObligationKey {
 }
 
 impl ObligationKey {
+    /// The canonical obligation-class string for a `VcKind` — the same classing
+    /// this key's `class` field carries ([`obligation_class`]), exposed
+    /// read-only so per-class instruments (the native-gen scorecard) can never
+    /// drift from the flip's own findings. Not a policy surface: adding a
+    /// second classing beside it is the defect this wrapper exists to prevent.
+    #[must_use]
+    pub fn class_of(kind: &VcKind) -> String {
+        obligation_class(kind)
+    }
+
     /// The user-visible message for the fail-closed finding the COMPILER raises
     /// when this obligation reaches nobody.
     ///
@@ -882,7 +892,28 @@ pub fn generate_native_or_flip_safety_vcs_with_discharged<'a, I>(
 where
     I: IntoIterator<Item = &'a VerificationCondition>,
 {
-    if let Some(native) = crate::lower::generate_native_safety_vcs(func) {
+    generate_native_or_flip_safety_vcs_with_reachability(func, vcgen_vcs, discharged, None)
+}
+
+/// [`generate_native_or_flip_safety_vcs_with_discharged`] plus the terminator-
+/// walk reachability population (W4/spine-derives-unreachable): `Some(set)`
+/// lets the spine derive the `Unreachable` rows over exactly trust-vcgen's own
+/// arm-1b block population (`trust_vcgen::terminator_vc_block_set`), so the
+/// two producers can AGREE on that enumeration instead of parking every
+/// affected function in `Disagreed`. `None` is the exact prior behavior —
+/// dispatch, verdicts, and every outcome are byte-identical on that path.
+pub fn generate_native_or_flip_safety_vcs_with_reachability<'a, I>(
+    func: &VerifiableFunction,
+    vcgen_vcs: Vec<VerificationCondition>,
+    discharged: I,
+    terminator_blocks: Option<&std::collections::HashSet<trust_types::BlockId>>,
+) -> (Vec<VerificationCondition>, NativeGenOutcome)
+where
+    I: IntoIterator<Item = &'a VerificationCondition>,
+{
+    if let Some(native) =
+        crate::lower::generate_native_safety_vcs_with_reachability(func, terminator_blocks)
+    {
         let (vcgen_l0, vcgen_rest): (Vec<_>, Vec<_>) =
             vcgen_vcs.iter().cloned().partition(|vc| is_l0_safety(vc));
         if vc_dispatch_multiset_eq(&native, &vcgen_l0) {
@@ -3137,8 +3168,13 @@ mod tests {
 
         // (2) The live formula carries the assert-passed semantic guard
         // `Eq(_4.0, x+1)`, and the spine now reproduces it.
+        // RE-PINNED 2026-08-30: guard operands now carry SSA-versioned
+        // spellings (`|_4.0#s0_1|`) — the spine/SSA landing that 406c58363e
+        // repinned the recovered-spine comparisons for missed these two
+        // contains-asserts. The semantic content (the `x+1` equality) is
+        // unchanged; only the variable spelling moved.
         assert!(
-            live_smt.contains("(= _4.0 (+ x 1))"),
+            live_smt.contains("(= |_4.0#s0_1| (+ x 1))"),
             "live postcondition carries the semantic-guard `_4.0 = x+1`: {live_smt}"
         );
 
@@ -3240,8 +3276,10 @@ mod tests {
             // It is body-aware: it embeds the return-value pin and the negated
             // postcondition over `_0`, plus the precondition conjunct — facts the
             // spine's bare predicate cannot reproduce without the body-aware pipeline.
+            // RE-PINNED 2026-08-30: SSA-versioned spelling (see the sibling
+            // test's note).
             assert!(
-                live_smt.contains("(= _0 _4.0)"),
+                live_smt.contains("(= _0 |_4.0#s0_1|)"),
                 "the live postcondition embeds the return-value pin `_0 = _4.0` \
                  (body-aware, irreproducible from the spine predicate): {live_smt}"
             );
@@ -4031,7 +4069,20 @@ mod missing_obligation_ratchet {
     /// unchanged. Thus the 53 recovered comparisons add 53 visible rows while
     /// independent class closures/reclassification net -3, for 364 total.
     /// `native_only` remains exactly zero: nothing the spine derives is unchecked.
-    const VCGEN_ONLY_CEILING: usize = 364;
+    /// RE-PINNED 364 -> 128 (2026-09-01, W4/spine-derives-unreachable). The
+    /// whole delta is ONE class, measured by scorecard A/B on the identical
+    /// corpus (2347 functions): `Unreachable` vcgen_only 236 -> 0 — the spine's
+    /// terminator walk (shared recognizers in
+    /// `trust_types::terminator_obligations`, vcgen's own arm-1b block
+    /// population as the reachability input) now derives every Unreachable row
+    /// trust-vcgen mints. Every other class is unmoved (Add 36, Mul 7, Rem 1,
+    /// Sub 7, Assertion 22, BoundsCheck 27, CopyBoundsViolation 7,
+    /// DivisionByZero 4, FfiBoundaryViolation 2, NegationOverflow 5,
+    /// RemainderByZero 1, UnboundedAllocation 7, UncheckedArithmeticOverflow 1,
+    /// UncheckedIndexBounds 1). Outcome shift: Disagreed 356 -> 147,
+    /// FlippedFallback 318 -> 527 (enumeration agreement; formula parity for
+    /// the class is the NEXT step), native_only exactly zero throughout.
+    const VCGEN_ONLY_CEILING: usize = 128;
 
     /// Trust (#63): the spine's DECLINE CENSUS — the pinned set of dump instances
     /// whose `generate_native_safety_vcs` returns `None`, keyed
@@ -4147,15 +4198,15 @@ mod missing_obligation_ratchet {
     /// gate. The recovered bodies expose +51 `Unreachable` and +2
     /// `BoundsCheck` vcgen-only rows, all still dispatched by trust-vcgen.
     const SPINE_DECLINED_PIN: &[(&str, &str)] = &[
-        // The 172 surviving declines that predate the two INTAKE rows below.
+        // The 169 surviving declines that predate the two INTAKE rows below.
+        // RE-PINNED 172 -> 169 (2026-08-31): the local R113 PtrOffset lowering
+        // (6f50340200) made the w2-iter-offset-modeled slice-iter family
+        // comparable (fixtures unchanged since 280306a5f1); rows transcribed
+        // out per the ratchet's own paste-ready output — PROGRESS direction.
         ("<[T] as lib::BitArray<T>>::bit_length", "0d044330f8215218"),
         (
             "<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::fold::<i32, {closure@<i32 as core::iter::traits::accum::Sum<&i32>>::sum<core::slice::iter::Iter<'_, i32>>::{closure#0}}>",
             "a14702a23ca07be2",
-        ),
-        (
-            "<core::slice::iter::Iter<'_, i32> as core::iter::traits::iterator::Iterator>::next",
-            "571566dc7d3e162a",
         ),
         (
             "<expr::subst::LevelParamSubstSlice<'_> as expr::visitor::opt::ExprFolderOpt>::fold_const_opt",
@@ -4233,14 +4284,9 @@ mod missing_obligation_ratchet {
         ("core::num::nonzero::NonZero::<u32>::new", "00893d35b7537777"),
         ("core::num::nonzero::NonZero::<u8>::new", "57464d39eb9c9486"),
         (
-            "core::slice::iter::<impl core::iter::traits::collect::IntoIterator for &[i32]>::into_iter",
-            "2738df63c73099d9",
-        ),
-        (
             "core::slice::iter::<impl std::iter::IntoIterator for &[i32]>::into_iter",
             "83df2ef4de83877c",
         ),
-        ("core::slice::iter::Iter::<'_, i32>::new", "08b9f642e295a020"),
         // exp_bump re-hashed 2026-08-21 (was "f3fd4d05d65aa8be"): the `4ca0cb0eac`
         // campaign re-spelled the fixture extractor-faithfully — its admission
         // audits reject a widthless signed `ConstValue::Int` against an unsigned
@@ -4459,8 +4505,12 @@ mod missing_obligation_ratchet {
     /// exact-callee-identity bodies stopped declining. See the aggregate ceiling
     /// and exact decline-census attribution above. Both classes remain emitted
     /// and dispatched by trust-vcgen; this records newly live comparison coverage.
+    /// `Unreachable` RE-PINNED 236 -> 0 (2026-09-01): the spine's terminator
+    /// walk closed the class (see the aggregate re-pin above). A ceiling of 0
+    /// is the tightest pin there is — ANY future Unreachable row in vcgen_only
+    /// is a regression of the shared-recognizer agreement, not intake.
     const VCGEN_ONLY_CLASS_CEILINGS: &[(&str, usize)] =
-        &[("BoundsCheck", 27), ("Unreachable", 236)];
+        &[("BoundsCheck", 27), ("Unreachable", 0)];
 
     /// Trust (#62, C-D0): the Assertion class is IDENTITY-PINNED, not count-bounded.
     ///
@@ -4662,11 +4712,18 @@ mod missing_obligation_ratchet {
                 if crate::lower::generate_native_safety_vcs(&func).is_none() {
                     spine_declined.insert(declined_key(&func));
                 }
-                let (_dispatched, outcome) = generate_native_or_flip_safety_vcs_with_discharged(
-                    &func,
-                    vcgen,
-                    discharged.iter(),
-                );
+                // Trust (W4/spine-derives-unreachable): measure the production-
+                // intended configuration — the terminator walk over vcgen's own
+                // arm-1b block population, the input the caller threads once the
+                // trust_verify hookup lands.
+                let terminator_blocks = trust_vcgen::terminator_vc_block_set(&func);
+                let (_dispatched, outcome) =
+                    generate_native_or_flip_safety_vcs_with_reachability(
+                        &func,
+                        vcgen,
+                        discharged.iter(),
+                        Some(&terminator_blocks),
+                    );
                 match outcome {
                     NativeGenOutcome::NativeGenerated(_) => native_generated += 1,
                     NativeGenOutcome::Disagreed { diff, .. } => {
@@ -4989,5 +5046,157 @@ mod missing_obligation_alarm_controls {
         let diff = l0_obligation_set_diff(&[], &vcgen);
         assert!(diff.native_only.is_empty(), "a spine gap is not an unchecked obligation");
         assert_eq!(render(&diff.vcgen_only), vec!["DivisionByZero@CTRL.rs:30:1"]);
+    }
+
+    // ------------------------------------------------------------------
+    // Trust (W4/spine-derives-unreachable) — the TERMINATOR-WALK controls.
+    // A gate that cannot go red is not a gate: these drive the full entry
+    // point over a real (lowerable) function whose one block is a bare
+    // `Terminator::Unreachable`, in all four directions the walk can go.
+    // ------------------------------------------------------------------
+
+    /// A minimal lowerable function whose entry block IS the unreachable
+    /// terminator — the smallest body the shared classifier fires on.
+    fn unreachable_probe() -> VerifiableFunction {
+        use trust_types::{
+            BasicBlock as TrustBlock, BlockId, LocalDecl, Terminator, Ty, VerifiableBody,
+        };
+        let span = SourceSpan {
+            file: "/tmp/unreachable_probe.rs".into(),
+            line_start: 3,
+            col_start: 5,
+            line_end: 3,
+            col_end: 20,
+        };
+        VerifiableFunction {
+            name: "unreachable_probe".into(),
+            def_path: "unreachable_probe".into(),
+            span,
+            body: VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: Ty::i32(), name: None }],
+                blocks: vec![TrustBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Unreachable,
+                }],
+                arg_count: 0,
+                return_ty: Ty::i32(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    fn probe_reachability() -> std::collections::HashSet<trust_types::BlockId> {
+        std::collections::HashSet::from([trust_types::BlockId(0)])
+    }
+
+    /// The spine's own Unreachable row, byte-for-byte (span = func.span, the
+    /// block has no Assign statement).
+    fn probe_unreachable_vc() -> VerificationCondition {
+        let func = unreachable_probe();
+        VerificationCondition {
+            kind: VcKind::Unreachable,
+            function: func.name.clone().into(),
+            location: func.span.clone(),
+            formula: Formula::Bool(true),
+            contract_metadata: None,
+            obligation: None,
+        }
+    }
+
+    #[test]
+    fn terminator_walk_overgeneration_is_disagreed_and_never_dispatched() {
+        // vcgen emitted NO row for the block — a spine row here must land in
+        // native_only (the alarm direction) with vcgen's (empty) set
+        // dispatched, never be silently dispatched itself.
+        let func = unreachable_probe();
+        let (dispatched, outcome) = generate_native_or_flip_safety_vcs_with_reachability(
+            &func,
+            Vec::new(),
+            std::iter::empty(),
+            Some(&probe_reachability()),
+        );
+        assert!(dispatched.is_empty(), "dispatch stays trust-vcgen's set: {dispatched:?}");
+        match outcome {
+            NativeGenOutcome::Disagreed { diff, .. } => {
+                assert_eq!(diff.native_only.len(), 1, "{diff:?}");
+                assert_eq!(diff.native_only[0].class, "Unreachable");
+            }
+            other => panic!("over-generation must be Disagreed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn terminator_walk_enumeration_agreement_without_formula_parity_is_fallback() {
+        // Same (kind, span) row on both sides but vcgen's formula is the
+        // ENRICHED one (path guards conjoined) — enumeration agrees, bytes do
+        // not, and the flip must fall back rather than dispatch the native set.
+        let func = unreachable_probe();
+        let mut enriched = probe_unreachable_vc();
+        enriched.formula =
+            Formula::And(vec![Formula::Bool(true), Formula::Bool(true)]);
+        let (dispatched, outcome) = generate_native_or_flip_safety_vcs_with_reachability(
+            &func,
+            vec![enriched.clone()],
+            std::iter::empty(),
+            Some(&probe_reachability()),
+        );
+        assert!(
+            matches!(outcome, NativeGenOutcome::FlippedFallback(_)),
+            "formula mismatch on an agreed enumeration is the benign fallback, got {outcome:?}"
+        );
+        assert_eq!(dispatched.len(), 1);
+        assert_eq!(
+            format!("{:?}", dispatched[0].formula),
+            format!("{:?}", enriched.formula),
+            "the dispatched row is trust-vcgen's, never the spine's"
+        );
+    }
+
+    #[test]
+    fn terminator_walk_byte_parity_is_native_generated() {
+        // The mutation twin of the two refusals above: byte-identical rows on
+        // both sides and the gate PASSES — proving it can go green, so the two
+        // red directions are gates rather than dead ends.
+        let func = unreachable_probe();
+        let (dispatched, outcome) = generate_native_or_flip_safety_vcs_with_reachability(
+            &func,
+            vec![probe_unreachable_vc()],
+            std::iter::empty(),
+            Some(&probe_reachability()),
+        );
+        assert!(
+            matches!(outcome, NativeGenOutcome::NativeGenerated(1)),
+            "byte parity must dispatch the spine's set, got {outcome:?}"
+        );
+        assert_eq!(dispatched.len(), 1);
+        assert!(matches!(dispatched[0].kind, VcKind::Unreachable));
+    }
+
+    #[test]
+    fn terminator_walk_none_input_is_the_pre_increment_behavior() {
+        // Without the reachability input the spine mints no terminator row, so
+        // a vcgen Unreachable row reads as the spine's coverage gap — exactly
+        // the pre-increment Disagreed/vcgen_only shape, and the production
+        // path until the trust_verify hookup threads the set.
+        let func = unreachable_probe();
+        let (_dispatched, outcome) = generate_native_or_flip_safety_vcs_with_reachability(
+            &func,
+            vec![probe_unreachable_vc()],
+            std::iter::empty(),
+            None,
+        );
+        match outcome {
+            NativeGenOutcome::Disagreed { diff, .. } => {
+                assert!(diff.native_only.is_empty());
+                assert_eq!(diff.vcgen_only.len(), 1);
+                assert_eq!(diff.vcgen_only[0].class, "Unreachable");
+            }
+            other => panic!("expected the pre-increment coverage-gap shape, got {other:?}"),
+        }
     }
 }

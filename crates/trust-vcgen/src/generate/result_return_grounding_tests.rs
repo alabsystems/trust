@@ -20,9 +20,7 @@ fn i64_ty() -> Ty {
 
 /// An opaque non-integer payload (the ny-cert `Rat` handle shape).
 fn opaque_payload_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "ny::Rat".into(),
         fields: vec![("0".into(), i64_ty())],
         variants: vec![],
@@ -35,9 +33,7 @@ fn opaque_payload_ty() -> Ty {
 /// `core::result::Result<ok_payload, i64>` in the flattened lowering shape
 /// (machine tags: Ok = 0, Err = 1 — mirrors the `std_result_ty` fixtures).
 fn std_result_ty(ok_payload: Ty) -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), i64_ty()),
@@ -64,9 +60,7 @@ fn std_result_ty(ok_payload: Ty) -> Ty {
 
 /// `core::option::Option<i64>` (machine tags: None = 0, Some = 1).
 fn std_option_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "core::option::Option".into(),
         fields: vec![("__tag".into(), i64_ty()), ("__v1_0".into(), i64_ty())],
         variants: vec![

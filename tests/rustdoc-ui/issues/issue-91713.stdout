@@ -9,7 +9,7 @@ strip-aliased-non-local - strips all non-local private aliased items from the ou
 collect-intra-doc-links - resolves intra-doc links
  collect-trait-impls - retrieves trait impls for items in the crate
 calculate-doc-coverage - counts the number of items with and without documentation
-           run-lints - runs some of rustdoc's lints
+           run-lints - runs some of trustdoc's lints
 
 Default passes for rustdoc:
  collect-trait-impls

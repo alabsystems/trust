@@ -4495,6 +4495,7 @@ mod tests {
             disc_index_safe: false,
             faithful_enum_repr: None,
             enum_layout: None,
+            arbitrary_precision: None,
             adt_kind: None,
             layout: None,
         }

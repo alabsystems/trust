@@ -1440,7 +1440,7 @@ fn reseated_deref_store_drops_alloc_guard() {
                             rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },
                             span: SourceSpan::default(),
                         },
-                        // reseat -> unique_whole_local_def(p) = None
+                        // reseat -> crate::local_defs::unique_value_def(p) = None
                         Statement::Assign {
                             place: Place::local(3),
                             rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },

@@ -35,6 +35,25 @@
 // caller-side charge `ca53846043` added is not what fails this crate. The definition-side
 // rejection is, and it is what is pinned. Do not re-add caller-count expectations without
 // measuring them in THIS lane.
+//
+// RE-MEASURED 2026-08-30 on stage1 at fb48832dc9 with this file's own flags. The ABORT IS
+// UNCHANGED — exit 1, and both `Trust strict verification failed` errors (the
+// executor-protocol premise rejection and the "3 obligation(s) were not fully verified"
+// aggregate) still fire on the DEFINITION, which is the guard this file owns. What moved
+// is Level-0 accounting: the two sentinel-family rows that measured FAILED on ec4783d80
+// ("2 failed") now decide UNSAT under the exactly-grounded resume-state entry premise and
+// report as CONDITIONALLY DISCHARGED (NOT proved) on D2's own conditional surface
+// (`conditional-on-exported-precondition`; the summary reads "3 conditionally discharged
+// (NOT proved), 0 failed, 0 unknown, 0 timed out, 1 runtime-checked, 1 skipped out of
+// 5"). Root cause: the 2026-08-28 assert-refutation grounding family in trust-vcgen
+// (e7a2860143 "ground source-versioned refutation guards" with siblings 3d1446f4c7 /
+// e6fae3f5be / 3128af71c0), which made the sentinel candidates' entry-precondition
+// conjunct bind the versioned selector read exactly, so the sentinel path decides UNSAT
+// (a conditional theorem) instead of spuriously SAT. With `failed 2 -> 0` the remaining
+// Level-0 gap is the single runtime-checked row, which the ratified completeness-gap
+// policy reports as a WARNING; the fail-closed abort rides the two dedicated strict
+// errors, exactly as pinned below. Nothing certifies: the whole-function panic-freedom
+// row stays runtime-checked and `certify_vc=false` (KERNEL_PROMOTE inconclusive).
 //@ needs-trust-verify
 //@ compile-flags: -Ztrust-verify=on
 //@ edition: 2021
@@ -47,7 +66,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 pub async fn tick(x: u32) -> u32 { x }
-//~^ ERROR Trust Level 0 safety verification incomplete
+//~^ WARN Trust Level 0 safety verification incomplete
 //~| ERROR coroutine executor-protocol premise is unproved
 //~| ERROR obligation(s) were not fully verified
 

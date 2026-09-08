@@ -237,6 +237,7 @@ fn test_emit_metadata_e2e_smoke() {
         crate_name: "trust_cg_smoke".to_string(),
         functions: vec![make_add(), make_identity(), make_checked_div(), make_sum_loop()],
         linkage: Vec::new(),
+        statics: Vec::new(),
     };
 
     // Step 1: codegen_crate (MIR -> LIR lowering for all functions)
@@ -319,7 +320,12 @@ fn test_emit_metadata_e2e_smoke() {
 fn test_emit_metadata_empty_crate() {
     let backend = TrustCgCodegenBackend::host();
     let crate_info =
-        CrateInfo { crate_name: "empty_crate".to_string(), functions: vec![], linkage: Vec::new() };
+        CrateInfo {
+            crate_name: "empty_crate".to_string(),
+            functions: vec![],
+            linkage: Vec::new(),
+            statics: Vec::new(),
+        };
 
     let ongoing =
         backend.codegen_crate(&crate_info).expect("empty crate should codegen successfully");
@@ -376,6 +382,7 @@ fn test_emit_metadata_float_function() {
         crate_name: "float_crate".to_string(),
         functions: vec![float_add],
         linkage: Vec::new(),
+        statics: Vec::new(),
     };
 
     let ongoing = backend.codegen_crate(&crate_info).expect("float function should codegen");

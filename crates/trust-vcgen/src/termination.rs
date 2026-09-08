@@ -596,6 +596,23 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
         }
     };
 
+    // Compound `bound - counter` measure — the additive extension for
+    // increasing-counter recursions (`cover(.., naxes, d)` counts `d` UP toward
+    // `naxes`; the bare single-decreasing-param lane cannot bind such a shape).
+    // Attempted ONLY in the inference regime (no authored function-level
+    // `decreases`, which is exact proof surface we must never override) and ONLY
+    // when EVERY fail-closed soundness guard in `infer_compound_recursion_measure`
+    // holds. When it fires the emitted VC is UNSAT (Proved) by construction (see
+    // `compound_recursion_vcs`), so this can only upgrade a bare-measure Unknown
+    // to Proved — it never flips an existing verdict and never admits a
+    // genuinely non-terminating recursion.
+    if explicit_clause.is_none()
+        && let Some(compound) = infer_compound_recursion_measure(func, &recursive_calls)
+    {
+        vcs.extend(compound_recursion_vcs(func, &recursive_calls, &compound));
+        return;
+    }
+
     let inferred_measure = || {
         if func.body.arg_count == 0 {
             return "unknown".to_string();
@@ -612,7 +629,24 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
         explicit_clause.and_then(|clause| unique_recursion_decreases_contract_index(func, clause));
     let mut recursion_vcs = Vec::new();
     let mut explicit_binding_failure = None;
+    // Trust (verifier-perf, MEASURED 2026-08-31): the per-call-site path-guard
+    // conjoin below needs two whole-CFG analyses that are pure functions of
+    // `func`. Build them ONCE for the whole loop instead of once per recursive
+    // call site. On `trust-spec-elab` this single call site was 99.9% of the R1
+    // pre-pass's thread time (driver `sha256:6bf8876323cc…d60b2`): `elab_term`,
+    // an 815-basic-block recursive syn tree-walker, paid two whole-CFG fixpoints
+    // at EVERY one of its recursive edges. The cache holds a shared borrow of
+    // `func`, so it cannot observe a mutation — see `FuncAnalysisScope`.
+    // Trust (L0 termination guarantee): this loop is one of the VC-generation
+    // walks the budget docs claim to bound. Measured 2026-08-31, it polled
+    // nothing. A trip drops the whole recursion set and records ONE unsupported
+    // row below — never a silent absence, and never a Proved.
+    let mut budget_tripped = false;
     for call_site in &recursive_calls {
+        if trust_types::verify_budget::budget_exhausted() {
+            budget_tripped = true;
+            break;
+        }
         let Some((measure_entry, measure_call, binding_facts, exact_site_span)) =
             recursion_measure_bindings(func, call_site, &measure)
         else {
@@ -679,6 +713,20 @@ pub(crate) fn check_termination(func: &VerifiableFunction, vcs: &mut Vec<Verific
             format!(
                 "function-level decreases parameter `{measure}` could not be bound to every \
                  recursive call under exact machine semantics"
+            ),
+        ));
+    } else if budget_tripped {
+        // Fail closed, LOUDLY. Dropping the partial `recursion_vcs` silently
+        // would make an unchecked recursive edge indistinguishable from a
+        // checked one — an obligation that DISAPPEARS is not one that proved.
+        // Emit the same unsupported row the binding-failure arm emits, so the
+        // truncation is a visible non-proof rather than an absence.
+        vcs.push(unsupported_recursion_decreases_vc(
+            func,
+            func.span.clone(),
+            format!(
+                "per-function verification budget exhausted before every recursive call site \
+                 could be checked against decreases measure `{measure}`"
             ),
         ));
     } else {
@@ -1082,6 +1130,481 @@ fn recursion_measure_bindings(
         facts.push(Formula::Ge(Box::new(entry.clone()), Box::new(Formula::Int(0))));
     }
     Some((entry, call_arg, facts, exact_site_span))
+}
+
+// ===========================================================================
+// Compound `bound - counter` recursion measure (additive termination lane)
+// ===========================================================================
+//
+// SOUNDNESS MODEL. For a recursion whose bare single-decreasing-parameter
+// measure fails (e.g. `cover(coords, naxes, d)` counts `d` UP), admit the
+// compound measure `M = bound - counter` under FOUR fail-closed guards, all of
+// which the pair of never-mutated integer VALUE parameters (`bound`, `counter`)
+// makes checkable INTRAPROCEDURALLY:
+//
+//   (1) STRICT DECREASE. At every recursive call `counter` is passed as
+//       `counter + k` / `counter.saturating_add(k)` with `k` a POSITIVE integer
+//       literal (`resolve_counter_increment`), so `M_call = bound - (counter+k)`
+//       is `M_entry - k < M_entry`.
+//   (2) `bound` INVARIANCE. `bound` is a value parameter never written in the
+//       body (`local_ever_mutated`) and passed UNCHANGED at every recursive
+//       call (`operand_reads_unchanged_local`). A value parameter cannot be
+//       mutated by any callee, so read-only-ness of the body is sufficient and
+//       sound — `bound_call == bound_entry`.
+//   (3) WELL-FOUNDEDNESS FROM A `>=`/`>` DOMINATING GUARD (NOT `==`). A base
+//       guard `counter >= bound` (or `counter > bound`) whose block DOMINATES
+//       every recursive-call block, and whose base (guard-TRUE) edge cannot
+//       reach any recursive call, forces every path to a recursive call through
+//       the guard-FALSE edge — where `counter < bound` (resp. `counter <= bound`)
+//       holds. Since `counter`/`bound` are immutable that fact carries to the
+//       call, giving `M_entry >= 1 > 0` (resp. `>= 0`). An `==` guard is
+//       REJECTED: it only yields `counter != bound`, which does NOT bound `M`
+//       below, and would falsely prove the non-terminating
+//       `fn bad(bound,counter){ if counter==bound {return} bad(bound,counter+1) }`
+//       called with `counter > bound`.
+//   (4) The `not_decreasing` VC `(M_call >= M_entry) OR (M_entry < 0)` conjoined
+//       with the guard fact is UNSAT: `M_call >= M_entry` reduces to `-k >= 0`
+//       (false), and `M_entry < 0` (`bound < counter`) contradicts the fact.
+//       So a VC is emitted ONLY for a genuinely terminating recursion.
+//
+// The `saturating_add(counter, k)` step is modeled as the plain `counter + k`
+// increase: given the guard fact `counter < bound <= usize::MAX` we have
+// `counter < usize::MAX`, so `saturating_add(counter, k) = min(counter+k, MAX)`
+// is `>= counter + 1 > counter` — a genuine strict increase — and the
+// `counter + k` substitution is refuted TOGETHER with the conjoined fact (it is
+// never emitted without it). See `resolve_saturating_add_increment`.
+//
+// The extension is strictly ADDITIVE: it fires only in the no-authored-clause
+// inference regime, and only when all guards hold (⇒ the VC is Proved), so it
+// can never change an existing verdict from terminating to not, nor admit a
+// recursion that may not terminate.
+
+/// A validated compound `bound - counter` termination measure over two
+/// never-mutated integer value parameters.
+#[derive(Debug, Clone, Copy)]
+struct CompoundRecursionMeasure {
+    /// The loop-invariant upper bound parameter (`naxes` for `cover`).
+    bound_local: usize,
+    /// The strictly-increasing recursion variable (`d` for `cover`).
+    counter_local: usize,
+    /// `true` for a `counter >= bound` guard (well-foundedness fact
+    /// `counter < bound`); `false` for `counter > bound` (fact `counter <= bound`).
+    strict: bool,
+}
+
+/// Try to infer a sound `bound - counter` measure for `func`'s direct recursion.
+/// Returns `Some` ONLY when every soundness guard (see the module note above)
+/// holds; otherwise `None` and the caller falls back to the bare lane.
+fn infer_compound_recursion_measure(
+    func: &VerifiableFunction,
+    recursive_calls: &[RecursiveCallSite],
+) -> Option<CompoundRecursionMeasure> {
+    if recursive_calls.is_empty() {
+        return None;
+    }
+    let arg_count = func.body.arg_count;
+    // Integer VALUE parameters that are never written in the body. Immutability
+    // is what lets `Var(param)` denote one value at every program point — the
+    // premise of the guard fact, `bound` invariance, and the increasing step.
+    let value_params: Vec<usize> = func
+        .body
+        .locals
+        .iter()
+        .filter(|decl| {
+            decl.index >= 1
+                && decl.index <= arg_count
+                && decl.ty.int_width().is_some()
+                && !local_ever_mutated(func, decl.index)
+        })
+        .map(|decl| decl.index)
+        .collect();
+    if value_params.len() < 2 {
+        return None;
+    }
+    for &counter_local in &value_params {
+        let Some(counter_pos) = counter_local.checked_sub(1) else {
+            continue;
+        };
+        // `counter` must be a strictly-increasing step of ITSELF at every call.
+        let counter_increases = recursive_calls.iter().all(|call| {
+            func.body
+                .blocks
+                .iter()
+                .find(|b| b.id == call.block)
+                .zip(call.args.get(counter_pos))
+                .is_some_and(|(block, arg)| {
+                    resolve_counter_increment(func, block, arg, counter_local).is_some()
+                })
+        });
+        if !counter_increases {
+            continue;
+        }
+        for &bound_local in &value_params {
+            if bound_local == counter_local {
+                continue;
+            }
+            let Some(bound_pos) = bound_local.checked_sub(1) else {
+                continue;
+            };
+            // `bound` must be passed UNCHANGED (a read of the same immutable
+            // param) at every recursive call.
+            let bound_unchanged = recursive_calls.iter().all(|call| {
+                call.args
+                    .get(bound_pos)
+                    .is_some_and(|arg| operand_reads_unchanged_local(func, arg, bound_local))
+            });
+            if !bound_unchanged {
+                continue;
+            }
+            if let Some(strict) =
+                find_dominating_bound_guard(func, recursive_calls, counter_local, bound_local)
+            {
+                return Some(CompoundRecursionMeasure { bound_local, counter_local, strict });
+            }
+        }
+    }
+    None
+}
+
+/// If `arg` is a strictly-increasing step `counter + k` (k a positive integer
+/// literal) of the `counter` param, return `k`. Handles the debug-build
+/// `counter + k` (CheckedAdd + no-overflow Assert chain, via the vetted
+/// `resolve_checked_arg_chain`) and `counter.saturating_add(k)`. Fail-closed.
+fn resolve_counter_increment(
+    func: &VerifiableFunction,
+    call_block: &BasicBlock,
+    arg: &Operand,
+    counter_local: usize,
+) -> Option<u128> {
+    // (a) debug `counter + k`: `_A = _T.0` with `_T = CheckedAdd(counter, k)` in
+    //     the unique no-overflow Assert predecessor (exact `counter + k` value).
+    if let Some((formula, _span)) = resolve_checked_arg_chain(func, call_block, arg) {
+        let expected_counter =
+            crate::operand_to_formula(func, &Operand::Copy(Place::local(counter_local)));
+        if let Some(k) = counter_increment_from_formula(&formula, &expected_counter) {
+            return Some(k);
+        }
+    }
+    // (b) `counter.saturating_add(k)`.
+    resolve_saturating_add_increment(func, arg, counter_local)
+}
+
+/// Extract `k >= 1` from a resolved step formula shaped `counter + k`
+/// (either operand order), where `expected_counter` is the counter param's own
+/// formula. Any other shape (a decrement, a non-literal, `k == 0`) is rejected.
+fn counter_increment_from_formula(formula: &Formula, expected_counter: &Formula) -> Option<u128> {
+    let Formula::Add(l, r) = formula else {
+        return None;
+    };
+    let k_side = if l.as_ref() == expected_counter {
+        r.as_ref()
+    } else if r.as_ref() == expected_counter {
+        l.as_ref()
+    } else {
+        return None;
+    };
+    match k_side {
+        Formula::Int(k) if *k >= 1 => u128::try_from(*k).ok(),
+        Formula::UInt(k) if *k >= 1 => Some(*k),
+        _ => None,
+    }
+}
+
+/// The std integer inherent `saturating_add` method
+/// (`core::num::<impl uN>::saturating_add` / signed siblings). CRATE-ORIGIN
+/// anchored exactly like `generate::saturating_add_sub_method`: a user-defined
+/// `mymod::saturating_add` must NOT match (matching one would inject a false
+/// strictly-increasing-step channel — a false-PROVE hole).
+fn is_std_saturating_add(callee: &str) -> bool {
+    let tail = callee.rsplit("::").next().unwrap_or(callee);
+    let tail = tail.split('<').next().unwrap_or(tail).trim();
+    tail == "saturating_add"
+        && (callee.starts_with("core::") || callee.starts_with("std::"))
+        && callee.contains("::num::")
+}
+
+/// If `arg` is `copy/move _X` where `_X`'s ONE value — on EVERY channel, the
+/// implicit ENTRY definition of a parameter included — is one std
+/// `saturating_add(counter, k)` call, with `counter` a bare read of the counter
+/// param and `k` a positive integer literal, return `k`. Fail-closed on every
+/// mismatch. See the module note for why modeling the saturating step as
+/// `counter + k` is sound.
+///
+/// THE VALUE QUESTION IS `local_defs`'S, and it must be: the `k` returned here is
+/// INLINED by `compound_recursion_vcs` as `M_call = bound - (counter + k)`, so a
+/// wrong answer is not a lost hypothesis, it is a termination VC that is UNSAT
+/// for a step that never happened. This scan used to be hand-rolled over
+/// `func.body.blocks` and was blind to the one channel that is not in them — a
+/// `mut` PARAMETER passed at the counter position, whose only body store is the
+/// saturating call, still carries its caller-chosen ENTRY value on every path
+/// that skips the call, and the resolver reported an increment on those paths
+/// too. `local_defs::unique_value_call` counts the entry definition, so such a
+/// parameter is two-valued and declines.
+fn resolve_saturating_add_increment(
+    func: &VerifiableFunction,
+    arg: &Operand,
+    counter_local: usize,
+) -> Option<u128> {
+    let temp = match arg {
+        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
+        _ => return None,
+    };
+    let Terminator::Call { func: callee, args, .. } =
+        crate::local_defs::unique_value_call(func, temp)?
+    else {
+        return None;
+    };
+    if !is_std_saturating_add(callee) || args.len() != 2 {
+        return None; // temp defined by some other call
+    }
+    let counter_ok = matches!(
+        &args[0],
+        Operand::Copy(p) | Operand::Move(p)
+            if p.projections.is_empty() && p.local == counter_local
+    );
+    if !counter_ok {
+        return None;
+    }
+    match &args[1] {
+        Operand::Constant(ConstValue::Uint(k, _)) if *k >= 1 => Some(*k),
+        Operand::Constant(ConstValue::Int(k)) if *k >= 1 => u128::try_from(*k).ok(),
+        _ => None,
+    }
+}
+
+/// `true` iff `operand` denotes the current value of the never-mutated value
+/// parameter `target_local`: either a direct bare read, or a bare read of a local
+/// whose ONE value — again on every channel, the ENTRY definition included — is
+/// `Use(bare read of target_local)`. Since `target_local` is immutable both forms
+/// denote the entry value. Fail-closed.
+///
+/// The hop is adjudicated by `local_defs`, not by a scan of `func.body.blocks`
+/// here. The two conjuncts are both needed and neither implies the other:
+/// `is_single_static_assignment` refuses the channels a resolver must not
+/// tolerate (a `Call` destination, a projected store, a `SetDiscriminant`/
+/// `Deinit`/`Drop`, a `&mut`/`&raw` ESCAPE, an unlocatable pointer write) and
+/// charges a parameter for its entry definition, so a `mut` parameter with one
+/// body store scores two and declines; `unique_value_def` is what names the
+/// value, and it declines every parameter outright.
+fn operand_reads_unchanged_local(
+    func: &VerifiableFunction,
+    operand: &Operand,
+    target_local: usize,
+) -> bool {
+    let place = match operand {
+        Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p,
+        _ => return false,
+    };
+    if place.local == target_local {
+        return true;
+    }
+    let hop = place.local;
+    crate::local_defs::is_single_static_assignment(func, hop)
+        && matches!(
+            crate::local_defs::unique_value_def(func, hop),
+            Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p)))
+                if p.projections.is_empty() && p.local == target_local
+        )
+}
+
+/// Find a base guard block that SOUNDLY establishes the well-foundedness fact on
+/// every recursive-call edge, per guard (3) of the module note. Returns
+/// `Some(strict)` — `true` for a `counter >= bound` guard (fact `counter < bound`),
+/// `false` for `counter > bound` (fact `counter <= bound`).
+///
+/// Requires: a `SwitchInt` block `G` whose bool discriminant is defined in `G`
+/// as a comparison of the two params expressing the BASE condition
+/// `counter >= bound` / `counter > bound` (`classify_bound_comparison`, so the
+/// base case is the guard-TRUE / value-1 edge and recursion is the guard-FALSE /
+/// value-0 edge); `G` dominates every recursive-call block; and the base
+/// (value-1) edge cannot reach any recursive-call block. Fail-closed on any miss.
+fn find_dominating_bound_guard(
+    func: &VerifiableFunction,
+    recursive_calls: &[RecursiveCallSite],
+    counter_local: usize,
+    bound_local: usize,
+) -> Option<bool> {
+    let dominators = compute_dominators(&func.body);
+    let recur_blocks: Vec<usize> = recursive_calls.iter().map(|c| c.block.0).collect();
+    for guard in &func.body.blocks {
+        let Terminator::SwitchInt { discr, targets, otherwise, .. } = &guard.terminator else {
+            continue;
+        };
+        let discr_local = match discr {
+            Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => p.local,
+            _ => continue,
+        };
+        let Some(strict) =
+            classify_bound_comparison(func, guard, discr_local, counter_local, bound_local)
+        else {
+            continue;
+        };
+        // `G` must dominate every recursive-call block.
+        let dominates_all = recur_blocks
+            .iter()
+            .all(|&rb| dominators.get(rb).is_some_and(|d| d.contains(&guard.id.0)));
+        if !dominates_all {
+            continue;
+        }
+        // The base case is the guard-TRUE (value-1) edge; it must not be able to
+        // reach a recursive call, otherwise control could arrive at the call with
+        // the guard TRUE (`counter >= bound`) and the fact would be unsound.
+        let base_tgt = bool_switch_value_target(targets, *otherwise, 1);
+        if block_reaches_any_block(func, base_tgt, &recur_blocks) {
+            continue;
+        }
+        return Some(strict);
+    }
+    None
+}
+
+/// Classify the bool discriminant defined in `block` (its last whole-local
+/// assignment to `discr_local`) as a base guard expressing `counter >= bound`
+/// (returns `Some(true)`) or `counter > bound` (`Some(false)`) over bare reads
+/// of the two params. The four accepted spellings all place the base case on the
+/// guard-TRUE edge and recursion on the guard-FALSE (value-0) edge:
+///   `Ge(counter, bound)` / `Le(bound, counter)`  -> strict (`counter < bound`)
+///   `Gt(counter, bound)` / `Lt(bound, counter)`  -> non-strict (`counter <= bound`)
+/// Any other operator, operand order, or non-bare operand fails closed — in
+/// particular an `==`/`!=` guard never matches.
+fn classify_bound_comparison(
+    func: &VerifiableFunction,
+    block: &BasicBlock,
+    discr_local: usize,
+    counter_local: usize,
+    bound_local: usize,
+) -> Option<bool> {
+    let _ = func;
+    let mut cmp: Option<&Rvalue> = None;
+    for stmt in block.stmts.iter().rev() {
+        if let Statement::Assign { place, rvalue, .. } = stmt
+            && place.local == discr_local
+            && place.projections.is_empty()
+        {
+            cmp = Some(rvalue);
+            break;
+        }
+    }
+    let Rvalue::BinaryOp(op, lhs, rhs) = cmp? else {
+        return None;
+    };
+    let reads = |operand: &Operand, local: usize| {
+        matches!(operand, Operand::Copy(p) | Operand::Move(p)
+            if p.projections.is_empty() && p.local == local)
+    };
+    let counter_then_bound = reads(lhs, counter_local) && reads(rhs, bound_local);
+    let bound_then_counter = reads(lhs, bound_local) && reads(rhs, counter_local);
+    match op {
+        BinOp::Ge if counter_then_bound => Some(true),
+        BinOp::Le if bound_then_counter => Some(true),
+        BinOp::Gt if counter_then_bound => Some(false),
+        BinOp::Lt if bound_then_counter => Some(false),
+        _ => None,
+    }
+}
+
+/// The target of a 2-valued (bool) `SwitchInt` for discriminant `value`: the
+/// listed target if present, else `otherwise`.
+fn bool_switch_value_target(
+    targets: &[(u128, BlockId)],
+    otherwise: BlockId,
+    value: u128,
+) -> BlockId {
+    targets.iter().find(|(v, _)| *v == value).map(|(_, b)| *b).unwrap_or(otherwise)
+}
+
+/// Forward CFG reachability: `true` if any block in `targets` is reachable from
+/// `start` (inclusive) along normal successor edges. Used to prove a base-case
+/// edge cannot reach a recursive call.
+fn block_reaches_any_block(
+    func: &VerifiableFunction,
+    start: BlockId,
+    targets: &[usize],
+) -> bool {
+    let mut seen: FxHashSet<usize> = FxHashSet::default();
+    let mut stack = vec![start.0];
+    while let Some(b) = stack.pop() {
+        if !seen.insert(b) {
+            continue;
+        }
+        if targets.contains(&b) {
+            return true;
+        }
+        if let Some(block) = func.body.blocks.iter().find(|bb| bb.id.0 == b) {
+            for succ in block_successors(&block.terminator) {
+                stack.push(succ.0);
+            }
+        }
+    }
+    false
+}
+
+/// Build the per-call recursion VCs for a validated compound `bound - counter`
+/// measure. Each VC is UNSAT (Proved) by construction (module note, guard (4)):
+/// the strictly-increasing step makes `M_call = bound - (counter + k)` strictly
+/// less than `M_entry = bound - counter` (`k >= 1`), and the conjoined
+/// well-foundedness fact refutes the `M_entry < 0` disjunct.
+fn compound_recursion_vcs(
+    func: &VerifiableFunction,
+    recursive_calls: &[RecursiveCallSite],
+    compound: &CompoundRecursionMeasure,
+) -> Vec<VerificationCondition> {
+    let bound_name = crate::place_to_var_name(func, &Place::local(compound.bound_local));
+    let counter_name = crate::place_to_var_name(func, &Place::local(compound.counter_local));
+    let measure_label = format!("{bound_name} - {counter_name}");
+    let Some(counter_pos) = compound.counter_local.checked_sub(1) else {
+        return Vec::new();
+    };
+    let bound_var = || Formula::Var(bound_name.clone(), Sort::Int);
+    let counter_var = || Formula::Var(counter_name.clone(), Sort::Int);
+    let mut vcs = Vec::new();
+    for call in recursive_calls {
+        let Some(block) = func.body.blocks.iter().find(|b| b.id == call.block) else {
+            continue;
+        };
+        let Some(k) = call
+            .args
+            .get(counter_pos)
+            .and_then(|arg| resolve_counter_increment(func, block, arg, compound.counter_local))
+        else {
+            // Every call bound during inference; a miss here can only DROP a row,
+            // never manufacture a proof. Skip it.
+            continue;
+        };
+        let Ok(k_int) = i128::try_from(k) else {
+            continue;
+        };
+        // M_entry = bound - counter ; M_call = bound - (counter + k).
+        let measure_entry = Formula::Sub(Box::new(bound_var()), Box::new(counter_var()));
+        let counter_call = Formula::Add(Box::new(counter_var()), Box::new(Formula::Int(k_int)));
+        let measure_call = Formula::Sub(Box::new(bound_var()), Box::new(counter_call));
+        let not_decreasing = Formula::Or(vec![
+            Formula::Ge(Box::new(measure_call), Box::new(measure_entry.clone())),
+            Formula::Lt(Box::new(measure_entry), Box::new(Formula::Int(0))),
+        ]);
+        // Well-foundedness fact from the dominating base guard (guard (3)).
+        let well_founded = if compound.strict {
+            Formula::Lt(Box::new(counter_var()), Box::new(bound_var()))
+        } else {
+            Formula::Le(Box::new(counter_var()), Box::new(bound_var()))
+        };
+        let core = Formula::And(vec![well_founded, not_decreasing]);
+        vcs.push(VerificationCondition {
+            kind: VcKind::NonTermination {
+                context: "recursion".to_string(),
+                measure: measure_label.clone(),
+            },
+            function: func.name.as_str().into(),
+            location: call.span.clone(),
+            formula: conjoin_recursion_preconditions(func, core),
+            contract_metadata: None,
+            // Pre-obligation-record semantics: this producer does not write the
+            // authenticated obligation record (None is stripped from the stable
+            // content hash — see `stable_model_json`).
+            obligation: None,
+        });
+    }
+    vcs
 }
 
 /// A direct recursion measure operand representable without call-block
@@ -4334,5 +4857,366 @@ mod tests {
         let mut vcs = Vec::new();
         check_termination(&func, &mut vcs);
         assert!(vcs.is_empty(), "signed checked-sub loop must remain obligation-free, got {vcs:?}");
+    }
+
+    // ── the compound `bound - counter` measure: the ENTRY-DEFINITION channel ──
+    //
+    // `resolve_saturating_add_increment` resolves the operand passed at the COUNTER
+    // position and `compound_recursion_vcs` INLINES the `k` it returns as
+    // `M_call = bound - (counter + k)`. A wrong `k` is therefore not a lost
+    // hypothesis: it is a `NonTermination` VC that is UNSAT for a step that never
+    // ran. The channel the hand-rolled block scan could not see is the one that is
+    // not in `body.blocks` at all — a `mut` PARAMETER's implicit ENTRY definition.
+
+    /// `fn f(bound, counter[, ...]) ` with `arg_count` params, `locals` many locals
+    /// and `blocks` as its whole CFG.
+    fn compound_func(
+        name: &str,
+        arg_count: usize,
+        locals: Vec<LocalDecl>,
+        blocks: Vec<BasicBlock>,
+    ) -> VerifiableFunction {
+        VerifiableFunction {
+            name: name.to_string(),
+            def_path: format!("test::{name}"),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals,
+                blocks,
+                arg_count,
+                return_ty: Ty::usize(),
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        }
+    }
+
+    fn usize_decl(index: usize, name: &str) -> LocalDecl {
+        LocalDecl { index, ty: Ty::usize(), name: Some(name.into()) }
+    }
+
+    fn bool_decl(index: usize, name: &str) -> LocalDecl {
+        LocalDecl { index, ty: Ty::Bool, name: Some(name.into()) }
+    }
+
+    fn call_term(callee: &str, args: Vec<Operand>, dest: usize, target: usize) -> Terminator {
+        Terminator::Call {
+            func: callee.to_string(),
+            args,
+            dest: Place::local(dest),
+            target: Some(BlockId(target)),
+            span: SourceSpan::default(),
+            atomic: None,
+            is_foreign: false,
+            is_unsafe_sig: false,
+            callee_identity: None,
+            unwind: UnwindEdge::Unreachable,
+        }
+    }
+
+    const SAT_ADD: &str = "core::num::<impl usize>::saturating_add";
+
+    /// `_5 = Ge(counter, bound); switch _5 { 1 => base, _ => other }` — the
+    /// dominating base guard `classify_bound_comparison` accepts.
+    fn base_guard_block(
+        discr: usize,
+        counter: usize,
+        bound: usize,
+        base: usize,
+        other: usize,
+    ) -> BasicBlock {
+        BasicBlock {
+            id: BlockId(0),
+            stmts: vec![Statement::Assign {
+                place: Place::local(discr),
+                rvalue: Rvalue::BinaryOp(
+                    BinOp::Ge,
+                    Operand::Copy(Place::local(counter)),
+                    Operand::Copy(Place::local(bound)),
+                ),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::SwitchInt {
+                discr: Operand::Copy(Place::local(discr)),
+                targets: vec![(1, BlockId(base))],
+                otherwise: BlockId(other),
+                exhaustive_enum_unreachable: false,
+                span: SourceSpan::default(),
+            },
+        }
+    }
+
+    /// THE CONTROL. `fn cover(bound, counter)` whose counter step is
+    /// `counter.saturating_add(1)` into a fresh TEMP `_4` that the call block itself
+    /// produces. `_4` is not a parameter, has exactly one definition, and the step
+    /// therefore genuinely runs on every path to the recursive call.
+    ///
+    ///   bb0: _3 = counter >= bound; switch _3 { 1 => bb3, _ => bb1 }
+    ///   bb1: _4 = saturating_add(counter, 1) -> bb2
+    ///   bb2: _0 = cover(bound, move _4)      -> bb3
+    ///   bb3: return
+    fn compound_temp_step() -> VerifiableFunction {
+        compound_func(
+            "cover",
+            2,
+            vec![
+                LocalDecl { index: 0, ty: Ty::usize(), name: None },
+                usize_decl(1, "bound"),
+                usize_decl(2, "counter"),
+                bool_decl(3, "guard"),
+                usize_decl(4, "step"),
+            ],
+            vec![
+                base_guard_block(3, 2, 1, 3, 1),
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: Vec::new(),
+                    terminator: call_term(
+                        SAT_ADD,
+                        vec![
+                            Operand::Copy(Place::local(2)),
+                            Operand::Constant(ConstValue::Uint(1, 64)),
+                        ],
+                        4,
+                        2,
+                    ),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: Vec::new(),
+                    terminator: call_term(
+                        "test::cover",
+                        vec![Operand::Copy(Place::local(1)), Operand::Move(Place::local(4))],
+                        0,
+                        3,
+                    ),
+                },
+                BasicBlock { id: BlockId(3), stmts: Vec::new(), terminator: Terminator::Return },
+            ],
+        )
+    }
+
+    /// THE WITNESS. `fn bad(bound, counter, mut step, c)` — identical except that the
+    /// saturating call's destination is the `mut` PARAMETER `_3`, and the store sits
+    /// behind `c`. On `c == false` control reaches the recursive call with `_3` still
+    /// holding its CALLER-CHOSEN ENTRY value, so no increment happened; `bad(5,0,0,false)`
+    /// recurses forever. The entry definition is not in `body.blocks`, so an
+    /// `Assign`+`Call`-dest scan of the blocks sees exactly one definition of `_3` and
+    /// reports the step.
+    ///
+    ///   bb0: _5 = counter >= bound; switch _5 { 1 => bb4, _ => bb1 }
+    ///   bb1: switch c { 1 => bb2, _ => bb3 }
+    ///   bb2: _3 = saturating_add(counter, 1)      -> bb3      (SKIPPED when !c)
+    ///   bb3: _0 = bad(bound, move _3, copy _3, c) -> bb4
+    ///   bb4: return
+    fn compound_mut_param_step() -> VerifiableFunction {
+        compound_func(
+            "bad",
+            4,
+            vec![
+                LocalDecl { index: 0, ty: Ty::usize(), name: None },
+                usize_decl(1, "bound"),
+                usize_decl(2, "counter"),
+                usize_decl(3, "step"),
+                bool_decl(4, "c"),
+                bool_decl(5, "guard"),
+            ],
+            vec![
+                base_guard_block(5, 2, 1, 4, 1),
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: Vec::new(),
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(4)),
+                        targets: vec![(1, BlockId(2))],
+                        otherwise: BlockId(3),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: Vec::new(),
+                    terminator: call_term(
+                        SAT_ADD,
+                        vec![
+                            Operand::Copy(Place::local(2)),
+                            Operand::Constant(ConstValue::Uint(1, 64)),
+                        ],
+                        3,
+                        3,
+                    ),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: Vec::new(),
+                    terminator: call_term(
+                        "test::bad",
+                        vec![
+                            Operand::Copy(Place::local(1)),
+                            Operand::Move(Place::local(3)),
+                            Operand::Copy(Place::local(3)),
+                            Operand::Copy(Place::local(4)),
+                        ],
+                        0,
+                        4,
+                    ),
+                },
+                BasicBlock { id: BlockId(4), stmts: Vec::new(), terminator: Terminator::Return },
+            ],
+        )
+    }
+
+    /// The control still resolves: the fix must not cost the lane its intended shape.
+    #[test]
+    fn a_fresh_temp_saturating_step_still_resolves_and_still_proves() {
+        let func = compound_temp_step();
+        assert_eq!(
+            resolve_saturating_add_increment(&func, &Operand::Move(Place::local(4)), 2),
+            Some(1),
+            "a non-parameter temp with one defining call is single-valued"
+        );
+        let calls = detect_recursive_calls(&func);
+        assert_eq!(calls.len(), 1, "one recursive call: {calls:?}");
+        let compound = infer_compound_recursion_measure(&func, &calls)
+            .expect("the `bound - counter` measure must still be inferred");
+        assert_eq!((compound.bound_local, compound.counter_local, compound.strict), (1, 2, true));
+        assert_eq!(compound_recursion_vcs(&func, &calls, &compound).len(), 1);
+    }
+
+    /// THE ROW. A `mut` parameter's ENTRY definition is not in `body.blocks`, so the
+    /// call in `bb2` is its SECOND value, not its only one. `local_defs` counts the
+    /// entry definition; the increment must not be reported.
+    #[test]
+    fn a_mut_parameter_counter_argument_reports_no_increment() {
+        let func = compound_mut_param_step();
+        assert!(
+            crate::local_defs::is_parameter(&func, 3),
+            "the witness is about a PARAMETER destination"
+        );
+        assert_eq!(
+            crate::local_defs::value_count(&func, 3),
+            trust_types::ValueCount::Exactly(2),
+            "entry definition + the saturating call"
+        );
+        assert_eq!(
+            crate::local_defs::unique_value_call(&func, 3).map(|_| ()),
+            None,
+            "a two-valued local has no unique defining call"
+        );
+        assert_eq!(
+            resolve_saturating_add_increment(&func, &Operand::Move(Place::local(3)), 2),
+            None,
+            "the entry value reaches the call on the !c path — no increment happened"
+        );
+    }
+
+    /// End to end: the phantom increment was the ONLY thing licensing the compound
+    /// measure for this body, so no `bound - counter` measure is inferred and no
+    /// termination VC is minted for a recursion that does not terminate.
+    #[test]
+    fn the_mut_parameter_witness_mints_no_compound_termination_vc() {
+        let func = compound_mut_param_step();
+        let calls = detect_recursive_calls(&func);
+        assert_eq!(calls.len(), 1, "one recursive call: {calls:?}");
+        assert!(
+            infer_compound_recursion_measure(&func, &calls).is_none(),
+            "a step that need not run cannot license the compound measure"
+        );
+        let mut vcs = Vec::new();
+        check_termination(&func, &mut vcs);
+        assert!(
+            !vcs.iter().any(|vc| matches!(
+                &vc.kind,
+                VcKind::NonTermination { context, measure }
+                    if context == "recursion" && measure.contains('-')
+            )),
+            "no compound-measure recursion VC may be minted: {vcs:?}"
+        );
+    }
+
+    /// The `bound`-invariance half of the same class: `operand_reads_unchanged_local`
+    /// hops through a local whose ONE value is `Use(bound)`. A `mut` PARAMETER with
+    /// that single body store still carries its entry value on a path that skips it,
+    /// so the hop must be refused there and allowed through a fresh temp.
+    #[test]
+    fn the_bound_invariance_hop_refuses_a_mut_parameter_and_allows_a_temp() {
+        let copy_bound = Rvalue::Use(Operand::Copy(Place::local(1)));
+        let mut func = compound_temp_step();
+        // Through the TEMP `_4`: one whole definition, no entry definition.
+        func.body.blocks[1].stmts.push(Statement::Assign {
+            place: Place::local(4),
+            rvalue: copy_bound.clone(),
+            span: SourceSpan::default(),
+        });
+        func.body.blocks[1].terminator = Terminator::Goto(BlockId(2));
+        assert!(
+            operand_reads_unchanged_local(&func, &Operand::Move(Place::local(4)), 1),
+            "a temp whose sole value is `Use(bound)` denotes bound"
+        );
+        // Through the `mut` PARAMETER `_3` of the witness body: the same single store,
+        // plus the entry definition no block scan can see.
+        let mut param = compound_mut_param_step();
+        param.body.blocks[2].stmts.push(Statement::Assign {
+            place: Place::local(3),
+            rvalue: copy_bound,
+            span: SourceSpan::default(),
+        });
+        param.body.blocks[2].terminator = Terminator::Goto(BlockId(3));
+        assert!(
+            !operand_reads_unchanged_local(&param, &Operand::Move(Place::local(3)), 1),
+            "a parameter's entry value is a second value the store does not replace"
+        );
+    }
+
+    /// THE CAPTURED BODY, not a synthetic one. `-Ztrust-dump=mir` of
+    ///
+    /// ```ignore
+    /// #[inline(never)]
+    /// pub fn bad(bound: usize, counter: usize, mut step: usize, c: bool) -> usize {
+    ///     if counter >= bound { return 0; }
+    ///     if c { step = counter.saturating_add(1); }
+    ///     bad(bound, step, 0, c)
+    /// }
+    /// ```
+    ///
+    /// compiled `-Copt-level=1 -Cpanic=abort -Ztrust-policy=certify` by a trustc built
+    /// at the base of this change. `optimized_mir` puts the saturating call's
+    /// destination directly on the `mut` PARAMETER `_3` (bb3) and passes `move _3` bare
+    /// at the counter position of the self-call (bb5) — so this is what the verifier
+    /// actually sees, not what a fixture author imagines it sees.
+    const MIR_BAD_MUT_PARAM_STEP: &str = r#"{"name":"bad","def_path":"v2::bad","span":{"file":"v2.rs","line_start":2,"col_start":0,"line_end":6,"col_end":1},"body":{"locals":[{"index":0,"ty":{"Int":{"width":64,"signed":false}},"name":null},{"index":1,"ty":{"Int":{"width":64,"signed":false}},"name":"bound"},{"index":2,"ty":{"Int":{"width":64,"signed":false}},"name":"counter"},{"index":3,"ty":{"Int":{"width":64,"signed":false}},"name":"step"},{"index":4,"ty":"Bool","name":"c"},{"index":5,"ty":"Bool","name":null}],"blocks":[{"id":0,"stmts":[{"StorageLive":5},{"Assign":{"place":{"local":5,"projections":[]},"rvalue":{"BinaryOp":["Ge",{"Copy":{"local":2,"projections":[]}},{"Copy":{"local":1,"projections":[]}}]},"span":{"file":"v2.rs","line_start":3,"col_start":7,"line_end":3,"col_end":23}}}],"terminator":{"SwitchInt":{"discr":{"Move":{"local":5,"projections":[]}},"targets":[[0,2]],"otherwise":1,"exhaustive_enum_unreachable":false,"span":{"file":"v2.rs","line_start":3,"col_start":7,"line_end":3,"col_end":23}}}},{"id":1,"stmts":[{"Assign":{"place":{"local":0,"projections":[]},"rvalue":{"Use":{"Constant":{"Uint":[0,64]}}},"span":{"file":"v2.rs","line_start":3,"col_start":33,"line_end":3,"col_end":34}}},{"StorageDead":5}],"terminator":{"Goto":7}},{"id":2,"stmts":[{"StorageDead":5}],"terminator":{"SwitchInt":{"discr":{"Copy":{"local":4,"projections":[]}},"targets":[[0,5]],"otherwise":3,"exhaustive_enum_unreachable":false,"span":{"file":"v2.rs","line_start":4,"col_start":7,"line_end":4,"col_end":8}}}},{"id":3,"stmts":[],"terminator":{"Call":{"func":"core::num::<impl usize>::saturating_add","args":[{"Move":{"local":2,"projections":[]}},{"Constant":{"Uint":[1,64]}}],"dest":{"local":3,"projections":[]},"target":4,"span":{"file":"v2.rs","line_start":4,"col_start":18,"line_end":4,"col_end":43},"atomic":null,"is_foreign":false,"is_unsafe_sig":false,"callee_identity":{"stable_crate_id":14915136950559021302,"def_index":28215,"substs_digest":[14241860155052752853,2268345107747320411]}}}},{"id":4,"stmts":[],"terminator":{"Goto":5}},{"id":5,"stmts":[],"terminator":{"Call":{"func":"v2::bad","args":[{"Move":{"local":1,"projections":[]}},{"Move":{"local":3,"projections":[]}},{"Constant":{"Uint":[0,64]}},{"Move":{"local":4,"projections":[]}}],"dest":{"local":0,"projections":[]},"target":6,"span":{"file":"v2.rs","line_start":5,"col_start":4,"line_end":5,"col_end":26},"atomic":null,"is_foreign":false,"is_unsafe_sig":false,"callee_identity":{"stable_crate_id":4708491588023007029,"def_index":3,"substs_digest":[14241860155052752853,2268345107747320411]}}}},{"id":6,"stmts":[],"terminator":{"Goto":7}},{"id":7,"stmts":[],"terminator":"Return"}],"arg_count":4,"return_ty":{"Int":{"width":64,"signed":false}}},"contracts":[],"preconditions":[{"And":[{"Ge":[{"Var":["bound","Int"]},{"Int":0}]},{"Le":[{"Var":["bound","Int"]},{"Int":18446744073709551615}]}]},{"And":[{"Ge":[{"Var":["counter","Int"]},{"Int":0}]},{"Le":[{"Var":["counter","Int"]},{"Int":18446744073709551615}]}]},{"And":[{"Ge":[{"Var":["step","Int"]},{"Int":0}]},{"Le":[{"Var":["step","Int"]},{"Int":18446744073709551615}]}]}],"postconditions":[],"spec":{"requires":[],"ensures":[],"invariants":[]}}"#;
+
+    /// The captured body agrees with the synthetic fixture above, and the resolver
+    /// declines it: the phantom increment is refused on the REAL extracted MIR.
+    ///
+    /// RUNTIME ORACLE (stock rustc, `-Copt-level=1`): `bad(5, 0, 0, false)` skips the
+    /// store, so `step` is still the caller's `0` at the call and the recursion is
+    /// `bad(5, 0, 0, false)` forever — it does not terminate.
+    #[test]
+    fn the_captured_optimized_mir_of_the_witness_reports_no_increment() {
+        let func: VerifiableFunction =
+            serde_json::from_str(MIR_BAD_MUT_PARAM_STEP).expect("captured body must deserialize");
+        assert_eq!(func.body.arg_count, 4);
+        assert!(crate::local_defs::is_parameter(&func, 3), "`step` is a parameter");
+        assert_eq!(
+            crate::local_defs::value_count(&func, 3),
+            trust_types::ValueCount::Exactly(2),
+            "entry definition + the saturating call destination"
+        );
+        assert_eq!(
+            resolve_saturating_add_increment(&func, &Operand::Move(Place::local(3)), 2),
+            None,
+            "the entry value reaches the self-call on the !c path"
+        );
+        let calls = detect_recursive_calls(&func);
+        assert_eq!(calls.len(), 1, "one self-call: {calls:?}");
+        assert!(
+            infer_compound_recursion_measure(&func, &calls).is_none(),
+            "no `bound - counter` measure may be inferred for a step that need not run"
+        );
     }
 }

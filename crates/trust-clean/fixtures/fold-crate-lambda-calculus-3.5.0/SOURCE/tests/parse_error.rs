@@ -1,9 +1,7 @@
 extern crate lambda_calculus as lambda;
 
+use lambda::{parser::parse, term::Notation::Classic};
 use std::error::Error;
-
-use lambda::parser::parse;
-use lambda::term::Notation::Classic;
 
 #[test]
 fn parse_error_question_mark_operator() {

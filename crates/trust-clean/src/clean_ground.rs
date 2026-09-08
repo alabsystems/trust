@@ -11112,9 +11112,7 @@ mod tests {
             name: "Wrapper".into(),
             fields: vec![("value".into(), Ty::Int { width: 32, signed: true })],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier =
             reflect_struct(&ty).expect("non-generic struct reflects to a named inductive");
         assert_eq!(carrier.name, "Trust.Adt.Wrapper");
@@ -11217,9 +11215,7 @@ mod tests {
                 ("y".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let pc = reflect_struct(&point).expect("Point reflects");
         // Parameterized `Wrapper<T> { value:T, count:u32 }`.
         let wrapper = Ty::Adt {
@@ -11238,9 +11234,7 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let wc = reflect_struct(&wrapper).expect("Wrapper<T> reflects parameterized");
 
         let mut env = Environment::with_prelude();
@@ -11276,9 +11270,7 @@ mod tests {
                 ("bad".into(), Ty::Never),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         assert_eq!(reflect_struct(&ty), None, "a never field must not register structurally");
     }
 
@@ -11299,9 +11291,7 @@ mod tests {
                 ("weight".into(), Ty::Float { width: 32 }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier =
             reflect_struct(&ty).expect("a struct with a float field now reflects structurally");
         let mut env = Environment::with_prelude();
@@ -11935,9 +11925,7 @@ mod tests {
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier =
             reflect_struct(&ty).expect("a bare-generic-field struct now reflects parameterized");
         assert_eq!(carrier.type_params, vec!["T/#0".to_string()]);
@@ -13095,9 +13083,7 @@ mod tests {
             name: "Empty".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let h_param = Ty::Unsupported {
             kind: "TyKind::Param".into(),
             detail: "generic parameter H/#0 needs monomorphization".into(),
@@ -13400,12 +13386,8 @@ mod tests {
                 ("ok".into(), Ty::Unit),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
-        let formatter = Ty::Adt {
-            adt_kind: None,
-            layout: None,
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        let formatter = Ty::Adt { adt_kind: None, layout: None,
             variants: Vec::new(),
             name: "core::fmt::Formatter".into(),
             fields: vec![(
@@ -13419,19 +13401,13 @@ mod tests {
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
-        let self_struct = Ty::Adt {
-            adt_kind: None,
-            layout: None,
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        let self_struct = Ty::Adt { adt_kind: None, layout: None,
             variants: Vec::new(),
             name: "MyType".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let func = VerifiableFunction {
             name: "fmt".into(),
             def_path: "crate::MyType::fmt".into(),
@@ -13508,9 +13484,7 @@ mod tests {
             fields: vec![("memo".into(), tree_full), ("r".into(), tree_backref)],
             variants: Vec::new(),
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let func = VerifiableFunction {
             name: "should_descend".into(),
             def_path: "crate::Holder::should_descend".into(),
@@ -14075,9 +14049,7 @@ mod tests {
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let func = VerifiableFunction {
             name: "f".into(),
             def_path: "crate::f".into(),
@@ -14239,9 +14211,7 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        }
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
     }
 
     /// PHASE 2 GATE 1 — a GENERIC struct `Wrapper<T>{value:T, count:u32}` registers
@@ -14343,9 +14313,7 @@ mod tests {
             name: "Holder".into(),
             fields: vec![("items".into(), Ty::Slice { elem: Box::new(t_param()) })],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         // The struct now reflects STRUCTURALLY (was `None`/Prod before).
         let carrier = reflect::reflect_struct(&ty)
             .expect("a sequence-over-type-var field now reflects STRUCTURALLY (was opaque before)");
@@ -14442,9 +14410,7 @@ mod tests {
                 name: name.into(),
                 fields: vec![("f".into(), fty.clone())],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            };
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
             // The struct now reflects STRUCTURALLY (was `None`/Prod before).
             let carrier = reflect::reflect_struct(&outer)
                 .unwrap_or_else(|| panic!("{name} now reflects STRUCTURALLY (was opaque before)"));
@@ -14534,9 +14500,7 @@ mod tests {
                 VariantDef { name: "None".into(), discriminant: 1, fields: Vec::new() },
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         assert_field_grounds("EnumHolder", opt_t, "Trust.Adt.Opt");
     }
 
@@ -14566,9 +14530,7 @@ mod tests {
                 Ty::Slice { elem: Box::new(Ty::Tuple(vec![t_param(), Ty::Never])) },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         assert!(
             reflect::reflect_struct(&never_nested).is_none(),
             "a sequence whose element nests a non-reflectable `never` must fall back to Prod (deferred)"
@@ -14591,9 +14553,7 @@ mod tests {
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         assert!(
             reflect::reflect_struct(&dyn_nested).is_none(),
             "a sequence element nesting a bare `dyn` trait object must fall back to Prod (deferred)"
@@ -14618,9 +14578,7 @@ mod tests {
                 ("tag".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        }
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
     }
 
     /// UNIVERSE-CORRECT DEPENDENT CARRIER (goal bullet 2) — the FIELD-POSITION
@@ -15378,9 +15336,7 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: true }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let func = trivial_returning("make_holder", holder);
         assert_eq!(
             inhabit_verifiable_function(&func),
@@ -15417,9 +15373,7 @@ mod tests {
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let func = VerifiableFunction {
             name: "f".into(),
             def_path: "crate::f".into(),
@@ -17431,7 +17385,11 @@ mod rustc_mir_three_way_differential {
             // uninterpreted opaque with no LEG-B bytecode lowering, and it is produced
             // only by the cast-then-return recognizer, never inside this harness's
             // i32-arithmetic corpus.
+            // Trust: EFHT-P — `Field2` joins the SAME refusing arm: the depth-2 path
+            // is an uninterpreted opaque projection (`idxElem` twice), CONSUMER-ONLY,
+            // never produced inside this harness's corpus.
             IrOperand::Field(..)
+            | IrOperand::Field2(..)
             | IrOperand::Index(..)
             | IrOperand::Len(_)
             | IrOperand::PreOpNotAt(..)
@@ -20419,7 +20377,7 @@ mod ptr_intrinsic_model {
     /// Build a `Ty::Adt` with an EXPLICIT `adt_kind` (the generic `Ty::adt` constructor
     /// is kind-agnostic ⇒ `None`; only a real extraction stamps `Some`). Two i64 fields.
     fn setter_adt(kind: Option<trust_types::AdtKind>) -> trust_types::Ty {
-        trust_types::Ty::Adt {
+        trust_types::Ty::Adt { arbitrary_precision: None, 
             name: "S".into(),
             fields: vec![
                 ("x".into(), trust_types::Ty::Int { width: 64, signed: true }),

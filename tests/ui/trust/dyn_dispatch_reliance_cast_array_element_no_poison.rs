@@ -10,18 +10,30 @@
 //!
 //! An element-projection cast only appears in USER code via a raw pointer, and a
 //! raw pointer cast raises `hardened_unsafe_operation`, which this file cannot and
-//! should not discharge. So one obligation survives no matter what, and the
-//! assertion has to be the COUNT:
+//! should not discharge. Since cd4faf5cfa the `p as usize` expose below adds a
+//! SECOND surviving row: trust-mir-extract now lowers a
+//! `PointerExposeProvenance` result to the better-typed
+//! `ConstValue::OpaqueScalar`, and trust-vcgen's operand collector (4ca0cb0eac)
+//! fail-closes on an identity-less opaque scalar as proof input
+//! ("`identity-less opaque unsigned 64-bit scalar cannot be used as proof
+//! input`", an UnsupportedMir -> Unknown row). That row is fail-closed
+//! tightening, not poison — measured 2026-08-30 (stage1, main tip): the report
+//! shows exactly `[hardened_unsafe_operation] FAILED` plus that `[unknown]`
+//! OpaqueScalar row, and NO dyn-site panic-freedom row, i.e. `d.emit()` still
+//! discharges. So the baseline is two obligations and the assertion is still
+//! the COUNT:
 //!
 //! ```text
-//! before the element-projection arm   2 obligation(s)   <- unsafe op + POISONED dyn site
-//! after it                            1 obligation(s)   <- unsafe op only
+//! before the element-projection arm   3 obligation(s)   <- unsafe op + expose row + POISONED dyn site
+//! after it                            2 obligation(s)   <- unsafe op + expose row only
 //! ```
 //!
-//! The `1 obligation(s)` in the annotations below is therefore the whole test. It
-//! was measured failing at `2 obligation(s)` before the arm existed. If it ever
-//! reads 2 again, the poison is back; if it reads 0, something has started
-//! discharging an unsafe operation and that is a bigger problem than this file.
+//! The `2 obligation(s)` in the annotations below is therefore the whole test.
+//! If it ever reads 3 again, the poison is back; if it reads 1, either
+//! something has started discharging an unsafe operation (a bigger problem
+//! than this file) or expose-casts became modeled (§5 allocation-identity,
+//! 0e831c4100 onward) and the expose row legitimately retired — check the
+//! report before touching the count.
 //!
 //! ## THE DOUBLE CAST IS THE ASSERTION — DELETING `p` GUTS THE TEST
 //!
@@ -57,8 +69,8 @@ impl Emit for A {
 }
 
 pub fn total() -> u32 {
-    //~^ ERROR 1 obligation(s) were not proved
-    //~| ERROR 1 obligation(s) were not fully verified
+    //~^ ERROR 2 obligation(s) were not proved
+    //~| ERROR 2 obligation(s) were not fully verified
     let a = A;
     // The one vtable minted in this bundle. Enumeration: `{A}`.
     let d: &dyn Emit = &a;

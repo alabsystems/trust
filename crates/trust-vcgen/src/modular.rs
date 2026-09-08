@@ -653,9 +653,32 @@ pub fn clean_origin_summary(
 
 /// Trust: Database of function summaries for modular verification.
 ///
-/// Stores and retrieves function summaries keyed by function name.
+/// Stores and retrieves function summaries keyed by `FunctionSummary::name`.
 /// Integrates with `SpecDatabase` to record proved postconditions as
 /// reusable facts for cross-function spec composition.
+///
+/// **The key is a STRING, and in production it is a DEF-PATH-shaped one — not
+/// the bare item name this field's own doc comment describes.** Corrected
+/// 2026-08-31 after the phrase "keyed by function name" made the lane look
+/// inert: every production producer (`trust_verify.rs`'s direct-call, dyn,
+/// Clean-origin and transitive minters) keys by
+/// `trust_mir_extract::func_operand_name(tcx, callee_op)`, and the caller-side
+/// lookup string is `Terminator::Call.func`, which `trust-mir-extract`'s
+/// `convert.rs` sets from the SAME function on the SAME operand. The two cannot
+/// diverge, so `get` HITS and the injection lane fires. Had the key really been
+/// `VerifiableFunction::name` the lookup would miss universally — that name is
+/// the bare item name (`new`, `parse`, `is_empty`), and 88.9% of the 12,476
+/// definition sites in `~/trust-corpora/mir-closed-mono` share one with another
+/// definition.
+///
+/// What follows from the key being a string at all: this type carries NO
+/// def-path and NO `CalleeIdentity`, so nothing here can tell two callees apart
+/// that render alike. The identity defence lives entirely in the producer —
+/// `trust_verify.rs`'s `identity:name-collision` DefId prescan and the
+/// `identity:generic` instantiation conjunct — and `first-insert-wins` at the
+/// mint loop decides who owns a contested key. See
+/// `generate/summary_key_collision_tests.rs` for what that means at the
+/// injection site.
 #[derive(Debug, Clone, Default)]
 pub struct SummaryDatabase {
     summaries: FxHashMap<String, FunctionSummary>,
@@ -960,10 +983,7 @@ pub fn modular_vcgen(func: &VerifiableFunction, summaries: &SummaryDatabase) -> 
                     && target.is_some()
                     && summary.is_some_and(|s| {
                         crate::generate::callee_postcondition_is_injectable(
-                            func,
-                            dest,
-                            s,
-                            args.len(),
+                            func, dest, s, args,
                         )
                     })
                 {
@@ -2745,4 +2765,156 @@ mod tests {
             "callee formals must not survive rebinding: {bb1:?}"
         );
     }
+
+    /// Trust (PROBER-1, 2026-08-31 — production reach of the call-site
+    /// postcondition assumption): **the injection lane is IDENTITY-BLIND, and
+    /// this test exists so that stays a DELIBERATE boundary rather than an
+    /// assumption someone re-derives from the type.**
+    ///
+    /// `Terminator::Call` carries an un-forgeable `callee_identity`
+    /// (`stable_crate_id` + `def_index` + region-erased `substs_digest`).
+    /// `build_semantic_guard_map_impl` destructures the terminator with `..`
+    /// and DROPS it, then looks the summary up by the `func` STRING alone;
+    /// `modular::FunctionSummary` has no `def_path` and no identity field to
+    /// compare it against even if it wanted to. So two call sites in ONE body
+    /// that share a `func` spelling but denote DIFFERENT functions BOTH receive
+    /// the same clause, rebound to their own actuals and dests.
+    ///
+    /// The two calls below are the Clean-origin `pick(a0, a1) = a0` shape
+    /// (`definitional_projection_pins_dest_to_projected_argument`) duplicated
+    /// under one key with a second, DIFFERENT `callee_identity`. The second
+    /// call's real callee returns its SECOND argument, so the injected
+    /// `dest == 41` is a claim no execution of it satisfies — a false PROVE, if
+    /// a producer ever lets two identities share a key.
+    ///
+    /// WHAT ACTUALLY KEEPS THAT UNREACHABLE — all of it upstream, in
+    /// `compiler/rustc_mir_transform/src/trust_verify.rs`, MEASURED end-to-end
+    /// on the stage1 `trustc` of 2026-08-31 (each attack, and the NAMED gate
+    /// that killed it):
+    ///
+    /// * `callee_postconditions_are_reusable_reasoned`'s `identity:generic`
+    ///   (`args.is_empty()`) — the whole measured intra-body key-collision
+    ///   population is unresolved-generic renderings, and it is the ONLY
+    ///   conjunct that separates two identities sharing a `DefId` and
+    ///   differing only in `substs_digest`, which the `reusable_name_owner`
+    ///   pre-scan compares away.
+    /// * that same function's `identity:name-collision` — the pre-scan at
+    ///   `trust_verify.rs` that maps each `func_operand_name` in the CALLER
+    ///   BODY to the single `DefId` it owns, `None` on the second distinct one.
+    /// * `trust_mir_extract::apply_cross_namespace_tag` — measured firing
+    ///   twice, and it is what makes the ONE producer that skips the pre-scan
+    ///   (`clean_origin_callee_summary`, which mints
+    ///   `with_definitional_postcondition` and `continue`s BEFORE the
+    ///   `reusable_name_owner` consult) unreachable: a local Clean-origin
+    ///   `def`'s key cannot be collided with, because a same-namespace clash is
+    ///   `E0428` and a cross-namespace one is tagged apart.
+    ///
+    /// A NEW producer of a `modular::SummaryDatabase` inherits NONE of those.
+    /// If this test ever starts failing because trust-vcgen grew its own
+    /// identity check, that is a real improvement — update it, do not delete
+    /// it.
+    #[test]
+    fn one_key_two_callee_identities_injects_into_both_call_sites() {
+        use crate::generate::build_semantic_guard_map_with_summaries;
+        let call = |identity: trust_types::CalleeIdentity,
+                    dest: usize,
+                    block: usize,
+                    next: usize| BasicBlock {
+            id: BlockId(block),
+            stmts: vec![],
+            terminator: Terminator::Call {
+                unwind: UnwindEdge::Unreachable,
+                is_unsafe_sig: false,
+                // The un-forgeable channel the injection lane never reads.
+                callee_identity: Some(identity),
+                is_foreign: false,
+                // ONE spelling, TWO functions — what every gate above exists
+                // to make impossible upstream.
+                func: "k::m::pick".to_string(),
+                args: vec![
+                    Operand::Constant(ConstValue::Uint(41, 64)),
+                    Operand::Constant(ConstValue::Uint(7, 64)),
+                ],
+                dest: Place::local(dest),
+                target: Some(BlockId(next)),
+                span: SourceSpan::default(),
+                atomic: None,
+            },
+        };
+        let caller = VerifiableFunction {
+            name: "caller".to_string(),
+            def_path: "test::caller".to_string(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                    LocalDecl { index: 1, ty: Ty::usize(), name: Some("v".into()) },
+                    LocalDecl { index: 2, ty: Ty::usize(), name: Some("w".into()) },
+                ],
+                blocks: vec![
+                    call(
+                        trust_types::CalleeIdentity {
+                            stable_crate_id: 0xAAAA,
+                            def_index: 11,
+                            substs_digest: [0, 0],
+                        },
+                        1,
+                        0,
+                        1,
+                    ),
+                    // A DIFFERENT function: different `def_index`, and a
+                    // different `substs_digest` besides, so neither half of the
+                    // identity matches the summary's minter.
+                    call(
+                        trust_types::CalleeIdentity {
+                            stable_crate_id: 0xAAAA,
+                            def_index: 22,
+                            substs_digest: [7, 7],
+                        },
+                        2,
+                        1,
+                        2,
+                    ),
+                    BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 0,
+                return_ty: Ty::Unit,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+
+        let mut db = SummaryDatabase::new();
+        db.insert(
+            // The exact Clean-origin Projection summary: `_0 == a0`, minted
+            // through the ONE injectable builder. It names no identity, so it
+            // cannot be bound to the function it was minted for.
+            FunctionSummary::new("k::m::pick")
+                .with_param_names(vec!["a0".to_string(), "a1".to_string()])
+                .with_definitional_postcondition(Formula::Eq(
+                    Box::new(Formula::var("_0", Sort::Int)),
+                    Box::new(Formula::var("a0", Sort::Int)),
+                )),
+        );
+
+        let r = modular_vcgen(&caller, &db);
+        assert_eq!(
+            r.assumptions_injected, 2,
+            "identity is not consulted: BOTH call sites take the clause"
+        );
+
+        let map = build_semantic_guard_map_with_summaries(&caller, &db);
+        for block in [1usize, 2] {
+            let facts = map.get(&BlockId(block)).cloned().unwrap_or_default();
+            assert!(
+                facts.iter().any(|f| has_versioned_var_and_int(f, 41)),
+                "block {block} must carry the version-pinned `dest == 41` fact \
+                 minted for a DIFFERENT callee identity: {facts:?}"
+            );
+        }
+    }
+
 }

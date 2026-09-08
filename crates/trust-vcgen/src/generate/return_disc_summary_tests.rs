@@ -15,9 +15,7 @@ const RESULT_UNWRAP: &str = "core::result::Result::<T, E>::unwrap";
 /// `Result<u64, ()>` in the flattened `lower_enum_adt` shape (`Ok` = 0,
 /// `Err` = 1) — identical to the unwrap panic-freedom fixtures.
 fn std_result_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), Ty::Int { width: 64, signed: true }),

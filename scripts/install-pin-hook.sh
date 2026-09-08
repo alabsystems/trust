@@ -6,7 +6,7 @@
 # There are two hook directories in this repo and they are not interchangeable:
 #
 #   scripts/hooks/      the FULL pre-push gate — every gate-manifest row carrying
-#                       the `push` profile (19 lanes, 15.7s measured 2026-08-27:
+#                       the `push` profile (19 lanes/15.7s when measured 2026-08-27 — drifts; `--list push` is authoritative:
 #                       drift, supply-chain, freeze, provenance, pin lanes and
 #                       their selftests) plus `x.py check --stage 1` (~9-11 min)
 #                       on any push touching compiler/ crates/ src/bootstrap/
@@ -43,7 +43,10 @@ status() {
   case "$current" in
     "$HOOKS_DIR")
       echo "Trust pin hooks: INSTALLED (core.hooksPath = $HOOKS_DIR)"
-      echo "  pre-push runs scripts/check_pin_coherence.sh only (~0.5s)."
+      echo "  pre-push runs EIGHT checkers (~4s): pin coherence, revert rationale,"
+      echo "  frozen files, measurement provenance, bridge pin, IR cohort,"
+      echo "  submodule remote reachability, and cfg(test) caller skew — the last"
+      echo "  of which is the only one about SOURCE. See scripts/hooks-pin/pre-push."
       echo "  post-merge / post-rewrite / post-checkout are advisory drift notices."
       return 0
       ;;
@@ -110,10 +113,21 @@ done
 git config --local core.hooksPath "$HOOKS_DIR"
 echo "Trust pin hooks: installed (core.hooksPath = $HOOKS_DIR)"
 echo
-echo "  pre-push  BLOCKING, ~0.5s: scripts/check_pin_coherence.sh, scoped per"
-echo "            submodule by scripts/hooks-pin/pin-waivers.txt. It never moves"
-echo "            a pointer and never runs a build."
+echo "  pre-push  BLOCKING, ~4s: EIGHT checkers, none of which runs a build or"
+echo "            moves a pointer — check_pin_coherence.sh (scoped per submodule"
+echo "            by scripts/hooks-pin/pin-waivers.txt), check_revert_rationale.sh,"
+echo "            check_frozen_files.sh, check_measurement_provenance.sh,"
+echo "            check_bridge_pin.sh, check_ir_cohort.py,"
+echo "            check_submodule_remote_reachability.py, and"
+echo "            check_cfg_test_caller_skew.py."
 echo "  post-*    ADVISORY: announce pin drift right after a pull/rebase/switch."
 echo
 echo "  NOT run by this directory: most of the gate manifest's \`push\` profile,"
 echo "  and x.py check --stage 1. For those, use scripts/install-git-hooks.sh."
+echo
+echo "  Read the last one as a NET, not as a type check. check_cfg_test_caller_skew.py"
+echo "  catches the arity/field skew that a #[cfg(test)] construction site can carry"
+echo "  past every build (a #[cfg(test)] body is in no lib target, so x.py build and"
+echo "  x.py test tests/ui cannot see it). It does NOT type-check anything. Only"
+echo "  scoped.compiler-check in the FULL set does that, and this directory is"
+echo "  deliberately not that set."

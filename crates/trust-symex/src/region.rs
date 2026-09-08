@@ -973,9 +973,7 @@ mod tests {
             name: "Point".into(),
             fields: vec![("x".into(), i32_ty()), ("y".into(), i32_ty())],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        }
+         faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
     }
 
     // --- Basic binding and read ---

@@ -77,9 +77,10 @@ use crate::memory_jobserver::{
 /// Additive/opt-in by presence: a worker built before this change ignores it.
 pub const SOCK_ENV: &str = "TRUST_MEMORY_JOBSERVER_SOCK";
 
-/// Force-skip daemon startup (debug/CI). When set to `1`, `ensure_daemon` is a
-/// no-op. A caller may use the file lane only when no socket domain is also
-/// configured; combining both fails closed to prevent split authority.
+/// Force-refuse daemon startup (debug/CI). When set to `1`, `ensure_daemon`
+/// returns [`EnsureDaemonError::Disabled`]. A caller may use the file lane only
+/// when no socket domain is also configured; combining both fails closed to
+/// prevent split authority.
 pub const DISABLE_ENV: &str = "TRUSTD_DISABLE";
 
 /// Schema tag embedded in every STATUS reply. The menubar parses this to confirm
@@ -126,9 +127,16 @@ pub(crate) const MAX_SERVER_CONNECTIONS: usize = 64;
 const SERVER_INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Poll budget for `ensure_daemon` readiness after spawning `trustd`.
-const SPAWN_READY_TIMEOUT: Duration = Duration::from_millis(500);
+///
+/// Process-level controls already allow three seconds for a freshly started
+/// daemon. Give packaged startup a little more room for loaded CI hosts while
+/// keeping the refusal absolutely bounded.
+const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-poll connect-attempt spacing while waiting for `trustd` to bind.
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Maximum child-stderr bytes retained in a startup error. The reader keeps
+/// draining after this bound so a verbose child cannot deadlock on a full pipe.
+const MAX_SPAWN_STDERR_BYTES: usize = 16 * 1024;
 
 /// Transport overhead allowed in addition to the admission wait itself. The
 /// client uses one absolute deadline, so a responder cannot extend this bound by
@@ -1590,6 +1598,10 @@ struct OwnedSocket {
 
 #[cfg(unix)]
 impl OwnedSocket {
+    fn mark_dirty(&self) -> std::io::Result<()> {
+        self.ownership_lock.mark_dirty()
+    }
+
     fn mark_clean(&self) -> std::io::Result<()> {
         self.ownership_lock.mark_clean()
     }
@@ -1992,17 +2004,29 @@ fn bind_owned_socket(sock: &Path) -> std::io::Result<OwnedSocket> {
         ));
     }
 
-    // No request can reach the listener before this function returns. Persist
-    // DIRTY first so SIGKILL/OOM at any later point cannot permit an empty-ledger
-    // replacement daemon while an already-admitted solver is still alive.
-    ownership_lock.mark_dirty()?;
-
     Ok(OwnedSocket {
         listener,
         #[cfg(test)]
         identity,
         ownership_lock,
     })
+}
+
+/// Bind and complete every fallible pre-admission listener initialization
+/// before arming the durable crash epoch. The listener can queue connections
+/// while `initialize` runs, but no request is accepted or admitted until after
+/// DIRTY is durable. Consequently an `initialize` failure leaves a provably
+/// empty CLEAN epoch that may restart automatically. Failure while persisting
+/// DIRTY itself may leave an invalid epoch and deliberately remains fail-closed.
+#[cfg(unix)]
+fn prepare_owned_socket<F>(sock: &Path, initialize: F) -> std::io::Result<OwnedSocket>
+where
+    F: FnOnce(&UnixListener) -> std::io::Result<()>,
+{
+    let owned = bind_owned_socket(sock)?;
+    initialize(&owned.listener)?;
+    owned.mark_dirty()?;
+    Ok(owned)
 }
 
 /// Explicit operator recovery for an unclean daemon epoch. The CLI requires a
@@ -2061,13 +2085,12 @@ pub fn recover_dirty_epoch_after_quiescence(sock: &Path) -> std::io::Result<bool
 #[cfg(unix)]
 pub fn serve(sock: &Path) -> std::io::Result<()> {
     let identity = runtime_daemon_identity()?;
-    let owned = bind_owned_socket(sock)?;
     let daemon = Daemon::new(identity);
+    let owned = prepare_owned_socket(sock, |listener| listener.set_nonblocking(true))?;
 
     // The accept loop owns the clean transition. Keeping refresh, the idle proof,
     // admission closure, and epoch sync in this thread avoids process::exit from
     // a maintenance thread bypassing the durable shutdown protocol.
-    owned.listener.set_nonblocking(true)?;
     let mut next_refresh =
         Instant::now().checked_add(BUDGET_REFRESH_INTERVAL).unwrap_or_else(Instant::now);
     loop {
@@ -2659,28 +2682,188 @@ pub fn daemon_matches_bound_identity(
         && compatible_daemon_at(sock, expected)
 }
 
-/// Best-effort: ensure a compatible daemon is listening on `sock`. Readiness
-/// requires both exact packaged-binary [`DaemonIdentity`] and a semantically
-/// valid [`STATUS_VERSION`] response, not merely a `PONG` from an arbitrary
-/// process. Otherwise spawn the packaged `trustd` and identity/status-poll for
-/// readiness up to [`SPAWN_READY_TIMEOUT`]. Returns `false` on failure; a caller
-/// that has provisioned this socket domain must not silently launch workers on
-/// an independent file authority. No-op when [`DISABLE_ENV`] is set.
+/// A bounded, diagnosable failure to establish the selected same-sysroot
+/// `trustd` authority.
 #[cfg(unix)]
-pub fn ensure_daemon(sock: &Path) -> bool {
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum EnsureDaemonError {
+    #[error("{DISABLE_ENV}=1 disables trustd startup")]
+    Disabled,
+    #[error(
+        "could not resolve the current executable while selecting its trustd sibling: {source}"
+    )]
+    CurrentExecutable {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "the selected executable {executable} has no regular, executable, non-symlink trustd sibling"
+    )]
+    SiblingUnavailable { executable: String },
+    #[error("could not authorize the same-sysroot trustd executable {executable}: {source}")]
+    ExecutableAuthority {
+        executable: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not derive the closed runtime identity for trustd {executable}: {source}")]
+    Identity {
+        executable: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not spawn the same-sysroot trustd {executable}: {source}")]
+    Spawn {
+        executable: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not inspect the spawned trustd {executable}: {source}")]
+    ChildStatus {
+        executable: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "same-sysroot trustd {executable} exited before exact-identity readiness with {status}; bounded stderr: {stderr}"
+    )]
+    EarlyExit { executable: String, status: std::process::ExitStatus, stderr: String },
+    #[error(
+        "same-sysroot trustd {executable} did not establish exact-identity readiness within {timeout:?}"
+    )]
+    ReadinessTimeout { executable: String, timeout: Duration },
+}
+
+#[cfg(unix)]
+fn capture_spawned_stderr(mut stderr: std::process::ChildStderr) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut retained = Vec::with_capacity(MAX_SPAWN_STDERR_BYTES);
+        let mut total = 0usize;
+        let mut read_error = None;
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => {
+                    total = total.saturating_add(count);
+                    let remaining = MAX_SPAWN_STDERR_BYTES.saturating_sub(retained.len());
+                    retained.extend_from_slice(&chunk[..count.min(remaining)]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    read_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let mut diagnostic = String::from_utf8_lossy(&retained).into_owned();
+        if total > retained.len() {
+            diagnostic.push_str(&format!(
+                "\n[stderr truncated after {} bytes; {} bytes observed]",
+                retained.len(),
+                total
+            ));
+        }
+        if let Some(error) = read_error {
+            diagnostic.push_str(&format!("\n[stderr read failed: {error}]"));
+        }
+        if diagnostic.is_empty() {
+            diagnostic.push_str("<empty>");
+        }
+        diagnostic
+    })
+}
+
+#[cfg(unix)]
+fn finish_spawned_stderr(reader: thread::JoinHandle<String>) -> String {
+    reader.join().unwrap_or_else(|_| "<stderr reader panicked>".to_string())
+}
+
+#[cfg(unix)]
+fn reap_spawned_child_in_background(
+    mut child: std::process::Child,
+    stderr_reader: thread::JoinHandle<String>,
+) {
+    thread::spawn(move || {
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+    });
+}
+
+#[cfg(unix)]
+fn wait_for_spawned_daemon<F>(
+    mut child: std::process::Child,
+    stderr_reader: thread::JoinHandle<String>,
+    executable: &Path,
+    timeout: Duration,
+    mut is_ready: F,
+) -> Result<(), EnsureDaemonError>
+where
+    F: FnMut(Instant) -> bool,
+{
+    let executable = executable.display().to_string();
+    let ready_deadline = Instant::now().checked_add(timeout).unwrap_or_else(Instant::now);
+    loop {
+        let probe_deadline = Instant::now()
+            .checked_add(OBSERVER_IO_TIMEOUT)
+            .unwrap_or(ready_deadline)
+            .min(ready_deadline);
+        if is_ready(probe_deadline) {
+            reap_spawned_child_in_background(child, stderr_reader);
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Another exact same-sysroot launcher may have won the stable
+                // ownership race while this child exited with AddrInUse.
+                let probe_deadline = Instant::now()
+                    .checked_add(OBSERVER_IO_TIMEOUT)
+                    .unwrap_or(ready_deadline)
+                    .min(ready_deadline);
+                if is_ready(probe_deadline) {
+                    reap_spawned_child_in_background(child, stderr_reader);
+                    return Ok(());
+                }
+                let stderr = finish_spawned_stderr(stderr_reader);
+                return Err(EnsureDaemonError::EarlyExit { executable, status, stderr });
+            }
+            Ok(None) => {}
+            Err(source) => {
+                reap_spawned_child_in_background(child, stderr_reader);
+                return Err(EnsureDaemonError::ChildStatus { executable, source });
+            }
+        }
+
+        let remaining = ready_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            reap_spawned_child_in_background(child, stderr_reader);
+            return Err(EnsureDaemonError::ReadinessTimeout { executable, timeout });
+        }
+        thread::sleep(SPAWN_POLL_INTERVAL.min(remaining));
+    }
+}
+
+/// Ensure a compatible daemon is listening on `sock`. Readiness requires both
+/// exact packaged-binary [`DaemonIdentity`] and a semantically valid,
+/// nonzero-budget [`STATUS_VERSION`] response, not merely a `PONG` from an
+/// arbitrary process. Otherwise spawn the packaged `trustd` and
+/// identity/status-poll up to [`SPAWN_READY_TIMEOUT`]. Every refusal retains its
+/// typed cause; a caller that selected this socket domain must not silently
+/// launch workers on an independent file authority.
+#[cfg(unix)]
+pub fn ensure_daemon(sock: &Path) -> Result<(), EnsureDaemonError> {
     if disabled() {
-        return false;
+        return Err(EnsureDaemonError::Disabled);
     }
     // Resolve only the trustd packaged beside this executable. An ambient
     // CARGO_HOME/PATH daemon is not part of this toolchain's authenticated
     // identity and must never become its memory-budget authority.
-    let Some((trustd, expected_identity)) = resolve_trustd() else {
-        return false;
-    };
+    let (trustd, expected_identity) = resolve_trustd()?;
     // Resolve and hash the exact packaged sibling before accepting any existing
     // endpoint. STATUS compatibility alone is intentionally insufficient.
     if compatible_daemon_at(sock, &expected_identity) {
-        return true;
+        return Ok(());
     }
     // Spawn without inherited stdio. A tiny waiter thread owns the Child handle
     // so idle exit cannot leave a zombie in a long-lived launcher process.
@@ -2696,28 +2879,21 @@ pub fn ensure_daemon(sock: &Path) -> bool {
         .env("TRUST_MEMORY_JOBSERVER_DEADLINE_MS", acquire_deadline().as_millis().to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let Ok(mut child) = command.spawn() else {
-        return false;
-    };
-    thread::spawn(move || {
-        let _ = child.wait();
-    });
-    // IDENTITY + STATUS poll for readiness. This checks executable bytes, build
-    // provenance, transport, protocol, closed schemas, and budget invariants.
-    let ready_deadline =
-        Instant::now().checked_add(SPAWN_READY_TIMEOUT).unwrap_or_else(Instant::now);
-    while Instant::now() < ready_deadline {
-        if compatible_daemon_until(sock, &expected_identity, ready_deadline) {
-            return true;
-        }
-        let remaining = ready_deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        thread::sleep(SPAWN_POLL_INTERVAL.min(remaining));
-    }
-    false
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().map_err(|source| EnsureDaemonError::Spawn {
+        executable: trustd.display().to_string(),
+        source,
+    })?;
+    let stderr = child.stderr.take().expect("piped trustd stderr must be present");
+    let stderr_reader = capture_spawned_stderr(stderr);
+
+    // IDENTITY + STATUS polling checks executable bytes, build provenance,
+    // transport, protocol, closed schemas, and budget invariants. Retain the
+    // Child until readiness or refusal so an early exit cannot be collapsed
+    // into the same timeout as a slow but live process.
+    wait_for_spawned_daemon(child, stderr_reader, &trustd, SPAWN_READY_TIMEOUT, |deadline| {
+        compatible_daemon_until(sock, &expected_identity, deadline)
+    })
 }
 
 /// Bounded liveness probe against an explicit trusted endpoint; `true` iff it
@@ -2882,14 +3058,25 @@ fn daemon_smoke_transition_is_valid(
 /// Fail closed when it is absent, non-executable, or a symlink; never consult
 /// `$CARGO_HOME` or `PATH` for an ambient authority.
 #[cfg(unix)]
-fn resolve_trustd() -> Option<(PathBuf, DaemonIdentity)> {
-    let candidate = resolve_trustd_sibling(&std::env::current_exe().ok()?)?;
+fn resolve_trustd() -> Result<(PathBuf, DaemonIdentity), EnsureDaemonError> {
+    let current = std::env::current_exe()
+        .map_err(|source| EnsureDaemonError::CurrentExecutable { source })?;
+    let candidate = resolve_trustd_sibling(&current).ok_or_else(|| {
+        EnsureDaemonError::SiblingUnavailable { executable: current.display().to_string() }
+    })?;
     // Return the same canonical, full-ancestor-authorized path that identity
     // hashing consumes. `ensure_daemon` must never hash one pathname and exec a
     // second traversal through a replaceable symlink/ancestor.
-    let path = canonical_trusted_executable_path(&candidate).ok()?;
-    let identity = daemon_identity_for_executable(&path).ok()?;
-    Some((path, identity))
+    let path = canonical_trusted_executable_path(&candidate).map_err(|source| {
+        EnsureDaemonError::ExecutableAuthority {
+            executable: candidate.display().to_string(),
+            source,
+        }
+    })?;
+    let identity = daemon_identity_for_executable(&path).map_err(|source| {
+        EnsureDaemonError::Identity { executable: path.display().to_string(), source }
+    })?;
+    Ok((path, identity))
 }
 
 #[cfg(unix)]
@@ -4609,7 +4796,8 @@ mod tests {
     #[test]
     fn dirty_epoch_refuses_automatic_restart_until_explicit_quiescence_recovery() {
         let fixture = TestSocket::new("dirty-epoch");
-        let owner = bind_owned_socket(&fixture.path).expect("first owner binds and marks DIRTY");
+        let owner = prepare_owned_socket(&fixture.path, |_| Ok(()))
+            .expect("first owner completes pre-admission initialization and marks DIRTY");
         drop(owner);
 
         let error = bind_owned_socket(&fixture.path)
@@ -4630,6 +4818,24 @@ mod tests {
         );
 
         let restarted = bind_owned_socket(&fixture.path).expect("recovered epoch may restart");
+        restarted.mark_clean().expect("leave fixture epoch clean");
+    }
+
+    #[test]
+    fn failed_pre_admission_initialization_leaves_clean_restartable_epoch() {
+        let fixture = TestSocket::new("pre-admission-failure");
+        let error = prepare_owned_socket(&fixture.path, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "injected pre-admission initialization failure",
+            ))
+        })
+        .err()
+        .expect("injected initialization must fail");
+        assert!(error.to_string().contains("injected pre-admission"));
+
+        let restarted = bind_owned_socket(&fixture.path)
+            .expect("no request was admitted, so the CLEAN epoch restarts automatically");
         restarted.mark_clean().expect("leave fixture epoch clean");
     }
 
@@ -4858,6 +5064,76 @@ mod tests {
         std::fs::remove_file(sibling).expect("remove sibling symlink");
         std::fs::remove_file(redirected).expect("remove redirected target");
         std::fs::remove_file(executable).expect("remove executable fixture");
+    }
+
+    fn spawn_readiness_fixture(script: &str) -> (std::process::Child, thread::JoinHandle<String>) {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn readiness fixture");
+        let stderr = child.stderr.take().expect("fixture stderr is piped");
+        (child, capture_spawned_stderr(stderr))
+    }
+
+    #[test]
+    fn spawned_daemon_readiness_can_exceed_the_old_half_second_bound() {
+        let (child, stderr) = spawn_readiness_fixture("sleep 1");
+        let started = Instant::now();
+        assert!(SPAWN_READY_TIMEOUT > Duration::from_millis(650));
+        wait_for_spawned_daemon(
+            child,
+            stderr,
+            Path::new("/fixture/trustd"),
+            SPAWN_READY_TIMEOUT,
+            |_| started.elapsed() >= Duration::from_millis(650),
+        )
+        .expect("slow but bounded exact readiness must succeed");
+        assert!(started.elapsed() >= Duration::from_millis(650));
+    }
+
+    #[test]
+    fn spawned_daemon_early_exit_preserves_status_and_bounded_stderr() {
+        let (child, stderr) = spawn_readiness_fixture(
+            "printf 'startup-sentinel' >&2; printf '%20000s' x >&2; exit 23",
+        );
+        let error = wait_for_spawned_daemon(
+            child,
+            stderr,
+            Path::new("/fixture/trustd"),
+            Duration::from_secs(2),
+            |_| false,
+        )
+        .expect_err("early exit must be distinguished from readiness timeout");
+        match error {
+            EnsureDaemonError::EarlyExit { status, stderr, .. } => {
+                assert_eq!(status.code(), Some(23));
+                assert!(stderr.contains("startup-sentinel"), "{stderr}");
+                assert!(
+                    stderr.contains("stderr truncated after 16384 bytes"),
+                    "retained stderr must be explicitly bounded: {stderr}"
+                );
+            }
+            other => panic!("unexpected startup error: {other}"),
+        }
+    }
+
+    #[test]
+    fn spawned_daemon_never_ready_has_an_absolute_timeout() {
+        let (child, stderr) = spawn_readiness_fixture("sleep 1");
+        let started = Instant::now();
+        let error = wait_for_spawned_daemon(
+            child,
+            stderr,
+            Path::new("/fixture/trustd"),
+            Duration::from_millis(60),
+            |_| false,
+        )
+        .expect_err("a live but never-ready child must time out");
+        assert!(matches!(error, EnsureDaemonError::ReadinessTimeout { .. }));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

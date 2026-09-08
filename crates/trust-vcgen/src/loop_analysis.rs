@@ -234,11 +234,22 @@ fn detect_step(rvalue: &Rvalue, local_idx: usize) -> Option<i128> {
 /// Find the initial value of an induction variable.
 ///
 /// Looks in blocks BEFORE the loop header for a `local = constant` assignment.
+///
+/// A PARAMETER is initialized at ENTRY and `body.blocks` never carries that
+/// definition, so a pre-header `p = c` is not what `p` holds on a path that skips it
+/// (`if c { i = 0; } while i < n { … }`). The answer here is INLINED as the CHC
+/// invariant's INITIAL state (`chc::build_init_args`), so a wrong one narrows the
+/// initial state and the invariant can be proved of executions that never happen.
+/// Declining leaves `build_init_args`' `init_<name>` fallback — an unconstrained
+/// initial value, which only makes the invariant harder to prove.
 fn find_init_value(
     func: &VerifiableFunction,
     loop_info: &LoopInfo,
     local_idx: usize,
 ) -> Option<Formula> {
+    if crate::local_defs::is_parameter(func, local_idx) {
+        return None;
+    }
     for block in &func.body.blocks {
         // Only look in blocks before the loop header
         if block.id.0 >= loop_info.header.0 {

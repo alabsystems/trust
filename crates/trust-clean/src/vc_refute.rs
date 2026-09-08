@@ -3864,9 +3864,7 @@ mod tests {
                 ("y".into(), trust_types::Ty::Int { width: 32, signed: true }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier = crate::reflect::reflect_struct(&ty).expect("Pt reflects");
         let mut env = clean_kernel::Environment::with_prelude();
         let registry =
@@ -3954,9 +3952,7 @@ mod tests {
                 },
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier = crate::reflect::reflect_struct(&enum_ty).expect("E reflects as an enum");
         assert_eq!(carrier.fields.len(), 1, "the sum carrier exposes payloads, not __tag");
         assert_eq!(carrier.fields[0].0, "0", "constructor fields retain source names");
@@ -4137,9 +4133,7 @@ mod tests {
                 fields,
                 variants,
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            };
+                faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
             let carrier = crate::reflect::reflect_struct(&malformed)
                 .unwrap_or_else(|| panic!("{case}: variant view reflects"));
             assert!(
@@ -4204,9 +4198,7 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier =
             crate::reflect::reflect_struct(&ty).expect("Wrapper<T> reflects parameterized");
         assert!(carrier.is_parameterized());

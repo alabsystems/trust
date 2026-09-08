@@ -23,16 +23,7 @@ fn usize_ty() -> Ty {
 }
 
 fn vec_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
-        faithful_enum_repr: None,
-        name: "std::vec::Vec".into(),
-        fields: vec![],
-        variants: vec![],
-        disc_index_safe: false,
-        enum_layout: None,
-    }
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,  faithful_enum_repr: None, name: "std::vec::Vec".into(), fields: vec![], variants: vec![], disc_index_safe: false, enum_layout: None, }
 }
 
 fn ref_vec_ty(mutable: bool) -> Ty {
@@ -42,9 +33,7 @@ fn ref_vec_ty(mutable: bool) -> Ty {
 /// `core::result::Result<ok_payload, i64>` in the flattened lowering shape
 /// (machine tags: Ok = 0, Err = 1).
 fn result_ty(ok_payload: Ty) -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "core::result::Result".into(),
         fields: vec![
             ("__tag".into(), i64_ty()),
@@ -470,19 +459,13 @@ fn second_return_path_without_construction_blocks_grounding() {
 /// (payload = struct { entailment: struct { premises: Vec, multipliers:
 /// Vec } } — component paths `.0.0` / `.0.1`).
 fn guarded_delegator_fn(mutate_before_ok: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "ny::Entailment".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let cert_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+        faithful_enum_repr: None, enum_layout: None, };
+    let cert_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
         name: "ny::CertifiedDeep".into(),
         fields: vec![("entailment".into(), ent_ty)],
         variants: vec![],
@@ -641,19 +624,13 @@ fn payload_mutation_after_guard_stays_fail_closed() {
 /// the guard: the hop's source is then unstable and everything must stay
 /// fail-closed — the returned lengths may differ from the guard snapshot).
 fn extract_then_guard_wrapper_fn(mutate_alias_source: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "ny::Entailment".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let cert_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+        faithful_enum_repr: None, enum_layout: None, };
+    let cert_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
         name: "ny::CertifiedDeep".into(),
         fields: vec![("entailment".into(), ent_ty)],
         variants: vec![],
@@ -885,19 +862,13 @@ const TWO_PAIR_ENSURES: &str = "!((result.is_ok()) && \
 /// Payload = struct { bound: i64, lambda: i64, mu_plus: Vec, mu_minus: Vec,
 /// entailment: struct { premises: Vec, multipliers: Vec } }.
 fn two_pair_guarded_fn(second_guard: bool) -> VerifiableFunction {
-    let ent_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "ny::EntailmentCertificate".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let cert_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+        faithful_enum_repr: None, enum_layout: None, };
+    let cert_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
         name: "ny::SbarUpperCert".into(),
         fields: vec![
             ("bound".into(), i64_ty()),
@@ -1135,19 +1106,13 @@ fn two_pairs_one_guard_leaves_the_other_ungrounded() {
 /// the exact `certify_upper` asymmetry. This test pins that BOTH pairs now
 /// ground on the real shape.
 fn destructure_rebuild_two_pair_fn() -> VerifiableFunction {
-    let ent_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "ny::EntailmentCertificate".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let cert_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+        faithful_enum_repr: None, enum_layout: None, };
+    let cert_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
         name: "ny::SbarUpperCert".into(),
         fields: vec![
             ("bound".into(), i64_ty()),
@@ -1413,19 +1378,13 @@ fn destructure_rebuild_flat_and_nested_pairs_both_ground_real_mir() {
 /// `ny::CertifiedDeep { entailment: ny::Entailment { premises: Vec,
 /// multipliers: Vec } }` — payload component paths `.0.0` / `.0.1`.
 fn nested_cert_ty() -> Ty {
-    let ent_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let ent_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "ny::Entailment".into(),
         fields: vec![("premises".into(), vec_ty()), ("multipliers".into(), vec_ty())],
         variants: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+        faithful_enum_repr: None, enum_layout: None, };
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None,
         name: "ny::CertifiedDeep".into(),
         fields: vec![("entailment".into(), ent_ty)],
         variants: vec![],
@@ -1699,5 +1658,95 @@ fn ok_edge_forward_never_grounds() {
         details[0].contains("_0__discr"),
         "the discr must stay ungrounded on an Ok-edge forward: {}",
         details[0]
+    );
+}
+
+/// `paired_push_fn`'s flat shape with a drop-elaboration JOIN spliced between
+/// the block that builds the returned value and the `Return`:
+///
+/// ```text
+///   bbN   : _3 = (v1, v2); _0 = Ok(_3);  goto bbN+1
+///   bbN+1 : <empty>                      goto bbN+2   <-- the join
+///   bbN+2 : Return
+/// ```
+///
+/// The `Return` block's only predecessor is the EMPTY join, which assigns
+/// nothing — so a resolver that searches only `[predecessor, return_block]`
+/// finds no `_0` definition and refuses the whole function's witness. This is
+/// the shape real drop elaboration produces around a returned owner.
+fn paired_push_join_fn(ensures: &str) -> VerifiableFunction {
+    let mut func = paired_push_fn(false, ensures);
+    let last = func.body.blocks.pop().expect("paired_push_fn ends with the return block");
+    let producer = last.id.0;
+    let join = producer + 1;
+    let ret = producer + 2;
+    // The producer keeps its aggregate statements, but now falls through.
+    func.body.blocks.push(BasicBlock {
+        id: BlockId(producer),
+        stmts: last.stmts,
+        terminator: Terminator::Goto(BlockId(join)),
+    });
+    // A genuinely empty `_0`-preserving join.
+    func.body.blocks.push(BasicBlock {
+        id: BlockId(join),
+        stmts: vec![],
+        terminator: Terminator::Goto(BlockId(ret)),
+    });
+    func.body.blocks.push(BasicBlock {
+        id: BlockId(ret),
+        stmts: vec![],
+        terminator: Terminator::Return,
+    });
+    func
+}
+
+#[test]
+fn drop_elaboration_join_does_not_refuse_the_witness() {
+    // EFFECT PIN for the return-producer walk. Identical construction to
+    // `paired_pushes_ground_both_lens_and_their_equality` — both tuple fields
+    // pushed once, lengths equal BY CONSTRUCTION — only with a join block
+    // between the producer and the `Return`. The join changes no value, so the
+    // verdict must not change either: the pair stays credited and the VC still
+    // pins the equality. Without the ancestor walk this asserts nothing about
+    // `_0` and the pair is refused, which is a pure completeness loss.
+    let func = paired_push_join_fn(TUPLE_PAIR_ENSURES);
+    assert!(
+        ungrounded_details(&func).is_empty(),
+        "a value-preserving join must not refuse the pair: {:#?}",
+        ungrounded_details(&func)
+    );
+    let vcs = postcondition_vcs(&func);
+    assert_eq!(vcs.len(), 1, "one return path -> one body-aware VC: {vcs:#?}");
+    // NAME LITERALS RE-POINTED 2026-08-31 (`_0_discr` -> `_0__discr`,
+    // `_0_value.N_len` -> `_0__value.N__len`). NOTHING IN PRODUCTION MOVED: model
+    // terms live in the RESERVED `__` namespace since `8295625fe913` (2026-08-13),
+    // which moved every synthetic projection leaf there so a user binding can never
+    // collide — `contracts.rs`'s `is_spec_model_var` pins the single-underscore
+    // `_0_discr` as a NEGATIVE, i.e. an ordinary user name, so the old literals
+    // could not possibly match a minted term. This test was authored at
+    // `dba87c583a4` on `b62-merge-redo`, whose tree pre-dated that rename and where
+    // it was internally consistent and green; the branch's own later merge of main
+    // respelled the file's 26 pre-existing occurrences and left these three, which
+    // no conflict could catch because the test was ADDED on the other side. It
+    // landed already-red in the squash `d24c6712111` (2026-08-31) and has never
+    // passed on main. No pre-push lane runs a `crates/` test.
+    //
+    // THE EFFECT PINNED HERE IS UNCHANGED AND WAS NEVER LOST: measured from this
+    // test's own panic dump, the emitted formula already carried BOTH
+    // `Eq(Var("_0__discr"), Int(1))` and
+    // `Eq(Var("_0__value.0__len"), Var("_0__value.1__len"))` — the needles simply
+    // matched nothing, so the pin vectors came back empty. Assertions (a) no
+    // ungrounded row and (b) exactly one VC were passing throughout. The no-join
+    // twin `paired_pushes_ground_both_lens_and_their_equality` asserts the same two
+    // facts on the same construction under the reserved spelling and is green.
+    let mut discr = Vec::new();
+    and_spine_int_pins(&vcs[0].formula, "_0__discr", &mut discr);
+    assert_eq!(discr, vec![1], "{:#?}", vcs[0].formula);
+    let mut eqs = Vec::new();
+    and_spine_var_pins(&vcs[0].formula, "_0__value.0__len", &mut eqs);
+    assert!(
+        eqs.contains(&"_0__value.1__len".to_string()),
+        "equality pin must survive the join: {:#?}",
+        vcs[0].formula
     );
 }

@@ -46,12 +46,30 @@
 # underneath it. The lock lives in x.py precisely so there is one place.
 #
 # PUSH CONTEXT. A manifest command string is fixed and gets no stdin, so the
-# refs git hands us are EXPORTED as TRUST_PUSHED_REFS. Exactly three lanes read
-# it, each via its own `--push-context` mode: fast.revert-rationale,
-# fast.measurement-provenance, fast.pin-regression. With the variable unset the
-# same rows widen to their history/`origin/main..HEAD` reading, so a `push`
-# profile run outside this hook still works — and each prints a `SUBJECT:` line
-# saying which reading it took, so the two are never confused.
+# refs git hands us are EXPORTED as TRUST_PUSHED_REFS. FIVE lanes read it, each
+# via its own `--push-context` mode: fast.revert-rationale,
+# fast.measurement-provenance, fast.pin-regression, fast.dependency-constellation
+# and fast.submodule-remote-reachability. With the variable unset the same rows
+# widen to their history/`origin/main..HEAD`/index reading, so a `push` profile
+# run outside this hook still works — and each prints a `SUBJECT:` line saying
+# which reading it took, so the two are never confused.
+#
+# This count has been stale twice. It said "exactly three" while
+# fast.dependency-constellation was already a fourth, and it kept saying three
+# after fast.submodule-remote-reachability became a fifth on 2026-08-30. The
+# enumeration is prose and nothing gates it, so treat the manifest as the
+# authority: `bash tests/run_trust_comprehensive_harness.sh --list push` and
+# grep the command strings for `--push-context`.
+#
+# WHY THE REACHABILITY LANE NEEDED IT (2026-08-30). It resolved its subject from
+# the LOCAL INDEX, and the predicate it tests — "the pinned commit is contained
+# in some fetched remote ref" — is satisfied MORE often by an OLDER pin. A clone
+# that is behind therefore audited a systematically SAFER pin set than the one
+# it was pushing. Measured that day on a clone 41 commits behind with 8 of 9
+# first-party gitlinks differing: the lane audited the wrong 12 pins and printed
+# PASS, while the pin set actually being published contained one reachable from
+# a single deletable topic branch. A behind clone biasing a gate GREEN is the
+# shape to look for whenever a lane reads the index.
 #
 # QUARANTINE, not bypass. A lane that is known-red gets a row in
 # `tests/trust-comprehensive/divergences.toml` with an owner, a reason, and an

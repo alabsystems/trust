@@ -4673,7 +4673,7 @@ fn resolve_datatype_backrefs(
                 Ty::SymArray { elem: Box::new(go(elem, defs, chain)), len_sym: len_sym.clone() }
             }
             Ty::Tuple(elems) => Ty::Tuple(elems.iter().map(|e| go(e, defs, chain)).collect()),
-            Ty::Adt { layout, name, fields, variants, disc_index_safe, faithful_enum_repr, enum_layout: _, adt_kind } => Ty::Adt {
+            Ty::Adt { layout, name, fields, variants, disc_index_safe, faithful_enum_repr, enum_layout: _, adt_kind, arbitrary_precision } => Ty::Adt {
                 name: name.clone(),
                 fields: fields
                     .iter()
@@ -4697,6 +4697,10 @@ fn resolve_datatype_backrefs(
                 // Trust: W19 — these transforms rewrite field TYPES only; the ADT
                 // kind (struct/union/enum) is a property of the DEF, carried through.
                 adt_kind: *adt_kind,
+                // Trust (F6): these transforms rewrite field TYPES only; the
+                // arbitrary-precision provenance stamp is a property of the DEF
+                // (StableCrateId-authenticated, serde-skipped) and carries through.
+                arbitrary_precision: *arbitrary_precision,
             },
             Ty::Closure { name, upvars, call } => Ty::Closure {
                 name: name.clone(),
@@ -5009,7 +5013,7 @@ pub(crate) fn resolve_adt_compaction(ty: &Ty, defs: &std::collections::HashMap<S
             }
         }
         match ty {
-            Ty::Adt { layout, name, fields, variants, disc_index_safe, faithful_enum_repr, enum_layout: _, adt_kind } => Ty::Adt {
+            Ty::Adt { layout, name, fields, variants, disc_index_safe, faithful_enum_repr, enum_layout: _, adt_kind, arbitrary_precision } => Ty::Adt {
                 name: name.clone(),
                 fields: fields
                     .iter()
@@ -5033,6 +5037,10 @@ pub(crate) fn resolve_adt_compaction(ty: &Ty, defs: &std::collections::HashMap<S
                 // Trust: W19 — these transforms rewrite field TYPES only; the ADT
                 // kind (struct/union/enum) is a property of the DEF, carried through.
                 adt_kind: *adt_kind,
+                // Trust (F6): these transforms rewrite field TYPES only; the
+                // arbitrary-precision provenance stamp is a property of the DEF
+                // (StableCrateId-authenticated, serde-skipped) and carries through.
+                arbitrary_precision: *arbitrary_precision,
             },
             Ty::Ref { mutable, inner } => {
                 Ty::Ref { mutable: *mutable, inner: Box::new(go(inner, defs, chain)) }
@@ -5287,7 +5295,7 @@ pub fn collapse_ambiguous_tys(ty: &Ty, ambiguous: &std::collections::HashSet<Str
         {
             Ty::Datatype { name: name.clone(), variants: Vec::new() }
         }
-        Ty::Adt { layout, name, fields, variants, disc_index_safe, faithful_enum_repr, enum_layout: _, adt_kind } => Ty::Adt {
+        Ty::Adt { layout, name, fields, variants, disc_index_safe, faithful_enum_repr, enum_layout: _, adt_kind, arbitrary_precision } => Ty::Adt {
             name: name.clone(),
             fields: fields
                 .iter()
@@ -5310,6 +5318,10 @@ pub fn collapse_ambiguous_tys(ty: &Ty, ambiguous: &std::collections::HashSet<Str
                 layout: layout.clone(), enum_layout: None,
                 // Trust: W19 — field-type rewrite only; ADT kind carried through.
                 adt_kind: *adt_kind,
+                // Trust (F6): these transforms rewrite field TYPES only; the
+                // arbitrary-precision provenance stamp is a property of the DEF
+                // (StableCrateId-authenticated, serde-skipped) and carries through.
+                arbitrary_precision: *arbitrary_precision,
         },
         Ty::Datatype { name, variants } => Ty::Datatype {
             name: name.clone(),
@@ -6234,7 +6246,7 @@ mod tests {
                 ("y".into(), Ty::Int { width: 32, signed: true }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let reflected = reflect_ty(&ty).expect("struct of scalars should reflect");
         infers_sort_ty(&reflected);
         // It is a product headed by Trust.Sort.Prod.
@@ -6258,7 +6270,7 @@ mod tests {
             name: "Wrapper".into(),
             fields: vec![("value".into(), Ty::Int { width: 32, signed: true })],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier =
             reflect_struct(&ty).expect("non-generic struct reflects to a named inductive");
         assert_eq!(carrier.name, "Trust.Adt.Wrapper");
@@ -6290,7 +6302,7 @@ mod tests {
                 ("y".into(), Ty::Int { width: 64, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier = reflect_struct(&ty).expect("struct of scalars reflects");
         // The mangled name collapses `::` to a single underscore.
         assert_eq!(carrier.name, "Trust.Adt.my_crate_Point");
@@ -6322,7 +6334,7 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier = reflect_struct(&ty).expect("a generic struct reflects parameterized");
         assert_eq!(carrier.name, "Trust.Adt.Wrapper");
         assert!(carrier.is_parameterized());
@@ -6342,7 +6354,7 @@ mod tests {
             name: "Pt".into(),
             fields: vec![("x".into(), Ty::Int { width: 32, signed: true })],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let pc = reflect_struct(&plain).expect("plain struct reflects");
         assert!(!pc.is_parameterized());
         assert!(pc.type_params.is_empty());
@@ -6363,7 +6375,7 @@ mod tests {
                 ("also_a".into(), param_field("generic parameter A/#0 needs monomorphization")),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier = reflect_struct(&ty).expect("multi-param generic struct reflects");
         assert_eq!(carrier.type_params, vec!["A/#0".to_string(), "B/#1".to_string()]);
         // `a` and `also_a` share param 0 (A); `b` is param 1 (B).
@@ -6386,7 +6398,7 @@ mod tests {
                 ("count".into(), Ty::Int { width: 32, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let bound =
             generic_struct_binding(&ty).expect("generic struct param has an applied binding");
         // `Trust.Adt.Wrapper (Trust.Param.T/#0)`.
@@ -6403,7 +6415,7 @@ mod tests {
             name: "Pt".into(),
             fields: vec![("x".into(), Ty::Int { width: 32, signed: true })],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         assert!(generic_struct_binding(&plain).is_none());
     }
 
@@ -6414,7 +6426,7 @@ mod tests {
             name: "Empty".into(),
             fields: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         assert_eq!(reflect_ty(&ty), Ok(cst(CARRIER_UNIT)));
     }
 
@@ -6426,7 +6438,7 @@ mod tests {
             name: "Point".into(),
             fields: vec![("x".into(), Ty::Int { width: 8, signed: false })],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let ty = Ty::Tuple(vec![point, Ty::Bool]);
         let reflected = reflect_ty(&ty).expect("nested composite of scalars should reflect");
         infers_sort_ty(&reflected);
@@ -6444,7 +6456,7 @@ mod tests {
             name: "Holder".into(),
             fields: vec![("r".into(), Ty::Never)],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         assert!(matches!(reflect_ty(&s), Err(ReflectError::NeverType(_))));
         // GOAL-ITEM #3 — a composite with a FLOAT component now reflects structurally
         // (the float is a structured carrier, not a non-reflectable family).
@@ -6455,7 +6467,7 @@ mod tests {
             name: "Holder2".into(),
             fields: vec![("r".into(), Ty::Float { width: 32 })],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         assert!(reflect_ty(&sf).is_ok(), "a struct with a float field now reflects structurally");
     }
 
@@ -7689,7 +7701,7 @@ mod tests {
             name: "Point".into(),
             fields: vec![("x".into(), i32()), ("y".into(), i32())],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let contract = reflect_contract(
             &[("p", &point)],
             &Formula::Bool(true),
@@ -8020,7 +8032,7 @@ mod tests {
                 },
             )],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let contract = reflect_contract(
             &[("f", &formatter)],
             &Formula::Bool(true),
@@ -8064,7 +8076,7 @@ mod tests {
             name: "core::fmt::FormattingOptions".into(),
             fields: vec![("flags".into(), Ty::Int { width: 32, signed: false })],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let formatter = Ty::Adt { adt_kind: None, layout: None,
             variants: Vec::new(),
             name: "core::fmt::Formatter".into(),
@@ -8079,7 +8091,7 @@ mod tests {
                 ),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None, enum_layout: None, };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let carrier = reflect_struct(&formatter)
             .expect("Formatter now registers as a named inductive via the Sink shim");
         // The `buf` field's carrier is the abstract Sink code; the struct is NOT

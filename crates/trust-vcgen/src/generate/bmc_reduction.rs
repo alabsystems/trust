@@ -130,7 +130,7 @@ fn root_local(func: &VerifiableFunction, op: &Operand, fuel: u32) -> Option<usiz
     if !p.projections.is_empty() {
         return None;
     }
-    match crate::unique_whole_local_def(func, p.local) {
+    match crate::local_defs::unique_value_def(func, p.local) {
         Some(Rvalue::Use(inner)) => root_local(func, inner, fuel - 1).or(Some(p.local)),
         _ => Some(p.local),
     }
@@ -149,7 +149,7 @@ fn fold_const_int(func: &VerifiableFunction, op: &Operand, fuel: u32) -> Option<
     if !p.projections.is_empty() {
         return None;
     }
-    match crate::unique_whole_local_def(func, p.local)? {
+    match crate::local_defs::unique_value_def(func, p.local)? {
         Rvalue::Use(inner) | Rvalue::Cast(inner, _) => fold_const_int(func, inner, fuel - 1),
         _ => None,
     }
@@ -169,7 +169,7 @@ fn fold_const_bool(func: &VerifiableFunction, op: &Operand, fuel: u32) -> Option
     if !p.projections.is_empty() {
         return None;
     }
-    match crate::unique_whole_local_def(func, p.local)? {
+    match crate::local_defs::unique_value_def(func, p.local)? {
         Rvalue::Use(inner) => fold_const_bool(func, inner, fuel - 1),
         Rvalue::BinaryOp(op_kind, l, r) => {
             let (l, r) = (fold_const_int(func, l, fuel)?, fold_const_int(func, r, fuel)?);
@@ -231,7 +231,7 @@ fn reachable_blocks(func: &VerifiableFunction) -> FxHashSet<usize> {
 fn is_iterator_option_switch(func: &VerifiableFunction, discr: &Operand, next_dest: usize) -> bool {
     let Some(local) = root_local(func, discr, 8) else { return false };
     matches!(
-        crate::unique_whole_local_def(func, local),
+        crate::local_defs::unique_value_def(func, local),
         Some(Rvalue::Discriminant(p)) if p.local == next_dest && p.projections.is_empty()
     )
 }
@@ -468,7 +468,7 @@ fn is_iterator_option_tag_fact(
         return false;
     }
     matches!(
-        crate::unique_whole_local_def(func, d),
+        crate::local_defs::unique_value_def(func, d),
         Some(Rvalue::Discriminant(p)) if p.local == next_dest && p.projections.is_empty()
     )
 }
@@ -602,7 +602,7 @@ fn deref_ref_root_local(func: &VerifiableFunction, op: &Operand, fuel: u32) -> O
     if !p.projections.iter().all(|proj| matches!(proj, trust_types::Projection::Deref)) {
         return None;
     }
-    match crate::unique_whole_local_def(func, base) {
+    match crate::local_defs::unique_value_def(func, base) {
         Some(Rvalue::Use(inner)) => deref_ref_root_local(func, inner, fuel - 1).or(Some(base)),
         Some(Rvalue::Ref { place, .. } | Rvalue::CopyForDeref(place))
             if place
@@ -832,7 +832,7 @@ fn cast_or_direct_element(func: &VerifiableFunction, op: &Operand) -> Option<usi
     if !p.projections.is_empty() {
         return None;
     }
-    match crate::unique_whole_local_def(func, p.local) {
+    match crate::local_defs::unique_value_def(func, p.local) {
         Some(Rvalue::Cast(Operand::Copy(xp) | Operand::Move(xp), _))
             if xp.projections.is_empty() =>
         {

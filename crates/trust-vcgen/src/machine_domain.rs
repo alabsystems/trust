@@ -49,8 +49,13 @@ pub(crate) struct MachineDomain {
 /// The Rust integer widths this lane models. Every one is a power of two, which
 /// is what makes the shift mask commute with a resize (see
 /// [`shift_amount_resize_and_mask`]).
+///
+/// Trust: the set itself now lives in the strict-lane VERIFIED crate
+/// `trust-widthconv`, which also owns the conversion rule table below. This is
+/// a thin adapter from its `u8` 0/1 answer to the `bool` this module's callers
+/// expect; there is no second copy of the width set here.
 pub(crate) fn width_supported(width: u32) -> bool {
-    matches!(width, 8 | 16 | 32 | 64 | 128)
+    trust_widthconv::width_supported(width) == 1
 }
 
 impl MachineDomain {
@@ -134,26 +139,25 @@ pub(crate) fn value_preserving_conversion(
     src: MachineDomain,
     dst: MachineDomain,
 ) -> Option<ValueConversion> {
-    if !width_supported(src.width) || !width_supported(dst.width) {
-        return None;
-    }
-    if src == dst {
-        return Some(ValueConversion::Identity);
-    }
-    // Row 7: any narrowing. Row 6 for equal widths falls through to the
-    // signedness rules below and is refused there.
-    if dst.width < src.width {
-        return None;
-    }
-    let extra = dst.width - src.width;
-    match (src.signed, dst.signed) {
-        // Row 2 / row 3, strict widening (equal widths were handled above).
-        (false, false) => Some(ValueConversion::ZeroExtend(extra)),
-        (true, true) => Some(ValueConversion::SignExtend(extra)),
-        // Row 4: the target needs the extra bit, so equal widths (extra == 0)
-        // are refused here — that IS row 6 for the `u8 -> i8` direction.
-        (false, true) if extra > 0 => Some(ValueConversion::ZeroExtend(extra)),
-        // Row 5 (signed source, unsigned target) and row 6's other direction.
+    // Trust: rows 1-7 are DECIDED in the strict-lane VERIFIED crate
+    // `trust-widthconv`, whose 100-point exhaustive oracle checks them against
+    // the seven prose rules above and whose `replaced_consumer_body_is_
+    // reproduced_exactly` runs this function's ORIGINAL body against the
+    // replacement over `0..=200` x `0..=200` x both signednesses. Nothing is
+    // re-decided here: this maps the answer onto the local type, which is the
+    // one thing the verified crate cannot do (it may not name an enum).
+    let code = trust_widthconv::conversion_code(
+        src.width,
+        u8::from(src.signed),
+        dst.width,
+        u8::from(dst.signed),
+    );
+    let extra = trust_widthconv::extension_bits(src.width, dst.width);
+    match code {
+        trust_widthconv::CONVERSION_IDENTITY => Some(ValueConversion::Identity),
+        trust_widthconv::CONVERSION_ZERO_EXTEND => Some(ValueConversion::ZeroExtend(extra)),
+        trust_widthconv::CONVERSION_SIGN_EXTEND => Some(ValueConversion::SignExtend(extra)),
+        // `CONVERSION_REFUSED`, and any code this match does not name.
         _ => None,
     }
 }
@@ -178,7 +182,18 @@ pub(crate) fn join(
     left: MachineDomain,
     right: MachineDomain,
 ) -> Option<(MachineDomain, ValueConversion, ValueConversion)> {
+    // Trust: the joined WIDTH is `trust_widthconv::join_width`, whose clause
+    // pair (`result >= left_width`, `result >= right_width`) is the reason a
+    // candidate narrower than either operand may be skipped: a value-preserving
+    // conversion never narrows (row 7), so the narrower candidate could not
+    // have been reached from the wider operand and this loop would have
+    // rejected it anyway. `a_width_below_an_operand_is_unreachable_from_it`
+    // pins that converse.
+    let joined_width = trust_widthconv::join_width(left.width, right.width);
     for candidate in [left, right] {
+        if candidate.width != joined_width {
+            continue;
+        }
         if let (Some(from_left), Some(from_right)) = (
             value_preserving_conversion(left, candidate),
             value_preserving_conversion(right, candidate),
@@ -246,7 +261,14 @@ pub(crate) fn shift_amount_resize_and_mask(
     let resize = shift_amount_resize(source_width, target_width)?;
     Some(Formula::BvAnd(
         Box::new(resize.apply(amount)),
-        Box::new(Formula::BitVec { value: i128::from(target_width - 1), width: target_width }),
+        // Trust: the mask is `trust_widthconv::shift_mask`, whose clause
+        // `result <= target_width` makes a mask wider than the value being
+        // shifted unstatable — the direction that would admit a shift count
+        // `>= width` (Rust UB) as a defined operation.
+        Box::new(Formula::BitVec {
+            value: i128::from(trust_widthconv::shift_mask(target_width)),
+            width: target_width,
+        }),
         target_width,
     ))
 }

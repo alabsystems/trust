@@ -185,8 +185,10 @@ fn rustdoc_sysroot_aliases_preserve_stage_policy() {
     );
 }
 
-fn tools_profile_default_tools() -> HashSet<String> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/defaults/bootstrap.tools.toml");
+fn default_profile_tools(profile: &str) -> HashSet<String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("defaults")
+        .join(format!("bootstrap.{profile}.toml"));
     let contents = fs::read_to_string(path).unwrap();
     let toml: toml::Value = toml::from_str(&contents).unwrap();
 
@@ -197,6 +199,25 @@ fn tools_profile_default_tools() -> HashSet<String> {
         .iter()
         .map(|tool| tool.as_str().unwrap().to_string())
         .collect()
+}
+
+fn tools_profile_default_tools() -> HashSet<String> {
+    default_profile_tools("tools")
+}
+
+#[test]
+fn contributor_profiles_select_every_verification_backend() {
+    for profile in ["compiler", "tools"] {
+        let tools = default_profile_tools(profile);
+        for backend in ["clean", "ty"] {
+            assert!(tools.contains(backend), "{profile} profile must include `{backend}`");
+        }
+
+        let bins = restored_sysroot_bins_for_tool_settings(true, Some(&tools), false, false);
+        for bin in [("clean", "clean"), ("ty", "ty")] {
+            assert!(bins.contains(&bin), "{profile} profile must restore `{}`", bin.1);
+        }
+    }
 }
 
 #[test]

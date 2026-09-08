@@ -117,11 +117,91 @@ pub(super) fn is_index_panicking_container_mutator(callee: &str) -> bool {
     if !matches!(method_tail(callee), "remove" | "insert" | "swap_remove" | "insert_str") {
         return false;
     }
+    // SOUNDNESS/precision (R20 Front A, measured on ny-cert gate R19): the
+    // receiver test must read the RECEIVER path, never a TURBOFISH generic
+    // ARGUMENT. `serde_json::Map::<std::string::String, serde_json::Value>::insert`
+    // is a TOTAL map insert (it returns `Option<Value>`; it has no index
+    // argument and no char-boundary), yet it carries the substring
+    // `string::String` inside its FIRST GENERIC ARGUMENT — so the raw
+    // `contains` matched it and stamped a fail-closed
+    // `Call::insert::panic-freedom-unverified` row that STRICT policy counts as
+    // FAILED. That single mis-recognition was 41 of ny-cert's 92 unknown
+    // obligations across 8 JSON-serializer functions: a rejection of valid code,
+    // exactly the over-match this lane's `collections::` exclusion already
+    // warns about.
+    //
+    // Stripping turbofish groups CANNOT lose a true positive: a turbofish holds
+    // generic ARGUMENTS, and the receiver type's own path head always PRECEDES
+    // it (`std::vec::Vec::<T, A>::insert` -> `std::vec::Vec::insert`,
+    // `std::string::String::insert` unchanged). A qualified-path spelling
+    // (`<std::vec::Vec<u8> as Ext>::insert`) opens its `<` after a path segment
+    // rather than after `::`, so it is left intact and still matches.
+    let spine = callee_without_turbofish_args(callee);
     // Total map/set/deque methods live under `collections::` — never match.
-    if callee.contains("collections::") {
+    if spine.contains("collections::") {
         return false;
     }
-    callee.contains("vec::Vec") || callee.contains("string::String")
+    spine.contains("vec::Vec") || spine.contains("string::String")
+}
+
+/// The callee path with every TURBOFISH generic-argument group (`::<…>`, which
+/// includes the trailing `::<__trust_args@HASH>` monomorph tag) removed, so a
+/// receiver-path test cannot be satisfied by text that only appears in a
+/// generic ARGUMENT. Balanced-aware, so nested groups
+/// (`::<Vec<Option<u8>>, u32>`) are removed whole; an UNBALANCED `<` is left
+/// as-is (fail-closed: the recognizer then sees the original text and keeps
+/// its fail-closed row rather than silently dropping one).
+///
+/// Deliberately does NOT touch a `<…>` that is not introduced by `::` — that
+/// is a QUALIFIED PATH (`<Recv as Trait>::m`) whose receiver lives inside the
+/// brackets, and removing it would blind every receiver test to it.
+pub(super) fn callee_without_turbofish_args(callee: &str) -> std::borrow::Cow<'_, str> {
+    if !callee.contains("::<") {
+        return std::borrow::Cow::Borrowed(callee);
+    }
+    let bytes = callee.as_bytes();
+    let mut out = String::with_capacity(callee.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // A turbofish opens at `::<`.
+        if bytes[i] == b'<' && i >= 2 && bytes[i - 1] == b':' && bytes[i - 2] == b':' {
+            let mut depth = 0i32;
+            let mut j = i;
+            let mut closed = None;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'<' => depth += 1,
+                    b'>' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            closed = Some(j);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            match closed {
+                // Skip the whole balanced group.
+                Some(end) => {
+                    i = end + 1;
+                    continue;
+                }
+                // Unbalanced: keep the remainder verbatim (fail-closed).
+                None => {
+                    out.push_str(&callee[i..]);
+                    return std::borrow::Cow::Owned(out);
+                }
+            }
+        }
+        // `callee` is a Rust path; step by chars so a multi-byte codepoint is
+        // never split.
+        let ch_len = callee[i..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&callee[i..i + ch_len]);
+        i += ch_len;
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Trust (hunt-15 Class D): a call to a std method that PANICS on its failure
@@ -254,7 +334,7 @@ pub(super) fn unwrap_tag_origin(func: &VerifiableFunction, local: usize) -> Opti
             return Some(cur);
         }
         let Some(Rvalue::Ref { mutable: false, place: referent }) =
-            crate::unique_whole_local_def(func, p.local)
+            crate::local_defs::unique_value_def(func, p.local)
         else {
             return Some(cur);
         };
@@ -361,7 +441,7 @@ pub(super) fn probe_call_definitions(
         return Vec::new();
     }
     let Some(Rvalue::Ref { mutable: false, place: referent }) =
-        crate::unique_whole_local_def(func, recv.local)
+        crate::local_defs::unique_value_def(func, recv.local)
     else {
         return Vec::new();
     };
@@ -439,7 +519,7 @@ pub(super) fn eq_side_receiver(func: &VerifiableFunction, arg: &Operand) -> Opti
         return None;
     }
     let Some(Rvalue::Ref { mutable: false, place: referent }) =
-        crate::unique_whole_local_def(func, place.local)
+        crate::local_defs::unique_value_def(func, place.local)
     else {
         return None;
     };
@@ -480,7 +560,7 @@ pub(super) fn eq_side_pinned_unit(
     if !unwrap_receiver_local_is_pinned(func, place.local) {
         return None;
     }
-    match crate::unique_whole_local_def(func, place.local)? {
+    match crate::local_defs::unique_value_def(func, place.local)? {
         Rvalue::Use(Operand::Constant(trust_types::ConstValue::UnitVariantRef {
             enum_name,
             variant,
@@ -489,7 +569,7 @@ pub(super) fn eq_side_pinned_unit(
             if !unwrap_receiver_local_is_pinned(func, referent.local) {
                 return None;
             }
-            match crate::unique_whole_local_def(func, referent.local)? {
+            match crate::local_defs::unique_value_def(func, referent.local)? {
                 Rvalue::Aggregate(
                     AggregateKind::Adt { name, variant, active_field: None, .. },
                     ops,
@@ -641,11 +721,11 @@ pub(super) fn field_subject_is_pinned(func: &VerifiableFunction, field_place: &P
 /// Fail-closed (`None`) on a projected pred actual or a too-deep chain.
 ///
 /// SOUNDNESS (aliased reseat, audit r3): EVERY hop local must be PINNED before
-/// its `unique_whole_local_def` is trusted — exactly as [`unwrap_receiver_origin`]
+/// its `unique_value_def` is trusted — exactly as [`unwrap_receiver_origin`]
 /// does for the whole-pointee lane. Without it, a reference local reseated
 /// through an ALIAS (`let mut r=o; mem::swap(&mut r, &mut r2); check(r)`) has a
 /// stale `Use(Copy(o))` def (the `&mut r` write is invisible to
-/// `unique_whole_local_def`), so the guard subject would mis-resolve to `*o`
+/// `unique_value_def`), so the guard subject would mis-resolve to `*o`
 /// while `r` points at `r2` at the call — threading the guard's fact onto the
 /// WRONG subject and discharging a genuinely-panicking `o.slot.unwrap()` (a safe
 /// -code FALSE PROVE). A `&mut`/alias-reseated `cur` fails `place_source_is_stable`.
@@ -658,7 +738,7 @@ pub(super) fn guard_receiver_subject(func: &VerifiableFunction, recv: &Place) ->
         if !unwrap_receiver_local_is_pinned(func, cur) {
             return None;
         }
-        match crate::unique_whole_local_def(func, cur) {
+        match crate::local_defs::unique_value_def(func, cur) {
             Some(Rvalue::Ref { mutable: false, place: referent }) => {
                 return Some(referent.clone());
             }
@@ -736,7 +816,7 @@ pub(super) fn inferred_pred_call_model(
             // while it points at `o2` at the call, so the fact would be minted
             // over the WRONG subject. An unpinned recv falls to the `_` arm,
             // whose `unwrap_tag_origin` pin-checks and returns None (fail-closed).
-            let origin = match crate::unique_whole_local_def(func, recv.local) {
+            let origin = match crate::local_defs::unique_value_def(func, recv.local) {
                 Some(Rvalue::Ref { mutable: false, place: referent })
                     if referent.projections.is_empty()
                         && unwrap_receiver_local_is_pinned(func, recv.local) =>
@@ -870,8 +950,8 @@ pub(super) fn unwrap_receiver_local_is_pinned(func: &VerifiableFunction, local: 
     if !crate::place_source_is_stable(func, local) {
         return false;
     }
-    let is_param = (1..=func.body.arg_count).contains(&local);
-    !(is_param && guards::whole_local_def_count(func, local) > 0)
+    !crate::local_defs::is_parameter(func, local)
+        || crate::local_defs::never_explicitly_reseated(func, local)
 }
 
 /// Follow value-preserving whole-local move/copy hops (`_5 = move _2`, the
@@ -885,7 +965,7 @@ pub(super) fn unwrap_receiver_origin(func: &VerifiableFunction, local: usize) ->
         if !unwrap_receiver_local_is_pinned(func, cur) {
             return None;
         }
-        match crate::unique_whole_local_def(func, cur) {
+        match crate::local_defs::unique_value_def(func, cur) {
             Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p)))
                 if p.projections.is_empty() && p.local != cur =>
             {
@@ -919,7 +999,7 @@ pub(super) fn discriminant_src_is_pinned_origin(
     matches!(src.projections.as_slice(), [trust_types::Projection::Deref])
         && unwrap_receiver_local_is_pinned(func, src.local)
         && matches!(
-            crate::unique_whole_local_def(func, src.local),
+            crate::local_defs::unique_value_def(func, src.local),
             Some(Rvalue::Ref { mutable: false, place })
                 if place.local == origin && place.projections.is_empty()
         )
@@ -945,7 +1025,7 @@ pub(super) fn unwrap_receiver_tag_term(
     origin: usize,
     variants: &[trust_types::VariantDef],
 ) -> Option<Formula> {
-    if let Some(Rvalue::Aggregate(kind, _)) = crate::unique_whole_local_def(func, origin)
+    if let Some(Rvalue::Aggregate(kind, _)) = crate::local_defs::unique_value_def(func, origin)
         && let AggregateKind::Adt { variant, active_field: None, .. } = kind
     {
         let tag = variants.get(*variant)?.discriminant;
@@ -963,13 +1043,13 @@ pub(super) fn unwrap_receiver_tag_term(
             }
             // `_d` itself must be single-valued: a bare non-param local whose ONE
             // whole-local definition is exactly this read (a second write would
-            // leave the term stale vs. the tag; `unique_whole_local_def` returns
+            // leave the term stale vs. the tag; `unique_value_def` returns
             // `None` on any second def, so the `Discriminant` match below implies
             // THIS statement is the sole def).
             if (1..=func.body.arg_count).contains(&dest.local)
                 || !crate::place_source_is_stable(func, dest.local)
                 || !matches!(
-                    crate::unique_whole_local_def(func, dest.local),
+                    crate::local_defs::unique_value_def(func, dest.local),
                     Some(Rvalue::Discriminant(_))
                 )
             {
@@ -1143,7 +1223,7 @@ pub(super) fn unwrap_field_place(func: &VerifiableFunction, recv: &Place) -> Opt
     if recv.projections.is_empty()
         && unwrap_receiver_local_is_pinned(func, recv.local)
         && let Some(Rvalue::Use(Operand::Copy(p) | Operand::Move(p))) =
-            crate::unique_whole_local_def(func, recv.local)
+            crate::local_defs::unique_value_def(func, recv.local)
         && is_simple_field(&p.projections)
     {
         return Some(p.clone());
@@ -1167,7 +1247,8 @@ pub(super) fn field_tag_observed_elsewhere(func: &VerifiableFunction, field_plac
             return true;
         }
         // A borrow whose referent roots at the base.
-        if let Some(Rvalue::Ref { place: r, .. }) = crate::unique_whole_local_def(func, place.local)
+        if let Some(Rvalue::Ref { place: r, .. }) =
+            crate::local_defs::unique_value_def(func, place.local)
             && (r.local == base || unwrap_receiver_origin(func, r.local) == Some(base))
         {
             return true;
@@ -1248,14 +1329,33 @@ pub(super) fn origin_tag_observed_elsewhere(func: &VerifiableFunction, origin: u
         // closes the as_ref-then-shared-borrow leak (a borrow of the as_ref
         // RESULT is a real observer the literal `referent.local == origin` check
         // missed).
+        //
+        // A DECLINE FROM THE RESOLVER ANSWERS YES HERE, NOT NO. This gate asks
+        // "could this place carry the origin's tag to a consumer this lane cannot
+        // model?", so the safe answer when the seam cannot say what the place holds
+        // is that it could: reading a decline as "not an alias" would drop the
+        // observer and mint a refutation over a tag the guard may have pinned. The
+        // last disjunct is that reading — a local that is BOTH unpinned and
+        // unresolvable — so a pinned local with an ordinary opaque def (a call dest)
+        // is not swept in. `whole_pointee_guard_through_reseat_does_not_connect` is
+        // the row.
+        //
+        // THE ALIAS SHAPE (`_b = &o; _m = &mut _b; *_m = &o2; check(_b)`) DOES NOT
+        // REACH THAT DISJUNCT, because `local_defs::unique_value_def` does not
+        // decline on a `&mut` escape — the seam's open defect, stated in its `Escape`
+        // arm. Here it happens not to matter: `_b`'s stale def is still `&o`, so the
+        // middle disjunct connects the observer anyway. It is not a general argument,
+        // and it stops being needed when that defect is repaired.
         unwrap_tag_origin(func, place.local) == Some(origin)
             || matches!(
-                crate::unique_whole_local_def(func, place.local),
+                crate::local_defs::unique_value_def(func, place.local),
                 Some(Rvalue::Ref { mutable: false, place: referent })
                     if referent.projections.is_empty()
                         && (referent.local == origin
                             || unwrap_tag_origin(func, referent.local) == Some(origin))
             )
+            || (!unwrap_receiver_local_is_pinned(func, place.local)
+                && crate::local_defs::unique_value_def(func, place.local).is_none())
     };
     for block in &func.body.blocks {
         for stmt in &block.stmts {
@@ -1468,11 +1568,11 @@ pub(super) fn unwrap_panic_freedom_vcs_with_blocks(
     if sites.is_empty() {
         return Vec::new();
     }
-    let guard_paths_map = v2_build_path_guard_map(func);
+    let guard_paths_map = super::guard_map_for(func);
     let semantic_guards = build_semantic_guard_map(func);
     let may_reassigned = v2_may_reassigned_per_block(func);
     // Trust (lane-A CSE): one statement-version oracle for the whole function.
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let path_definition_map = v2_build_path_definition_map(func);
     let global_facts = build_global_invariant_facts(func);
     let empty = FxHashSet::default();

@@ -63,6 +63,24 @@ ignore = [
     # Trust: FROZEN files (scripts/frozen-files.txt pins their blobs BYTE-IDENTICAL;
     # the freeze gate blocks any movement, including whitespace) and the frozen
     # R functor. A formatter pass is a blob move like any other.
+    # Trust: fixture SOURCE trees are VERBATIM COPIES of code this repo does not
+    # own — a published crates.io tarball, or the exact `library/` files a
+    # differential fixture was cut from — and each is pinned byte-for-byte
+    # (`metadata/source-selection.json` carries a tree manifest; `SOURCE.sha256`
+    # carries per-file digests). Formatting one does not "tidy" it, it BREAKS the
+    # claim that it is the published source, and the pin then reads as corruption
+    # because that is exactly what it is.
+    #
+    # This is not hypothetical: `9fc06acc40` ("fmt: tree-wide reformat") ran over
+    # all four of them. That commit added the frozen-blob rows just below for
+    # precisely this reason and missed these trees, so the lambda-calculus
+    # collector had been failing closed ever since — `vendored SOURCE differs
+    # from pinned bytes`, 46 files unchanged in number but 6,404 bytes lighter —
+    # and the three stdlib-leaf fixtures each failed one digest. All four were
+    # restored to their pre-reformat bytes and every pin now matches exactly.
+    # A glob, not four paths, so the next fixture is covered on arrival.
+    "crates/trust-clean/fixtures/*/SOURCE/",
+
     "crates/trust-clean/src/reflect.rs",
     "crates/trust-clean/src/source_reflect.rs",
     "crates/trust-thir-lower/src/mir_differential.rs",

@@ -1449,11 +1449,29 @@ fn analysis(tcx: TyCtxt<'_>, (): ()) {
     // harvest would be pure wasted work (and optimizing MIR of code that
     // failed type/borrow checking is ICE-prone).
     if front_end_errors_before_trust_hooks.is_none() {
+        // Trust: the once-initializer re-entrancy check — a `OnceLock`/`LazyLock`/
+        // `Once` (or `OnceCell`/`LazyCell`) `static` whose initializer can wait on
+        // its own cell is a HARD error (aterm v0.65.0's update-apply deadlock,
+        // 2026-08-30). It runs FIRST here because it borrows
+        // `mir_drops_elaborated_and_const_checked`, which the backing-certificate
+        // initializer below STEALS through `optimized_mir`; and it is gated by
+        // NOTHING but front-end cleanliness — not by `-Ztrust-verify`, which is
+        // `off` on every ordinary build. A gate a flag can switch off is a lint;
+        // this is a compilation-correctness check. See
+        // `rustc_mir_transform::trust_once_reentrancy`.
+        rustc_mir_transform::trust_check_once_initializer_reentrancy(tcx);
         // Trust: compute interprocedural backing-invariant certificates now, while
         // post-analysis MIR (`mir_drops_elaborated_and_const_checked`) is still
         // borrowable — `optimized_mir` STEALS it later during codegen, and running
         // this inside that pass would cause a query cycle. Self-gates on whether
         // Trust verification is enabled. See docs/backing-cert-compiler-wiring.md.
+        // Trust (#42): the companion refusal of an unconsumed `#[trust::<name>]`
+        // does NOT live here. It runs in `rustc_resolve::macros`, at the one seam
+        // every tool attribute passes through exactly once — see the E5
+        // conservation check in `smart_resolve_macro_path`. A HIR walk at this
+        // seam was tried and is strictly worse: lowering ALIASES one attribute
+        // slice onto several HIR ids, so it double-reports, and it cannot see an
+        // attribute that expansion already consumed.
         rustc_mir_transform::trust_init_backing_certificates(tcx);
         // Trust #540 (R1): retain the pre-steal initialization seam, but the
         // strengthening authority is hard-disabled. The initializer therefore

@@ -69,3 +69,21 @@
 # again from this commit on.
 #
 # No active rows. That is the intended steady state: every drift blocks.
+
+# --- Opened 2026-08-30 -------------------------------------------------------
+# first-party/ay's recorded pin b851ff380a2c does not exist anywhere reachable:
+# not in the submodule's object store, not in the sibling ay clone,
+# and not on ay's origin after `fetch --all` on both. It was set by 4e10b0af72
+# ("deps(ay): move the pin off the trust-cg epoch that required an UNPUBLISHED
+# trust-ir") — a commit whose own subject is about depending on something
+# unpublished, which is exactly what its gitlink then did.
+#
+# This is the hazard CLAUDE.md states directly: "Always push a sibling before
+# pushing the superproject gitlink that names it." Until ay pushes b851ff38, the
+# pin gate blocks EVERY push to this repo from every clone, not just this lane's.
+#
+# Waived per-path and dated, not quarantined: the gate still blocks on drift in
+# any other submodule, and this row self-destructs — it stops applying after the
+# date, and the hook FAILS the push once first-party/ay is back at its pin, so it
+# cannot outlive the problem. Nothing here is fixable locally; the commit exists
+# only on the machine that authored it.

@@ -11,7 +11,7 @@
 use rustc_abi::{TagEncoding, Variants};
 use rustc_middle::ty::{self, TyCtxt, TyKind, TypeVisitableExt};
 use trust_types::fx::FxHashMap;
-use trust_types::{FnSig, Ty as TrustTy};
+use trust_types::{AdtAuth, ArbPrecKind, FnSig, SerdeJsonKind, TotalMapKind, Ty as TrustTy};
 
 // verifier-perf: original budget restored. An earlier patch bumped
 // nodes 4096 → 65536, but that interacted badly with the alias-normalize
@@ -83,10 +83,35 @@ const MAX_TYPE_LOWERING_NODES: usize = 4096;
 // obligation set identical to the corrected-meter run. The "never completes /
 // non-terminating lowering" note that used to justify this constant was never
 // backed by a run; the runs that did exist recorded an OOM-KILL WITH PROGRESS
-// ("29/1771 fns in 40 min"), which is memory exhaustion, not divergence. Every
+// ("29/1771 fns in 40 min"), which is memory exhaustion, not divergence.
+//
+// CORRECTION 2026-09-01 — the sentence that used to close this paragraph said "Every
 // recursion in this module is bounded (`MAX_TYPE_LOWERING_DEPTH`,
 // `MAX_TYPE_LOWERING_NODES`, `MAX_CUT_DEFINITION_NESTING` + the `in_progress` set,
-// `MAX_CANONICAL_CUT_NODES`), so divergence is not reachable here.
+// `MAX_CANONICAL_CUT_NODES`), so divergence is not reachable here." Every bound it
+// names is real and none of them was missing — and the conclusion was still FALSE,
+// because all of them live in the `TyLoweringCtx` and `convert_ty_in_env` builds a
+// FRESH one. The `TyKind::Dynamic` arm calls `faithful_principal_key`, whose renderer
+// classifies each component by calling back into `convert_ty_in_env`; a trait object
+// whose principal ARGUMENT is a type that HOLDS that trait object therefore closes a
+// cycle that resets every bound above once per trip. MEASURED: a 13-line crate, and
+// `clean-runtime`, both took `trustc` down with a SIGBUS — a native
+// stack overflow — in under a second. The associated-type BINDING term reaches the same
+// renderer and is the same edge in principle, but no binding-term instance reproduces
+// today, and the reason is worth knowing before widening anything here: a type whose
+// only cycle runs through a `dyn`'s key is invisible to `canonical_cut_set` (its
+// `nominal_frontier` peels `Ref`/`RawPtr`/`Adt` fields and does not follow predicate
+// arguments), so it is NOT a cut point and the fresh walk expands it — whereas every
+// binding-term shape found so far also carries an ordinary recursive field, which makes
+// it a cut point and reduces the fresh walk to a one-node marker. That is a property of
+// the cut set, not a property of the binding position; see the `Cycle2`/`Guarded` pair
+// in `tests/ui/trust/trust_vtable_key_reentrancy_cycle.rs`, which differ in exactly that
+// field and in exactly whether they crash. A bound is a bound only over the scope it
+// survives; enumerating bounds is not a termination argument until the enumeration
+// covers the RE-ENTRANT edges too. The cycle is now cut at its one crossing point by
+// `crate::KeySkeletonFrame` (an in-progress set that outlives the fresh context, plus a
+// well-founded frame bound), and both of its outcomes are reported under their own
+// refusal tags rather than folded into an existing bucket.
 //
 // The budget STAYS: it is the only bound on a DAG-to-tree expansion whose size is
 // not otherwise capped, and on this crate it now sits 8000/5633 = 1.42x above the
@@ -1187,7 +1212,14 @@ fn strongly_connected_components(edges: &[Vec<usize>], alive: &[bool]) -> Vec<Ve
 /// blow-up that OOM-killed extraction / stalled `place_ty`) exceed it and
 /// collapse to a by-name datatype reference, which keeps the enclosing type
 /// MODELED (not bailed to `Unsupported`) so the Lever-A win lands.
-const MAX_DATATYPE_FIELD_NODES: usize = 64;
+// R142 (MEASURED EXPERIMENT): 64 -> 128. The ×14 ".1 into the
+// compacted-aggregate marker" wall sits in btree node internals over
+// <String, ny_cert::Json> — the node struct's flattened subtree crosses 64
+// while the thousands-of-nodes kernel Expr/Level blowups this bound exists
+// for sit far above 128. Doubling admits the btree nodes structurally while
+// keeping the OOM guard. REVERT IF the R142 gate shows extraction
+// memory/wall regression or the marker rows do not move.
+const MAX_DATATYPE_FIELD_NODES: usize = 128;
 
 /// Compact an oversized recursive-enum/struct field subtree to a small, modeled
 /// placeholder. If the subtree is an aggregate carrying a name (an `Adt` or a
@@ -1708,6 +1740,19 @@ fn convert_ty_inner<'tcx>(
     // lowering loop by the per-function budget. Bailing to `Unsupported` lets
     // extraction finish fast; the compiler's post-extraction checkpoint then
     // reports the overrun as a hard error. Fail-closed: never a proof.
+    //
+    // PRECONDITION, and it did not always hold: this poll bounds nothing unless
+    // an enclosing scope INSTALLED a `VerifyBudgetGuard`. With none installed,
+    // `VERIFY_STEPS` is `u64::MAX` and `current_deadline()` is `None`, so
+    // `budget_exhausted()` is a decrement that can never reach zero — the poll
+    // is live code with a dead effect. MEASURED 2026-08-31: the whole-crate R1
+    // pre-pass (`trust_verify::trust_init_r1_attributions`) installed no budget
+    // at all, so every poll reachable from it — this one included — was inert,
+    // and the pre-pass consumed >=99.7% of `trust-spec-elab`'s compile with no
+    // timeout able to bound it. A guard is now installed around the harvest.
+    // Before trusting this poll from a NEW caller, check that the caller
+    // installs a budget; `grep -rn 'VerifyBudgetGuard::install' compiler/ crates/`
+    // is the whole list.
     if ctx.remaining_nodes % 256 == 0 && trust_types::verify_budget::budget_exhausted() {
         return unsupported_ty(
             "TyKind",
@@ -1826,7 +1871,15 @@ fn convert_ty_inner<'tcx>(
             // `Unsupported` marker. Def-path gated to EXACTLY `Level` (the `Expr`/
             // `ExprKind` datatypes have their own step-5 gates below); `Name` still
             // keeps its existing lowering.
-            if is_level_datatype_target(tcx, adt_def.did()) {
+            // `Vec<T>` carries its ELEMENT TYPE. Without this the RawVec
+            // expansion below mentions `T` nowhere, so `Vec<Term>` and
+            // `Vec<Lit>` extracted identically and every identity check on a
+            // vector-typed field was vacuous. Placed ahead of the other gates
+            // because it is a whole-type replacement, not a refinement of the
+            // structural lowering.
+            if is_std_vec(tcx, adt_def.did()) && args.types().count() >= 1 {
+                TrustTy::Seq { elem: Box::new(convert_ty_inner(tcx, args.type_at(0), ctx)) }
+            } else if is_level_datatype_target(tcx, adt_def.did()) {
                 lower_level_datatype(tcx, ty, *adt_def, args, &name, ctx)
             }
             // Lever A step 5: the kernel `ExprKind` ENUM — the structural
@@ -1944,6 +1997,29 @@ fn convert_ty_inner<'tcx>(
                             convert_ty_inner(tcx, f.ty(tcx, args).skip_normalization(), ctx);
                         if ty_node_count(&field_ty, MAX_DATATYPE_FIELD_NODES + 1)
                             > MAX_DATATYPE_FIELD_NODES
+                            // Trust (F6, Build V): NEVER size-compact a field that
+                            // carries an authenticated arbitrary-precision /
+                            // total-std-map stamp. `compact_oversized_field` spells
+                            // the type as a stampless by-name `Ty::Datatype`,
+                            // dropping the `arbitrary_precision` stamp that the
+                            // bridge's bignum/map panic-freedom gates
+                            // (`is_arbitrary_precision_ty`, the std-map key gate)
+                            // read — silently failing every bignum arithmetic /
+                            // predicate at this field position (e.g. `Rat`'s inner
+                            // `Ratio<BigInt>`) CLOSED. A bignum / total-map is
+                            // modeled OPAQUELY (the SMT value never inspects its
+                            // fields), so keeping the full stamped `Adt` costs only
+                            // its small fixed node count AND preserves the single
+                            // type spelling (no Adt-vs-Datatype struct-id split
+                            // that Lever A otherwise creates). SOUND: the stamp was
+                            // written only by `authenticate_arbitrary_precision`
+                            // after a `StableCrateId` match and stays serde-skipped
+                            // — this changes WHERE an already-authenticated fact is
+                            // read, never WHAT is authenticated.
+                            && !matches!(
+                                &field_ty,
+                                TrustTy::Adt { arbitrary_precision: Some(_), .. }
+                            )
                         {
                             field_ty = compact_oversized_field(&field_ty);
                         }
@@ -1951,6 +2027,56 @@ fn convert_ty_inner<'tcx>(
                     })
                     .collect();
                 ctx.adt_stack.pop();
+                // Trust (F6): AUTHENTICATE arbitrary-precision provenance by the
+                // defining crate's StableCrateId (the num-bigint/num-rational big
+                // types are all STRUCTS, so this is the only stamp site). Empty
+                // allowlist ⇒ `None` ⇒ fail closed.
+                //
+                // Trust (C2): FALLING BACK to the std-map totality stamp — a
+                // default-hasher/allocator, total-key `HashMap`/`BTreeMap` (both
+                // are STRUCTS too). The carrier field holds an `AdtAuth`; a map is
+                // never a bignum, so the two authenticators are disjoint (the
+                // `or_else` only runs when the bignum one declines).
+                //
+                // Trust (Build D): serde_json Value/Map are AUTHENTICATED FIRST
+                // (StableCrateId-gated `authenticate_serde_json`, the SOLE writer of
+                // the `SerdeJson` stamp) so a `Map` gets `SerdeJson(Map)` rather than
+                // a `TotalDrop(None)`/`TotalStdMap` from the drop/map fallback. Empty
+                // allowlist ⇒ `None` ⇒ fail closed (byte-identical to today).
+                let arbitrary_precision = authenticate_serde_json(tcx, adt_def.did(), args)
+                    .map(AdtAuth::SerdeJson)
+                    .or_else(|| {
+                        authenticate_arbitrary_precision(tcx, adt_def.did(), args)
+                            .map(AdtAuth::ArbPrec)
+                    })
+                    .or_else(|| {
+                        // Trust (ROOT2): certify whole-owned-tree DROP-totality from
+                        // the CONCRETE monomorphized `ty` (where a container's real
+                        // `K`/`V` are visible, unlike the element-erased compatibility
+                        // IR the bridge sees). Fold in the C2 total-key stamp so a map
+                        // that is BOTH total-key AND drop-total carries both facts on
+                        // the single carrier:
+                        //   * `TotalDrop(Some(k))` -- drop-total AND a total-`k` std
+                        //     map: the map-key gate reads the inner `k` (no `insert`/
+                        //     `get` regression); the drop classifier admits it
+                        //     field-free.
+                        //   * `TotalDrop(None)`   -- drop-total but NOT a total-key
+                        //     std map: drop admitted field-free; the key gate still
+                        //     declines it.
+                        //   * `TotalStdMap(k)`    -- total-key but NOT drop-certified
+                        //     (a value/key with a user `Drop` may panic): key gate
+                        //     only; drop DECLINES field-free (the C2 reservation).
+                        // SOUND: `tcx_drop_is_total` certifies NO user `Drop` anywhere
+                        // in the owned tree; the stamp is `#[serde(skip)]` (a decoded
+                        // bundle reads `None`, fail-closed).
+                        let map_kind = authenticate_total_std_map(tcx, adt_def.did(), args);
+                        let drop_total = crate::convert::tcx_drop_is_total(tcx, ty);
+                        match (map_kind, drop_total) {
+                            (map, true) => Some(AdtAuth::TotalDrop(map)),
+                            (Some(k), false) => Some(AdtAuth::TotalStdMap(k)),
+                            (None, false) => None,
+                        }
+                    });
                 // Trust: PHASE 4 — a struct/union has NO variants; the `fields`
                 // are its single anonymous constructor's fields.
                 // Trust: enum-disc-full-native — a struct is never disc-index-safe.
@@ -2024,6 +2150,7 @@ fn convert_ty_inner<'tcx>(
                     variants: Vec::new(),
                     disc_index_safe: false,
                     faithful_enum_repr: None,
+                    arbitrary_precision,
                     layout,
                     enum_layout: None,
                     // Trust: W19 — the struct/union kind, read from rustc's AdtDef.
@@ -2178,13 +2305,16 @@ fn convert_ty_inner<'tcx>(
         //     frame-field projection STILL returns `None` there → still havoc'd,
         //     unchanged from the empty-upvars behavior (the across-await staleness
         //     trap is unaffected).
-        //   * native trust-ir-bridge lane: it now resolves the field TYPE from
-        //     these upvars, but the frame VALUE is built as an opaque `Inst::Undef`
-        //     (piece #13 step-2 aggregate lowering), so an `ExtractField` off it
-        //     yields a FRESH UNCONSTRAINED value — the field TYPE is precise but
-        //     the field VALUE is havoc'd, exactly the sound over-approximation for
-        //     "anything the executor left across a suspend". A value held across
-        //     `.await` therefore never carries a stale pre-suspend fact.
+        //   * native trust-ir-bridge lane: the frame lowers as a ZERO-FIELD opaque
+        //     struct on this lane (CORRECTED 2026-08-29: an earlier version of this
+        //     comment claimed the ExtractField "yields a FRESH UNCONSTRAINED value";
+        //     against the zero-field struct it is an OUT-OF-RANGE extract that trust-mc
+        //     refuses as AggregateProjection-unsupported — fail-closed, not havoc).
+        //     Under the stage-1b differential lane witness the frame carries real
+        //     __upvar{i} fields and the Undef-built frame DOES make extracts fresh
+        //     unconstrained values there — the sound over-approximation the original
+        //     text described. A value held across `.await` never carries a stale
+        //     pre-suspend fact on either spelling.
         // Only the captured-arg prefix fields are typed here; a HIGHER field
         // (an across-await saved local, only reached in a body with an `.await`)
         // has no upvar entry and the native lane fails that projection closed
@@ -2482,6 +2612,18 @@ fn is_level_datatype_target(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -
     is_level_path(tcx.crate_name(def_id.krate).as_str(), &crate::safe_def_path_str(tcx, def_id))
 }
 
+/// Is `def_id` the real `alloc::vec::Vec`?
+///
+/// Authenticated through the DIAGNOSTIC ITEM, not through a rendered path.
+/// A def-path string test would also fire on any user type whose path ends
+/// in `Vec` (`mod fake { pub struct Vec<T>(T); }`), and admitting a
+/// look-alike as a sequence is exactly the confusion this lowering exists to
+/// remove. `rustc_diagnostic_item = "Vec"` is attached to the one `Vec` in
+/// `alloc`, so the gate cannot be spoofed from user code.
+fn is_std_vec(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> bool {
+    tcx.is_diagnostic_item(rustc_span::sym::Vec, def_id)
+}
+
 /// Lever A step 5 — is `(crate_name, def_path)` the kernel `Expr` STRUCT (the
 /// `ExprKind` + cached-metadata wrapper that the whole kernel passes around)?
 /// Same crate-name guard + both `def_path_str` renderings as [`is_level_path`].
@@ -2696,6 +2838,414 @@ fn lower_adt_as_datatype<'tcx>(
     }
     ctx.adt_stack.pop();
     TrustTy::Datatype { name: name.to_string(), variants }
+}
+
+/// Trust (F6): TCB allowlist of the ARBITRARY-PRECISION crates whose big-number
+/// arithmetic (`Add`/`Sub`/`Mul`/`Neg`) is trusted-total. Each entry is a
+/// `(crate_name, stable_crate_id)` pair captured FROM THIS TOOLCHAIN compiling
+/// ny-cert.
+///
+/// `StableCrateId` is NOT a portable constant: it hashes the exact crate
+/// version, the cargo pkgid, and the rustc/toolchain version, so it must be
+/// captured from the build that actually resolves these dependencies — it cannot
+/// be hard-coded blindly. This list therefore starts EMPTY. An empty (or stale)
+/// list means [`authenticate_arbitrary_precision`] authenticates NOTHING and the
+/// F6 discharge FAILS CLOSED — byte-identical to the previously-disabled gates.
+/// This is the SOUND default: a wrong/absent id can only LOSE proofs, never
+/// fabricate one.
+///
+/// TO POPULATE: build stage2 with the env var `TRUST_BIGNUM_TCB_LOG=1` set (see
+/// [`authenticate_arbitrary_precision`]), verify ny-cert, and
+/// `grep BIGNUM_TCB_CANDIDATE` in the build/verify log. Each line prints the
+/// live `name`, `scid` (as `0x…`), crate `hash`, and resolved item path. Copy
+/// the `num_bigint` AND `num_rational` `(name, scid)` pairs into this list. BOTH
+/// crates must be listed for `Ratio<BigInt>`/`Ratio<BigUint>` (`BigRational`) to
+/// authenticate — the element type is re-authenticated against this same list.
+const BIGNUM_TCB_ALLOWLIST: &[(&str, u64)] = &[
+    // RE-CAPTURED (R3, aligned toolchain aa3416d81f) via TRUST_BIGNUM_TCB_LOG=1
+    // (`targo trust check -p ny-cert`, .gatelogs/gateR3stampprobe.log) resolving the
+    // SAME num-bigint 0.4.6 / num-rational 0.4.2 (ny Cargo.lock unchanged — the id
+    // drift is the toolchain-substrate jump, not a dependency change; the capture
+    // log shows exactly ONE scid per crate name, no duplicate-crate ambiguity).
+    // StableCrateId::new (rustc_span/src/def_id.rs) hashes cfg_version, so these ids
+    // are only stable because the toolchain build pins cfg_version via
+    // `rust.omit-git-hash = true` in bootstrap.toml (cfg_version = "1.99.0-dev",
+    // commit-INDEPENDENT). WITHOUT that pin every commit changes the ids and F6
+    // silently fails closed. If the pin is removed or num-bigint/num-rational
+    // versions change → RE-CAPTURE (a stale id only FAILS CLOSED — loses the
+    // discharge, never fabricates a proof).
+    // Items authenticated: num_bigint::bigint::BigInt, num_bigint::biguint::BigUint,
+    // num_rational::Ratio (Ratio<BigInt>/<BigUint> re-authenticate the element here).
+    ("num_bigint", 0x05fd11254f06c303),
+    ("num_rational", 0x2dd210af5a766a67),
+];
+
+/// Trust (F6): environment variable that turns on the one-shot candidate log
+/// used to CAPTURE the real [`StableCrateId`]s for [`BIGNUM_TCB_ALLOWLIST`].
+const BIGNUM_TCB_LOG_ENV: &str = "TRUST_BIGNUM_TCB_LOG";
+
+/// Trust (Build D): `(crate_name, stable_crate_id)` for the AUTHENTICATED
+/// serde_json crate, captured FROM THIS TOOLCHAIN compiling ny-cert. Same
+/// `StableCrateId` discipline as [`BIGNUM_TCB_ALLOWLIST`]: the id hashes the exact
+/// crate version + cargo pkgid + toolchain cfg_version, so it is NOT a portable
+/// constant and starts EMPTY. Empty/stale list ⇒ [`authenticate_serde_json`]
+/// returns `None` ⇒ every serde_json op discharge FAILS CLOSED (loses proofs,
+/// never fabricates one — byte-identical to the previously-disabled state).
+///
+/// The SAME cfg_version pin caveat as bignum applies verbatim
+/// (`rust.omit-git-hash = true` in bootstrap.toml pins `cfg_version = "1.99.0-dev"`);
+/// if the pin is removed or serde_json's version changes, RE-CAPTURE. A wrong/absent
+/// id fails closed.
+///
+/// TO POPULATE: build stage2 with `TRUST_SERDE_JSON_TCB_LOG=1` set, run
+/// `targo trust build -p ny-cert` (or the ny-cert verify), and
+/// `grep SERDE_JSON_TCB_CANDIDATE` the log. Copy the printed `(name, scid 0x…)`
+/// pair for serde_json 1.0.150 (ny Cargo.lock) here. A stale id only fails closed.
+const SERDE_JSON_TCB_ALLOWLIST: &[(&str, u64)] = &[
+    // RE-CAPTURED (R3, aligned toolchain aa3416d81f) via TRUST_SERDE_JSON_TCB_LOG=1
+    // (.gatelogs/gateR3stampprobe.log) resolving the SAME serde_json 1.0.150 (ny
+    // Cargo.lock unchanged — the id drift is the toolchain-substrate jump; the
+    // capture log shows exactly ONE scid for the crate name). Stable under
+    // `rust.omit-git-hash=true` (commit-independent cfg_version), same
+    // discipline/caveat as BIGNUM_TCB_ALLOWLIST — RE-CAPTURE if the pin is dropped
+    // or serde_json's version changes; a stale id only FAILS CLOSED.
+    // Authenticates serde_json::value::Value + serde_json::map::Map.
+    ("serde_json", 0x9ff2b873b02615d0),
+];
+
+/// Trust (Build D): environment variable that turns on the one-shot candidate log
+/// used to CAPTURE the real [`StableCrateId`] for [`SERDE_JSON_TCB_ALLOWLIST`].
+const SERDE_JSON_TCB_LOG_ENV: &str = "TRUST_SERDE_JSON_TCB_LOG";
+
+/// Trust (F6): RUSTC-AUTHENTICATED arbitrary-precision provenance.
+///
+/// Returns `Some(kind)` ONLY when `did` names the REAL `num_bigint::BigInt`
+/// (→`Signed`) / `BigUint` (→`Unsigned`), or a `num_rational::Ratio<T>` whose
+/// element `T` is itself one of those authenticated big types
+/// (`Ratio<BigInt>`→`Signed`, `Ratio<BigUint>`→`Unsigned`). Identity is decided
+/// by the DEFINING CRATE's [`StableCrateId`] (matched against
+/// [`BIGNUM_TCB_ALLOWLIST`]) — NOT the spoofable printed def-path — plus the
+/// item's final name. EVERYTHING unmatched (a primitive, a `Ratio` over a
+/// primitive or a nested `Ratio`, an unauthenticated crate, an unlisted id)
+/// returns `None` and FAILS CLOSED.
+///
+/// SOUNDNESS: this is the SOLE writer of the `ArbPrecKind` stamp. A dependency
+/// that re-exports a same-named `BigInt` with panicking arithmetic gets a
+/// DIFFERENT `StableCrateId`, fails the allowlist, and is never authenticated.
+/// With the allowlist empty this returns `None` for everything (fail-closed).
+pub(crate) fn authenticate_arbitrary_precision<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: rustc_hir::def_id::DefId,
+    args: ty::GenericArgsRef<'tcx>,
+) -> Option<ArbPrecKind> {
+    let krate = did.krate;
+    let crate_name = tcx.crate_name(krate);
+    let name_str = crate_name.as_str();
+    let scid = tcx.stable_crate_id(krate).as_u64();
+
+    // One-shot CAPTURE log (env-gated, allowlist-INDEPENDENT): whenever a
+    // num-bigint/num-rational crate is seen, print its live StableCrateId so the
+    // human can populate `BIGNUM_TCB_ALLOWLIST`. This fires regardless of whether
+    // the id is currently allowlisted, so the very first build with an EMPTY
+    // list still reveals the real ids. Precedent for `.as_u64()` on an external
+    // crate: `convert::direct_call_def_path`.
+    if matches!(name_str, "num_bigint" | "num-bigint" | "num_rational" | "num-rational")
+        && std::env::var_os(BIGNUM_TCB_LOG_ENV).is_some()
+    {
+        let crate_hash = tcx.crate_hash(krate);
+        eprintln!(
+            "[BIGNUM_TCB_CANDIDATE] name={name_str} scid={scid:#x} hash={crate_hash:?} item={}",
+            crate::safe_def_path_str(tcx, did)
+        );
+    }
+
+    // AUTHENTICATE the defining crate by (name, StableCrateId). Empty/stale list
+    // ⇒ no match ⇒ fail closed.
+    if !BIGNUM_TCB_ALLOWLIST.iter().any(|&(n, s)| n == name_str && s == scid) {
+        return None;
+    }
+
+    // Resolve the item within the authenticated crate by its FINAL name.
+    match tcx.item_name(did).as_str() {
+        "BigInt" => Some(ArbPrecKind::Signed),
+        "BigUint" => Some(ArbPrecKind::Unsigned),
+        "Ratio" => {
+            // `Ratio<T>`: authenticate ONLY when the element `T` is itself a
+            // DIRECT authenticated `BigInt`/`BigUint`. The recursion re-checks
+            // the element crate's StableCrateId, so `Ratio<BigInt>` requires BOTH
+            // num_rational AND num_bigint in the allowlist. A `Ratio` over a
+            // primitive (`Rational64 = Ratio<i64>` — the SAME ADT name, but an
+            // overflow-capable primitive element), an unauthenticated ADT, or a
+            // nested `Ratio` all fall to `None` (fail-closed).
+            //
+            // RC-C: re-stamp the RATIO with a DISTINCT `Ratio*` kind (never the plain
+            // integer `Signed`/`Unsigned`), so the bridge arith gates can tell a genuine
+            // total integer bignum from a `Ratio<Big>` whose arithmetic PANICS on a zero
+            // denominator (`Ratio::new -> reduce`, `Ratio::new_raw(_, 0)`).
+            let elem = args.type_at(0);
+            let ty::TyKind::Adt(elem_def, elem_args) = elem.kind() else { return None };
+            match tcx.item_name(elem_def.did()).as_str() {
+                "BigInt" | "BigUint" => {
+                    match authenticate_arbitrary_precision(tcx, elem_def.did(), elem_args)? {
+                        ArbPrecKind::Signed => Some(ArbPrecKind::RatioSigned),
+                        ArbPrecKind::Unsigned => Some(ArbPrecKind::RatioUnsigned),
+                        // A `Ratio`/`Ratio`-nested element cannot reach here (the name
+                        // gate above admits only `BigInt`/`BigUint`); decline defensively.
+                        ArbPrecKind::RatioSigned | ArbPrecKind::RatioUnsigned => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Trust (Build D): RUSTC-AUTHENTICATED serde_json provenance. Returns
+/// `Some(SerdeJsonKind::Value|Map)` ONLY when `did` names the REAL
+/// `serde_json::value::Value` / `serde_json::map::Map`, decided by the DEFINING
+/// crate's [`StableCrateId`] ([`SERDE_JSON_TCB_ALLOWLIST`]) plus the item's final
+/// name — NOT the spoofable def-path. SOLE writer of the `SerdeJson` stamp; a user
+/// crate merely NAMED serde_json has a different scid, fails the allowlist, and is
+/// never authenticated. Empty allowlist ⇒ `None` (fail-closed).
+pub(crate) fn authenticate_serde_json<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: rustc_hir::def_id::DefId,
+    _args: ty::GenericArgsRef<'tcx>,
+) -> Option<SerdeJsonKind> {
+    let krate = did.krate;
+    let crate_name = tcx.crate_name(krate);
+    let name_str = crate_name.as_str();
+    let scid = tcx.stable_crate_id(krate).as_u64();
+
+    // One-shot capture log (env-gated, allowlist-INDEPENDENT) — mirror bignum. This
+    // fires regardless of whether the id is allowlisted, so the very first build
+    // with an EMPTY list still reveals the real id to capture.
+    if matches!(name_str, "serde_json" | "serde-json")
+        && std::env::var_os(SERDE_JSON_TCB_LOG_ENV).is_some()
+    {
+        let crate_hash = tcx.crate_hash(krate);
+        eprintln!(
+            "[SERDE_JSON_TCB_CANDIDATE] name={name_str} scid={scid:#x} hash={crate_hash:?} item={}",
+            crate::safe_def_path_str(tcx, did)
+        );
+    }
+
+    // AUTHENTICATE the defining crate by (name, StableCrateId). Empty/stale ⇒ fail
+    // closed.
+    if !SERDE_JSON_TCB_ALLOWLIST.iter().any(|&(n, s)| n == name_str && s == scid) {
+        return None;
+    }
+
+    // Resolve the item within the authenticated crate by its FINAL name. `Value` is
+    // the enum; `Map` is the object struct. Both are defined IN serde_json
+    // (coherence: no user crate can add inherent methods or a Drop impl to them).
+    match tcx.item_name(did).as_str() {
+        "Value" => Some(SerdeJsonKind::Value),
+        "Map" => Some(SerdeJsonKind::Map),
+        _ => None,
+    }
+}
+
+/// Trust (F6): true iff `krate` is a StableCrateId-AUTHENTICATED arbitrary-precision
+/// crate — `num_bigint` / `num_rational` from [`BIGNUM_TCB_ALLOWLIST`]. Gated on the
+/// crate NAME **and** its `StableCrateId` (the SAME un-spoofable authentication
+/// [`authenticate_arbitrary_precision`] uses): a user crate merely NAMED `num_rational`
+/// has a different id and returns `false`.
+///
+/// Used to EXCLUDE these trusted-bignum deps from the native callee bundle
+/// (`native_trust_ir_direct_local_fn_callees`). Their arith/sign/accessor/Zero/One/
+/// cmp/Clone panic-freedom is discharged by the F6/F7 recognizers at the CONCRETE
+/// caller call site (where the receiver is a stamped `Ratio<BigInt>`); bundling their
+/// GENERIC (`T`-unbound) bodies re-verifies nothing (their `<T as Op>::op` calls can
+/// never authenticate) and poisons every Rat-using caller. SOUND: a method NOT
+/// F6-recognized simply stays an absent-callee may-panic → UNKNOWN (fail-closed); a
+/// wrong/absent id only LOSES the exclusion (crate stays bundled → its generic body
+/// still fails closed), never fabricates a proof.
+pub fn is_authenticated_bignum_crate(tcx: TyCtxt<'_>, krate: rustc_hir::def_id::CrateNum) -> bool {
+    let name = tcx.crate_name(krate);
+    let scid = tcx.stable_crate_id(krate).as_u64();
+    BIGNUM_TCB_ALLOWLIST
+        .iter()
+        .any(|&(n, s)| n == name.as_str() && s == scid)
+}
+
+/// Trust (Route A): true iff `krate` is the StableCrateId-AUTHENTICATED serde_json
+/// crate (`SERDE_JSON_TCB_ALLOWLIST`) — the SAME
+/// un-spoofable authentication [`authenticate_serde_json`] uses (crate NAME **and**
+/// its `StableCrateId`). A user crate merely NAMED serde_json has a different id and
+/// returns `false`. Used to EXCLUDE serde_json's generic `#[inline]` `Value::index`
+/// from the native callee bundle; a wrong/absent id only LOSES the exclusion (body
+/// stays bundled → its generic form still fails closed), never fabricates a proof.
+/// Mirrors [`is_authenticated_bignum_crate`] line-for-line.
+pub fn is_authenticated_serde_json_crate(
+    tcx: TyCtxt<'_>,
+    krate: rustc_hir::def_id::CrateNum,
+) -> bool {
+    let name = tcx.crate_name(krate);
+    let scid = tcx.stable_crate_id(krate).as_u64();
+    SERDE_JSON_TCB_ALLOWLIST
+        .iter()
+        .any(|&(n, s)| n == name.as_str() && s == scid)
+}
+
+/// Trust (C2): true iff `k` is a key type whose std `Hash`+`Eq` (and derived
+/// `Ord`) run NO user code, so a `HashMap`/`BTreeMap` navigation over it cannot
+/// panic. Decided HERE on the CONCRETE rustc type (before the bridge erases the
+/// hasher/allocator), mirroring the bridge's `is_std_total_*_key_ty` arms:
+///   * a primitive int/`bool`/`char` or `str` — machine hash/eq/compare;
+///   * a slice/array/tuple of such (derived, elementwise);
+///   * an element-free std leaf (`String`/`Ordering`/`Duration`/`NonZero` — the
+///     [`convert::is_element_free_total_std_adt`] set) or an AUTHENTICATED
+///     num-bigint `BigInt`/`BigUint` / `num_rational::Ratio<Big…>` (via the SAME
+///     `StableCrateId` gate F6 uses): each `Hash`/`Eq` bottoms out in primitives
+///     (num-rational's `Eq` is a bignum cross-multiply — no overflow — and its
+///     `Hash` an `is_zero`-guarded continued-fraction walk, both user-code-free).
+///
+/// FAIL-CLOSED for a `Float` (not `Eq`/`Hash`), a user ADT (whose `Hash`/`Eq`/
+/// `Ord` may panic), or an unresolved/param type. References are peeled (a
+/// `&str`/`&String`/`&i32` key). This bakes K-totality into the extraction stamp
+/// (so a `HashMap`/`BTreeMap` MUTATION driving `K::hash`/`K::eq`/`K::cmp` on the
+/// OWNED key discharges). It does NOT by itself close the `get::<Q>` READ hole:
+/// the earlier claim that "a total std leaf `K` only `Borrow`s to total std types"
+/// is FALSE — the ORPHAN RULE permits a fully-concrete `impl Borrow<LocalQ> for
+/// String` (local `Q`), so a stamped std leaf `K` CAN `Borrow` to a panicking user
+/// `Q`. The read hole is closed on the BRIDGE side: `read_query_arg_is_std_total`
+/// gates the erased query `Q` (recovered as the `k: &Q` argument type) with this
+/// SAME total-key predicate, so a user `Q`/`Borrow<Q>` fails closed there.
+fn tcx_key_is_std_total<'tcx>(tcx: TyCtxt<'tcx>, k: ty::Ty<'tcx>) -> bool {
+    let mut k = k;
+    while let TyKind::Ref(_, inner, _) = k.kind() {
+        k = *inner;
+    }
+    match k.kind() {
+        TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Uint(_) | TyKind::Str => true,
+        // A slice/array key hashes/compares elementwise; a tuple key uses the
+        // derived elementwise `Hash`/`Eq`/`Ord`.
+        TyKind::Slice(elem) | TyKind::Array(elem, _) => tcx_key_is_std_total(tcx, *elem),
+        TyKind::Tuple(elems) => elems.iter().all(|e| tcx_key_is_std_total(tcx, e)),
+        TyKind::Adt(def, adt_args) => {
+            let did = def.did();
+            crate::convert::is_element_free_total_std_adt(tcx, did)
+                || authenticate_arbitrary_precision(tcx, did, adt_args).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Trust (C2): RUSTC-AUTHENTICATED standard-map totality provenance — the
+/// panic-free-`get`/`insert`/`new` unblocker for `HashMap`/`BTreeMap`.
+///
+/// Returns `Some(TotalMapKind::HashDefault)` ONLY for a REAL
+/// `std::collections::HashMap<K, V, S>` whose hasher `S` is the std DEFAULT
+/// `std::hash::random::RandomState` (SipHash — never panics) AND whose key `K`
+/// is total-`Hash`+`Eq` ([`tcx_key_is_std_total`]); resp.
+/// `Some(TotalMapKind::OrdGlobal)` for a `BTreeMap<K, V, A>` with the std
+/// `Global` allocator and a total-`Ord` key. EVERYTHING else — a custom hasher,
+/// a user `RandomState` LOOKALIKE (its defining crate is NOT the reserved
+/// `std`), a custom allocator, a panicking-`Hash`/`Eq`/`Ord` key, a non-map ADT,
+/// or a malformed/short arg list — returns `None` and FAILS CLOSED.
+///
+/// SOUNDNESS. (1) The map/hasher/allocator identities are decided by the
+/// RESERVED crate name (`std`/`alloc`, which no user crate can claim — the
+/// un-spoofable anchor) PLUS the exact defining def-path, never a spoofable
+/// printed name. (2) K-totality is BAKED INTO the stamp HERE, where the CONCRETE
+/// `K` is visible — see [`tcx_key_is_std_total`] for why this closes the
+/// call-site `Borrow<Q>` erasure hole. This is the SOLE writer of a
+/// `TotalStdMap` stamp; being `#[serde(skip)]`, a decoded/shadow bundle reads
+/// `None` (never authenticated).
+fn authenticate_total_std_map<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    did: rustc_hir::def_id::DefId,
+    args: ty::GenericArgsRef<'tcx>,
+) -> Option<TotalMapKind> {
+    // Un-spoofable identity: DEFINING crate is the reserved sysroot `std`/`alloc`
+    // (no user crate can be named these) AND the exact defining def-path matches.
+    // SOUNDNESS (crate-name forgery): rustc does NOT reserve `std`/`alloc`, so
+    // `tcx.crate_name(item.krate) == want_crate` is SPOOFABLE — a dep compiled with
+    // `--crate-name std` prints "std". Bind the un-forgeable sysroot `StableCrateId`
+    // (any genuine core/alloc/std crate) PLUS the exact defining def-path: together
+    // they pin the ONE real HashMap/BTreeMap/BTreeSet and decline a like-named
+    // impostor whose insert/`Ord`/`Hash` path can panic. (`_want_crate` retained for
+    // call-site self-documentation; the scid bind subsumes the printed-name check.)
+    let is_reserved =
+        |item: rustc_hir::def_id::DefId, _want_crate: rustc_span::Symbol, want_path: &str| {
+            crate::convert::is_real_sysroot_crate(tcx, item.krate)
+                && crate::safe_def_path_str(tcx, item) == want_path
+        };
+    // Recover a TYPE generic argument WITHOUT panicking on a malformed/short arg
+    // list (fail closed on the unexpected shape).
+    let type_arg = |i: usize| args.get(i).and_then(|a| a.as_type());
+
+    // HashMap<K, V, S = RandomState>: authenticate S == the std default hasher.
+    if is_reserved(did, rustc_span::sym::std, "std::collections::hash::map::HashMap") {
+        let (Some(k), Some(s)) = (type_arg(0), type_arg(2)) else {
+            return None;
+        };
+        let ty::TyKind::Adt(s_def, _) = s.kind() else {
+            return None;
+        };
+        let s_did = s_def.did();
+        // SOUNDNESS (crate-name forgery): bind `S` to a genuine sysroot crate by scid,
+        // not the spoofable printed `std` name; the exact def-path below pins RandomState.
+        let s_is_default_random_state = crate::convert::is_real_sysroot_crate(tcx, s_did.krate) && {
+            // The real std `RandomState` (SipHash — panic-free). Accept BOTH the
+            // defining and re-export spellings; both are in the reserved `std`
+            // crate, so the crate-name anchor keeps this sound. A custom hasher
+            // or a `BuildHasherDefault<…>` renders a DIFFERENT path and fails.
+            let p = crate::safe_def_path_str(tcx, s_did);
+            p == "std::hash::random::RandomState"
+                || p == "std::collections::hash_map::RandomState"
+        };
+        if !s_is_default_random_state {
+            return None;
+        }
+        return tcx_key_is_std_total(tcx, k).then_some(TotalMapKind::HashDefault);
+    }
+
+    // BTreeMap<K, V, A = Global>: authenticate A == the std `Global` allocator.
+    if is_reserved(did, rustc_span::sym::alloc, "alloc::collections::btree::map::BTreeMap") {
+        let (Some(k), Some(a)) = (type_arg(0), type_arg(2)) else {
+            return None;
+        };
+        let ty::TyKind::Adt(a_def, _) = a.kind() else {
+            return None;
+        };
+        let a_did = a_def.did();
+        // SOUNDNESS (crate-name forgery): bind `A` to a genuine sysroot crate by scid,
+        // not the spoofable printed `alloc` name; the exact def-path below pins Global.
+        let a_is_global = crate::convert::is_real_sysroot_crate(tcx, a_did.krate)
+            && crate::safe_def_path_str(tcx, a_did) == "alloc::alloc::Global";
+        if !a_is_global {
+            return None;
+        }
+        return tcx_key_is_std_total(tcx, k).then_some(TotalMapKind::OrdGlobal);
+    }
+
+    // Build D: BTreeSet<T, A = Global> is a newtype over BTreeMap<T, SetValZST, A>:
+    // insert/contains navigate the SAME K::cmp tree and allocate via A, and the ZST
+    // value has no drop code — so its totality reduces EXACTLY to the BTreeMap
+    // OrdGlobal gate. Reuse the OrdGlobal stamp. ARG LAYOUT DIFFERS from BTreeMap:
+    // key = arg0, allocator = arg1 (no V), so a mis-copy fails closed via the let-else.
+    if is_reserved(did, rustc_span::sym::alloc, "alloc::collections::btree::set::BTreeSet") {
+        let (Some(k), Some(a)) = (type_arg(0), type_arg(1)) else {
+            return None;
+        };
+        let ty::TyKind::Adt(a_def, _) = a.kind() else {
+            return None;
+        };
+        let a_did = a_def.did();
+        // SOUNDNESS (crate-name forgery): bind `A` to a genuine sysroot crate by scid,
+        // not the spoofable printed `alloc` name; the exact def-path below pins Global.
+        let a_is_global = crate::convert::is_real_sysroot_crate(tcx, a_did.krate)
+            && crate::safe_def_path_str(tcx, a_did) == "alloc::alloc::Global";
+        if !a_is_global {
+            return None;
+        }
+        return tcx_key_is_std_total(tcx, k).then_some(TotalMapKind::OrdGlobal);
+    }
+
+    None
 }
 
 fn lower_enum_adt<'tcx>(
@@ -2938,6 +3488,14 @@ fn lower_enum_adt<'tcx>(
     // `canonical_tag_repr` (a false NotRun). The legacy lane and every
     // ineligible enum get `None` — byte-identical historical behavior.
     let eligible = faithful_scalars() && !compacted && !variants.is_empty() && fields_admissible;
+    if std::env::var_os("TRUST_ENUM_ELIGIBILITY_DEBUG").is_some() {
+        eprintln!(
+            "[trust_enum_eligibility] {name}: faithful={} compacted={compacted} variants={} \
+             fields_admissible={fields_admissible} eligible={eligible}",
+            faithful_scalars(),
+            variants.len(),
+        );
+    }
     let faithful_enum_repr = if eligible { extractor_enum_repr_hint(adt_def) } else { None };
     // Trust (B3-3): the concrete enum layout twin — filled ONLY alongside the
     // faithful first-class spelling (an ineligible enum keeps the flat view,
@@ -2959,6 +3517,36 @@ fn lower_enum_adt<'tcx>(
     } else {
         None
     };
+    // Trust (F6): the num-bigint/num-rational big types are STRUCTS, never enums,
+    // so an enum is never arbitrary-precision.
+    //
+    // Trust (Build D): serde_json's `Value` IS an enum — AUTHENTICATE it by the
+    // defining crate's StableCrateId (`authenticate_serde_json`, the SOLE writer of
+    // the `SerdeJson` stamp). This is the ONLY enum that ever carries a stamp; every
+    // other enum declines and resolves to `None`. Empty allowlist ⇒ fail closed.
+    let arbitrary_precision = authenticate_serde_json(tcx, adt_def.did(), args)
+        .map(AdtAuth::SerdeJson)
+        .or_else(|| {
+            // Trust (ROOT2 enum parity): certify whole-owned-tree DROP-totality from
+            // the CONCRETE monomorphized enum `ty` — every variant's every field —
+            // exactly as the struct arm does. An enum whose entire owned tree carries
+            // no user `Drop` (e.g. `Result<Rat, BridgeError>`, `Option<enum>`) has
+            // drop glue that runs NO user code, so its `[trust-drop-glue-assumption]
+            // may panic` obligation is vacuously dischargeable field-free. The
+            // `authenticate_total_std_map` fold is kept identical to the struct arm
+            // for shape parity; an enum is never a std map, so it returns `None` and
+            // the stamp is always `TotalDrop(None)` here (the `(Some(k), false)` arm
+            // is unreachable for enums). SOUND: `tcx_drop_is_total` (convert.rs) fails
+            // closed on ANY user `Drop`, non-monomorphic type, or fuel-bail, and
+            // the carrier is `#[serde(skip)]` (a decoded bundle reads `None`).
+            let map_kind = authenticate_total_std_map(tcx, adt_def.did(), args);
+            let drop_total = crate::convert::tcx_drop_is_total(tcx, ty);
+            match (map_kind, drop_total) {
+                (map, true) => Some(AdtAuth::TotalDrop(map)),
+                (Some(k), false) => Some(AdtAuth::TotalStdMap(k)),
+                (None, false) => None,
+            }
+        });
     // Trust: W19 — this arm is reached ONLY for a genuine enum (`lower_enum_adt` is
     // called after the `!is_struct() && !is_union()` guard), so stamp `Enum`. The
     // setter recognizer declines it (an enum is outside the single-anonymous-
@@ -2969,6 +3557,7 @@ fn lower_enum_adt<'tcx>(
         variants,
         disc_index_safe,
         faithful_enum_repr,
+        arbitrary_precision,
         layout: None,
         enum_layout,
         adt_kind: Some(trust_types::AdtKind::Enum),
@@ -3978,6 +4567,8 @@ mod tests {
             variants: vec![],
             disc_index_safe: false,
             faithful_enum_repr: None,
+            // Not a bignum/std-map: the unauthenticated (fail-closed) default.
+            arbitrary_precision: None,
             layout: None,
             enum_layout: None,
             adt_kind: None,

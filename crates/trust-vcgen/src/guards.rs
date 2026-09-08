@@ -512,25 +512,26 @@ fn latest_same_block_bool_definition(
     // SwitchInt block that consumes it, so the bool def is one block back. A local
     // with a single static definition dominates all its uses (MIR never reads an
     // uninitialized local), so resolve the UNIQUE defining block when it flows
-    // forward unconditionally (`Goto`). Fail-closed on 0 or >1 defining blocks: a
-    // multiply-assigned local's reaching def is path-dependent and may not
-    // dominate. Bounded recursion: the unique block is necessarily not `block`
-    // (which has no def for `local`), and resolves the def directly there.
-    let mut defining: Option<&BasicBlock> = None;
-    for candidate in &func.body.blocks {
-        let defines_here = candidate.stmts.iter().any(|stmt| {
-            matches!(stmt, Statement::Assign { place, .. }
-                if place.local == local && place.projections.is_empty())
-        });
-        if defines_here {
-            if defining.is_some() {
-                return None;
-            }
-            defining = Some(candidate);
-        }
-    }
+    // forward unconditionally (`Goto`). THE RECURSION TERMINATES: the arm below only
+    // recurses into a block whose terminator is a `Goto`, and control reaches here only
+    // when the loop above walked every statement of `block` without finding a
+    // whole-local `Assign` of `local`. So if `local`'s one write is IN `block` it is a
+    // `Call` destination, a `TailCall`, or an unlocatable one — every one of which
+    // leaves `block` with a terminator that is not a `Goto`, and the arm declines
+    // instead of re-entering. Any other defining block is a different block, and the
+    // recursive call finds its definition in the loop above.
+    //
+    // THE UNIQUENESS QUESTION BELONGS TO THE SEAM. The dominance argument needs the
+    // definition to be unique on EVERY channel a local can be written through, and it
+    // is false outright for a PARAMETER; `local_defs::unique_defining_block` answers
+    // both, and its doc names the two kernel-certified false proofs (`p7`, `p8`) that
+    // a hand-rolled `Statement::Assign`-only scan here produced. The SAME-BLOCK arm
+    // above needs no such check: that definition precedes the block's own terminator
+    // by program order, whoever wrote the local first.
+    let defining = crate::local_defs::unique_defining_block(func, local)
+        .and_then(|index| func.body.blocks.get(index))?;
     match defining {
-        Some(b) if matches!(b.terminator, Terminator::Goto(_)) => {
+        b if matches!(b.terminator, Terminator::Goto(_)) => {
             latest_same_block_bool_definition(func, b, local)
         }
         _ => None,
@@ -987,7 +988,24 @@ fn deref_through_ref(func: &VerifiableFunction, operand: &Operand) -> Option<Ope
     None
 }
 
+/// The callee and first argument of the `Call` terminator that defines whole-local
+/// `local`, when that call is the ONLY thing that gives `local` a value.
+///
+/// Every caller's conclusion is about the value `local` holds at a LATER READ, so the
+/// call has to be the definition reaching that read. An earlier revision left that as a
+/// REQUIREMENT on the three callers and argued it was met because rustc never makes a
+/// parameter a `Call` destination — an argument from probing, and one that says nothing
+/// about a second `Call` or an `Assign` writing the same local. The requirement is now
+/// discharged HERE, by the seam: `local_defs::holds_one_value` counts a parameter's
+/// ENTRY definition and every `trust_types::LocalWrite` channel, so any local that can
+/// hold a second value — from a parameter's entry value, another `Call`, an `Assign`, a
+/// projected store, a `SetDiscriminant`/`Deinit`/`Drop`, or an unlocatable pointer
+/// write — is refused before any caller sees an answer. Declining is monotone: each
+/// caller loses a hypothesis, so a PROVE can become a FAIL and never the reverse.
 fn call_defining_local(func: &VerifiableFunction, local: usize) -> Option<(&str, &Operand)> {
+    if !crate::local_defs::holds_one_value(func, local) {
+        return None;
+    }
     for block in &func.body.blocks {
         let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
             continue;
@@ -1012,10 +1030,11 @@ fn call_defining_local(func: &VerifiableFunction, local: usize) -> Option<(&str,
 /// to a slice length (`slice_len_formula(recv)` is `Some`) — true for the `str`/
 /// `&[u8]` receiver of the real `str::as_bytes`, and FAIL-CLOSED (`None`) for any
 /// other receiver (e.g. a user `Foo::as_bytes` whose `&Foo` has no slice length),
-/// so a non-length-preserving impostor cannot borrow a bogus length. Uses the
-/// unique-def `call_defining_local` (fail-closed on ambiguity). An UNguarded
-/// `recv.as_bytes()[i]` still REFUTES: `recv`'s length var is unconstrained without
-/// the guard, so `0 < len` stays unprovable.
+/// so a non-length-preserving impostor cannot borrow a bogus length. Resolves the
+/// defining call with [`call_defining_local`], which returns the FIRST `Call` whose
+/// dest is `local` — see its own note for what that does and does not establish.
+/// An UNguarded `recv.as_bytes()[i]` still REFUTES: `recv`'s length var is
+/// unconstrained without the guard, so `0 < len` stays unprovable.
 pub(crate) fn as_bytes_length_receiver(
     func: &VerifiableFunction,
     local: usize,
@@ -1537,28 +1556,14 @@ pub(crate) fn build_checked_arith_facts(func: &VerifiableFunction) -> Vec<Formul
     }
     // Soundness gate (issue 4): every fact produced here is conjoined onto EVERY
     // sep VC in the function (see generate.rs), so each must be a function-wide
-    // invariant — not a value a later reassignment can falsify. Count how many
-    // times each local is assigned (unprojected statement-assigns + call dests);
-    // a fact `payload == a OP b` is emitted only when the payload and each
-    // operand base-local is assigned at most once (SSA-stable). A multiply-
-    // assigned local could hold a different value at the VC site than at the
-    // checked-arith site, which would make the global conjunction unsound.
-    let mut assign_count: FxHashMap<usize, usize> = FxHashMap::default();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, .. } = stmt
-                && place.projections.is_empty()
-            {
-                *assign_count.entry(place.local).or_insert(0) += 1;
-            }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.projections.is_empty()
-        {
-            *assign_count.entry(dest.local).or_insert(0) += 1;
-        }
-    }
-    let stable_local = |l: usize| assign_count.get(&l).copied().unwrap_or(0) <= 1;
+    // invariant — not a value a later reassignment can falsify. A fact
+    // `payload == a OP b` is emitted only when the payload and each operand
+    // base-local holds AT MOST ONE VALUE. A multiply-valued local could hold a
+    // different value at the VC site than at the checked-arith site, which would
+    // make the global conjunction unsound — and a PARAMETER's first explicit store
+    // is already its second value, which a block scan cannot see
+    // (`crate::local_defs`).
+    let stable_local = |l: usize| crate::local_defs::value_count(func, l).is_at_most(1);
     let stable_operand = |op: &Operand| match op {
         Operand::Constant(_) => true,
         Operand::Copy(p) | Operand::Move(p) => stable_local(p.local),
@@ -1893,9 +1898,12 @@ fn extract_block_definitions_until_impl(
                 // (`o@k.field == op`) and the demux re-injection; this is the READ-ALIASING
                 // sibling — the `*r = b` Deref-store through the `&mut o` is not tracked as a
                 // write to `o`, so the payload symbol stays stale. Emit a FRESH dest (skip
-                // the equality) so the two reads are independent. Fail-closed: dropping the
-                // equality only turns PROVE -> not-proved, never a false-FAIL; the safe
-                // non-mutated form (no `&mut o`) is unaffected and still proves.
+                // the equality) so the two reads are independent. Fail-closed FOR THE
+                // HYPOTHESIS: dropping the equality only turns PROVE -> not-proved, never a
+                // false-FAIL; the safe non-mutated form (no `&mut o`) is unaffected and
+                // still proves. The dest WRITE stays in the gen-sets via
+                // `generate::extend_with_assigned_place_dests` (a skipped def must never
+                // hide the write itself — the dropped-def write-visibility class).
                 if let Operand::Copy(p) | Operand::Move(p) = operand
                     && p.projections
                         .iter()
@@ -2007,11 +2015,16 @@ fn extract_block_definitions_until_impl(
                     // GLOBAL `build_modulo_bound_facts` is SUFFICIENT to discharge
                     // the index (with the `len>0` guard), so DROP this nonlinear
                     // scalar def rather than emit a term no linear backend can
-                    // parse. DROP-ONLY: removing a hypothesis can only WEAKEN a
-                    // PROVE, never manufacture a false-PROVE; the bound fact
-                    // compensates for the common bound/comparison uses. A CONSTANT
-                    // divisor keeps its def (`% k` is a smaller, often-handled term
-                    // whose exact value may matter).
+                    // parse. DROP-ONLY for the HYPOTHESIS: removing it can only
+                    // WEAKEN a PROVE; the bound fact compensates for the common
+                    // bound/comparison uses. The WRITE itself must stay visible
+                    // regardless — `generate::extend_with_assigned_place_dests`
+                    // keeps the destination in every gen-set, because a dropped
+                    // def that also vanished from the write domain let stale
+                    // bare facts unify across the assignment (the measured
+                    // false-proof class in `tests/dropped_def_write_visibility.rs`).
+                    // A CONSTANT divisor keeps its def (`% k` is a smaller,
+                    // often-handled term whose exact value may matter).
                     if matches!(op, trust_types::BinOp::Rem)
                         && !signed
                         && !matches!(rhs, Operand::Constant(_))
@@ -2052,11 +2065,23 @@ fn extract_block_definitions_until_impl(
                     // picking an out-of-range operand — and the pre-Eq order is
                     // the same clobber-dedup rationale as `shift_result_range`).
                     // `Mul` and width>64 have no encoding in this lane: DROP
-                    // the def (fail-closed — an ungrounded value can only
-                    // demote a row toward runtime-checked, never mis-decide
-                    // it), exactly the call form's `WrappingMul => None`
+                    // the def, exactly the call form's `WrappingMul => None`
                     // boundary. An Add/Sub/Mul whose operand width is UNKNOWN
                     // is likewise dropped, never modeled unbounded.
+                    //
+                    // SOUNDNESS OF THE DROP: it is fail-closed for the
+                    // HYPOTHESIS only — an ungrounded value can only demote a
+                    // row. It is NOT fail-closed for the version-map
+                    // side-channel: the gen-sets used to be derived from the
+                    // extracted defs, so this `continue` also deleted the WRITE
+                    // from write visibility, downstream reads rendered BARE,
+                    // and rename-exempt bare facts (preconditions, path/
+                    // semantic guards) unified across the invisible write — a
+                    // measured false PROOF (`tests/dropped_def_write_visibility.rs`).
+                    // The write stays visible via
+                    // `generate::extend_with_assigned_place_dests`, which
+                    // unions every raw statement destination into the gen-sets
+                    // regardless of whether a def was emitted here.
                     if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
                         let Some(width) = width else { continue };
                         let Some(wrap) =
@@ -2138,6 +2163,20 @@ fn extract_block_definitions_until_impl(
                 // Pushed BEFORE the `dest == source` equality for the same
                 // clobber-dedup ordering reason as the two ranges above.
                 push_unsize_slice_len(func, &dest_name, op, to_ty, &mut defs, &mut seen_dests);
+                // Trust (verified-sysroot §5 step 3, slice 2): when the expose
+                // cast's SOURCE pointer provably roots at a model-covered
+                // allocation (`&x`/`&raw x` of a whole local of statically
+                // sized scalar/array sort, through unique thin-identity defs),
+                // bound the minted ADDRESS by the model's two axioms — never
+                // null, one-past-end representable. This is what turns the
+                // `*mut T::add::precondition_check` overflow legs from
+                // STATABLE into PROVABLE on covered shapes. Pushed BEFORE the
+                // `dest == source` equality (clobber-dedup ordering, as the
+                // ranges above). Fail-closed: an unrooted / reassigned /
+                // projected / non-covered source mints NOTHING.
+                if let Some(bounds) = alloc_model_expose_root_bounds(func, op, to_ty, &dest_name) {
+                    defs.push(bounds);
+                }
                 match cast_definition_formula(func, place, op, to_ty) {
                     Some(formula) => formula,
                     None => continue,
@@ -2172,7 +2211,10 @@ fn extract_block_definitions_until_impl(
                 // the `arr[i]` bounds obligation on the mutated payload `i==b` (OOB). The downstream
                 // kill machinery does not remove it (the demux re-injects, and the `*r=b` Deref-store
                 // through the returned `&mut` is not tracked as a write to `o`), so drop it at the
-                // SOURCE. Fail-closed: losing a construction fact only turns PROVE -> not-proved.
+                // SOURCE. Fail-closed FOR THE HYPOTHESIS: losing a construction fact only turns
+                // PROVE -> not-proved. The aggregate WRITE itself stays gen-set-visible via
+                // `generate::extend_with_assigned_place_dests` even when every field fact is
+                // suppressed here.
                 if !(place.projections.is_empty() && local_is_mutably_borrowed(func, place.local)) {
                     for (field_name, field_def) in field_defs.drain(..).rev() {
                         if seen_dests.insert(field_name) {
@@ -2272,6 +2314,17 @@ fn extract_block_definitions_until_impl(
     // dedup above only catches a redefined *destination*; this catches a
     // redefined *operand*. Dropping a fact only removes a hypothesis, so it can
     // introduce a false-FAIL but never a false-PROVE.
+    //
+    // KNOWN RESIDUAL (intra-extraction sibling of the dropped-def
+    // write-visibility class): `clobbered` is keyed on EMITTED def lhs only, so
+    // a dropped-def write (bare Mul, non-constant Rem, ...) between a def and
+    // block end does not clobber an earlier extracted fact reading the
+    // overwritten name. The UNversioned consumers (hardened arm recovery) can
+    // still see that stale fact; the versioned consumers are protected by the
+    // establish-point stamp, and the inter-block channels by
+    // `generate::extend_with_assigned_place_dests`. Closing it here needs
+    // per-def statement indices — separable, tracked by the write-visibility
+    // fixture family.
     let mut clobbered: FxHashSet<String> = FxHashSet::default();
     defs.retain(|d| {
         let lhs = match d {
@@ -3837,30 +3890,6 @@ fn base_collection_step(func: &VerifiableFunction, cur: usize) -> Option<usize> 
     None
 }
 
-/// Number of WHOLE-local definitions of `local` (a projection-free `Statement::Assign`
-/// or a `Call` dest) across all blocks. `> 1` means the local is conditionally merged
-/// or reassigned, so its base collection — and hence its length — is AMBIGUOUS.
-pub(crate) fn whole_local_def_count(func: &VerifiableFunction, local: usize) -> usize {
-    let mut n = 0;
-    for b in &func.body.blocks {
-        for s in &b.stmts {
-            if let Statement::Assign { place, .. } = s
-                && place.local == local
-                && place.projections.is_empty()
-            {
-                n += 1;
-            }
-        }
-        if let Terminator::Call { dest, .. } = &b.terminator
-            && dest.local == local
-            && dest.projections.is_empty()
-        {
-            n += 1;
-        }
-    }
-    n
-}
-
 /// Trace to the base collection local, returning `None` if ANY local on the trace
 /// chain (start..base inclusive) has more than one whole-local definition — i.e. is a
 /// conditional merge `let v = if c { a } else { b }`. Tying a length to such a local
@@ -3872,13 +3901,13 @@ pub(crate) fn base_collection_local_unique(
     start: usize,
 ) -> Option<usize> {
     let mut cur = start;
-    if whole_local_def_count(func, cur) > 1 {
+    if crate::local_defs::value_count(func, cur).may_exceed(1) {
         return None;
     }
     for _ in 0..(func.body.locals.len() + 4) {
         match base_collection_step(func, cur) {
             Some(n) if n != cur => {
-                if whole_local_def_count(func, n) > 1 {
+                if crate::local_defs::value_count(func, n).may_exceed(1) {
                     return None;
                 }
                 cur = n;
@@ -3932,12 +3961,12 @@ pub(crate) fn coll_len_var_place(func: &VerifiableFunction, base: &trust_types::
 ///    self.b[0] }` would falsely PROVE — is structurally impossible here.
 ///  * hop uniqueness: the underlying local trace already fails closed on any hop
 ///    with more than one whole-local definition (conditional merge / reassignment,
-///    call dests included via `whole_local_def_count`).
+///    call dests included via `local_defs::value_count`).
 ///  * hop reseat exclusion: NO local on the trace chain may be mutably or raw
 ///    borrowed ([`local_is_mutably_borrowed`] — covers a `*p = other_ref` reseat
 ///    through a `&mut`-to-the-temp that leaves the whole-local def count at 1) nor
 ///    written through a projection ([`local_has_projected_write`] — covers `*t = v`
-///    / projected call dests that `whole_local_def_count` does not count).
+///    / projected call dests that `local_defs::value_count` does not count).
 ///  * root immutability & stability: the field-reborrow gates (root is a SHARED
 ///    reference, root storage is stable, the path is `[Deref, Field+]` only, and no
 ///    interior-mutability wrapper is crossed) guarantee the field place denotes ONE
@@ -4005,7 +4034,8 @@ fn shared_stable_field_reborrow_place(
     func: &VerifiableFunction,
     leaf: usize,
 ) -> Option<trust_types::Place> {
-    let Rvalue::Ref { mutable: false, place } = crate::unique_whole_local_def(func, leaf)? else {
+    let Rvalue::Ref { mutable: false, place } = crate::local_defs::unique_value_def(func, leaf)?
+    else {
         return None;
     };
     let (first, fields) = place.projections.split_first()?;
@@ -4070,7 +4100,7 @@ fn ty_is_interior_mut_wrapper(ty: &Ty) -> bool {
 }
 
 /// Any store through a PROJECTION of `local` (`(*l).f = v`, `l.f = v`, a projected
-/// call dest, `SetDiscriminant`/`Deinit`) — writes `whole_local_def_count` does NOT
+/// call dest, `SetDiscriminant`/`Deinit`) — writes `local_defs::value_count` does NOT
 /// count, but which can change what a place rooted at (or reborrowed from) `local`
 /// denotes. Used by [`base_collection_place_unique`] to fail closed on
 /// reseat-through-deref of a trace-chain temp.
@@ -4378,7 +4408,7 @@ pub(crate) fn slice_get_some_index_bound_definitions(
                 // not the arg temp). Gated: the copy must be in the CALL block with
                 // no later same-block write overlapping the source base.
                 if p.projections.is_empty()
-                    && whole_local_def_count(func, p.local) == 1
+                    && crate::local_defs::has_one_explicit_def(func, p.local)
                     && let Some((src_stmt_idx, src)) =
                         b.stmts.iter().enumerate().find_map(|(i, s)| match s {
                             Statement::Assign {
@@ -4908,6 +4938,94 @@ fn aggregate_field_definitions(
         .collect()
 }
 
+/// Trust (verified-sysroot §5 step 3, slice 2): allocation-root bounds for the
+/// provenance-EXPOSE cast `dest = p as usize`. When `p` PROVABLY denotes the
+/// address of a model-covered allocation ROOT — `&x` / `&raw x` of a WHOLE
+/// local whose sort has a statically known byte size
+/// (`trust_types::alloc_model::known_alloc_byte_size`), reached through
+/// unique whole-local defs and thin-identity casts only — return the model's
+/// two-axiom bound on the minted address
+/// (`alloc_model::alloc_root_address_bounds`):
+///
+/// ```text
+/// 1 <= dest  &&  dest <= usize::MAX - size_of(x)
+/// ```
+///
+/// This is the fact that makes the `*mut T::add::precondition_check` overflow
+/// legs PROVABLE on covered shapes: `addr + byte_len` cannot wrap when
+/// `byte_len <= size_of(x)`. Everything else declines, fail-closed:
+///
+///   * not the expose cast (wrong source/target sort) — `None`;
+///   * `p` reassigned anywhere, or defined by anything but a root borrow /
+///     whole-local copy / thin-identity cast (`local_defs::unique_value_def` +
+///     the fueled chase) — `None`;
+///   * the borrow is PROJECTED (`&x.f`, `&x[i]` — nonzero offset, size of a
+///     sub-object) — `None`;
+///   * the root's sort is not size-covered (ADT/tuple padding, slice/str,
+///     pointer-typed roots) — `None`.
+///
+/// SOUND: the bounds are per-value theorems of the allocation model (see the
+/// axiom discussion on `alloc_root_address_bounds`), so a conjoined fact can
+/// only discharge a false-FAIL. No fact ever RELATES two distinct roots, so
+/// cross-allocation comparisons stay exactly as unprovable as before.
+fn alloc_model_expose_root_bounds(
+    func: &VerifiableFunction,
+    op: &Operand,
+    to_ty: &Ty,
+    dest_name: &str,
+) -> Option<Formula> {
+    let from_ty = operand_ty(func, op)?;
+    if !crate::is_thin_pointer_address_expose_cast(&from_ty, to_ty) {
+        return None;
+    }
+    let (Operand::Copy(p) | Operand::Move(p)) = op else {
+        return None;
+    };
+    if !p.projections.is_empty() {
+        return None;
+    }
+    let byte_size = expose_root_alloc_byte_size(func, p.local, 8)?;
+    trust_types::alloc_model::alloc_root_address_bounds(
+        Formula::Var(dest_name.to_string(), Sort::Int),
+        byte_size,
+    )
+}
+
+/// The chase half of [`alloc_model_expose_root_bounds`]: the statically known
+/// byte size of the allocation `local` roots at, or `None`. Follows only
+/// value-preserving pointer defs (whole-local `Use`, thin-identity `Cast`)
+/// down to a `Ref`/`AddressOf` of a WHOLE local; fuel exhaustion fails
+/// CLOSED. `local_defs::unique_value_def` already declines any local assigned more
+/// than once or through a projection, so the chased value is unambiguous.
+fn expose_root_alloc_byte_size(
+    func: &VerifiableFunction,
+    local: usize,
+    fuel: u8,
+) -> Option<u128> {
+    let fuel = fuel.checked_sub(1)?;
+    match crate::local_defs::unique_value_def(func, local)? {
+        Rvalue::Ref { place: root, .. } | Rvalue::AddressOf(_, root) => {
+            if !root.projections.is_empty() {
+                return None;
+            }
+            let root_ty = crate::local_ty_ref(func, root.local)?;
+            trust_types::alloc_model::known_alloc_byte_size(root_ty)
+        }
+        Rvalue::Use(Operand::Copy(q) | Operand::Move(q)) if q.projections.is_empty() => {
+            expose_root_alloc_byte_size(func, q.local, fuel)
+        }
+        Rvalue::Cast(Operand::Copy(q) | Operand::Move(q), cast_to) if q.projections.is_empty() => {
+            let inner_ty = crate::local_ty_ref(func, q.local)?;
+            // Only a thin->thin pointer identity preserves the address value.
+            if !crate::is_thin_pointer_identity_cast(inner_ty, cast_to) {
+                return None;
+            }
+            expose_root_alloc_byte_size(func, q.local, fuel)
+        }
+        _ => None,
+    }
+}
+
 fn cast_definition_formula(
     func: &VerifiableFunction,
     dest: &trust_types::Place,
@@ -4995,11 +5113,16 @@ fn cast_definition_formula(
         && *to_w >= from_w
         && let Operand::Copy(p) | Operand::Move(p) = op
         && p.projections.is_empty()
-        && let Some(Rvalue::Discriminant(disc_place)) = crate::unique_whole_local_def(func, p.local)
+        && let Some(Rvalue::Discriminant(disc_place)) =
+            crate::local_defs::unique_value_def(func, p.local)
         && let Some(enum_ty) = crate::operand_ty(func, &Operand::Copy(disc_place.clone()))
         && let Ty::Adt { variants, disc_index_safe: true, .. } = &enum_ty
         && !variants.is_empty()
-        && variants.iter().map(|v| v.discriminant).min().is_some_and(|m| m >= 0)
+        && variants
+            .iter()
+            .map(|v| normalize_raw_discriminant(v.discriminant, from_w, from_ty.is_signed()))
+            .min()
+            .is_some_and(|m| m >= 0)
     {
         // Caller wraps this in `Eq(Var(dest), value)`, i.e. `_d == e_disc`.
         return Some(operand_to_formula(func, op));
@@ -5051,6 +5174,31 @@ fn cast_definition_formula(
     }
 
     None
+}
+
+/// Reinterpret the extractor's RAW discriminant bit pattern (stored non-negative in an
+/// `i128`: `-1` in `repr(i8)` arrives as `255`, `-5` in `repr(i16)` as `65531`) as its
+/// TRUE signed value, per the discriminant's own repr type. For an unsigned repr the
+/// raw pattern already IS the value.
+///
+/// Mirror of the native bridge's `normalize_disc` / `sign_extend_raw_value`
+/// (`crates/trust-ir-bridge/src/lower.rs`). REQUIRED before any ORDER comparison on a
+/// declared discriminant — comparing the raw pattern makes a negative-discriminant enum
+/// look non-negative and opens a false proof (see the GATE-NONNEG note above). Equality
+/// comparisons against a tag variable that itself carries the raw pattern are unaffected
+/// and must NOT be normalized.
+///
+/// Fail-safe on degenerate widths: a `0` or `>= 128` width returns the pattern unchanged
+/// rather than shifting out of range (`width` here comes from `Ty::int_width()`, which
+/// yields 8/16/32/64/128, so those arms are defensive).
+pub(crate) fn normalize_raw_discriminant(pattern: i128, width: u32, signed: bool) -> i128 {
+    if !signed || width == 0 || width >= 128 {
+        return pattern;
+    }
+    let mask = (1u128 << width) - 1;
+    let value = (pattern as u128) & mask;
+    let sign_bit = 1u128 << (width - 1);
+    if value & sign_bit == 0 { value as i128 } else { (value as i128) - (1i128 << width) }
 }
 
 /// `2^exp` as an `i128`, or `None` when it does not fit.
@@ -5213,7 +5361,7 @@ fn shift_lhs_unsigned_max(func: &VerifiableFunction, lhs: &Operand) -> Option<u1
         Operand::Constant(ConstValue::Uint(v, _)) => Some(*v),
         Operand::Constant(ConstValue::Int(v)) if *v >= 0 => Some(*v as u128),
         Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
-            let Rvalue::Cast(src, _) = crate::unique_whole_local_def(func, p.local)? else {
+            let Rvalue::Cast(src, _) = crate::local_defs::unique_value_def(func, p.local)? else {
                 return None;
             };
             let src_ty = crate::operand_ty_cow(func, src)?;
@@ -6097,9 +6245,7 @@ mod tests {
                     // flattened payload fields (`__v1_0` for `Some`'s field 0).
                     fields: vec![("__tag".into(), Ty::i32()), ("__v1_0".into(), Ty::u32())],
                     disc_index_safe: false,
-                    faithful_enum_repr: None,
-                    enum_layout: None,
-                },
+                    faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
                 name: Some("o".into()),
             },
         ];
@@ -6130,6 +6276,166 @@ mod tests {
         assert!(
             constrains_downcast_payload,
             "enum payload write must constrain `o@1.0 == 7`, got: {defs:?}"
+        );
+    }
+
+    /// Build `_c = Discriminant(e); _d = _c as usize` over a `#[repr(i8)]` enum with
+    /// the given RAW discriminant bit patterns, and ask `cast_definition_formula` for
+    /// the cast's definition fact.
+    fn enum_disc_index_cast_def(raw_patterns: &[i128]) -> Option<Formula> {
+        let variants: Vec<trust_types::VariantDef> = raw_patterns
+            .iter()
+            .enumerate()
+            .map(|(i, d)| trust_types::VariantDef {
+                name: format!("V{i}"),
+                discriminant: *d,
+                fields: vec![],
+            })
+            .collect();
+        let mut func = test_func();
+        func.body.locals = vec![
+            LocalDecl { index: 0, ty: Ty::u8(), name: Some("ret".into()) },
+            LocalDecl {
+                index: 1,
+                ty: Ty::Adt {
+                    adt_kind: None,
+                    layout: None,
+                    name: "E".into(),
+                    fields: vec![("__tag".into(), Ty::i8())],
+                    variants,
+                    // `#[repr(i8)]` inhibits niche layout, so rustc classifies this
+                    // enum `Variants::Multiple { Direct }` — the gate PASSES here; the
+                    // discriminant SIGN is what must decline it.
+                    disc_index_safe: true,
+                    faithful_enum_repr: None,
+                    enum_layout: None,
+                    arbitrary_precision: None,
+                },
+                name: Some("e".into()),
+            },
+            // The `Discriminant` read dest: the repr type `i8`.
+            LocalDecl { index: 2, ty: Ty::i8(), name: Some("c".into()) },
+            LocalDecl { index: 3, ty: Ty::usize(), name: Some("d".into()) },
+        ];
+        func.body.arg_count = 1;
+        func.body.blocks = vec![BasicBlock {
+            id: BlockId(0),
+            stmts: vec![Statement::Assign {
+                place: Place::local(2),
+                rvalue: Rvalue::Discriminant(Place::local(1)),
+                span: SourceSpan::default(),
+            }],
+            terminator: Terminator::Return,
+        }];
+        cast_definition_formula(
+            &func,
+            &Place::local(3),
+            &Operand::Copy(Place::local(2)),
+            &Ty::usize(),
+        )
+    }
+
+    /// ADVERSARIAL (R5): GATE-NONNEG on the enum-disc-index cast must test the
+    /// **normalized** discriminant, not the raw bit pattern.
+    ///
+    /// The old `min(v.discriminant) >= 0` test was vacuous when
+    /// `VariantDef::discriminant` still carried the extractor's RAW pattern — always
+    /// non-negative in its `i128` carrier (`-1` in `repr(i8)` arrived as `255`).
+    /// Witness — a live FALSE PROOF:
+    ///
+    /// ```ignore
+    /// #[repr(i8)] enum E { A = 0, B = -1 }
+    /// fn f(e: E, arr: &[u8; 256]) -> u8 { arr[e as usize] }
+    /// ```
+    ///
+    /// `repr(i8)` inhibits niche layout so `disc_index_safe` is true and the raw gate
+    /// passed; the emitted `_d == e_disc` equality plus `_c: i8`'s `[-128, 127]` range
+    /// let the bounds VC `_d < 256` PROVE, while `e == B` really indexes
+    /// `0xFFFF_FFFF_FFFF_FFFF`. **The `_d == e_disc` equality must be DROPPED** — that,
+    /// and only that, is what this test pins.
+    ///
+    /// STALE PREMISE CORRECTED 2026-08-31: extraction now DECODES the tag at the single
+    /// boundary (`trust_mir_extract::ty_convert`'s `decode_discr_tag_or_raw`, added by
+    /// `b4fd4c0e43a` repair #1), so `VariantDef::discriminant` is the TRUE SIGNED tag —
+    /// see the GATE-NONNEG note at `cast_definition_formula`, which says the same. The
+    /// helper below still feeds RAW patterns (255/251) only because
+    /// `normalize_raw_discriminant` is IDEMPOTENT on already-decoded values
+    /// (`normalize(-1, 8, true) == -1`), so both spellings exercise the same gate arm.
+    #[test]
+    fn enum_disc_index_cast_negative_repr_i8_fails_closed() {
+        // PIN RE-POINTED 2026-08-31 (was `== None` for both tag sets). WHAT MOVED, AND
+        // WHY THE PIN — NOT THE PROPERTY — WAS WRONG:
+        //
+        // Two campaigns fixed the SAME false proof and a squash merge took their union.
+        // `b4fd4c0e43a` (2026-08-26) decoded the tag at the extraction boundary AND added
+        // a new branch to `cast_definition_formula` AFTER GATE-NONNEG: the exact
+        // non-narrowing signed->unsigned two's-complement value relation. The b62 campaign
+        // branch instead normalized at each consumer and wrote THIS test — and on that
+        // branch GATE-NONNEG was the LAST branch before `None`, so declining it really did
+        // drop the fact (verified: `git show origin/b62-merge-redo:.../guards.rs` holds
+        // this test and ZERO hits for the two's-complement branch). The squash
+        // `d24c6712111` landed the b62 gate + test onto a tree where the decline now falls
+        // THROUGH into the newer branch, so this test went red at its own landing commit
+        // and has never passed on main. No pre-push lane runs a `crates/` test, so nothing
+        // said so.
+        //
+        // THE PROPERTY IS UNCHANGED AND STILL HOLDS: the plain `_d == e_disc` equality is
+        // still refused for a negative-tag enum. `== None` was an over-specified proxy for
+        // that — it pinned the absence of ANY fact rather than the absence of the FALSE
+        // one. What replaced the dropped fact is the EXACT `as` semantics, which is
+        // strictly STRONGER than dropping:
+        //   * it is a total value-level identity of the statement (`dest == if src >= 0
+        //     { src } else { src + 2^64 }`), so it constrains no input and removes no
+        //     execution from the model — it cannot manufacture a proof;
+        //   * at `e == B` it yields `_d == 2^64-1`, so the witness this test defends
+        //     (`arr[e as usize]` over `[u8; 256]`) still REFUTES — and now with a model
+        //     that names the failing input, where `None` refuted only by `_d` being
+        //     unconstrained.
+        // Formula arithmetic is over SMT `Int`, not `BitVec`, so `c + 2^64` does not wrap.
+        //
+        // THE NAMED DEPENDENCY, which is why the negative arm is asserted structurally:
+        // this lane is sound only because the discriminant source denotes the TRUE SIGNED
+        // tag. If any consumer ever re-RAWs it (`_4 == 255`), the `Ite` takes its POSITIVE
+        // arm and `_d == 255 < 256` becomes a false PROVE. Today decode happens once, at
+        // the extraction boundary.
+        let two_to_the_64 = 1i128 << 64;
+        for tags in [&[0i128, 255][..], &[251, 3][..]] {
+            let def = enum_disc_index_cast_def(tags).unwrap_or_else(|| {
+                panic!("the signed->unsigned relation lane must still model this cast: {tags:?}")
+            });
+            assert_ne!(
+                def.var_name(),
+                Some("c"),
+                "a negative `repr(i8)` discriminant must NOT get the plain `_d == e_disc` \
+                 equality: `e as usize` reinterprets the sign bit as ~2^64, so the equality \
+                 is false and the bounds VC falsely proves. tags {tags:?}, got {def:?}"
+            );
+            assert!(
+                matches!(&def, Formula::Ite(cond, then, els)
+                    if matches!(cond.as_ref(), Formula::Ge(l, r)
+                        if l.var_name() == Some("c") && matches!(r.as_ref(), Formula::Int(0)))
+                    && then.var_name() == Some("c")
+                    && matches!(els.as_ref(), Formula::Add(l, r)
+                        if l.var_name() == Some("c")
+                        && matches!(r.as_ref(), Formula::Int(m) if *m == two_to_the_64))),
+                "the NEGATIVE arm must be `c + 2^64` — that arm is the whole reason the \
+                 out-of-bounds witness stays reachable; a plain equality, a wrong modulus \
+                 or a dropped else arm is the false proof this test exists for. \
+                 tags {tags:?}, got {def:?}"
+            );
+        }
+    }
+
+    /// Positive control for the test above: the lever the gate exists to enable must
+    /// still fire for a genuinely non-negative `repr(i8)` enum, otherwise the fix would
+    /// have "fixed" the false proof by disabling the feature.
+    #[test]
+    fn enum_disc_index_cast_nonneg_repr_i8_still_emits_the_equality() {
+        let def = enum_disc_index_cast_def(&[0, 1, 2])
+            .expect("a non-negative repr(i8) enum must keep emitting `_d == e_disc`");
+        assert!(
+            def.var_name() == Some("c"),
+            "the emitted value is the discriminant operand itself, got {def:?}"
         );
     }
 
@@ -8987,6 +9293,78 @@ mod tests {
         assert!(!id(&Ty::i32(), &Ty::u32()), "same-width signedness reinterpret changes value");
         assert!(!id(&Ty::i8(), &Ty::u32()), "signed->unsigned widening wraps negatives");
         assert!(!id(&Ty::i32(), &Ty::i8()), "signed narrowing truncates");
+
+        // Trust (verified-sysroot §5 step 3, slice 1): thin-pointer address
+        // EXPOSE is identity over the collapsed allocation model's value.
+        let thin_const = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+        let thin_mut = Ty::RawPtr { mutable: true, pointee: Box::new(Ty::i32()) };
+        let thin_ref = Ty::Ref { mutable: false, inner: Box::new(Ty::u64()) };
+        let nonnull_newtype = Ty::adt(
+            "core::ptr::non_null::NonNull",
+            vec![("pointer".to_string(), thin_const.clone())],
+        );
+        assert!(id(&thin_const, &Ty::usize()), "thin *const expose is the addr() shape");
+        assert!(id(&thin_mut, &Ty::usize()), "thin *mut expose is the addr() shape");
+        assert!(id(&thin_ref, &Ty::usize()), "thin &T expose (transmute leg) preserves the address");
+        assert!(id(&nonnull_newtype, &Ty::usize()), "thin single-pointer newtype expose (NonNull::addr)");
+        // FALSIFYING refusals — each goes red if the semantics are widened
+        // wrongly rather than merely if the accept case works:
+        assert!(!id(&Ty::usize(), &thin_const), "RECOVER direction manufactures provenance; must refuse");
+        assert!(!id(&thin_const, &Ty::u32()), "narrowing expose truncates the address; must refuse");
+        assert!(!id(&thin_const, &Ty::i64()), "signed expose reinterprets high addresses; must refuse");
+        let fat_slice = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+        let fat_str = Ty::Ref { mutable: false, inner: Box::new(Ty::Str) };
+        let fat_dyn = Ty::Ref {
+            mutable: false,
+            inner: Box::new(Ty::Dynamic { trait_name: "t::Tr".into(), principal_key: None }),
+        };
+        assert!(!id(&fat_slice, &Ty::usize()), "fat *const [T] has no single-address value; must refuse");
+        assert!(!id(&fat_str, &Ty::usize()), "fat &str has no single-address value; must refuse");
+        assert!(!id(&fat_dyn, &Ty::usize()), "fat &dyn has no single-address value; must refuse");
+    }
+
+    /// Trust (verified-sysroot §5 step 3, slice 1) — VALUE-LANE falsifier for
+    /// the provenance-EXPOSE cast. The accept case must yield the pointer's OWN
+    /// term (`dest == p`, the statability seam); every guarded refusal must
+    /// yield `None` (dest stays unconstrained / fail-closed). Red if the accept
+    /// case regresses to opaque, and red if any refusal is wrongly admitted.
+    #[test]
+    fn ptr_expose_value_lane_identity_vs_refusal() {
+        let thin = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+        let fat = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
+        let func_with = |src_ty: Ty, dest_ty: Ty| {
+            let mut func = test_func();
+            func.body.locals = vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("ret".into()) },
+                LocalDecl { index: 1, ty: src_ty, name: Some("p".into()) },
+                LocalDecl { index: 2, ty: dest_ty, name: Some("addr_w".into()) },
+            ];
+            func.body.arg_count = 1;
+            func.body.return_ty = Ty::Unit;
+            func
+        };
+        let op = Operand::Copy(Place::local(1));
+        let dest = Place::local(2);
+
+        // ACCEPT: thin expose is identity over the pointer's model value.
+        let func = func_with(thin.clone(), Ty::usize());
+        let value = super::cast_definition_formula(&func, &dest, &op, &Ty::usize())
+            .expect("thin-pointer expose must produce a value fact (statability)");
+        assert_eq!(value.var_name(), Some("p"), "the value fact must be the pointer's OWN term, got {value:?}");
+
+        // REFUSE (each falsifies a wrongly-widened semantics):
+        let func = func_with(thin.clone(), Ty::u32());
+        assert!(super::cast_definition_formula(&func, &dest, &op, &Ty::u32()).is_none(),
+            "narrowing expose truncates the address; the value lane must decline");
+        let func = func_with(thin.clone(), Ty::i64());
+        assert!(super::cast_definition_formula(&func, &dest, &op, &Ty::i64()).is_none(),
+            "signed expose reinterprets high addresses; the value lane must decline");
+        let func = func_with(Ty::usize(), thin.clone());
+        assert!(super::cast_definition_formula(&func, &dest, &op, &thin).is_none(),
+            "RECOVER (int->ptr) manufactures provenance; the value lane must decline");
+        let func = func_with(fat.clone(), Ty::usize());
+        assert!(super::cast_definition_formula(&func, &dest, &op, &Ty::usize()).is_none(),
+            "a fat pointer has no single-address model value; the value lane must decline");
     }
 
     /// Build a 2-block function: bb0 calls an ascii predicate `callee(ch)` into a

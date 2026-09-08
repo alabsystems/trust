@@ -1,0 +1,16 @@
+# trust-modular: total, verified modular integer arithmetic over a runtime modulus.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-modular"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

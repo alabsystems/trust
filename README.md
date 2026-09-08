@@ -160,6 +160,14 @@ a compatibility record only — no version, channel, gate, or proof claim derive
 from it. Full rules, including what may serve as a stage0, are in the internal
 `VERSIONING.md`.
 
+**Two version lines, and they do not agree — say which one you mean.** The
+number above is the *product* version: it is what `targo trust version` prints
+and what the `trust:` line of `trustc -Vv` carries. The *release* version — the
+`vX.Y.0` tag on this repository and the name on its release assets — is derived
+by the publication engine from `[workspace.package].version` in the root
+`Cargo.toml`, on its own counter. Read whichever file answers your question;
+neither is inlined here, because both move.
+
 ## Build
 
 Trust builds on top of a Trust-named stage0 seed — a previous Trust release, not
@@ -222,8 +230,9 @@ byte-identical copies: `rustc` and `cargo`, because rustup requires them, and
 
 ### One command for the `trust` toolchain on a machine that has none
 
-Several sibling repositories — among them `clean`, `trust-vc`, and `aterm` —
-pin `channel = "trust"` in their `rust-toolchain.toml`, and their format and lint gates need `trustfmt` and
+Most sibling repositories — among them `ay`, `clean`, `trust-vc`, `ty` and
+`aterm` — pin `channel = "trust"` in their `rust-toolchain.toml`, and their
+format and lint gates need `trustfmt` and
 `tippy` out of a Trust sysroot. Where that channel does not resolve those gates
 refuse to run rather than fall back to stock `rustfmt`/`clippy` and report a
 green from a different lint set. To make it resolve, from a Trust checkout:
@@ -248,12 +257,27 @@ Two things it cannot do for you:
   shim is the only thing that reads `rust-toolchain.toml`; with a real `rustc`
   in front of it the pin is never consulted. Only your shell rc can fix that:
   `export PATH="$HOME/.cargo/bin:$PATH"`.
-- **Do not delete or move the build tree afterwards.** The rustup toolchain is a
-  symlink into `build/<host>/stage1`, not a copy, so removing that directory
-  breaks every repository that pins the channel.
+- **Do not delete or move the build tree afterwards.** That installer links the
+  rustup toolchain as a symlink into `build/<host>/stage1`, not a copy, so
+  removing that directory breaks every repository that pins the channel.
 
 `scripts/prove-trust-frontend-gate.sh` re-runs the proof at any time. Stage 1 is
 a developer artifact, not release evidence.
+
+**Prefer a sealed artifact once you have a stage 2.** A `build/` tree is a live
+build directory: every `x.py` run empties `bin/` and the stdlib for its
+duration, so a channel pointed there fails intermittently with `error[E0463]`
+whenever a rebuild is in flight, and a plain link also loses the
+`rustc-private-sysroots` pairing that out-of-tree `rustc_private` driver tools
+resolve beside the sysroot. Seal first, then link:
+
+```bash
+scripts/promote-toolchain.sh    # immutable artifact + atomic channel flip
+```
+
+This is the default registration lane; [INSTALL.md](INSTALL.md) has the full
+contract. The direct link above stays available for throwaway iteration on a
+machine where nothing pins the channel.
 
 ### Backends
 

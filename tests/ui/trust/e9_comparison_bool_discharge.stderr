@@ -1,0 +1,50 @@
+note: Clean island kernel-checked: 4 declaration(s) registered (key64, le_isl, le_u, in_range)
+  --> $DIR/e9_comparison_bool_discharge.rs:33:5
+   |
+LL | /     def key64 (v : BitVec 64) : Nat :=
+LL | |         Nat.xor (BitVec.toNat v) 9223372036854775808
+LL | |     def le_isl (a : BitVec 64) (b : BitVec 64) : Bool :=
+LL | |         decide (Nat.le (key64 a) (key64 b))
+LL | |     def le_u (a : UInt64) (b : UInt64) : Bool := decide (a <= b)
+LL | |     def in_range (a : BitVec 64) : Bool := Bool.true
+   | |____________________________________________________^
+
+
+=== Trust Verification Report (e9_comparison_bool_discharge) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_comparison_bool_discharge.rs:45:1
+   |
+LL | / pub fn le_i64(a: i64, b: i64) -> bool
+LL | |     ensures result == (a <= b) && result == le_isl(a, b)
+LL | | {
+LL | |     a <= b
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_comparison_bool_discharge.rs:56:1
+   |
+LL | / pub fn le_u64(a: u64, b: u64) -> bool
+LL | |     ensures result == (b >= a) && result == le_u(a, b)
+LL | | {
+LL | |     a <= b
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_comparison_bool_discharge.rs:74:1
+   |
+LL | / pub fn prop_position(a: i64) -> bool
+LL | |     ensures in_range(a)
+LL | | {
+LL | |     true
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+

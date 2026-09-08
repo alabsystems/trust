@@ -215,9 +215,21 @@ tests/trust-falsification/*.mir
 *.pending-snap
 /install/
 
+# Externally generated dependency-constellation evidence.  The terminal
+# TrustWP/Trust cycle cannot commit a receipt without adding a forbidden second
+# R0 -> R1 tree delta; the checker authenticates clean HEAD and writes v3 here.
+/docs/audits/first-party-constellation-v3.json
+
 # Publish tool work area
 publish/.out/
 .buildlogs/
+/target-r2test/
+
+# Build output: an errant `git add` in 8a03c447ad tracked 8.33 GB of rustc
+# incremental caches (target-align/debug/incremental/**/dep-graph.bin, 90-180 MB
+# each). That is what makes this branch exceed the ~2 GB push limit.
+target-align/
+
 crates/trust-disasm/harness/x86-decode-differential/target/
 crates/trust-disasm/harness/x86-semantic-differential/target/
 crates/trust-disasm/harness/x86-semantic-differential/natsem86

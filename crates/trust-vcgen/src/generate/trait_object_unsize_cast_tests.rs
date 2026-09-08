@@ -37,6 +37,7 @@ fn cast_fn(target: Ty) -> VerifiableFunction {
             layout: None,
             enum_layout: None,
             adt_kind: Some(trust_types::AdtKind::Struct),
+            arbitrary_precision: None,
         }),
     };
     VerifiableFunction {

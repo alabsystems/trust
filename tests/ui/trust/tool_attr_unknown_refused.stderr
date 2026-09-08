@@ -1,0 +1,47 @@
+error: Trust: `#[trust::asume_total]` is not a Trust attribute
+  --> $DIR/tool_attr_unknown_refused.rs:31:3
+   |
+LL | #[trust::asume_total]
+   |   ^^^^^^^^^^^^^^^^^^
+   |
+   = note: `trust::` is a RESERVED namespace: every name in it must be claimed by a compiler consumer, so a misspelled or invented clause can never be silently ignored while its author believes it was verified
+   = note: the claimed vocabulary is: action, assume_total, backing, contract_panic, contracts_ensures, contracts_requires, decreases, ensures, invariant, must_consume, paired, panic_free, panic_free_drop, reachable, requires, single_writer, skip, terminating, trust_decreases, trust_ensures, trust_invariant, trust_requires, var, verified_codegen
+   = help: did you mean `#[trust::assume_total]`?
+   = help: to state a property this compiler has no name for yet, write it as a `requires` / `ensures` clause or a `clean { .. }` island — an unrecognized attribute states nothing
+   = help: to compile this crate outside the Trust attribute vocabulary: under Targo use `targo --unverified`, which lowers onto the same off-switch (Targo refuses a caller-supplied `-Ztrust-verify=off` while a verification session is active); calling `trustc` directly, pass `-Ztrust-verify=off`
+
+error: Trust: `#[trust::totally_made_up]` is not a Trust attribute
+  --> $DIR/tool_attr_unknown_refused.rs:36:3
+   |
+LL | #[trust::totally_made_up]
+   |   ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `trust::` is a RESERVED namespace: every name in it must be claimed by a compiler consumer, so a misspelled or invented clause can never be silently ignored while its author believes it was verified
+   = note: the claimed vocabulary is: action, assume_total, backing, contract_panic, contracts_ensures, contracts_requires, decreases, ensures, invariant, must_consume, paired, panic_free, panic_free_drop, reachable, requires, single_writer, skip, terminating, trust_decreases, trust_ensures, trust_invariant, trust_requires, var, verified_codegen
+   = help: to state a property this compiler has no name for yet, write it as a `requires` / `ensures` clause or a `clean { .. }` island — an unrecognized attribute states nothing
+   = help: to compile this crate outside the Trust attribute vocabulary: under Targo use `targo --unverified`, which lowers onto the same off-switch (Targo refuses a caller-supplied `-Ztrust-verify=off` while a verification session is active); calling `trustc` directly, pass `-Ztrust-verify=off`
+
+error: Trust: `#[trust::skip::garbage]` is not a Trust attribute
+  --> $DIR/tool_attr_unknown_refused.rs:41:3
+   |
+LL | #[trust::skip::garbage]
+   |   ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `trust::` is a RESERVED namespace: every name in it must be claimed by a compiler consumer, so a misspelled or invented clause can never be silently ignored while its author believes it was verified
+   = note: the claimed vocabulary is: action, assume_total, backing, contract_panic, contracts_ensures, contracts_requires, decreases, ensures, invariant, must_consume, paired, panic_free, panic_free_drop, reachable, requires, single_writer, skip, terminating, trust_decreases, trust_ensures, trust_invariant, trust_requires, var, verified_codegen
+   = help: to state a property this compiler has no name for yet, write it as a `requires` / `ensures` clause or a `clean { .. }` island — an unrecognized attribute states nothing
+   = help: to compile this crate outside the Trust attribute vocabulary: under Targo use `targo --unverified`, which lowers onto the same off-switch (Targo refuses a caller-supplied `-Ztrust-verify=off` while a verification session is active); calling `trustc` directly, pass `-Ztrust-verify=off`
+
+error: Trust: `#[trust::loop_invariant]` is not a Trust attribute
+  --> $DIR/tool_attr_unknown_refused.rs:52:3
+   |
+LL | #[trust::loop_invariant(true)]
+   |   ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `trust::` is a RESERVED namespace: every name in it must be claimed by a compiler consumer, so a misspelled or invented clause can never be silently ignored while its author believes it was verified
+   = note: the claimed vocabulary is: action, assume_total, backing, contract_panic, contracts_ensures, contracts_requires, decreases, ensures, invariant, must_consume, paired, panic_free, panic_free_drop, reachable, requires, single_writer, skip, terminating, trust_decreases, trust_ensures, trust_invariant, trust_requires, var, verified_codegen
+   = help: to state a property this compiler has no name for yet, write it as a `requires` / `ensures` clause or a `clean { .. }` island — an unrecognized attribute states nothing
+   = help: to compile this crate outside the Trust attribute vocabulary: under Targo use `targo --unverified`, which lowers onto the same off-switch (Targo refuses a caller-supplied `-Ztrust-verify=off` while a verification session is active); calling `trustc` directly, pass `-Ztrust-verify=off`
+
+error: aborting due to 4 previous errors
+

@@ -51,6 +51,8 @@ enum State<T, F> {
 /// //   92
 /// ```
 #[stable(feature = "lazy_cell", since = "1.80.0")]
+// Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+#[rustc_diagnostic_item = "LazyCell"]
 pub struct LazyCell<T, F = fn() -> T> {
     state: UnsafeCell<State<T, F>>,
 }
@@ -72,6 +74,8 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     #[inline]
     #[stable(feature = "lazy_cell", since = "1.80.0")]
     #[rustc_const_stable(feature = "lazy_cell", since = "1.80.0")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "lazy_cell_new"]
     pub const fn new(f: F) -> LazyCell<T, F> {
         LazyCell { state: UnsafeCell::new(State::Uninit(f)) }
     }
@@ -135,6 +139,8 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     #[inline]
     #[stable(feature = "lazy_cell", since = "1.80.0")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "lazy_cell_force"]
     pub fn force(this: &LazyCell<T, F>) -> &T {
         // SAFETY:
         // This invalidates any mutable references to the data. The resulting
@@ -176,6 +182,8 @@ impl<T, F: FnOnce() -> T> LazyCell<T, F> {
     /// ```
     #[inline]
     #[stable(feature = "lazy_get", since = "1.94.0")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[rustc_diagnostic_item = "lazy_cell_force_mut"]
     pub fn force_mut(this: &mut LazyCell<T, F>) -> &mut T {
         #[cold]
         /// # Safety

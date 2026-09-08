@@ -1,0 +1,21 @@
+; TrustIr text format v1
+module "m1shift"
+target "aarch64-unknown-linux-gnu" 8 little structpass=unclassified
+file 0 "m1shift.rs"
+
+functy.0 = (u32, u32) -> (u32)
+
+rustcc fn @sh_safe(functy.0) {
+    ; #producer: trust
+    ; #names: %0="a", %1="k"
+bb0(%0: u32, %1: u32):
+    %2 = const u32 31  ; #loc: 0 2 50
+    %3 = and u32 %1, %2  ; #loc: 0 2 45
+    %4 = const u32 32  ; #loc: 0 2 40
+    %5 = icmp ult u32 %3, %4  ; #loc: 0 2 40
+    assert %5  ; #proof: shift_in_range  ; #loc: 0 2 40
+    %6 = shl u32 %0, %3  ; #loc: 0 2 40
+    ret %6  ; #loc: 0 2 55
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L2C40 of `m1shift::sh_safe`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "m1shift::sh_safe#L2C40#overflow#o0" range 0 2 40 2 53 site f0/bb0#4

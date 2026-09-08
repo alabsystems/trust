@@ -78,6 +78,8 @@ union Data<T, F> {
 /// }
 /// ```
 #[stable(feature = "lazy_cell", since = "1.80.0")]
+// Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+#[cfg_attr(not(test), rustc_diagnostic_item = "LazyLock")]
 pub struct LazyLock<T, F = fn() -> T> {
     // FIXME(nonpoison_once): if possible, switch to nonpoison version once it is available
     once: Once,
@@ -101,6 +103,8 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     #[inline]
     #[stable(feature = "lazy_cell", since = "1.80.0")]
     #[rustc_const_stable(feature = "lazy_cell", since = "1.80.0")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "lazy_lock_new")]
     pub const fn new(f: F) -> LazyLock<T, F> {
         LazyLock { once: Once::new(), data: UnsafeCell::new(Data { f: ManuallyDrop::new(f) }) }
     }
@@ -174,6 +178,8 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     /// ```
     #[inline]
     #[stable(feature = "lazy_get", since = "1.94.0")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "lazy_lock_force_mut")]
     pub fn force_mut(this: &mut LazyLock<T, F>) -> &mut T {
         #[cold]
         /// # Safety
@@ -238,6 +244,8 @@ impl<T, F: FnOnce() -> T> LazyLock<T, F> {
     #[inline]
     #[stable(feature = "lazy_cell", since = "1.80.0")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "lazy_lock_force")]
     pub fn force(this: &LazyLock<T, F>) -> &T {
         this.once.call_once_force(|state| {
             if state.is_poisoned() {

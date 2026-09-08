@@ -1642,9 +1642,7 @@ fn callee_trace_requires_matching_extracted_arity() {
 // exact production residual shape (48 unknowns in a3d-geom).
 
 fn vec3_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "Vec3".into(),
         fields: vec![
             ("x".into(), Ty::f64_ty()),
@@ -1659,9 +1657,7 @@ fn vec3_ty() -> Ty {
 }
 
 fn aabb_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "Aabb".into(),
         fields: vec![("min".into(), vec3_ty()), ("max".into(), vec3_ty())],
         variants: Vec::new(),

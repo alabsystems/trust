@@ -31,7 +31,7 @@ gate_id = "upstream.trust-compat"
 status = "accepted_narrow_divergence"
 owner = "@trust-release"
 reason = "RESOLVED to an explicit porter model: the tests/ui vanilla lane is GREEN (21159 passed / 0 failed / 606 ignored, exit 0). Trust's deliberate branding and prose are represented directly in the reviewed in-tree tests/ui expectations; structural/non-branding deviations remain enumerated in tests/upstream-rust/patches.toml. Compiletest only normalizes platform/path classes that the porter does not encode. The in-tree expectation set is therefore an audited Trust adapter, not a pristine upstream mirror."
-issue = "local:reports/trust-comprehensive/upstream.trust-compat"
+issue = "local:reports/2026-07-30-upstream-compat-ledger-audit.md#finding-2--both-issue-anchors-pointed-at-a-path-that-has-never-existed"
 reviewed_on = "2026-07-11"
 expires_on = "2026-10-01"
 note = "2026-07-11 policy reconciliation: porter commit 9d808e84011 moved branded explain hints, ICE notes, and Trust documentation prose into the in-tree UI expectations and removed TRUST_WORDING_NORMALIZATIONS from compiletest. The large expectation rewrite is intentional adapter data, not blind bless output. The upstream Rust baseline remains recoverable from its recorded import commit; Trust release evidence reviews the adapter diff plus patches.toml rather than claiming byte-for-byte-pristine upstream expectations."
@@ -49,7 +49,7 @@ gate_id = "upstream.trust-compat"
 status = "resolved"
 owner = "@trust-release"
 reason = "Resolved by retiring the sole recorded crash-status divergence through the upstream de-ICE process."
-issue = "local:reports/trust-comprehensive/upstream.trust-compat#crashes"
+issue = "local:reports/2026-07-30-upstream-compat-ledger-audit.md#finding-2--both-issue-anchors-pointed-at-a-path-that-has-never-existed"
 reviewed_on = "2026-07-23"
 note = "2026-07-23 review: commit e7aaf75872 deleted the sole recorded reproducer, tests/crashes/135122.rs, replaced it with the blessed tests/ui/implied-bounds/ice-implied-outlives-bounds-135122.rs non-ICE regression, marked the exact per-test exception resolved, and recorded the adopted fix in tests/upstream-rust/upstream-fixes.toml. The 2026-07-11 evidence inventory identified exactly one crash-status-drift row and it was 135122, so no category-level crash divergence remains."
 allowed_exit_codes = [0]
@@ -66,7 +66,7 @@ gate_id = "upstream.trust-compat"
 status = "resolved"
 owner = "@trust-release"
 reason = "Resolved by implementing and directly testing both recorded codegen reproducers."
-issue = "local:reports/trust-comprehensive/upstream.trust-compat#codegen"
+issue = "local:reports/2026-07-30-upstream-compat-ledger-audit.md#finding-2--both-issue-anchors-pointed-at-a-path-that-has-never-existed"
 reviewed_on = "2026-07-23"
 note = "2026-07-23 review: commit c2c4747b8b implemented the i386 SysV 3/5/6/7-byte small-struct register-return ABI and enabled x86-c-struct-return.rs. The supposedly missing foreign-unwind implementation was also already present in rustc_codegen_ssa: foreign-ABI detection emits a volatile frame anchor, an intermediate foreign_unwind_pad landing pad, and a volatile reload before the real cleanup. Commit 863f86b2e8 corrected that regression's FileCheck line to the emitted two-line invoke. A fresh exact stage2 codegen run on cb246323ca passed all three revisions across the two tests, so no recorded category-level codegen drift remains."
 allowed_exit_codes = [0]
@@ -100,40 +100,36 @@ required_action = "Run the rustdoc/parser rustc_private TOOL builds on a strict 
 [[divergences]]
 id = "upstream.trust-compat.2026-05-07.rustdoc-linkcheck-drift"
 gate_id = "upstream.trust-compat"
-status = "active"
+status = "resolved"
 owner = "@trust-release"
-reason = "The strict stage2 upstream-compat lane still contains rustdoc OUTPUT drift (suite=rustdoc-ui). This is a release blocker unless each output change is a reviewed Trust-owned documentation/name change. The linkcheck half of this row was RETIRED 2026-07-30 as unproducible — see note."
-issue = "local:reports/2026-07-30-upstream-compat-ledger-audit.md#rustdoc"
-reviewed_on = "2026-07-30"
-expires_on = "2026-09-10"
-note = "2026-07-30 review — the FIRST renewal carrying a measurement rather than a restatement. (1) The linkcheck half is RETIRED and its `broken link` pattern deleted: `Linkcheck::is_default_step` returns `builder.config.docs` (src/bootstrap/src/core/build_steps/test.rs:134), `scripts/recreate_bootstrap.py:2262` writes `docs = false` into every generated bootstrap.toml, and this tree's bootstrap.toml:17 agrees — so the linkchecker is not a default step in any standard Trust build and THIS GATE CANNOT PRODUCE A BROKEN-LINK FAILURE. The row had claimed that blocker through five renewals. (2) The `issue` anchor was dead: `local:reports/trust-comprehensive/...` has never existed in this repository (0 commits across all history); it now points at a real artifact. (3) STILL UNMEASURED, stated plainly: the rustdoc-ui output drift itself. Confirming or clearing it needs a full strict stage2 vanilla pass, which was not run. This renewal narrows a false claim and fixes a dead reference; it does not accept the remaining divergence, and the next renewal must carry the suite run or retire the row."
-allowed_exit_codes = [1]
+reason = "RESOLVED 2026-08-29 BY MEASUREMENT AND FIX. The rustdoc-ui suite under --trust-vanilla on a stage2 built from 7a8214546 was measured for the first time: 385 passed / 12 failed / 7 ignored. Every failure was triaged individually and adversarially reviewed: two fork DEFECTS were fixed at the source with `// Trust:` markers — the initial-commit rebrand had renamed the LANGUAGE to `Trust code` in rustdoc's invalid_rust_codeblocks lint (3 tests, which also carry a legitimate `error from trustc:` tool-name rebrand, ledgered), and had dropped the issue URL in collect_intra_doc_links' malformed-generics note (1 test, source-only); 10 tests carried STATIC rebrands (tool names, Trust-owned doc prose, Trust's ICE tracker URL) and are ledgered per test in tests/upstream-rust/patches.toml (13 rows) with the replace text applied on disk; 1 (scrape-examples) was already covered by the trust_docs_reference_notes adapter rule and only lacked the on-disk half. One INVOCATION-DERIVED surface (rustdoc's `--passes list` headers) is folded for comparison by compiletest rule (e), scoped to this suite. After: vanilla 397 passed / 0 failed / 7 ignored AND branded 397 / 0 / 7 on the same snapshot. The linkcheck half was retired 2026-07-30 as unproducible in any standard Trust build (`docs = false`)."
+issue = "local:reports/artifacts/2026-08-29-rustdoc-ui-lanes.log"
+reviewed_on = "2026-08-29"
+note = "2026-08-29: the seventh review and the first to run the suite; the 07-30 note's demand — carry the suite run or retire the row — is met by both. What the measurement showed about the row's own claim: the drift was real (12 tests) but NONE of it was `rustdoc OUTPUT drift` in the sense of behaviour — every diff was a string the fork itself had rebranded and never ledgered, plus one URL it had dropped. Going forward a new rustdoc-ui divergence gets a per-test patches.toml row (STATIC), a compiletest comparison rule scoped to the suite (INVOCATION-DERIVED), or a source fix (DEFECT) per docs/UPSTREAM_DIVERGENCE_POLICY.md; this category row is not reopened."
+allowed_exit_codes = [0]
 allowed_patterns = [
-    "Some tests failed in compiletest suite=rustdoc-ui",
+    "test result: ok. 397 passed; 0 failed; 7 ignored",
 ]
 classification = "rustdoc_output_drift"
-compatibility_status = "blocker"
-required_action = "Fix rustdoc/linkcheck behavior or convert reviewed Trust-owned wording changes into deterministic patch-manifest rows."
+compatibility_status = "resolved"
+required_action = "None; keep both rustdoc-ui lanes green. The 13 patches.toml rows added 2026-08-29 (ids trust.divergence.rustdoc-*) expire 2026-11-29 and are renewed or retired on the porter's next upstream import."
 
 [[divergences]]
 id = "upstream.trust-compat.2026-05-07.run-make-trust-defaults"
 gate_id = "upstream.trust-compat"
-status = "active"
+status = "resolved"
 owner = "@trust-release"
-reason = "The strict stage2 upstream-compat lane still contains run-make failures around Trust naming and default verification behavior. Trust naming may require expected-output patches; verification leakage into vanilla upstream compatibility is a blocker."
-issue = "local:reports/2026-07-30-upstream-compat-ledger-audit.md#run-make"
-reviewed_on = "2026-07-30"
-expires_on = "2026-09-10"
-note = "2026-07-30 review. The `issue` anchor was DEAD — `local:reports/trust-comprehensive/...` has never existed in this repository (0 commits across all history) — so five renewals cited evidence a reader could not open; it now points at a real artifact. The divergence itself remains UNMEASURED and this renewal says so rather than restating the prior note in new words: confirming or clearing it needs a vanilla-mode full run-make pass, which was not run. The focused certified-monitor run-make gate being green is NOT that pass and cannot establish that verification or default behaviour never leaks into inherited tests. This is the sixth consecutive renewal without a full-lane measurement; per the repo rule that a ledger row must not be a hiding place, the next renewal must either carry that measurement or break this category into per-test entries."
-allowed_exit_codes = [1]
+reason = "RESOLVED 2026-08-29 BY MEASUREMENT. The full run-make suite under --trust-vanilla, on a stage2 built from 7a8214546, is 348 passed / 0 failed / 160 ignored (`x.py test --stage 2 --trust-vanilla --no-fail-fast tests/run-make`, 2583s), reproducing the same day's independent 350/0 on another stage (77c7fa96dc). No verification or default-behaviour leakage into inherited run-make tests remains. The naming divergences that DID exist were fixed at source or ledgered PER TEST in tests/upstream-rust/patches.toml (4e66398c00, 1245158ab4, 8f03c1031d, 3179750340, 77c7fa96dc, 0375f48809) — never through this category row."
+issue = "local:reports/artifacts/2026-08-29-run-make-vanilla-lane.log"
+reviewed_on = "2026-08-29"
+note = "2026-08-29: the seventh review and the FIRST to carry the measurement this row has demanded since 2026-05-07 — six renewals restated the divergence; this one ran the lane. Protocol: unskipped — no --skip was passed, so the 18 Trust-added tests/run-make/trust-* directories were in scope in the vanilla lane too (8 of them appear by name in the log; compiletest's run-make renderer prints no per-test ok/ignored lines, so which of the other 10 ran versus were platform-ignored is not readable from the log). 0 failed over that superset means the gate's own --skip protocol reads at least as green. None of the row's original allowed_patterns (`tests/run-make/const-trait-stable-toolchain`, `RUSTC_BOOTSTRAP`, `-Ztrust-verify=off`) appears in the log. The 07-30 note's demand — carry the measurement or split into per-test entries — is met by the former."
+allowed_exit_codes = [0]
 allowed_patterns = [
-    "tests/run-make/const-trait-stable-toolchain",
-    "RUSTC_BOOTSTRAP",
-    "-Ztrust-verify=off",
+    "test result: ok. 348 passed; 0 failed; 160 ignored",
 ]
 classification = "run_make_default_behavior"
-compatibility_status = "blocker"
-required_action = "Keep vanilla upstream compatibility on no-verification semantics and patch only reviewed Trust-owned output naming."
+compatibility_status = "resolved"
+required_action = "None; keep the vanilla run-make lane green. A new run-make naming divergence gets a per-test patches.toml row (STATIC rebrand) or a per-recipe fold (INVOCATION-DERIVED name) per docs/UPSTREAM_DIVERGENCE_POLICY.md — never a category row."
 
 [[divergences]]
 id = "verify.precision.2026-07-08.call-havoc-guard-severing"
@@ -141,7 +137,7 @@ gate_id = "verify.precision"
 status = "active"
 owner = "@trust-release"
 reason = "SOUNDNESS FIX (callee-write false-accept sweep): a guard read of a pointee (`*r`, `s.v` behind &mut) no longer transfers across ANY Call/Drop/Opaque terminator — the conservative havoc severs guard-to-use fact flow when a call/drop sits between a pointee guard and its arithmetic use, flipping previously-PROVING safe idioms to REFUTE: println!/logging between guard and use, unrelated calls with disjoint arguments, &self getters inside &mut-self methods, provably-disjoint-&mut-arg calls (probes or1_println, or1_unrelated, or2_disjoint, or2_unrelated, or3_self, or3_self_getter, or4_println, or5_div, or7_vec). ACCEPTED per the sacred invariant: the same havoc closes a CONFIRMED silent false-accept (guard `*r < 1000`, callee writes `*r = u32::MAX`, use `*r + 1` verified '1 proved' yet panicking at runtime) plus its method/nested/field/mem-replace/mem-swap/Drop-glue variants. The snapshot idiom (`let n = *r;` before the call) remains a zero-cost sound rewrite and PROVES (or6_snapshot control). SCOPE NARROWED (per-argument havoc refinement, same day): calls whose arguments are ALL constants or copies of pure pointer-free values — and whose function contains no raw-pointer laundering site — no longer sever the guard (or1_unrelated, or2_unrelated, or5_div restored CLEAN). Still severed pending the deeper lanes: pointer-carrying args incl. fmt closures (or1/or4_println), place-level disjoint &mut args (or2_disjoint, or7_vec), and &self getters inside &mut-self methods (or3_self, or3_self_getter)."
-issue = "local:task#14-callee-write-false-accept"
+issue = "local:crates/trust-vcgen/src/generate/per_arg_havoc_refinement_tests.rs"
 reviewed_on = "2026-07-08"
 expires_on = "2026-10-08"
 allowed_exit_codes = [1]
@@ -196,4 +192,3 @@ required_action = "Precision follow-ups scheduled BEHIND the soundness fix, neve
 # If upstream already reads the way rustc is suggesting, the code is fine and
 # the PIN is stale — and a waiver would suppress the gate for a week over
 # something already fixed.
-

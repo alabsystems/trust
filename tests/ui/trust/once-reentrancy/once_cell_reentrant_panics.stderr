@@ -1,0 +1,43 @@
+error: the initializer of `C` can wait on `C` itself: a `core::cell::OnceCell` initializer that re-enters its own cell panics (reentrant init)
+  --> $DIR/once_cell_reentrant_panics.rs:18:17
+   |
+LL |     unsafe { *C.get_or_init(|| value() + 1) }
+   |                 ^^^^^^^^^^^^^^^-------^^^^^
+   |                 |              |
+   |                 |              the initializer reaches the re-entrant wait through this call
+   |                 the initializer of `C` reaches this call, which waits on `C` again
+   |
+   = note: call path: `value::{closure#0}` -> `value` -> `C.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `value` — read the input it needs directly instead of asking `C` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `C.get_or_init(|| v)` (or `C.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `C`, read `C.get()` there — it never waits
+note: `C` is declared here
+  --> $DIR/once_cell_reentrant_panics.rs:15:1
+   |
+LL | static mut C: OnceCell<u32> = OnceCell::new();
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: the initializer of `D` can wait on `D` itself: a `core::cell::OnceCell` initializer that re-enters its own cell panics (reentrant init)
+  --> $DIR/once_cell_reentrant_panics.rs:27:23
+   |
+LL |           *D.get_or_init(|| {
+   |  ____________-
+LL | |             let _ = D.set(7);
+   | |                       ^^^^^^ the initializer of `D` reaches this call, which waits on `D` again
+LL | |
+LL | |             8
+LL | |         })
+   | |__________- this call starts the initializer of `D`
+   |
+   = note: call path: `seed::{closure#0}` -> `D.set(..)`
+   = help: compute the value inside the initializer without waiting on `D` in it — read the input it needs directly instead of asking `D` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `D.get_or_init(|| v)` (or `D.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `D`, read `D.get()` there — it never waits
+note: `D` is declared here
+  --> $DIR/once_cell_reentrant_panics.rs:22:1
+   |
+LL | static mut D: OnceCell<u32> = OnceCell::new();
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

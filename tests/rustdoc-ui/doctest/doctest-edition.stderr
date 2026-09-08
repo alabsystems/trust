@@ -7,7 +7,7 @@ LL | | //! foo'b'
 LL | | //! ```
    | |_______^
    |
-   = note: error from rustc: prefix `foo` is unknown
+   = note: error from trustc: prefix `foo` is unknown
 note: the lint level is defined here
   --> $DIR/doctest-edition.rs:3:9
    |

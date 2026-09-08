@@ -1,0 +1,8 @@
+error: expected the end of the contract clause after its `by` citation
+  --> $DIR/trust-spec-attribute-citation-trailing-tokens.rs:15:40
+   |
+LL | #[trust::ensures(result <= x by self_le; junk)]
+   |                                        ^
+
+error: aborting due to 1 previous error
+

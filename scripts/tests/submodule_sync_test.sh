@@ -476,6 +476,29 @@ if [ "$RC_C" -eq 2 ]; then
 else
   fail "expected exit 2 for the unfetchable-pin fixture, got $RC_C"
 fi
+# The ADVICE, not just the state. `fetch --all` fetches each remote's default
+# refspec — branches — so it cannot retrieve a commit that is on no branch, and
+# an anchored pin (`refs/pins/*`, what audit_first_party_pins.py --anchor parks
+# there) is precisely that. Measured 2026-08-30 on first-party/ay b851ff38:
+# `fetch --all` exited 0 and the object was STILL absent, so the report repeated
+# PIN-MISSING at a reader who had done exactly what it asked. A diagnostic whose
+# fix does not fix is worse than none — it spends the reader's trust.
+TEXT_C="$(bash "$SYNC" --root "$SUPER_C" 2>&1 || true)"
+# Anchor on the `inspect:` line, not on the whole report: the fixed advice
+# NAMES `fetch --all` in prose to say do-not-use-it, and a bare substring grep
+# matches that too — which is how this assertion first failed against the very
+# fix it exists to protect.
+if printf '%s' "$TEXT_C" | grep -q 'inspect:.*fetch --all'; then
+  fail "PIN-MISSING advises 'fetch --all', which cannot retrieve an anchored pin"
+else
+  pass "PIN-MISSING does not advise 'fetch --all'"
+fi
+if printf '%s' "$TEXT_C" | grep -q 'fetch origin 0123456789012345678901234567890123456789'; then
+  pass "PIN-MISSING advises fetching the pin BY SHA, which works off-branch"
+else
+  fail "PIN-MISSING advice does not name the pin sha to fetch"
+fi
+
 before_gone="$(sha "$SUPER_C/gone" HEAD)"
 bash "$SYNC" --root "$SUPER_C" --restore --force >/dev/null 2>&1
 if [ "$(sha "$SUPER_C/gone" HEAD)" = "$before_gone" ]; then

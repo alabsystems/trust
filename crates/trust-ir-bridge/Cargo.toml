@@ -40,13 +40,32 @@ compiler-context = ["dep:trust-mir-extract"]
 # workspace can consume the real lowering path). See trust-vcgen/Cargo.toml
 # for the same rationale.
 trust-types = { path = "../trust-types", default-features = false }
+# Trust: the two's-complement width bounds below `native_int_min_max` are no
+# longer computed here. `trust-intbound` is a strict-lane VERIFIED crate
+# (docs/STRICT_VERIFICATION_FRAGMENT.md §16) and this is the first edge from
+# Trust's own verification stack into one. COST, measured and accepted
+# 2026-08-30: a verified crate uses the native `ensures` grammar and therefore
+# does NOT compile on stock rustc, so this dependency makes trust-ir-bridge
+# Trust-toolchain-only and gives up the stable-channel property the line above
+# is about. That property was unexercised when this landed — no harness gate
+# builds this crate on stable and no `first-party/clean` manifest names it — but
+# if `clean` ever does consume the lowering path on stable, THIS is the edge to
+# make optional. See §16.8.
+trust-intbound = { workspace = true }
 trust-verifier-api = { workspace = true }
 # `binary` is a pure cfg-gate (`binary = []`, no deps) enabling the ratified
 # stable serializer behind `Module::stable_digest` — the canonical content-hash
 # `cache_key::module_stable_content_hash` exposes for verification caching.
 trust-ir = { workspace = true, features = ["serde", "binary"] }
 thiserror = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value` (Step 6 increment 2, docs/design/DIRECT-LANE-PROOF-AUTHORITY.md):
+# the direct-formula dump embeds the once-rendered `formula_json` bytes
+# VERBATIM via `serde_json::value::RawValue` — never a re-render at dump or
+# grade time — so byte-parity grading compares what the mint actually produced.
+serde_json = { workspace = true, features = ["raw_value"] }
+# serde derive for the dump schema structs (`direct_formula_dump.rs`); already
+# in the crate's transitive closure via trust-types/serde_json.
+serde = { workspace = true }
 trust-mir-extract = { path = "../trust-mir-extract", optional = true }
 
 [dev-dependencies]

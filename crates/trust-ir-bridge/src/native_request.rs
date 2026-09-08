@@ -347,6 +347,16 @@ pub fn native_verification_bundle_from_module_owners(
         return Err(NativeVerificationBundleBuildError::EmptyRequests);
     }
     bundle.validate().map_err(NativeVerificationBundleBuildError::Validation)?;
+    // TRUSTED LIVE SEAM (b62 merge migration): the old direct mark-live bundle
+    // flag (deliberately not spelled here: trust-bmc's
+    // `root_source_authority_issuer_is_unique_and_legacy_marker_is_absent`
+    // census greps the tree, comments included, to prove the forgeable legacy
+    // marker is GONE) was superseded by trust-ir
+    // main's strictly stronger `SourceGenerationAuthority::mint_from_live_lowering`
+    // (private Arc-nonce identity, one-shot validated mint, full-bundle-digest
+    // binding). The builder therefore returns the bundle UNMARKED; the compiler's
+    // authorized seam mints the affine authority from the live bundle itself, and
+    // a deserialized copy can never be authorized (fail-closed direction kept).
     Ok(bundle)
 }
 
@@ -561,7 +571,7 @@ fn populate_compiler_facts_for_owners(
     Ok(())
 }
 
-fn native_monomorphization_fact(
+pub(crate) fn native_monomorphization_fact(
     module: &Module,
     function: FuncId,
     id: NativeMonomorphizationId,
@@ -606,7 +616,7 @@ fn native_monomorphization_digest(
     ProofDigest::sha256_domain("trust.native-request.monomorphization.v2", &bytes)
 }
 
-fn obligation_sources_for_owners(
+pub(crate) fn obligation_sources_for_owners(
     module: &Module,
     owner_indices: &BTreeMap<FuncId, usize>,
     root: FuncId,
@@ -663,7 +673,7 @@ fn obligation_sources_for_owners(
         .collect()
 }
 
-fn native_obligation_cause(kind: &ObligationKind) -> NativeObligationCause {
+pub(crate) fn native_obligation_cause(kind: &ObligationKind) -> NativeObligationCause {
     match kind {
         ObligationKind::Precondition => NativeObligationCause::Precondition,
         ObligationKind::Postcondition => NativeObligationCause::Postcondition,
@@ -776,7 +786,7 @@ fn trust_mc_native_admission_replay_identity(
     ))
 }
 
-fn native_replay_context(
+pub(crate) fn native_replay_context(
     module: &Module,
     compiler_facts: &NativeCompilerFacts,
     obligations: &[ProofId],

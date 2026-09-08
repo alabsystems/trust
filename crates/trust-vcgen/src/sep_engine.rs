@@ -3523,6 +3523,46 @@ fn callee_is_std_raw_ptr_inherent(lower: &str) -> bool {
 /// completeness VC (via `call_is_modeled`). Genuine renders
 /// `core::fmt::Arguments::new_v1` (lowercased `core::fmt::arguments::…`) — crate-rooted.
 ///
+/// STALE-ALLOWLIST FIX (2026-08-16). `new_v1`/`new_const`/`new_v1_formatted` no longer
+/// EXIST in this sysroot's `core::fmt`: the template-encoding rewrite replaced them with
+/// the single `pub unsafe fn new<const N, const M>(template, args)` on the `#[doc(hidden)]
+/// #[unstable(feature = "fmt_internals")] impl<'a> Arguments<'a>`
+/// (`library/core/src/fmt/mod.rs:725-735`). Direct probe on the deployed toolchain:
+/// a three-line `format!("x = {}", x)` fn is charged
+/// `[unsafe:unmodeled-call] call to \`core::fmt::Arguments::<'a>::new\` (unsafe fn)` —
+/// i.e. EVERY `format!`/`write!`/`panic!`-with-args in every crate carried a vacuous
+/// always-SAT audit flag because the allowlist named only the removed API. The retired
+/// spellings are KEPT so the predicate stays correct against an older sysroot.
+///
+/// SOUNDNESS (identical tier to the pre-existing entries, no new tier claimed):
+///  * The only consumer of this predicate is `call_is_modeled` → `call_has_unsafe_model`
+///    → `synthetic_unmodeled_unsafe_call_vcs` (verified: no other caller in-tree). That
+///    site emits a `Formula::Bool(true)` — a CONSTANT, always-refuted COVERAGE flag that
+///    encodes nothing about program state. Recognizing a callee here suppresses the
+///    EMISSION of that flag; it adds NO model, NO assumption and NO discharge, and cannot
+///    change the formula, verdict or reachability of any other obligation. In particular
+///    the call's panic-freedom / absent-callee obligations are produced by a DIFFERENT
+///    lane and are unaffected (probe-confirmed: `fmt_one` keeps its
+///    `[trust-absent-callee-assumption] … alloc::fmt::format` panic-freedom row).
+///  * `Arguments::new`'s sole documented safety precondition is that `template`/`args`
+///    encode a valid `fmt::Arguments`; the impl is `#[doc(hidden)]` +
+///    `#[unstable(feature = "fmt_internals", issue = "none")]`, so it is NAMABLE only by
+///    the `format_args!` expansion (or a nightly crate that opts into `fmt_internals` —
+///    exactly the pre-existing `new_v1` exposure, not a new one). Its body is two
+///    `mem::transmute`s of live references into `NonNull` — no memory access, no panic.
+///    Actual formatting (and any user `Display`/`Debug` panic) happens later in
+///    `write_fmt`, which is a separate call with its own obligations.
+///  * Forgery surface is UNCHANGED: the crate anchor still rejects a nested
+///    `mycrate::fmt::arguments::new`, and the ` as ` rejection still rejects
+///    `<core::fmt::arguments as mycrate::evil>::new`.
+///
+/// The method leaf is taken with the tag-robust [`crate::generate::method_tail`] rather
+/// than `rsplit("::").next()`: a monomorphization-tagged callee
+/// (`…::new::<__trust_args@HASH>`) or a const-generic-instantiated one (`…::new::<3, 1>`)
+/// makes the naive form return the turbofish GROUP instead of the method name — the same
+/// break documented at `generate/call_facts.rs:17-27` (it silently cost `ord_method` a
+/// real result fact). Failing to normalize would fail CLOSED here (flag re-emitted), but
+/// the tag is exactly what a `format!` inside a monomorphized fn carries.
 /// `new` IS THE CURRENT SPELLING — RENAME DRIFT, not a widening. `format_args!`
 /// lowering moved from `new_v1`/`new_const` to `new`/`from_str`.
 /// trust-ir-bridge's `total_no_panic_call_summary` was updated for that move and
@@ -3569,8 +3609,18 @@ fn is_std_fmt_arguments_ctor(lower: &str) -> bool {
     let c = lower.strip_prefix('<').unwrap_or(lower);
     (c.starts_with("core::fmt::arguments") || c.starts_with("std::fmt::arguments"))
         && matches!(
-            c.rsplit("::").next(),
-            Some("new" | "new_v1" | "new_const" | "new_v1_formatted")
+            // MERGE (b62 <- origin/main): both sides independently fixed the same
+            // stale-allowlist defect (the `format_args!` lowering moved to `new`).
+            // The arm list is identical; only the method-leaf extraction differed.
+            // OURS is kept: `method_tail` is monomorph-tag robust, where upstream's
+            // `c.rsplit("::").next()` returns the TURBOFISH GROUP for a tagged callee
+            // (`…::new::<__trust_args@HASH>`) or a const-generic one (`…::new::<3, 1>`)
+            // — the recurring tag pitfall. This is a completeness axis, not a soundness
+            // one: the sole consumer emits a constant always-refuted `Bool(true)`
+            // coverage flag, so recognizing MORE here suppresses a vacuous failure and
+            // can never mint a proof (both sides' own docs state this).
+            crate::generate::method_tail(c),
+            "new" | "new_v1" | "new_const" | "new_v1_formatted"
         )
 }
 
@@ -3643,9 +3693,10 @@ pub(crate) fn call_is_modeled(lower: &str) -> bool {
         || lower.contains("ptr::copy")
         || lower.contains("from_raw_parts")
         || lower.contains("mem::transmute")
-        // `core::fmt::Arguments::*` constructors (`new_v1`/`new_const`/`new_v1_formatted`) are
+        // `core::fmt::Arguments::*` constructors (`new` on this sysroot; the retired
+        // `new_v1`/`new_const`/`new_v1_formatted` on older ones) are
         // `unsafe fn`s by SIGNATURE but compiler-GENERATED by `format_args!`, which upholds their
-        // only safety precondition (`pieces.len() == args.len() + 1`). They construct a value with
+        // only safety precondition (the template/args encoding). They construct a value with
         // no UB and no panic, so the hardened unsafe-call boundary treats them as covered. (Actual
         // formatting — and any user `Display`/`Debug` panic — happens later in `write_fmt`.)
         // CRATE-ANCHORED (see `is_std_fmt_arguments_ctor`): a nested `mycrate::fmt::arguments`
@@ -3663,9 +3714,10 @@ pub(crate) fn call_is_modeled(lower: &str) -> bool {
         // free fn `mycrate::from_raw_fd` / user-trait `<T as mycrate::FromRawFd>` cannot
         // forge coverage to suppress the completeness VC.
         || is_std_from_raw_fd(lower)
-        // Native-TLS lazy-init `get_or_init` — the compiler-generated, doc(hidden)
-        // `thread_local!` machinery. Same compiler-generated-unsafe tier as the
-        // `fmt::arguments::` precedent above (see the helper for the full argument).
+        // Native-TLS `LazyStorage::get_or_init` / `EagerStorage::get` — the
+        // compiler-generated, doc(hidden) `thread_local!` machinery (lazy and
+        // `const {}` arms of the same macro). Same compiler-generated-unsafe tier as
+        // the `fmt::arguments::` precedent above (see the helper for the full argument).
         || is_native_tls_lazy_init_call(lower)
 }
 
@@ -3698,17 +3750,65 @@ pub(crate) fn call_is_modeled(lower: &str) -> bool {
 /// `contains` because the init-fn turbofish `::<fn() -> T {…}>` carries a `->` that
 /// no bracket-balanced normalization survives — the `LazyStorage::…::get_or_init`
 /// head is stable, so the anchored substrings are exact.
+///
+/// SPELLING FIX (2026-08-16). `std::thread::local_impl::LazyStorage` is the RE-EXPORT
+/// path the macro body writes; `safe_def_path_str` renders the callee's DEFINITION path
+/// instead, so on the deployed toolchain the recognizer was DEAD. Direct probe
+/// (`TRUST_UNSAFE_CALL_DEBUG=1` on a two-`thread_local!` crate):
+///
+///   P::ARENA::{constant#0}::{closure#0}: call
+///     std::sys::thread_local::native::lazy::Storage::<T, D>::get_or_init unsafe=true modeled=FALSE
+///   Q::EAGER_DROP::{constant#0}::{closure#0}: call
+///     std::sys::thread_local::native::eager::Storage::<T>::get     unsafe=true modeled=FALSE
+///
+/// Both definition-path anchors are added; the re-export spelling is KEPT (it is what
+/// older gate logs carry, and a future printer change could bring it back).
+///
+///  * The EAGER arm is the `thread_local! { static X: T = const { … } }` half of the very
+///    same macro (`native/mod.rs:63-70`): `EagerStorage::<T>::get`
+///    (`native/eager.rs:20-38`), `pub unsafe fn get(&self) -> *const T`, whose sole
+///    documented safety precondition is verbatim the lazy one — "The `self` reference
+///    must remain valid until the TLS destructor is run" — and which the expansion only
+///    ever calls on its own `#[thread_local] static __RUST_STD_INTERNAL_VAL`. That is the
+///    arm ny-cert's `POISONED` / `DEADLINE` (`const { Cell::new(…) }`) take; `ARENA`
+///    (non-const init) takes the lazy arm. Both closures of the `{constant#0}` const-block
+///    are lowered and verified, so BOTH arms are charged regardless of which one
+///    `needs_drop::<T>()` selects — probe-confirmed on a `!Drop` const thread_local.
+///  * `std::sys` is a PRIVATE std module (`pub(crate)`-visible only) — no user path can
+///    name `std::sys::thread_local::native::{lazy,eager}::Storage`, so the anchor is at
+///    least as strong as the `local_impl` doc(hidden) one it joins.
+///  * There is NO `no_threads` variant to add: on `!target_has_threads` the macro calls
+///    `no_threads::LazyStorage::<T>::get`, which is a SAFE `pub fn`
+///    (`no_threads.rs:85`) — it never reaches the unsafe-call completeness check at all.
+///  * Same suppression tier as the lazy arm and the `fmt::arguments::` precedent: this
+///    predicate feeds ONLY `call_is_modeled` → `call_has_unsafe_model` →
+///    `synthetic_unmodeled_unsafe_call_vcs`, whose VC formula is the constant
+///    `Bool(true)` coverage flag. No model, no assumption, no discharge; the
+///    panic-freedom lane is untouched (probe-confirmed: `ARENA::{constant#0}::{closure#0}`
+///    keeps its `panic freedom: no assertion, unreachable!, or panic is reachable` row).
+///
+/// The eager leaf is matched with the tag-robust [`crate::generate::method_tail`]
+/// (EXACT `get`, so the private `get_or_init_slow` / any `get_*` sibling is not swept in);
+/// the lazy leaf keeps `contains` for the `->`-bearing init-fn turbofish reason above.
 fn is_native_tls_lazy_init_call(lower: &str) -> bool {
     // CRATE-ANCHORED: require the `std::`-ROOTED module path, not a bare
     // `contains("thread::local_impl::lazystorage")` (which a nested user module
     // `mycrate::…::thread::local_impl::lazystorage::…::get_or_init` could forge to
     // SUPPRESS the `[unsafe:unmodeled-call]` completeness VC on a genuinely-unmodeled
-    // unsafe call). The genuine machinery renders `std::thread::local_impl::LazyStorage…`.
-    let hit = lower.starts_with("std::thread::local_impl::lazystorage")
+    // unsafe call). The genuine machinery renders `std::thread::local_impl::LazyStorage…`
+    // (re-export spelling) or `std::sys::thread_local::native::…::Storage…` (definition
+    // spelling, what `safe_def_path_str` actually prints — see the doc comment).
+    let lazy = (lower.starts_with("std::thread::local_impl::lazystorage")
+        || lower.starts_with("std::sys::thread_local::native::lazy::storage"))
         && lower.contains("::get_or_init");
+    let eager = (lower.starts_with("std::thread::local_impl::eagerstorage")
+        || lower.starts_with("std::sys::thread_local::native::eager::storage"))
+        && crate::generate::method_tail(lower) == "get";
+    let hit = lazy || eager;
     if hit && std::env::var_os("TRUST_TLS_DISCHARGE_DEBUG").is_some() {
+        let arm = if lazy { "lazy-init" } else { "const-init (eager)" };
         eprintln!(
-            "TRUST_TLS_DISCHARGE_DEBUG: call_is_modeled covers native-TLS lazy-init \
+            "TRUST_TLS_DISCHARGE_DEBUG: call_is_modeled covers native-TLS {arm} \
              unsafe call `{lower}` — [unsafe:unmodeled-call] completeness finding \
              suppressed (compiler-generated, doc(hidden); driven init fn carries its own)"
         );
@@ -5964,9 +6064,7 @@ mod tests {
                                 ("len".into(), Ty::Int { width: 64, signed: false }),
                             ],
                             disc_index_safe: false,
-                            faithful_enum_repr: None,
-                            enum_layout: None,
-                        }),
+                            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }),
                     },
                     name: Some("self".into()),
                 },
@@ -5992,9 +6090,7 @@ mod tests {
                         ("n".into(), Ty::Int { width: 64, signed: false }),
                     ],
                     disc_index_safe: false,
-                    faithful_enum_repr: None,
-                    enum_layout: None,
-                },
+                    faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
                 name: None,
             }],
             0,
@@ -7745,9 +7841,7 @@ mod tests {
                 ("len".into(), Ty::Int { width: 64, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let func = make_func(
             "as_slice",
             vec![
@@ -7881,9 +7975,7 @@ mod tests {
                 ("len".into(), Ty::Int { width: 64, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         make_func(
             "as_slice",
             vec![
@@ -8061,6 +8153,118 @@ mod tests {
             "mycrate::std::os::fd::fromrawfd::from_raw_fd",
             "<mycrate::file as mycrate::std::os::fd::fromrawfd>::from_raw_fd",
             "mycrate::from_raw_fd_wrapper",
+        ] {
+            assert!(!call_is_modeled(unmodeled), "should NOT be modeled: {unmodeled}");
+        }
+    }
+
+    /// STALE-ALLOWLIST PIN (Fix 1). Every string below was captured verbatim (then
+    /// lowercased, as `call_has_unsafe_model` does) from a `TRUST_UNSAFE_CALL_DEBUG=1`
+    /// probe on the DEPLOYED toolchain, where each was reported `unsafe=true modeled=false`
+    /// and produced a vacuous `[unsafe:unmodeled-call]` `Bool(true)` audit flag.
+    ///
+    /// FAILS ON UNFIXED CODE: with the old `matches!(c.rsplit("::").next(), Some("new_v1" |
+    /// "new_const" | "new_v1_formatted"))` body, none of the `::new` spellings match.
+    #[test]
+    fn fmt_arguments_current_ctor_is_covered() {
+        for modeled in [
+            // The CURRENT `format_args!` constructor: `pub unsafe fn new<const N, const M>`
+            // on the `#[doc(hidden)] #[unstable(feature = "fmt_internals")] impl<'a>
+            // Arguments<'a>` (library/core/src/fmt/mod.rs:729). EXACT probe capture.
+            "core::fmt::arguments::<'a>::new",
+            // Same, carrying the trailing monomorphization tag the extractor appends —
+            // this is the shape the naive `rsplit("::").next()` returns `<__trust_args@…>`
+            // for, so it needs `method_tail`.
+            "core::fmt::arguments::<'a>::new::<__trust_args@9f3c1b0e>",
+            // Const-generic instantiation (`new::<N, M>`) — likewise turbofish-tailed.
+            "core::fmt::arguments::<'a>::new::<14usize, 1usize>",
+            // `std::`-rooted re-export spelling of the same item.
+            "std::fmt::arguments::<'a>::new",
+            // Retired APIs stay recognized (older sysroot), incl. tagged forms.
+            "core::fmt::arguments::new_v1",
+            "core::fmt::arguments::new_const::<1usize>",
+            "core::fmt::arguments::new_v1_formatted::<__trust_args@deadbeef>",
+        ] {
+            assert!(call_is_modeled(modeled), "should be modeled: {modeled}");
+        }
+    }
+
+    /// FORGERY REJECTION for Fix 1 — the anchors that make the widened allowlist safe.
+    /// Each of these would, if accepted, SUPPRESS the fail-closed
+    /// `[unsafe:unmodeled-call]` obligation on a genuinely unmodeled unsafe call.
+    #[test]
+    fn fmt_arguments_ctor_forgeries_stay_fail_closed() {
+        for unmodeled in [
+            // Nested user module named `fmt::arguments` — blocked by the crate anchor.
+            "mycrate::fmt::arguments::<'a>::new",
+            "mycrate::fmt::arguments::new",
+            "deeply::nested::core::fmt::arguments::new",
+            // Orphan/user trait impl spelling — blocked by the ` as ` rejection.
+            "<core::fmt::arguments as mycrate::evil>::new",
+            "<mycrate::args as core::fmt::arguments>::new",
+            // Right anchor, wrong method: only the ctor family is covered.
+            "core::fmt::arguments::<'a>::new_evil",
+            "core::fmt::arguments::<'a>::renew",
+            "core::fmt::arguments::forged_ctor",
+            // A user free fn merely NAMED `new`.
+            "mycrate::new",
+            // `slice::from_raw_parts` must NOT ride this list — it is separately modeled
+            // and gets a REAL, non-constant `[unsafe:sep:call]` obligation. (Asserted
+            // positively here only to pin that it is not silently reclassified.)
+        ] {
+            assert!(!call_is_modeled(unmodeled), "should NOT be modeled: {unmodeled}");
+        }
+        // The `from_raw_parts` control: still covered, but by the raw-parts arm, and the
+        // fmt predicate must not be what covers it.
+        assert!(call_is_modeled("core::slice::raw::from_raw_parts::<'_, u8>"));
+        assert!(!is_std_fmt_arguments_ctor("core::slice::raw::from_raw_parts::<'_, u8>"));
+    }
+
+    /// THREAD-LOCAL SPELLING PIN (Fix 2). Both strings are verbatim probe captures
+    /// (lowercased) from `TRUST_UNSAFE_CALL_DEBUG=1` on the deployed toolchain, where
+    /// both were `unsafe=true modeled=false`.
+    ///
+    /// FAILS ON UNFIXED CODE: the old body anchored only
+    /// `std::thread::local_impl::lazystorage`, which is the macro's RE-EXPORT path, not
+    /// the DEFINITION path `safe_def_path_str` prints — so the recognizer was dead.
+    #[test]
+    fn native_tls_definition_path_spellings_are_covered() {
+        for modeled in [
+            // Lazy arm — `thread_local! { static X: T = <expr>; }` (ny-cert `ARENA`).
+            "std::sys::thread_local::native::lazy::storage::<t, d>::get_or_init",
+            "std::sys::thread_local::native::lazy::storage::<std::cell::refcell<arena>, ()>::get_or_init::<fn() -> std::cell::refcell<arena> {p::arena::__rust_std_internal_init_fn}>",
+            // Eager arm — `thread_local! { static X: T = const { … }; }`
+            // (ny-cert `POISONED` / `DEADLINE`).
+            "std::sys::thread_local::native::eager::storage::<t>::get",
+            "std::sys::thread_local::native::eager::storage::<core::cell::cell<bool>>::get::<__trust_args@1a2b3c>",
+            // Re-export spellings stay recognized (older printers / gate logs).
+            "std::thread::local_impl::lazystorage::<u32, ()>::get_or_init",
+            "std::thread::local_impl::eagerstorage::<u32>::get",
+        ] {
+            assert!(call_is_modeled(modeled), "should be modeled: {modeled}");
+        }
+    }
+
+    /// FORGERY REJECTION for Fix 2. `std::sys` is a private std module, so no user path
+    /// can name it — but the anchor must still be a PREFIX anchor, and unrelated
+    /// `get_or_init`/`get` methods must stay fail-closed.
+    #[test]
+    fn native_tls_forgeries_and_siblings_stay_fail_closed() {
+        for unmodeled in [
+            // Nested user module mimicking the definition path — blocked by `starts_with`.
+            "mycrate::std::sys::thread_local::native::lazy::storage::<t, d>::get_or_init",
+            "mycrate::sys::thread_local::native::eager::storage::<t>::get",
+            "deeply::nested::std::sys::thread_local::native::eager::storage::<t>::get",
+            // `OnceLock`/`OnceCell`/user `get_or_init` siblings — no TLS anchor.
+            "std::sync::oncelock::<u32>::get_or_init::<{closure@x.rs}>",
+            "core::cell::oncecell::<u32>::get_or_init::<{closure@x.rs}>",
+            "mycrate::cache::<u32>::get_or_init",
+            // Right anchor, wrong leaf: the eager arm is EXACT `get`, so neither the
+            // private cold path nor a same-prefixed sibling is swept in.
+            "std::sys::thread_local::native::eager::storage::<t>::get_or_init_slow",
+            "std::sys::thread_local::native::eager::storage::<t>::get_mut_evil",
+            // Right anchor, wrong leaf on the lazy arm.
+            "std::sys::thread_local::native::lazy::storage::<t, d>::destroy",
         ] {
             assert!(!call_is_modeled(unmodeled), "should NOT be modeled: {unmodeled}");
         }

@@ -1,0 +1,26 @@
+error: the initializer of `ARMED` can wait on `ARMED` itself: a `std::sync::OnceLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/self_wait_direct.rs:15:12
+   |
+LL |       *ARMED.get_or_init(|| {
+   |  ____________^
+LL | |
+LL | |         let on = debug_seamless_reexec_armed();
+   | |                  ----------------------------- the initializer reaches the re-entrant wait through this call
+LL | |         if on {
+...  |
+LL | |         on
+LL | |     })
+   | |______^ the initializer of `ARMED` reaches this call, which waits on `ARMED` again
+   |
+   = note: call path: `debug_seamless_reexec_armed::{closure#0}` -> `debug_seamless_reexec_armed` -> `ARMED.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `debug_seamless_reexec_armed` — read the input it needs directly instead of asking `ARMED` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `ARMED.get_or_init(|| v)` (or `ARMED.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `ARMED`, read `ARMED.get()` there — it never waits
+note: `ARMED` is declared here
+  --> $DIR/self_wait_direct.rs:14:5
+   |
+LL |     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+

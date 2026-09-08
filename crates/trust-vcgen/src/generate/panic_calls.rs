@@ -348,7 +348,7 @@ pub(super) fn operand_is_len_of_base(
     if !p.projections.is_empty() {
         return false;
     }
-    // `_len = X.len()` is a Call (not a Statement::Assign), so `unique_whole_local_def`
+    // `_len = X.len()` is a Call (not a Statement::Assign), so `unique_value_def`
     // returns None for it — scan the Call terminators directly, reusing the same
     // `method_tail == "len"` + unique-base trace the tie site keys on. CRUCIAL: the len
     // dest itself must be UNIQUELY whole-local defined (`base_collection_local_unique ==
@@ -375,7 +375,7 @@ pub(super) fn operand_is_len_of_base(
         }
     }
     // A slice-view length carrier: `Len(place)` / `PtrMetadata(&place)` over the base.
-    match crate::unique_whole_local_def(func, p.local) {
+    match crate::local_defs::unique_value_def(func, p.local) {
         Some(Rvalue::Len(place)) if place.projections.is_empty() => {
             guards::base_collection_local_unique(func, place.local) == Some(base)
         }
@@ -429,7 +429,7 @@ pub(super) fn operand_within_abstract_len(
     // `checked_self_decrement_const`'s `lhs == l` to any length-of-base operand.
     if p.projections == [trust_types::Projection::Field(0)] {
         if let Some(Rvalue::CheckedBinaryOp(trust_types::BinOp::Sub, lhs, rhs)) =
-            crate::unique_whole_local_def(func, p.local)
+            crate::local_defs::unique_value_def(func, p.local)
         {
             return operand_is_nonneg_const(rhs)
                 && operand_within_abstract_len(func, lhs, base, fuel - 1);
@@ -439,7 +439,7 @@ pub(super) fn operand_within_abstract_len(
     if !p.projections.is_empty() {
         return false;
     }
-    if let Some(Rvalue::Use(inner)) = crate::unique_whole_local_def(func, p.local) {
+    if let Some(Rvalue::Use(inner)) = crate::local_defs::unique_value_def(func, p.local) {
         return operand_within_abstract_len(func, inner, base, fuel - 1);
     }
     false

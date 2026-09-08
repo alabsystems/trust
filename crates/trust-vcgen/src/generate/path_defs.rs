@@ -226,9 +226,8 @@ pub(crate) fn terminator_def_names(
             // points-to (disjoint `&mut` args) is a further completeness
             // refinement. Shared-ref interior mutability
             // is a separate, narrower residual.
-            let mut names = mutably_borrowed_havoc_names(func);
-            // Trust #soundness (round-12/13): also havoc every local whose type
-            // TRANSITIVELY contains a mutable reference / raw pointer — a `&mut`/
+            // Trust #soundness (round-12/13): the list also havocs every local whose
+            // type TRANSITIVELY contains a mutable reference / raw pointer — a `&mut`/
             // `*mut` PARAMETER, a pointer RETURNED from a call, or one NESTED in an
             // aggregate (`struct Wrapper { p: &mut u32 }`, a tuple/array/closure
             // capture, …). None have a syntactic `&mut x` statement, and the nested
@@ -236,7 +235,7 @@ pub(crate) fn terminator_def_names(
             // mutably_borrowed_local_names misses them. The callee can mutate the
             // pointee, so we havoc the local's BASE name — its prefix-overlap kills
             // the pointer, its pointee `s*`, and any nested pointee `s.f*`.
-            names.extend(mutable_pointer_local_names(func));
+            let mut names = function_havoc_names(func).as_ref().clone();
             // Trust (BLOCKER 2 — opaque callee effect summaries): the alias list
             // above is a WHOLE-FUNCTION over-approximation by BASE LOCAL name, so
             // for a `&mut self` method it is the single name `self` — a projection
@@ -287,8 +286,7 @@ pub(crate) fn terminator_def_names(
         // mut-pointer-carrying local, the dropped place itself, and its
         // deref-extension (the pointee spelling a `Box`/ref drop mutates).
         Terminator::Drop { place, .. } => {
-            let mut names = mutably_borrowed_havoc_names(func);
-            names.extend(mutable_pointer_local_names(func));
+            let mut names = function_havoc_names(func).as_ref().clone();
             names.push(place_to_var_name(func, place));
             let mut dp = place.clone();
             dp.projections.push(trust_types::Projection::Deref);
@@ -299,11 +297,7 @@ pub(crate) fn terminator_def_names(
         // InlineAsm / unlowered constructs that preserve successors) can run
         // arbitrary code — same conservative havoc as a Call (minus a dest,
         // which Opaque does not model). Dropping facts is monotone-sound.
-        Terminator::Opaque { .. } => {
-            let mut names = mutably_borrowed_havoc_names(func);
-            names.extend(mutable_pointer_local_names(func));
-            names
-        }
+        Terminator::Opaque { .. } => function_havoc_names(func).as_ref().clone(),
         _ => Vec::new(),
     }
 }
@@ -423,7 +417,7 @@ pub(crate) fn mutably_borrowed_local_names(func: &VerifiableFunction) -> Vec<Str
 /// precondition) survives STALE — vacuously discharging a real obligation over the
 /// post-store value (a confirmed false-PROVE: a reseated `*r = 4e9` left `x == 5`
 /// live and proved `x + x` non-overflowing). The single-borrow case is already
-/// folded (round-12, `unique_whole_local_def` skips deref-stores), so this fires
+/// folded (round-12, `unique_value_def` skips deref-stores), so this fires
 /// ONLY for the genuinely-opaque case and keeps full precision otherwise.
 ///
 /// Conservatively havoc every mutably-borrowed / mutable-pointer local — the exact
@@ -455,26 +449,53 @@ pub(crate) fn mutably_borrowed_local_names(func: &VerifiableFunction) -> Vec<Str
 /// opaque pointer. Measured: the element-store controls (`&mut T` through a
 /// two-branch borrow, `v[i] = x`, a `&mut` element write in a loop, a raw-pointer
 /// element store) all keep their proofs under this scoping.
+///
+/// verifier-perf: the returned list is a pure function of `func` ALONE — the
+/// `block` argument only selects whether the (block-gated) havoc is in effect at
+/// all. Both halves are therefore memoized per function by `havoc_memo`: the
+/// list itself once per `func`, and the block gate once per block (keyed by the
+/// block's statement-buffer address — see `havoc_memo::block_key`). Sharing the
+/// list behind an `Rc` also keeps the hot `writes_until` path from cloning
+/// O(locals) strings at every program point. See `havoc_memo`'s header for the
+/// staleness argument; the values are byte-identical to the unmemoized ones.
 pub(super) fn deref_store_havoc_names(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
-) -> Vec<String> {
-    let has_opaque_deref_store = block.stmts.iter().any(|stmt| {
-        let Statement::Assign { place, .. } = stmt else { return false };
-        // Opaque ⟺ the pointer does not fold to a concrete referent — covers the
-        // reseated/multi-borrow/param case AND a cast-laundered pointer
-        // (`&mut x as *mut`, IntToPtr) whose def `resolve_referent` cannot fold.
-        // `deref_pointer_is_opaque` is the strict, name-mint-consistent superset of
-        // the old `unique_whole_local_def(..).is_none()` check.
-        matches!(place.projections.first(), Some(trust_types::Projection::Deref))
-            && crate::deref_pointer_is_opaque(func, place.local)
-    });
+) -> std::rc::Rc<Vec<String>> {
+    let has_opaque_deref_store =
+        crate::havoc_memo::block_has_opaque_store(func, crate::havoc_memo::block_key(block), || {
+            block.stmts.iter().any(|stmt| {
+                let Statement::Assign { place, .. } = stmt else { return false };
+                // Opaque ⟺ the pointer does not fold to a concrete referent — covers the
+                // reseated/multi-borrow/param case AND a cast-laundered pointer
+                // (`&mut x as *mut`, IntToPtr) whose def `resolve_referent` cannot fold.
+                // `deref_pointer_is_opaque` is the strict, name-mint-consistent superset of
+                // the old `crate::local_defs::unique_value_def(..).is_none()` check.
+                matches!(place.projections.first(), Some(trust_types::Projection::Deref))
+                    && crate::deref_pointer_is_opaque(func, place.local)
+            })
+        });
     if !has_opaque_deref_store {
-        return Vec::new();
+        return std::rc::Rc::new(Vec::new());
     }
-    let mut names = mutably_borrowed_havoc_names(func);
-    names.extend(mutable_pointer_local_names(func));
-    names
+    function_havoc_names(func)
+}
+
+/// The whole-function conservative havoc list —
+/// `mutably_borrowed_havoc_names(func) ++ mutable_pointer_local_names(func)` —
+/// shared behind an `Rc` and computed once per function.
+///
+/// This is the SINGLE spelling of that union. It was previously open-coded at
+/// four sites (`Call`, `Drop`, `Opaque` and the opaque-deref-store gate), which
+/// made it four independently-forkable copies of one rule as well as four
+/// whole-function rescans; routing them all through here keeps them equal by
+/// construction.
+pub(super) fn function_havoc_names(func: &VerifiableFunction) -> std::rc::Rc<Vec<String>> {
+    crate::havoc_memo::havoc_list(func, || {
+        let mut names = mutably_borrowed_havoc_names(func);
+        names.extend(mutable_pointer_local_names(func));
+        names
+    })
 }
 
 /// Append `new_defs` onto `defs`, first dropping any existing fact that *mentions*
@@ -526,8 +547,12 @@ pub(super) fn v2_live_path_defs(
     block_defs.extend(extract_set_discriminant_definitions(func, block));
     let mut redefined: FxHashSet<String> =
         block_defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+    // Extraction-declined destinations still invalidate entry facts — the write
+    // must stay in the kill even where the def was refused (the unified write
+    // oracle, see `extend_with_assigned_place_dests`).
+    extend_with_assigned_place_dests(func, &block.stmts, &mut redefined);
     extend_with_derived_slice_len(&mut redefined);
-    redefined.extend(deref_store_havoc_names(func, block));
+    redefined.extend(deref_store_havoc_names(func, block).iter().cloned());
     if redefined.is_empty() {
         return entry_defs.to_vec();
     }
@@ -575,9 +600,93 @@ pub(crate) fn block_written_names(
     defs.extend(extract_set_discriminant_definitions(func, block));
     let mut names: FxHashSet<String> =
         defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+    extend_with_assigned_place_dests(func, &block.stmts, &mut names);
     extend_with_derived_slice_len(&mut names);
     names.extend(block_deref_store_havoc_names(func, block));
     names.extend(terminator_def_names(func, block));
+    names
+}
+
+/// THE UNIFIED WRITE ORACLE: the name of every EXPLICIT place destination in
+/// `stmts` (`Assign` / `SetDiscriminant` / `Deinit`), spelled by
+/// `place_to_var_name` — the same fail-closed enumeration
+/// `conservative_snapshot_writes` uses for the proof-snapshot lane, generalized
+/// to every gen-set the version map and the kills are built from.
+///
+/// Definition extraction (`extract_block_definitions_until_impl`) intentionally
+/// DECLINES a def for several rvalues — bare wrapping `Mul` / unknown widths,
+/// unsigned non-constant `Rem`, unsupported casts, FP shapes whose lhs is not a
+/// `Var`, `&mut` borrows, the generic catch-all. Each refusal is sound as a
+/// dropped HYPOTHESIS, but the gen-sets used to be derived from
+/// `formula_def_name` over the extracted defs alone, so each such `continue`
+/// also deleted the WRITE from write visibility: downstream reads of the
+/// assigned place rendered BARE and every rename-exempt bare fact
+/// (preconditions, path guards, semantic guards, arg type ranges) unified
+/// straight across the invisible write — a measured false PROOF
+/// (`tests/dropped_def_write_visibility.rs`). Unioning the raw destinations in
+/// makes the write domain a superset of what `stmt_writes_name` recognizes, so
+/// the version-token gate and the per-statement token search agree by
+/// construction (`mod.rs`'s `version_token_at` invariant), and widening is the
+/// monotone-sound direction: an extra gen-set name only versions MORE reads,
+/// and a versioned read with no defining equation is a FREE symbol — it can
+/// weaken a proof or widen a refutation, never manufacture a proof.
+///
+/// Union-only: never replaces `formula_def_name` entries (synthetic lhs names
+/// like `r*`, `r__slice_len`, `arr$L$vN` keep their own spellings alongside).
+/// Call BEFORE `extend_with_derived_slice_len` so each added dest gets its
+/// `__slice_len` twin, matching `conservative_snapshot_writes`' own derivation.
+pub(crate) fn extend_with_assigned_place_dests(
+    func: &VerifiableFunction,
+    stmts: &[Statement],
+    names: &mut FxHashSet<String>,
+) {
+    for stmt in stmts {
+        let place = match stmt {
+            Statement::Assign { place, .. }
+            | Statement::SetDiscriminant { place, .. }
+            | Statement::Deinit { place } => place,
+            // Fail-closed contract for every OTHER variant:
+            // `Statement::write_effect` is EXHAUSTIVE in trust-types (a new
+            // variant fails to compile until classified there). `NoValueWrite`
+            // variants write no place; `FailClosedOrBackstopped` variants with
+            // no destination place (`Intrinsic`, `CopyNonOverlapping`,
+            // `Unsupported`) cannot be captured by ANY place-keyed gen-set and
+            // are refused by their own gates (UnsupportedMir degradation, the
+            // sep-engine copy rows, the mutable-borrow havoc). The tripwire
+            // below fires if a place-writing variant is ever added without
+            // being enumerated here.
+            _ => {
+                debug_assert!(
+                    !matches!(stmt.write_effect(), trust_types::WriteEffect::Captured),
+                    "place-destination statement not enumerated in the write oracle: {stmt:?}"
+                );
+                continue;
+            }
+        };
+        names.insert(crate::place_to_var_name(func, place));
+    }
+}
+
+/// The kill a block's OWN statements impose on facts that were true at its
+/// ENTRY: extracted def names + every raw statement destination
+/// (`extend_with_assigned_place_dests`) + derived `__slice_len` twins + the
+/// opaque-deref-store havoc. Terminator defs are deliberately EXCLUDED — a
+/// block's own safety obligations sit at its terminator, before any `Call`-dest
+/// write takes effect (the same exclusion `v2_may_reassigned_per_block` applies
+/// at the defining block). This is the exact intra-block half of the staleness
+/// kill for consumers whose threaded facts already received the flow-sensitive
+/// inter-block kills in `v2_path_def_fixpoint` (see `hardened.rs`).
+pub(crate) fn block_entry_fact_kill_names(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+) -> FxHashSet<String> {
+    let mut block_defs = guards::extract_block_definitions(func, block);
+    block_defs.extend(extract_set_discriminant_definitions(func, block));
+    let mut names: FxHashSet<String> =
+        block_defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+    extend_with_assigned_place_dests(func, &block.stmts, &mut names);
+    extend_with_derived_slice_len(&mut names);
+    names.extend(deref_store_havoc_names(func, block).iter().cloned());
     names
 }
 
@@ -654,7 +763,7 @@ fn deref_store_havoc_names_over(
         if !opaque_store_confined_to_written_place(func, place) {
             // Unconfined: this statement alone havocs the whole list, so the
             // union is the whole list and nothing further can shrink it.
-            return havoc.into_iter().collect();
+            return havoc.iter().cloned().collect();
         }
         // Minted with the SAME construction `mutable_pointer_local_names` uses,
         // so the exclusion is name-consistent with the list by construction.
@@ -841,7 +950,24 @@ pub(crate) fn shadow_parity_disagreements_overlap(func: &VerifiableFunction) -> 
 /// statement-granular version derived from this is drop-equivalent to the kill at
 /// the correct granularity. Includes set-discriminant defs and the opaque-deref
 /// havoc (attributed conservatively when a deref-store occurs in the prefix).
+///
+/// verifier-perf: this is a pure function of `(func, block, stmt_idx)` — it does
+/// NOT depend on the name being queried — yet `version_token_at` calls it once
+/// per (program point x name), so the raw form recomputed the whole prefix
+/// analysis O(names) times at every point. Memoized per `(BlockId, stmt_idx)`
+/// and shared behind an `Rc`; see `havoc_memo` for why an entry cannot outlive
+/// or cross the function it was computed for.
 pub(crate) fn writes_until(
+    func: &VerifiableFunction,
+    block: &trust_types::BasicBlock,
+    stmt_idx: usize,
+) -> std::rc::Rc<FxHashSet<String>> {
+    crate::havoc_memo::writes_until(func, crate::havoc_memo::block_key(block), stmt_idx, || {
+        writes_until_uncached(func, block, stmt_idx)
+    })
+}
+
+fn writes_until_uncached(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
     stmt_idx: usize,
@@ -850,6 +976,13 @@ pub(crate) fn writes_until(
     defs.extend(extract_set_discriminant_definitions_until(func, block, stmt_idx));
     let mut names: FxHashSet<String> =
         defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
+    // Same per-statement destination union as `block_written_names`,
+    // prefix-restricted — the two oracles must agree (the unified write oracle).
+    extend_with_assigned_place_dests(
+        func,
+        &block.stmts[..stmt_idx.min(block.stmts.len())],
+        &mut names,
+    );
     extend_with_derived_slice_len(&mut names);
     // Opaque deref-store havoc: if any opaque `*p = v` appears in stmts[..stmt_idx],
     // its referent-havoc is in effect from that point. `deref_store_havoc_names` is
@@ -886,20 +1019,255 @@ pub(crate) fn writes_until(
 pub(crate) fn block_entry_versions(
     func: &VerifiableFunction,
 ) -> FxHashMap<BlockId, FxHashMap<String, std::collections::BTreeSet<String>>> {
+    let n = func.body.blocks.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, b) in func.body.blocks.iter().enumerate() {
+        // UNWIND-INCLUSIVE predecessor edges, matching the fact-transport graph
+        // (`v2_path_def_fixpoint` transports facts across cleanup edges): a
+        // cleanup-only-reachable block must NOT render its reads bare when a
+        // normal-path write precedes the unwind — bare is exactly what let a
+        // rename-exempt entry precondition unify across a dropped-def write on
+        // the unwind shape (`tests/dropped_def_write_visibility.rs`). Extra
+        // predecessor edges only ADD reaching tokens, moving reads AWAY from
+        // the bare/entry rendering — rename-exempt bare facts can only LOSE
+        // unification points (monotone-sound).
+        for t in full_graph_terminator_targets(&b.terminator, b.id) {
+            if t.0 < n {
+                preds[t.0].push(i);
+            }
+        }
+    }
+    entry_versions_fixpoint(func, &preds).0
+}
+
+/// Every successor edge `v2_path_def_fixpoint` can transport a fact across:
+/// `unguarded_successors` (which includes the unwind/cleanup successor) plus the
+/// in-CFG `discovered_clauses` targets — the same union
+/// `entry_sentinel_tie_subsumption_tests::fixpoint_enqueue_targets` pins as the
+/// fixpoint's enqueue set for every `Terminator` variant, present and future.
+/// `v2_terminator_targets` is unioned in as belt-and-braces so a future divergence
+/// between the two successor functions fails toward MORE predecessor edges — i.e.
+/// fewer `#e` mints — never fewer.
+pub(crate) fn full_graph_terminator_targets(
+    terminator: &Terminator,
+    source: BlockId,
+) -> Vec<BlockId> {
+    let mut targets: Vec<BlockId> = terminator.unguarded_successors();
+    for clause in terminator.discovered_clauses(source) {
+        if let trust_types::ClauseTarget::Block(target) = clause.target {
+            targets.push(target);
+        }
+    }
+    targets.extend(v2_terminator_targets(terminator));
+    targets.sort_unstable_by_key(|t| t.0);
+    targets.dedup();
+    targets
+}
+
+/// FAIL-CLOSED sibling of [`block_entry_versions`]: the same reaching-version
+/// fixpoint over the same unwind-inclusive predecessor relation (since
+/// 2026-08-30 both build their edges from `full_graph_terminator_targets`; this
+/// one predates that adoption). Under this map, a name whose reaching union at a
+/// block is exactly `{e}` has NO writer on ANY runtime path into the block, normal
+/// or unwind — the entry-denotation guarantee the `#e` mint gate in
+/// `pin_in_place_update_reads` requires. The remaining difference is convergence
+/// semantics: `None` when the fixpoint hit its step cap without converging; the
+/// sole consumer fails closed on `None` (no `#e` minted), while the v2 caller
+/// keeps its historical partial-map behavior.
+pub(crate) fn block_entry_versions_full_graph(
+    func: &VerifiableFunction,
+) -> Option<FxHashMap<BlockId, FxHashMap<String, std::collections::BTreeSet<String>>>> {
+    let n = func.body.blocks.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, b) in func.body.blocks.iter().enumerate() {
+        for t in full_graph_terminator_targets(&b.terminator, b.id) {
+            if t.0 < n {
+                preds[t.0].push(i);
+            }
+        }
+    }
+    let (map, converged) = entry_versions_fixpoint(func, &preds);
+    converged.then_some(map)
+}
+
+/// The shared fixpoint of [`block_entry_versions`] and
+/// [`block_entry_versions_full_graph`]; only the predecessor relation differs.
+/// The second return is CONVERGENCE: `false` iff the step cap was hit while the
+/// in-sets were still changing, OR the ambient verify budget tripped and the
+/// walk was abandoned (the v2 caller keeps its historical behavior of using the
+/// partial map; the full-graph caller fails closed). On a budget trip the
+/// caller's own post-generation checkpoint discards the function's whole
+/// inventory, so no row built on a partial map can be kept — see the poll.
+fn entry_versions_fixpoint(
+    func: &VerifiableFunction,
+    preds: &[Vec<usize>],
+) -> (FxHashMap<BlockId, FxHashMap<String, std::collections::BTreeSet<String>>>, bool) {
     use std::collections::BTreeSet;
     let n = func.body.blocks.len();
-    let gen_sets: Vec<FxHashSet<String>> =
-        func.body.blocks.iter().map(|b| block_written_names(func, b)).collect();
-    let all_names: FxHashSet<String> = gen_sets.iter().flatten().cloned().collect();
-    // Precompute each block's OUT token per gen'd name (constant across the
-    // fixpoint): the last statement writing/havocing the name, else a terminator
-    // marker `s{b}_t` for a name the block's TERMINATOR defines (Call dest).
-    let gen_out: Vec<FxHashMap<String, String>> = func
-        .body
-        .blocks
-        .iter()
-        .enumerate()
-        .map(|(bi, b)| {
+    // The gen-sets, the name universe and the per-block OUT tokens are a pure
+    // function of `func` (see `EntryVersionGenSets`), so both callers share one
+    // build. `None` = the ambient budget tripped mid-precompute; the whole
+    // fixpoint is abandoned rather than run against a short gen-set.
+    let Some(precomputed) = entry_version_gen_sets(func) else {
+        return (FxHashMap::default(), false);
+    };
+    let EntryVersionGenSets { gen_sets, all_names, gen_out } = precomputed.as_ref();
+    let sentinel = || BTreeSet::from([ENTRY_VERSION_SENTINEL.to_string()]);
+    let entry_in: FxHashMap<String, BTreeSet<String>> =
+        all_names.iter().map(|nm| (nm.clone(), sentinel())).collect();
+    let mut in_sets: Vec<FxHashMap<String, BTreeSet<String>>> = vec![FxHashMap::default(); n];
+    if n > 0 {
+        in_sets[0] = entry_in.clone();
+    }
+    let mut changed = true;
+    let mut guard = 0usize;
+    let mut budget_tripped = false;
+    let cap = n.saturating_mul(n).saturating_add(n).saturating_mul(8).saturating_add(4096);
+    while changed && guard < cap {
+        changed = false;
+        guard += 1;
+        for b in 0..n {
+            // BUDGET POLL (`-Ztrust-verify-function-budget-{ms,steps}`). This
+            // loop had none, and `cap` alone is `8n^2 + 8n + 4096` ROUNDS over
+            // `n` blocks x predecessor edges x live names — measured, a budgeted
+            // run of `nn-core` sat 10+ minutes here with the budget LIVE and
+            // correctly reporting 'timed out' elsewhere, because the checkpoint
+            // that reports an overrun sits AFTER generation returns and
+            // generation never returned.
+            //
+            // Per BLOCK, not merely per round: one round of a large CFG is
+            // itself long enough to be the whole overrun.
+            //
+            // Breaking out is the ONLY sound degradation. A reaching-version
+            // oracle may not hand back a truncated answer — a SHORT reaching
+            // set is a short kill set, which lets a stale fact survive and
+            // vacuously discharge a real obligation (a false PROVE) — so the
+            // in-sets are left exactly as computed and the result is reported
+            // NOT CONVERGED. `block_entry_versions_full_graph` already fails
+            // closed on that (no `#e` is minted anywhere in the function), and
+            // the caller in `rustc_mir_transform::trust_verify` observes the
+            // spent budget at its existing checkpoint and applies the
+            // discipline `d9d9d675e3` landed: advisory warns and substitutes
+            // one COUNTED `Unknown` with the partial VCs discarded wholesale,
+            // strict/certify/memory-safe keep the located hard error. This adds
+            // a poll to an existing mechanism; it does not introduce a second.
+            if trust_types::verify_budget::budget_exhausted() {
+                budget_tripped = true;
+                break;
+            }
+            // verifier-perf: ACCUMULATE into `in_sets[b]` instead of rebuilding
+            // it. This was `let mut new_in = ...; for p { for (nm, s) in
+            // out_of(p, &in_sets[p]) { new_in.entry(nm).or_default().extend(s) }
+            // }; if new_in != in_sets[b] { in_sets[b] = new_in }` — which, for
+            // EVERY (round x block x predecessor edge), materialized a whole
+            // intermediate `FxHashMap<String, BTreeSet<String>>` (`out_of`),
+            // deep-cloned every name and every token into a second one
+            // (`new_in`), and then compared two full maps. That churn was the
+            // #1 self-time leaf of a stack sample of the wedged `nn-core`
+            // generator, with `HashMap<String, BTreeSet<String>>`'s
+            // `reserve_rehash` and `insert` the #2 and #3.
+            //
+            // WHY ACCUMULATING IS EXACTLY THE SAME COMPUTATION. The transfer is
+            // MONOTONE and the in-sets only ever GROW, so `new_in` was always a
+            // SUPERSET of the `in_sets[b]` it replaced. Induction: every in-set
+            // starts empty (block 0 starts at `entry_in`); block `b`'s stored
+            // value is `F_b` applied to an EARLIER, componentwise-smaller state,
+            // and `F_b` is monotone, so re-applying it to the current state can
+            // only add. Hence `new_in == in_sets[b] union contributions`, and
+            // `new_in != in_sets[b]` holds exactly when some contribution was
+            // absent — which is what `additions` records. Block 0's `entry_in`
+            // seed is already contained in `in_sets[0]` (it is its initial
+            // value, and it only grows), so dropping the per-visit reseed drops
+            // nothing.
+            //
+            // The two contribution families are `out_of`'s two arms verbatim:
+            // for each name in `all_names`, the singleton `{gen_out[p][nm]}`
+            // when `p` gens it, else `in_sets[p][nm]` when present. `gen_sets[p]`
+            // is a subset of `all_names` by construction (`all_names` is their
+            // union) and every in-set key is an `all_names` key by the same
+            // induction, so iterating the two families visits exactly the pairs
+            // `out_of` emitted and nothing else.
+            //
+            // The read phase borrows `in_sets` immutably throughout, so a
+            // SELF-LOOP (`p == b`) reads block `b`'s pre-visit value — exactly
+            // what `out_of(b, &in_sets[b])` did.
+            let mut additions: Vec<(String, String)> = Vec::new();
+            for &p in &preds[b] {
+                for nm in &gen_sets[p] {
+                    let tok = &gen_out[p][nm];
+                    if !in_sets[b].get(nm).is_some_and(|have| have.contains(tok)) {
+                        additions.push((nm.clone(), tok.clone()));
+                    }
+                }
+                for (nm, s) in &in_sets[p] {
+                    if gen_sets[p].contains(nm) {
+                        continue;
+                    }
+                    let have = in_sets[b].get(nm);
+                    for tok in s {
+                        if !have.is_some_and(|h| h.contains(tok)) {
+                            additions.push((nm.clone(), tok.clone()));
+                        }
+                    }
+                }
+            }
+            if !additions.is_empty() {
+                for (nm, tok) in additions {
+                    in_sets[b].entry(nm).or_default().insert(tok);
+                }
+                changed = true;
+            }
+        }
+        if budget_tripped {
+            break;
+        }
+    }
+    let map = func.body.blocks.iter().enumerate().map(|(i, b)| (b.id, in_sets[i].clone())).collect();
+    // A budget trip is NOT convergence even when the interrupted round happened
+    // to change nothing: the remaining blocks of that round were never visited.
+    (map, !changed && !budget_tripped)
+}
+
+/// The predecessor-INDEPENDENT half of [`entry_versions_fixpoint`].
+///
+/// `preds` is consulted nowhere in building these three, yet the fixpoint runs
+/// TWICE per function — once from [`block_entry_versions`] and once from
+/// [`block_entry_versions_full_graph`], differing ONLY in the predecessor
+/// relation — so they were built identically twice. The second build is the
+/// expensive one to repeat: `gen_out` is an O(blocks x names x statements)
+/// `stmt_writes_name` scan.
+struct EntryVersionGenSets {
+    /// The names each block writes (`block_written_names`), by block index.
+    gen_sets: Vec<FxHashSet<String>>,
+    /// Their union — the fixpoint's whole name universe.
+    all_names: FxHashSet<String>,
+    /// Each block's OUT token per gen'd name, constant across the fixpoint.
+    gen_out: Vec<FxHashMap<String, String>>,
+}
+
+/// Build (or reuse) the precompute above. `None` iff the ambient verify budget
+/// tripped part-way, in which case NOTHING is memoized — see
+/// `crate::havoc_memo::entry_gen_sets` for why a truncated one may never be
+/// stored or returned.
+fn entry_version_gen_sets(func: &VerifiableFunction) -> Option<std::rc::Rc<EntryVersionGenSets>> {
+    crate::havoc_memo::entry_gen_sets(func, || {
+        let gen_sets: Vec<FxHashSet<String>> =
+            func.body.blocks.iter().map(|b| block_written_names(func, b)).collect();
+        let all_names: FxHashSet<String> = gen_sets.iter().flatten().cloned().collect();
+        // Precompute each block's OUT token per gen'd name (constant across the
+        // fixpoint): the last statement writing/havocing the name, else a terminator
+        // marker `s{b}_t` for a name the block's TERMINATOR defines (Call dest).
+        let mut gen_out: Vec<FxHashMap<String, String>> = Vec::with_capacity(func.body.blocks.len());
+        for (bi, b) in func.body.blocks.iter().enumerate() {
+            // BUDGET POLL: this walk is O(names x statements) per block with a
+            // whole-block `stmt_writes_name` scan inside, so it is its own
+            // overrun channel. Abandoning it returns `None` all the way out —
+            // a PARTIAL `gen_out` is not a cheaper answer, it is a WRONG one
+            // (a missing OUT token is a missing kill), so it is never built,
+            // never cached, and never handed to the fixpoint.
+            if trust_types::verify_budget::budget_exhausted() {
+                return None;
+            }
             // The block's TERMINATOR writes (a `Call` dest + escaping `&mut`s) run
             // AFTER every statement, so a name it reassigns has its OUT token pinned
             // to the terminator marker `s{b}_t` — DISTINCT from any statement
@@ -909,69 +1277,28 @@ pub(crate) fn block_entry_versions(
             // cannot see the terminator), and a stale pre-call fact would re-unify
             // with the post-call read (the case `terminator_def_names` defends).
             let term_defs = terminator_def_names(func, b);
-            gen_sets[bi]
-                .iter()
-                .map(|nm| {
-                    let tok = if term_defs.iter().any(|t| place_names_overlap(t, nm)) {
-                        format!("s{}_t", b.id.0)
-                    } else {
-                        match (0..b.stmts.len()).rev().find(|&k| stmt_writes_name(func, b, k, nm)) {
-                            Some(k) => format!("s{}_{k}", b.id.0),
-                            None => format!("s{}_t", b.id.0),
-                        }
-                    };
-                    (nm.clone(), tok)
-                })
-                .collect()
-        })
-        .collect();
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (i, b) in func.body.blocks.iter().enumerate() {
-        for t in v2_terminator_targets(&b.terminator) {
-            if t.0 < n {
-                preds[t.0].push(i);
-            }
+            gen_out.push(
+                gen_sets[bi]
+                    .iter()
+                    .map(|nm| {
+                        let tok = if term_defs.iter().any(|t| place_names_overlap(t, nm)) {
+                            format!("s{}_t", b.id.0)
+                        } else {
+                            match (0..b.stmts.len())
+                                .rev()
+                                .find(|&k| stmt_writes_name(func, b, k, nm))
+                            {
+                                Some(k) => format!("s{}_{k}", b.id.0),
+                                None => format!("s{}_t", b.id.0),
+                            }
+                        };
+                        (nm.clone(), tok)
+                    })
+                    .collect(),
+            );
         }
-    }
-    let sentinel = || BTreeSet::from([ENTRY_VERSION_SENTINEL.to_string()]);
-    let entry_in: FxHashMap<String, BTreeSet<String>> =
-        all_names.iter().map(|nm| (nm.clone(), sentinel())).collect();
-    let mut in_sets: Vec<FxHashMap<String, BTreeSet<String>>> = vec![FxHashMap::default(); n];
-    if n > 0 {
-        in_sets[0] = entry_in.clone();
-    }
-    let out_of = |b: usize, in_b: &FxHashMap<String, BTreeSet<String>>| {
-        let mut out: FxHashMap<String, BTreeSet<String>> = FxHashMap::default();
-        for nm in &all_names {
-            if gen_sets[b].contains(nm) {
-                out.insert(nm.clone(), BTreeSet::from([gen_out[b][nm].clone()]));
-            } else if let Some(s) = in_b.get(nm) {
-                out.insert(nm.clone(), s.clone());
-            }
-        }
-        out
-    };
-    let mut changed = true;
-    let mut guard = 0usize;
-    let cap = n.saturating_mul(n).saturating_add(n).saturating_mul(8).saturating_add(4096);
-    while changed && guard < cap {
-        changed = false;
-        guard += 1;
-        for b in 0..n {
-            let mut new_in: FxHashMap<String, BTreeSet<String>> =
-                if b == 0 { entry_in.clone() } else { FxHashMap::default() };
-            for &p in &preds[b] {
-                for (nm, s) in out_of(p, &in_sets[p]) {
-                    new_in.entry(nm).or_default().extend(s);
-                }
-            }
-            if new_in != in_sets[b] {
-                in_sets[b] = new_in;
-                changed = true;
-            }
-        }
-    }
-    func.body.blocks.iter().enumerate().map(|(i, b)| (b.id, in_sets[i].clone())).collect()
+        Some(EntryVersionGenSets { gen_sets, all_names, gen_out })
+    })
 }
 
 /// True iff an opaque deref-store to `place` provably CONFINES its effect —
@@ -1096,6 +1423,16 @@ pub(super) fn stmt_writes_name(
         }
         Statement::SetDiscriminant { place, .. } => {
             place_names_overlap(&crate::place_to_var_name(func, place), name)
+        }
+        // `Deinit` invalidates its place. With Deinit dests in the gen-sets
+        // (`extend_with_assigned_place_dests`), the token search must find the
+        // statement — gate/search parity, keeping the `s{b}_pre` phantom arm of
+        // `version_token_at` unreachable for union-admitted names. Deliberately
+        // NOT an establish point (`block_def_establish_stmt` unchanged — a
+        // deinit defines nothing).
+        Statement::Deinit { place } => {
+            let dest = crate::place_to_var_name(func, place);
+            place_names_overlap(&dest, name) || write_covers_derived_slice_len(&dest, name)
         }
         _ => false,
     }
@@ -1237,7 +1574,7 @@ pub(crate) fn version_rename_at(
 /// CORRECT (statement) granularity — the witness the block-level audit cannot give.
 #[cfg(test)]
 pub(crate) fn flip_matches_kill_stmt(func: &VerifiableFunction) -> usize {
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let may = v2_may_reassigned_per_block(func);
     let empty = FxHashSet::default();
     let mut disagreements = 0usize;
@@ -1317,7 +1654,7 @@ pub(crate) fn flip_matches_kill_stmt(func: &VerifiableFunction) -> usize {
 /// distinguishes the values the rename must keep apart.
 #[cfg(test)]
 pub(crate) fn flip_token_distinctness_violations(func: &VerifiableFunction) -> usize {
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let mut violations = 0usize;
     for block in &func.body.blocks {
         for k in 0..block.stmts.len() {
@@ -1363,12 +1700,10 @@ pub(crate) fn v2_may_reassigned_per_block(
     let mut gen_stmt: Vec<FxHashSet<String>> = Vec::with_capacity(n);
     let mut gen_term: Vec<FxHashSet<String>> = Vec::with_capacity(n);
     for block in &func.body.blocks {
-        let mut block_defs = guards::extract_block_definitions(func, block);
-        block_defs.extend(extract_set_discriminant_definitions(func, block));
-        let mut stmt: FxHashSet<String> =
-            block_defs.iter().filter_map(formula_def_name).map(str::to_string).collect();
-        extend_with_derived_slice_len(&mut stmt);
-        stmt.extend(deref_store_havoc_names(func, block));
+        // Extracted def names + raw statement destinations + derived twins +
+        // deref-store havoc — the unified write oracle, so the kill and the
+        // version map agree by construction (the parity audits demand it).
+        let stmt = block_entry_fact_kill_names(func, block);
         let term: FxHashSet<String> = terminator_def_names(func, block).into_iter().collect();
         gen_stmt.push(stmt);
         gen_term.push(term);
@@ -1399,7 +1734,13 @@ pub(crate) fn v2_may_reassigned_per_block(
         out.extend(gen_stmt[i].iter().cloned());
         out.extend(gen_term[i].iter().cloned());
 
-        for succ in v2_terminator_targets(&func.body.blocks[i].terminator) {
+        // Propagate across the FULL fact-transport graph (incl. unwind/cleanup
+        // edges), matching `v2_path_def_fixpoint`'s enqueue set and the
+        // unwind-inclusive entry-version map — a write on the normal path is a
+        // reassignment on the cleanup path too. More kill edges is drop-only.
+        for succ in
+            full_graph_terminator_targets(&func.body.blocks[i].terminator, func.body.blocks[i].id)
+        {
             let si = succ.0;
             if si >= n {
                 continue;
@@ -1477,7 +1818,7 @@ pub(crate) fn conjoin_preconditions_versioned_recorded(
 ) -> (Formula, Vec<Formula>) {
     use crate::versioned::{Fact, Vc, conjoin};
     let _ = killed; // the kill is REPLACED by the version rename (item 3: deleted)
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     // Trust (lane-A CSE): id==index invariant → O(1) indexed lookup; the
     // `.filter` preserves the exact `map_or(0, ..)` fallback of the find.
     let terminal =
@@ -1564,70 +1905,51 @@ fn entry_sentinel_ties(
     ties
 }
 
-/// May `Eq(base#e, base)` be asserted at `(block, terminal)`? Three clauses, each
+/// May `Eq(base#e, base)` be asserted at `(block, terminal)`? Two clauses, each
 /// closing one way the equation could be FALSE rather than merely uninformative.
+/// The division of labor (re-derived 2026-08-29, when the whole-function
+/// quantifier was retired):
 ///
-///  * MINT SIDE. `version_token_at` also returns `None` at a block whose
-///    entry-version map is EMPTY — every block with no `v2_terminator_targets`
-///    in-edge, i.e. every cleanup block, because that successor function omits
-///    unwind edges while `v2_path_def_fixpoint` transports facts across them. An
-///    `#e` minted there names that block's local value, not the entry value. We
-///    cannot tell at the consumer WHICH block minted it, so refuse unless NO block
-///    of the function could have minted a spurious one.
-///  * CONSUMER SIDE. Tie only where this consumer VERSIONS the base, so the pinned
-///    def's subject has been stamped `base#tok` and cannot coincide with the tie's
-///    bare side. Where the subject renders bare the tie would re-mint `n == n / 3` —
-///    n pinned to 0, the original false proof, split across two conjuncts where
-///    `self_referential_definition` cannot see it.
-///    DEAD GIVEN STEP (0) BELOW — and only given it. This previously read "provably
-///    dead … no fixture isolates it", which was FALSE: the argument's step (3)
-///    silently assumed a def's version GEN-KEY is its PIN SUBJECT.
-///    `block_def_subject` SPLITS the lhs name at '#' while `block_written_names`
-///    keys the gen-set on the WHOLE name (`formula_def_name`), so a def of a local
-///    named `n#x` gens `n#x` and ships a fact whose subject is BARE `n` — a name
-///    the entry-version dataflow never saw written. Measured 2026-08-29: the
-///    `debug_assert!` below FIRED, mint side passing while this clause decided.
-///    `no_pin_when_the_defs_gen_key_is_not_its_subject` is the fixture.
-///    The repair was to enforce the missing premise at the mint site rather than to
-///    lean on this clause, and the clause is KEPT: `debug_assert!` compiles out
-///    under `-C debug-assertions=off`, so the `return false` below is the only thing
-///    that fails closed in a release trustc.
-///    Recorded as the argument rather than as a suspicion, in the order a future
-///    edit breaks it:
-///      0. `formula_def_name(def) == block_def_subject(def)` — a def is pinned ONLY
-///         where its gen-key is its subject. ENFORCED at the mint site by
-///         `pin_in_place_update_reads`; guarded by
-///         `no_pin_when_the_defs_gen_key_is_not_its_subject`. This is the premise
-///         step (3) needs and did not have.
-///      1. `v2_terminator_targets` ⊆ the fixpoint's enqueue set on EVERY
-///         `Terminator` variant — they differ only by the unwind edges the
-///         fixpoint adds. Guarded by `entry_sentinel_tie_subsumption_tests`.
-///      2. the token `{e}` is seeded only at bb0 and any gen replaces it, so a
-///         consumer whose set is exactly `{e}` has no v2-ancestor writing `base`.
-///      3. `base#e` has ONE mint site — `stamp_entry_valued_recurrent_read`, via
-///         `pin_in_place_update_reads` inside this fixpoint's own gen-set
-///         construction — and it stamps only a def SUBJECT, so BY (0) only a block
-///         the entry-version dataflow counts as a base-WRITER can gen one. Without
-///         (0) this step is false, which is precisely how it failed.
-///    A `base#e` fact must therefore cross a v2 in-edge of the consumer; by (1)
-///    the fixpoint explores that edge and intersects its outflow in, and by (2)+(3)
-///    that predecessor gens none — so the intersection removes it. An unwind edge
-///    can still DELIVER the def, but the mandatory v2 in-edge removes it again, and
-///    a consumer with NO v2 in-edge is exactly what the MINT-SIDE clause refuses.
-///    Corroboration, not proof: 57 real-MIR fixtures (2 mint `#e`, 0 carry a
-///    bare-subject pinned def) and 6 hand-built shapes incl. all three
-///    unwind-bearing terminators; the three unwind shapes are the negative
-///    controls in `entry_sentinel_tie_subsumption_tests`.
-///    Kept because dropping a refusal is never the safer direction — and here that
-///    is concrete, not a slogan: the `debug_assert!` below is inert in release, so
-///    retiring the clause would leave the shipped trustc with NO fail-closed check
-///    where one fired on real input. What is TESTED is the mint-site invariant (0)
-///    that makes the clause dead, plus the IMPLICATION itself (the `debug_assert!`).
-///    The clause must not be cited as an independently falsified guarantee.
+///  * THE MINT GATE OWNS "`base#e` DENOTES THE ENTRY VALUE". `#e` has ONE mint
+///    site — `stamp_entry_valued_recurrent_read`, called only from
+///    `pin_in_place_update_reads` — and that site now stamps `#e` only where
+///    `full_graph_union_is_entry_only` holds at the MINTING block: the
+///    UNWIND-INCLUSIVE reaching union is exactly `{e}`, i.e. no path (normal or
+///    unwind) into the mint block writes the base. Everywhere else it stamps the
+///    never-tieable `#pre_s{b}_{k}`. So by the time this function sees a `#e`,
+///    the symbol denotes the function-entry value BY CONSTRUCTION, no matter
+///    which block minted it — which is exactly why the whole-function
+///    `entry_map_covers` quantifier this function used to open with could go.
+///    That quantifier was BOTH too strong (one droppable `String`'s cleanup
+///    cluster vetoed the tie at every consumer of the function) and too weak
+///    (a mixed shape where an unwind edge delivers a write into a v2-`{e}`
+///    block passed it while `#e` named a post-write value — the measured false
+///    proof `no_entry_sentinel_when_an_unwind_path_can_deliver_a_write` pins).
+///  * CONSUMER SIDE — the clause owns "BARE MEANS ENTRY WHERE THE TIE LANDS".
+///    Tie only where this consumer VERSIONS the base: `version_token_at` Some
+///    means the terminal rename (`version_rename_at` stamps every '#'-free var)
+///    left NO bare occurrence of the base anywhere in the renamed formula — in
+///    particular the pinned def's subject is stamped `base#tok` and cannot
+///    coincide with the tie's bare side. The tie's bare side then meets ONLY the
+///    `Fact::entry` bucket (preconditions, param ranges), whose contract is that
+///    bare names denote entry values. HISTORY: a cleanup consumer used to have
+///    an EMPTY v2 entry map (`v2_terminator_targets` had no unwind arm), bare
+///    there was the pinned def's POST-write subject, and this clause was the
+///    ONLY refusal on that shape. Since 2026-08-30 `block_entry_versions` is
+///    unwind-inclusive, a consumer holding a threaded `#e` fact is downstream
+///    of the mint block's own write and therefore versions the base, so the
+///    clause ADMITS there — the tie is the true identity `entry == entry`
+///    (adjudicated in `the_tie_at_a_cleanup_consumer_is_sound_and_the_stale_sibling_degrades`).
+///    The clause is KEPT as the fail-closed refusal for the corners where a
+///    base can still render bare with `#e` in scope: a step-cap partial map
+///    and a block the fixpoint never reached.
 ///  * COLLAPSE. If the base's version tokens all normalize back to the bare name,
 ///    the tie degenerates to the tautology `x == x`, which the recurrence scanners
 ///    report as an offending self-referential definition. Nothing is lost: both
 ///    sides of the tie collapse together, so the connection exists anyway.
+///
+/// (The COLLISION refusal — a caller-declared local literally named `base#e` —
+/// lives in `entry_sentinel_ties` and at the mint site, unchanged.)
 fn entry_sentinel_tie_is_sound(
     func: &VerifiableFunction,
     sv: &StmtVersionCtx,
@@ -1635,21 +1957,6 @@ fn entry_sentinel_tie_is_sound(
     terminal: usize,
     base: &str,
 ) -> bool {
-    if !func.body.blocks.iter().all(|b| sv.entry_map_covers(b.id, base)) {
-        return false;
-    }
-    // "mint-side passed ⇒ consumer-side passes" — the implication that makes the
-    // next clause dead. INERT IN RELEASE: it gates nothing, the `return false`
-    // below is what fails closed. Its only job is to make a silent reachability
-    // change loud in dev/test, because a live consumer-side clause means one of
-    // the three doc-comment steps above stopped holding.
-    debug_assert!(
-        sv.version_token_at(func, block, terminal, base).is_some(),
-        "`{}`: mint-side passed yet `{base}` still renders BARE at {block:?}/{terminal} — \
-         the consumer-side clause is LIVE again; re-derive its argument before \
-         trusting this refusal",
-        func.name
-    );
     if sv.version_token_at(func, block, terminal, base).is_none() {
         return false;
     }
@@ -1745,12 +2052,43 @@ fn pin_in_place_update_reads(
     let Some(k) = block_def_establish_stmt(func, block, base, block.stmts.len()) else {
         return def;
     };
+    // THE MINT GATE (entry-denotation guarantee). A read that renders bare at
+    // `(block, k)` proves only that the v2 reaching union is empty-or-`{e}`.
+    // The v2 map is unwind-inclusive since 2026-08-30, but "empty" still covers
+    // a block the fixpoint never reached, and the v2 caller keeps a PARTIAL map
+    // when the fixpoint hits its step cap. Stamp `#e` only where the fail-closed
+    // full-graph oracle proves the reaching union is exactly `{e}` (converged,
+    // reachable, no non-`e` token); then every `#e` in existence denotes the
+    // function-entry value BY CONSTRUCTION, which is what licenses
+    // `entry_sentinel_tie_is_sound` to run without its whole-function
+    // quantifier. Everywhere else stamp the per-point token `#pre_s{block}_{k}`:
+    // a FRESH spelling, never the bare def — bare would re-mint the
+    // `x#t == f(x#t)` recurrence this pin exists to prevent — and never `#e`.
+    // A fresh unconstrained read-symbol is a pure havoc-weakening (the actual
+    // pre-write value satisfies it on every trace), and `entry_sentinel_ties`
+    // matches the token `e` EXACTLY, so `#pre_…` can never be tied to bare.
+    // Guarded by `no_entry_sentinel_when_an_unwind_path_can_deliver_a_write` and
+    // `a_cleanup_block_mint_is_stamped_pre_not_entry` (tie_guards).
+    let token = if sv.full_graph_union_is_entry_only(block.id, &subj) {
+        ENTRY_VERSION_SENTINEL.to_string()
+    } else {
+        format!("{PRE_WRITE_SENTINEL_PREFIX}_s{}_{k}", block.id.0)
+    };
+    // The chosen spelling must be FRESH — the `#e` collision refusal above,
+    // repeated verbatim for the fallback spelling. Fail closed: no repair (the
+    // bare recurrence then collapses at the consumer and the scanners DEGRADE
+    // the obligation — never a false proof).
+    let minted_symbol = format!("{subj}#{token}");
+    if func.body.locals.iter().any(|l| l.name.as_deref() == Some(minted_symbol.as_str())) {
+        return def;
+    }
     let read_versioned = version_rename_at(&def, sv, func, block.id, k);
-    let read_versioned = stamp_entry_valued_recurrent_read(read_versioned, &subj);
+    let read_versioned = stamp_entry_valued_recurrent_read(read_versioned, &subj, &token);
     rebind_block_def_subject(read_versioned, &subj, None)
 }
 
-/// Give a recurrent read that renders BARE the explicit entry token (`n#e`).
+/// Give a recurrent read that renders BARE an explicit pre-write token — the entry
+/// sentinel `n#e` where the mint gate proved entry-denotation, else `n#pre_s{b}_{k}`.
 ///
 /// `version_token_at` returns `None` — i.e. the bare name — when the value read is
 /// the function-ENTRY one, deliberately, so never-havoced parameter reads stay
@@ -1765,18 +2103,21 @@ fn pin_in_place_update_reads(
 /// (safe), where it demotes 1 of 1 obligations — fixture
 /// `tests/data/entry_block_in_place_update.json`.
 ///
-/// `e` is the designated entry sentinel (`ENTRY_VERSION_SENTINEL`), so the read now
-/// names the pre-write value and only that. It is WEAKER than the bare read: bare,
-/// it would have unified with any other entry-valued read of the subject; `#e`
-/// unifies with nothing else. That cost is confined to the update's own subject —
-/// every OTHER read in the def keeps its bare entry spelling and stays connected —
-/// and it buys nothing away, because every block this def flows to is dominated by
-/// the write and so reads the subject POST-write anyway.
-fn stamp_entry_valued_recurrent_read(def: Formula, subj: &str) -> Formula {
+/// `token` is chosen by the caller's mint gate: `e` (`ENTRY_VERSION_SENTINEL`) only
+/// where the unwind-inclusive reaching union proves the pre-write value IS the entry
+/// value, else the never-tieable `pre_s{b}_{k}`. Either way the read now names the
+/// pre-write value and only that. It is WEAKER than the bare read: bare, it would
+/// have unified with any other entry-valued read of the subject; the stamped symbol
+/// unifies with nothing else (`#e` only through the guarded tie). That cost is
+/// confined to the update's own subject — every OTHER read in the def keeps its bare
+/// entry spelling and stays connected — and it buys nothing away, because every
+/// block this def flows to is dominated by the write and so reads the subject
+/// POST-write anyway.
+fn stamp_entry_valued_recurrent_read(def: Formula, subj: &str, token: &str) -> Formula {
     let stamp = |f: &Formula| {
         f.clone().map(&mut |node| match node {
             Formula::Var(name, sort) if name == subj => {
-                Formula::Var(format!("{name}#{ENTRY_VERSION_SENTINEL}"), sort)
+                Formula::Var(format!("{name}#{token}"), sort)
             }
             other => other,
         })
@@ -1816,7 +2157,7 @@ pub(super) fn v2_path_def_fixpoint(
 ) -> FxHashMap<BlockId, Vec<Formula>> {
     use std::collections::VecDeque;
 
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let n = func.body.blocks.len();
     let mut result: FxHashMap<BlockId, Vec<Formula>> = FxHashMap::default();
     let mut queue: VecDeque<(BlockId, Vec<Formula>)> = VecDeque::from([(BlockId(0), Vec::new())]);
@@ -1883,8 +2224,23 @@ pub(super) fn v2_path_def_fixpoint(
         // FAIL, never the reverse.
         let store_havoc = deref_store_havoc_names(func, block);
         if !store_havoc.is_empty() {
-            let store_set: FxHashSet<String> = store_havoc.into_iter().collect();
+            let store_set: FxHashSet<String> = store_havoc.iter().cloned().collect();
             next_defs.retain(|f| formula_survives_redefs(f, &store_set));
+        }
+        // Extraction-declined destinations kill incoming/seeded facts too. The
+        // facts in this channel are conjoined PRE-rename (renamed WITH the
+        // body), so the use-point rename UNIFIES a stale survivor with the live
+        // read — for this channel the KILL, not the rename, is load-bearing
+        // (the same reason the deref-store havoc above must kill here). Applied
+        // BEFORE the block's own extracted defs are re-added, so a fact this
+        // block itself establishes still flows out. Drop-only, hence monotone.
+        {
+            let mut assigned: FxHashSet<String> = FxHashSet::default();
+            extend_with_assigned_place_dests(func, &block.stmts, &mut assigned);
+            extend_with_derived_slice_len(&mut assigned);
+            if !assigned.is_empty() {
+                next_defs.retain(|f| formula_survives_redefs(f, &assigned));
+            }
         }
         // Reads of an in-place update are pinned to their pre-write values BEFORE the
         // defs cross a block boundary; the subject stays bare, so the kill computed
@@ -2061,13 +2417,10 @@ pub(crate) fn v2_conjoin_path_guards_for_hardened(
     block: BlockId,
     formula: Formula,
 ) -> Formula {
-    let guard_paths_map = v2_build_path_guard_map(func);
+    let guard_paths_map = super::guard_map_for(func);
     match guard_paths_map.get(&block) {
         Some(block_guard_paths) => {
-            // Trust (lane-A CSE): `v2_formula_with_path_guards` now takes the
-            // statement-version oracle by reference; build it here for this one call.
-            let sv = StmtVersionCtx::build(func);
-            v2_formula_with_path_guards(func, &sv, block_guard_paths, formula)
+            v2_formula_with_path_guards(func, &super::stmt_versions_for(func), block_guard_paths, formula)
         }
         None => formula,
     }

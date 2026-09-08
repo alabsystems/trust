@@ -29,14 +29,21 @@
 # moving two DIVERGENT submodule pointers that the standing safety rules forbid
 # anyone to move. That is how a gate teaches people `--no-verify`.
 #
-# This directory is the pin gate WITHOUT that blast radius. It runs six
+# This directory is the pin gate WITHOUT that blast radius. It runs eight
 # checkers and nothing else — `scripts/check_pin_coherence.sh` (0.49s measured),
 # `scripts/check_revert_rationale.sh` (0.49s measured over the whole
 # 7,089-commit history), `scripts/check_frozen_files.sh`,
 # `scripts/check_measurement_provenance.sh` (0.95s measured over 7,112 commits
 # in the wider --history mode), `scripts/check_bridge_pin.sh --check` (0.23s
-# measured), and `scripts/check_ir_cohort.py` (0.84s measured, added 2026-08-27)
-# — for a combined budget of about three seconds. No x.py, no build of any kind,
+# measured), `scripts/check_ir_cohort.py` (0.84s measured, added 2026-08-27),
+# `scripts/check_submodule_remote_reachability.py`, and
+# `scripts/check_cfg_test_caller_skew.py` (added 2026-09-01, the only SOURCE
+# checker here) — for a combined budget of about four seconds. (This paragraph
+# said "six" and omitted the reachability lane until 2026-09-01;
+# `install-pin-hook.sh` said "check_pin_coherence.sh only", so three sources
+# carried three different counts — 1, 6 and 7 — and an agent debugging a red
+# `check_ir_cohort.py` could read that it does not run. If you add a ninth,
+# change this number in the same edit.) No x.py, no build of any kind,
 # and NOT the gate manifest's `push` profile: this list is hand-maintained here
 # on purpose, because the point of this directory is a fixed small blast radius
 # that does not grow when someone adds a row. scripts/hooks/pre-push is the one
@@ -407,12 +414,95 @@ else
   COHORT_RC=1
 fi
 
-if [ "$PIN_RC" -eq 0 ] && [ "$FREEZE_RC" -eq 0 ] && [ "$revert_rc" -eq 0 ] && [ "$prov_rc" -eq 0 ] && [ "$BRIDGE_RC" -eq 0 ] && [ "$COHORT_RC" -eq 0 ]; then
+# ------------------------------------------- lane: submodule remote reachability
+# MEASURED COST OF ITS ABSENCE (2026-08-30 audit of all 1,500 gitlink values ever
+# recorded on main): 22 pins name commits that exist on NO remote and in none of
+# 873 local object stores, nor in staging or release (44 probes, 44 "not our
+# ref"). They are unrecoverable, and because a pin stays live until the next
+# bump, 169 superproject commits — 2.12% of main — cannot be reproduced at their
+# recorded sibling revision.
+#
+# The cause is a machine landing a superproject gitlink whose sibling commit was
+# never pushed. check_pin_coherence.sh above CANNOT catch it: it asks whether a
+# pin resolves LOCALLY, which is true by construction on precisely the machine
+# that authored the unpushed commit. This checker asks the remote instead.
+#
+# It belongs in THIS directory by the same rule as the rest — git plumbing only,
+# no build, no build-tree lock. Measured 2.2s wall on a 12-pin clone, inside the
+# directory's budget. It reads TRUST_PUSHED_REFS so it judges the revisions
+# actually being published rather than the index (a behind clone otherwise
+# audits an older, systematically safer pin set and prints PASS).
+REACH_CHECKER="scripts/check_submodule_remote_reachability.py"
+REACH_RC=0
+echo
+if [ -f "$REACH_CHECKER" ]; then
+  TRUST_PUSHED_REFS="$PUSHED_REFS" python3 "$REACH_CHECKER" --push-context || REACH_RC=1
+else
+  echo "pin-hook: $REACH_CHECKER is missing — a gitlink could land naming a commit no one else can fetch"
+  REACH_RC=1
+fi
+
+# ------------------------------------------------- lane: cfg(test) caller skew
+# THE EIGHTH CHECKER, and the first one in this directory that is about SOURCE
+# rather than about gitlinks.
+#
+# Everything above this line is a pin, a freeze or a message check. That is the
+# whole design of this directory — and it means a clone that installs it, which
+# is what the repo tells shared machines to do, has NOTHING between a source
+# break and `origin`. The full set's `scoped.compiler-check` is the only lane
+# anywhere that type-checks a `crates/**` TEST target, and by this file's own
+# header that set is not installed here and must not be.
+#
+# MEASURED COST OF THAT GAP, twice in eighteen hours, same crate, same producer:
+#   d26cb8c40e  E0063 — `PendingConst::promoted_global` reached every production
+#               construction site and missed the `#[cfg(test)]` one. Repaired by
+#               cf89d447db, whose own body blamed the SCOPE filter; that reading
+#               was wrong — d26cb8c40e touches `crates/`, so it was in scope.
+#   78a0bef5ff  E0061 — seven taint walkers widened, both production callers
+#               updated, 45 `#[cfg(test)]` call sites left at the old arity.
+#               Still red on origin/main at ad074447848d29974bec329d7e3587bb92dc4d38.
+# Both trees BUILT. `x.py build` and `x.py test tests/ui` compile lib targets and
+# a `#[cfg(test)]` body is not in a lib target, so no amount of care in the
+# producer's measurement loop can surface this class.
+#
+# It belongs in the NARROW set by this file's own admission test: it reads the
+# blobs in the pushed range with `git show` and nothing else — no build, no
+# cargo, no x.py, no network, no build-tree lock — and it NEVER MUTATES.
+# Measured under a second on a producer-sized push. It judges only definitions
+# the pushed range CHANGED and declines rather than guesses, so it is quiet:
+# over the 300 single-commit ranges ending at ad07444784 it names the two
+# commits above and nothing else.
+#
+# It is NOT a type checker and does not retire `scoped.compiler-check`, which
+# remains the authority. It exists so that the authority is not the only thing
+# standing between this class and `main`.
+SKEW_CHECKER="scripts/check_cfg_test_caller_skew.py"
+SKEW_RC=0
+echo
+if [ -f "$SKEW_CHECKER" ]; then
+  TRUST_PUSHED_REFS="$PUSHED_REFS" python3 "$SKEW_CHECKER" --push-context || SKEW_RC=1
+else
+  echo "cfg-test-skew: $SKEW_CHECKER is missing — a signature change could land"
+  echo "               with its #[cfg(test)] construction sites behind it."
+  SKEW_RC=1
+fi
+
+if [ "$PIN_RC" -eq 0 ] && [ "$FREEZE_RC" -eq 0 ] && [ "$revert_rc" -eq 0 ] && [ "$prov_rc" -eq 0 ] && [ "$BRIDGE_RC" -eq 0 ] && [ "$COHORT_RC" -eq 0 ] && [ "$REACH_RC" -eq 0 ] && [ "$SKEW_RC" -eq 0 ]; then
   exit 0
 fi
 
 echo
-echo "PRE-PUSH: RED (pin=$PIN_RC freeze=$FREEZE_RC revert=$revert_rc provenance=$prov_rc bridge=$BRIDGE_RC cohort=$COHORT_RC)."
+echo "PRE-PUSH: RED (pin=$PIN_RC freeze=$FREEZE_RC revert=$revert_rc provenance=$prov_rc bridge=$BRIDGE_RC cohort=$COHORT_RC reach=$REACH_RC skew=$SKEW_RC)."
+if [ "$SKEW_RC" -ne 0 ]; then
+  echo "  skew: a definition this push changes has a construction site that did not"
+  echo "        follow it. Under #[cfg(test)] no lib build can see this — it is a"
+  echo "        real compile error that lands green and is paid for by the next lane."
+fi
+if [ "$REACH_RC" -ne 0 ]; then
+  echo "  reach: a submodule pin above names a commit no remote can serve."
+  echo "         push the sibling repo first, or anchor it:"
+  echo "         scripts/audit_first_party_pins.py --anchor"
+fi
 if [ "$COHORT_RC" -ne 0 ]; then
   echo "  cohort: consumers disagree about what a trust-ir module MEANS."
   echo "          inventory with: scripts/check_ir_cohort.py --report"

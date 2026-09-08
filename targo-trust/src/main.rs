@@ -209,7 +209,50 @@ fn print_version() {
     print!("{}", version_text());
 }
 
+/// The verified lane must produce artifacts it is itself willing to execute.
+///
+/// `trust_router::coordinator` refuses any runtime-library path component that
+/// is group- or world-writable, because such a path lets another local
+/// principal substitute the executed object between authorization and
+/// execution. That refusal is correct and is not relaxed here.
+///
+/// The problem is that WE create the objects it then refuses. Under `umask
+/// 0002` — the default wherever per-user groups are configured — the Cargo
+/// fan-out this process drives writes `target/debug/deps/**` as 0664/0775, so
+/// the very next verification step rejects the build we just performed:
+///
+///   error: verified runtime-library candidate path component
+///   `.../deps/trust_intbound-<hash>.<...>.rcgu.dwo` is group- or
+///   world-writable (uid=1000, mode=0o664)
+///
+/// Measured 2026-08-31: chmod'ing the whole target tree cleared it exactly
+/// once, and the next compilation recreated fresh 0664 objects and broke it
+/// again — so this cannot be fixed by fixing up the tree, only by not creating
+/// them that way. The sibling clamp in bootstrap does the same for the sysroot
+/// half (`src/bootstrap/src/bin/main.rs`).
+///
+/// Scoped deliberately to the VERIFIED driver rather than to `targo` at large:
+/// only this lane has the requirement, so only this lane pays for it. Children
+/// inherit the mask across `exec`, which is what makes it reach the Cargo
+/// fan-out at all.
+#[cfg(unix)]
+fn clamp_umask_for_verified_artifacts() {
+    // SAFETY: `umask` is a process-global getter/setter over a scalar with no
+    // failure mode and no pointer arguments, called before this process spawns
+    // a thread or creates a file.
+    unsafe {
+        let previous = libc::umask(0o022);
+        // Only ever ADD restrictions: a caller already excluding more keeps it.
+        libc::umask(previous | 0o022);
+    }
+}
+
+#[cfg(not(unix))]
+fn clamp_umask_for_verified_artifacts() {}
+
 fn main() -> ExitCode {
+    clamp_umask_for_verified_artifacts();
+
     // Trust: Windows' main-thread stack (~1 MB) is far smaller than Unix's
     // (~8 MB default), so the deeply-recursive verifier / proof-report processing
     // overflows it and aborts with STATUS_STACK_OVERFLOW (0xC00000FD) — even after

@@ -72,7 +72,177 @@ fn ty_in_closed_fragment(ty: &Ty) -> bool {
     match ty {
         Ty::Bool | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Char | Ty::Unit => true,
         Ty::Tuple(fields) => fields.iter().all(ty_in_closed_fragment),
+        // DELIBERATELY NOT recursive into `Ty::Adt`. This predicate governs
+        // EVERY local, so admitting a struct here would put one at an arbitrary
+        // temporary -- which is what `the_struct_widening_reaches_parameters_
+        // only_and_scalars_only` pins against, and which it caught when this
+        // arm briefly existed. Struct nesting is allowed by
+        // `ty_is_scalar_struct` instead, which is consulted only at the
+        // positions that explicitly permit a struct.
         _ => false,
+    }
+}
+
+/// Whether `ty` is an ALL-SCALAR STRUCT: an `Adt` with NO enum variants whose
+/// every declared field is itself in the closed scalar fragment.
+///
+/// This is the ONE aggregate shape the closed fragment admits, and only at a
+/// PARAMETER position (see [`local_ty_in_closed_fragment`]). Three things make
+/// it safe to read a field of one:
+///
+///   * **No destructor, no drop glue.** Every field is a scalar and the struct
+///     has no enum variants, so `needs_drop` is false and rustc emits no `Drop`
+///     terminator — which the validator refuses outright anyway.
+///   * **No hidden mutation channel.** A `u64` field IS the `u64`; there is no
+///     `UnsafeCell` on the path, so its value cannot change through a shared
+///     borrow. (An interior-mutable field would be an `Adt`, and a nested `Adt`
+///     is not in the closed fragment.)
+///   * **Nothing else opens up.** A field READ is admitted by `place_ty`, but
+///     comparison still requires a comparable scalar, `SwitchInt` still
+///     requires a scalar discriminant, and a NON-parameter local of struct type
+///     is still refused — so a struct can be projected and nothing more.
+///
+/// ENUMS are excluded deliberately: an enum's `fields` list is the union view
+/// across variants, so field `i` is variant-relative and is reached through a
+/// `Downcast` the validator does not admit. Reading it as a struct field would
+/// name a different value than the program does.
+#[must_use]
+pub fn ty_is_scalar_struct(ty: &Ty) -> bool {
+    match ty {
+        Ty::Adt { fields, variants, .. } => {
+            // A field may be a scalar, or ITSELF an all-scalar struct:
+            // `Term { coeff: i64, lit: Lit }` is a bundle of scalars however
+            // deep the nesting goes, and the properties that make a flat one
+            // safe hold verbatim -- no destructor or drop glue (no field needs
+            // drop, no enum variants anywhere in the tree), no hidden mutation
+            // channel (a `u32` field IS the `u32`), and no reference or float.
+            // Before this, `Term` was refused for its `lit` field alone.
+            //
+            // The recursion terminates because Rust forbids a struct containing
+            // itself by value: such a type is infinitely sized and never
+            // reaches extraction.
+            variants.is_empty()
+                && fields
+                    .iter()
+                    .all(|(_, field)| ty_in_closed_fragment(field) || ty_is_scalar_struct(field))
+        }
+        _ => false,
+    }
+}
+
+/// The signed payload width when `ty` is EXACTLY the std `Option<iN>` shape the
+/// overflow-checked arithmetic lane admits, and `None` for every other type.
+///
+/// Pinned, fail-closed conditions (checked-arith spec §2/§5.3):
+///   * the ADT is the std `core::option::Option` by extracted def-path name;
+///   * it has EXACTLY the two std variants, in declaration order: `None`
+///     (discriminant 0, no fields) and `Some` (discriminant 1, ONE field);
+///   * the `Some` payload is a PLAIN SIGNED machine integer of a supported
+///     width (8/16/32/64/128) — no reference, no `NonZero*`, no nested ADT;
+///   * `disc_index_safe` is `true`: the rustc-layout-aware extractor confirmed
+///     a fieldless/Direct TAG encoding, so variant indices 0/1 mean what they
+///     say. Every NICHE-encoded `Option` (`Option<&T>`, `Option<NonZeroU8>`)
+///     has `disc_index_safe == false` and is REFUSED here — a discriminant or
+///     variant index read on a niche layout does not recover a dense tag, and
+///     admitting one could silently swap the `Some`/`None` arms. `Option<iN>`
+///     for a plain integer payload always has the Direct encoding (integers
+///     leave `Option` no niche to steal).
+///
+/// This is the ONE definition of "the admissible Option shape": the E6 body
+/// recognizer (`admissible_body::recognize_checked_arithmetic`) and the
+/// diagnostic facet scan both call it, so the two lanes cannot drift.
+#[must_use]
+pub fn ty_is_std_option_of_signed(ty: &Ty) -> Option<u32> {
+    let Ty::Adt { name, variants, disc_index_safe, .. } = ty else {
+        return None;
+    };
+    if name != "core::option::Option" || !disc_index_safe {
+        return None;
+    }
+    let [none_v, some_v] = variants.as_slice() else {
+        return None;
+    };
+    if none_v.name != "None" || none_v.discriminant != 0 || !none_v.fields.is_empty() {
+        return None;
+    }
+    if some_v.name != "Some" || some_v.discriminant != 1 {
+        return None;
+    }
+    let [(_, payload)] = some_v.fields.as_slice() else {
+        return None;
+    };
+    match payload {
+        Ty::Int { width, signed: true } if matches!(width, 8 | 16 | 32 | 64 | 128) => Some(*width),
+        _ => None,
+    }
+}
+
+/// Whether local `index` of a function with `arg_count` value parameters may
+/// carry type `ty` inside the closed fragment.
+///
+/// Identical to the scalar rule for every local EXCEPT a source parameter
+/// (`1..=arg_count`), which may additionally be an all-scalar struct
+/// ([`ty_is_scalar_struct`]), and the RETURN SLOT (`index == 0`), which may
+/// additionally be the std `Option<iN>` shape
+/// ([`ty_is_std_option_of_signed`], checked-arithmetic widening). Restricting
+/// the Option widening to the return slot is what keeps it to CONSTRUCTION:
+/// no temporary and no parameter carries an `Option`, so one can be built and
+/// returned but never read back, projected, or matched in this fragment.
+#[must_use]
+/// Whether `ty` is a local the CONTRACT lowering injected rather than a step of
+/// the body's own computation.
+///
+/// An `ensures` written in CLOSURE form is materialised by
+/// `contract_check_ensures` as an `Option<{closure}>` local of the very
+/// function being contracted. Letting that local decide the function's facets
+/// makes "does this body carry a specification" change "is this body pure" --
+/// which is backwards, and self-defeating: attaching a contract removed the
+/// admissibility the contract needs in order to be kernel-cited. Measured on
+/// `veripb_core_proved::sat_term`, where ALL FOUR facets reported the same
+/// single cause, `local _4 has type Adt { name: "core::option::Option", …
+/// Closure { name: "lib::sat_term::{closure#0}" … } }`, and the same function
+/// with a signature-form clause was admissible.
+///
+/// NARROW ON PURPOSE. Only a closure belonging to THIS function (`<def_path>::
+/// {closure#N}`), bare or as an `Option` payload — the exact shape the lowering
+/// mints. A closure from anywhere else, and any USE of one, is untouched:
+/// this exempts a local from the TYPE gate only, and every statement and
+/// terminator is still validated, so a body that actually calls a closure is
+/// refused exactly as before.
+#[must_use]
+pub fn is_contract_injected_ty(ty: &Ty, def_path: &str) -> bool {
+    fn own_closure(ty: &Ty, def_path: &str) -> bool {
+        matches!(ty, Ty::Closure { name, .. }
+            if name.strip_prefix(def_path).is_some_and(|rest| rest.starts_with("::{closure#")))
+    }
+    match ty {
+        Ty::Closure { .. } => own_closure(ty, def_path),
+        Ty::Adt { name, fields, .. } if name == "core::option::Option" => {
+            fields.iter().any(|(_, field)| own_closure(field, def_path))
+        }
+        _ => false,
+    }
+}
+
+pub fn local_ty_in_closed_fragment(ty: &Ty, index: usize, arg_count: usize) -> bool {
+    ty_in_closed_fragment(ty)
+        || ((1..=arg_count).contains(&index) && ty_is_scalar_struct(ty))
+        || (index == 0 && ty_is_std_option_of_signed(ty).is_some())
+        // The RETURN SLOT may also be an all-scalar struct. A body that
+        // CONSTRUCTS one is admitted by `rvalue_matches_ty`, which type-checks
+        // every operand against the field it initialises; without this the
+        // constructed value could never be returned, so that admission was
+        // unreachable for its motivating case (`sat_term`).
+        || (index == 0 && ty_is_scalar_struct(ty))
+}
+
+/// The bit width of an integer type, `None` for anything else (including
+/// pointer-sized integers, whose width is target-relative and therefore not a
+/// disclosed narrowing boundary).
+fn int_bit_width(ty: &Ty) -> Option<u32> {
+    match ty {
+        Ty::Int { width, .. } => Some(*width),
+        _ => None,
     }
 }
 
@@ -89,6 +259,14 @@ fn place_ty<'a>(func: &'a VerifiableFunction, place: &Place) -> Option<&'a Ty> {
     for projection in &place.projections {
         match (projection, ty) {
             (Projection::Field(field), Ty::Tuple(fields)) => ty = fields.get(*field)?,
+            // One declared field of an all-scalar STRUCT. `variants.is_empty()`
+            // is the struct test: an enum's field is variant-relative and is
+            // reached through a `Downcast`, which this loop refuses.
+            (Projection::Field(field), Ty::Adt { fields, variants, .. })
+                if variants.is_empty() =>
+            {
+                ty = &fields.get(*field)?.1;
+            }
             _ => return None,
         }
     }
@@ -190,6 +368,25 @@ fn rvalue_matches_ty(func: &VerifiableFunction, rvalue: &Rvalue, destination: &T
             }
             _ => false,
         },
+        // Integer WIDTH-CHANGING casts only, and the boundary is disclosed
+        // rather than inherited. A width-changing integer cast has exactly one
+        // canonical semantics, and the kernel models both directions: a
+        // STRICTLY narrower destination is truncation (`BitVec.ofNat n
+        // (toNat v)`, the guarded-narrow model), and a STRICTLY wider one is
+        // the extension the SOURCE type's signedness determines (sext for
+        // signed -- `sextWide`, the `eq_ok` model -- zext for unsigned; Rust
+        // `as` widening follows source signedness, so nothing here is a
+        // choice). A SAME-WIDTH cast is refused: it is a value
+        // REINTERPRETATION (signed<->unsigned over the same bits) that the
+        // validated fragment does not model, and it is precisely the shape
+        // the adversarial audit caught when this arm briefly admitted every
+        // scalar cast (`cast_is_declined_by_the_compiler_visible_firewall`).
+        Rvalue::Cast(operand, cast_ty) => {
+            let dest_w = int_bit_width(destination);
+            let src_w = operand_place_ty(func, operand).and_then(|t| int_bit_width(&t));
+            cast_ty == destination
+                && matches!((dest_w, src_w), (Some(d), Some(s)) if d != s)
+        }
         Rvalue::CheckedBinaryOp(BinOp::Add | BinOp::Sub | BinOp::Mul, lhs, rhs) => {
             let Ty::Tuple(fields) = destination else { return false };
             let [value_ty, overflow_ty] = fields.as_slice() else { return false };
@@ -198,12 +395,76 @@ fn rvalue_matches_ty(func: &VerifiableFunction, rvalue: &Rvalue, destination: &T
                 && operand_matches_ty(func, lhs, value_ty)
                 && operand_matches_ty(func, rhs, value_ty)
         }
+        // Constructing the std `Option<iN>` return value (checked-arithmetic
+        // widening): value-total and effect-free — an `Aggregate` writes only
+        // its destination place. Valid ONLY when the destination is the pinned
+        // std Option shape ([`ty_is_std_option_of_signed`]), the aggregate
+        // names the SAME ADT, and the variant/operand pairing is exactly
+        // `None`/no operands (variant 0) or `Some`/one payload of the exact
+        // signed width (variant 1). The variant indices are trustworthy
+        // because the shape gate requires the Direct tag encoding
+        // (`disc_index_safe`); a niche-encoded Option never gets here. Every
+        // other aggregate kind (tuples, arrays, closures, other ADTs) remains
+        // outside the closed fragment.
+        Rvalue::Aggregate(crate::AggregateKind::Adt { name, variant, active_field, .. }, ops) => {
+            let Ty::Adt { name: dest_name, fields, variants, .. } = destination else {
+                return false;
+            };
+            // A union field-write aliases its siblings, so it is never a
+            // value-total construction of the whole destination.
+            if name != dest_name || active_field.is_some() {
+                return false;
+            }
+            if let Some(width) = ty_is_std_option_of_signed(destination) {
+                return match (variant, ops.as_slice()) {
+                    (0, []) => true,
+                    (1, [payload]) => {
+                        operand_matches_ty(func, payload, &Ty::Int { width, signed: true })
+                    }
+                    _ => false,
+                };
+            }
+            // A PLAIN STRUCT construction — `Term { coeff, lit }`, the shape
+            // every mapping rule's per-term step builds. `variants` is empty
+            // exactly for a struct, so an enum (where a field is
+            // variant-relative and the tag encoding would have to be trusted)
+            // still falls out here.
+            //
+            // FAITHFULNESS: the aggregate writes only its destination place,
+            // and every operand is matched against the DECLARED type of the
+            // field it initialises, by position, with the operand count
+            // required to equal the field count -- so a construction that
+            // omits, reorders past the end, or mistypes a field is refused.
+            // That makes it value-total, effect-free, deterministic and
+            // panic-free, which is exactly what the four facets assert.
+            if !variants.is_empty() || *variant != 0 || ops.len() != fields.len() {
+                return false;
+            }
+            ops.iter()
+                .zip(fields.iter())
+                .all(|(op, (_, field_ty))| operand_matches_ty(func, op, field_ty))
+        }
         _ => false,
     }
 }
 
 fn statement_is_valid(func: &VerifiableFunction, statement: &Statement) -> bool {
     match statement {
+        // A write to a CONTRACT-INJECTED local is specification machinery, not
+        // a step of the body -- the same reason the type gate exempts the local
+        // itself (`is_contract_injected_ty`). Exempting the local alone was not
+        // enough: the lowering also STORES the closure into it, and that store
+        // is an `Option<{closure}>` destination no rvalue rule admits, so the
+        // firewall declined the body for the contract's own bookkeeping.
+        //
+        // Still narrow: only a write whose DESTINATION is that local. Reads of
+        // it, and every other statement, go through the normal rules.
+        Statement::Assign { place, .. }
+            if place_ty(func, place)
+                .is_some_and(|ty| is_contract_injected_ty(ty, &func.def_path)) =>
+        {
+            true
+        }
         Statement::Assign { place, rvalue, .. } => place_ty(func, place)
             .is_some_and(|destination| rvalue_matches_ty(func, rvalue, destination)),
         Statement::StorageLive(local) | Statement::StorageDead(local) => {
@@ -321,11 +582,30 @@ fn terminator_is_valid(
                     *is_unsafe_sig,
                 );
             }
+            // An overflow-CHECKED signed primitive method (Shape A of the
+            // checked-arithmetic lane): compiler-marked identity, exactly two
+            // operands of the SIGNED width, destination typed at the pinned
+            // std `Option<iN>` shape of the SAME width. Pure, total,
+            // deterministic, and panic-free as a function into `Option` —
+            // rustc lowers it to an overflow-FLAG branch with no `Assert`.
+            if let Some(method) = crate::RustcCheckedPrimitiveMethod::classify(callee) {
+                let expected = Ty::Int { width: method.width(), signed: true };
+                return atomic.is_none()
+                    && !is_foreign
+                    && !is_unsafe_sig
+                    && args.len() == 2
+                    && args.iter().all(|arg| operand_matches_ty(func, arg, &expected))
+                    && place_ty(func, dest)
+                        .and_then(ty_is_std_option_of_signed)
+                        .is_some_and(|w| w == method.width())
+                    && (*target).is_some_and(|normal| target_exists(func, normal));
+            }
             // This namespace is closed: a malformed or excluded marker must
             // not fall through to same-unit call authority even if a hostile
             // serialized bundle also supplies the same impossible def-path.
             if callee.starts_with(crate::TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX)
                 || callee.starts_with(crate::TRUST_RUSTC_WRAPPING_REFUTATION_METHOD_PATH_PREFIX)
+                || callee.starts_with(crate::TRUST_RUSTC_CHECKED_PRIMITIVE_METHOD_PATH_PREFIX)
             {
                 return false;
             }
@@ -358,7 +638,17 @@ fn is_valid_closed_leaf(
         || func.body.blocks.is_empty()
         || func.body.locals.is_empty()
         || func.body.arg_count >= func.body.locals.len()
-        || !ty_in_closed_fragment(&func.body.return_ty)
+        // The return type must be a closed scalar, the std `Option<iN>` shape
+        // (checked-arithmetic widening), or an ALL-SCALAR STRUCT — the same
+        // three the local-0 gate below admits through
+        // `local_ty_in_closed_fragment`. The two rules have to agree: local 0's
+        // type is required to EQUAL the return type on the next line, so a
+        // return type this check refuses makes that gate unreachable, which is
+        // what kept a constructed `Term { coeff, lit }` out even after
+        // `rvalue_matches_ty` learned to admit building one.
+        || !(ty_in_closed_fragment(&func.body.return_ty)
+            || ty_is_std_option_of_signed(&func.body.return_ty).is_some()
+            || ty_is_scalar_struct(&func.body.return_ty))
         || func.body.locals[0].ty != func.body.return_ty
     {
         return false;
@@ -367,13 +657,11 @@ fn is_valid_closed_leaf(
     // Require the serialized identities to agree with their canonical vector
     // positions.  This simultaneously rejects duplicates, sparse IDs, a missing
     // bb0/return slot, and the map-overwrite/index-confusion class of bugs.
-    if func
-        .body
-        .locals
-        .iter()
-        .enumerate()
-        .any(|(index, local)| local.index != index || !ty_in_closed_fragment(&local.ty))
-        || func.body.blocks.iter().enumerate().any(|(index, block)| block.id.0 != index)
+    if func.body.locals.iter().enumerate().any(|(index, local)| {
+        local.index != index
+            || !(local_ty_in_closed_fragment(&local.ty, index, func.body.arg_count)
+                || is_contract_injected_ty(&local.ty, &func.def_path))
+    }) || func.body.blocks.iter().enumerate().any(|(index, block)| block.id.0 != index)
     {
         return false;
     }
@@ -962,6 +1250,132 @@ mod tests {
         assert!(inferred(f).all());
     }
 
+    /// The GUARDED-NARROW lane's one new statement form: an integer-to-integer
+    /// cast is pure, total, deterministic and panic-free, so the whole
+    /// `if fits { Some(x as i64) } else { None }` body stays certifiable. This
+    /// is what makes `veripb_core_proved::guard::narrow` facet-admissible at
+    /// all — before the `Rvalue::Cast` arm the body failed EVERY facet on the
+    /// cast statement alone (measured: probe c2, `admissible=false`).
+    #[test]
+    fn an_integer_cast_stays_in_the_closed_fragment() {
+        let i64_ty = Ty::Int { width: 64, signed: true };
+        let i128_ty = Ty::Int { width: 128, signed: true };
+        let option = Ty::adt_enum_with_disc_safety(
+            "core::option::Option",
+            vec![
+                crate::VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                crate::VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), i64_ty.clone())],
+                },
+            ],
+            true,
+        );
+        let agg = |variant: usize| crate::AggregateKind::Adt {
+            name: "core::option::Option".into(),
+            variant,
+            active_field: None,
+            args: Some("core::option::Option<i64>".into()),
+        };
+        let cmp = |place: usize, op: BinOp, bound: i128| Statement::Assign {
+            place: Place::local(place),
+            rvalue: Rvalue::BinaryOp(
+                op,
+                Operand::Copy(Place::local(1)),
+                Operand::Constant(ConstValue::Int(bound)),
+            ),
+            span: SourceSpan::default(),
+        };
+        let switch = |flag: usize, zero: usize, other: usize| Terminator::SwitchInt {
+            discr: Operand::Move(Place::local(flag)),
+            targets: vec![(0, BlockId(zero))],
+            otherwise: BlockId(other),
+            exhaustive_enum_unreachable: false,
+            span: SourceSpan::default(),
+        };
+        let f = func_with(
+            "crate::narrow",
+            vec![
+                LocalDecl { index: 0, ty: option.clone(), name: None },
+                LocalDecl { index: 1, ty: i128_ty, name: Some("x".into()) },
+                LocalDecl { index: 2, ty: Ty::Bool, name: None },
+                LocalDecl { index: 3, ty: Ty::Bool, name: None },
+                LocalDecl { index: 4, ty: i64_ty.clone(), name: None },
+            ],
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![cmp(2, BinOp::Ge, -9_223_372_036_854_775_808)],
+                    terminator: switch(2, 3, 1),
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![cmp(3, BinOp::Le, 9_223_372_036_854_775_807)],
+                    terminator: switch(3, 3, 2),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(4),
+                            rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), i64_ty),
+                            span: SourceSpan::default(),
+                        },
+                        Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::Aggregate(
+                                agg(1),
+                                vec![Operand::Move(Place::local(4))],
+                            ),
+                            span: SourceSpan::default(),
+                        },
+                    ],
+                    terminator: Terminator::Goto(BlockId(4)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Aggregate(agg(0), vec![]),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Goto(BlockId(4)),
+                },
+                BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
+            ],
+            1,
+            option,
+        );
+        assert!(inferred(f.clone()).all(), "the guarded-narrow body must certify all four facets");
+
+        // Fail-closed edges of the new arm: the cast's recorded TARGET type
+        // must be the destination's own declared type (a mismatch is a
+        // malformed body, not a cast this lane models), and a NON-integer end
+        // is refused outright.
+        let mut mistyped = f.clone();
+        mistyped.body.blocks[2].stmts[0] = Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::Cast(
+                Operand::Copy(Place::local(1)),
+                Ty::Int { width: 32, signed: true },
+            ),
+            span: SourceSpan::default(),
+        };
+        assert_eq!(inferred(mistyped), FacetSet::default(), "cast target/destination mismatch");
+
+        let mut const_source = f;
+        const_source.body.blocks[2].stmts[0] = Statement::Assign {
+            place: Place::local(4),
+            rvalue: Rvalue::Cast(
+                Operand::Constant(ConstValue::Int(1)),
+                Ty::Int { width: 64, signed: true },
+            ),
+            span: SourceSpan::default(),
+        };
+        assert_eq!(inferred(const_source), FacetSet::default(), "a constant cast source");
+    }
+
     #[test]
     fn assert_poisons_only_no_panic_after_validation() {
         let f = unit_func(
@@ -1005,5 +1419,576 @@ mod tests {
             float,
         );
         assert_eq!(inferred(f), FacetSet::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // E6/E9 widening increment 7 — an all-scalar STRUCT is in the closed
+    // fragment, at a PARAMETER position only.
+    // -----------------------------------------------------------------------
+
+    fn scalar_cst() -> Ty {
+        Ty::adt("crate::Cst", vec![("degree".into(), Ty::u64()), ("coeff".into(), Ty::u64())])
+    }
+
+    /// `fn deg(c: Cst) -> u64 { c.degree }` with local 1 declared at `param_ty`
+    /// and the body reading `projections` off it.
+    fn field_leaf(param_ty: Ty, projections: Vec<Projection>) -> VerifiableFunction {
+        func_with(
+            "crate::deg",
+            vec![
+                LocalDecl { index: 0, ty: Ty::u64(), name: None },
+                LocalDecl { index: 1, ty: param_ty, name: Some("c".into()) },
+            ],
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Use(Operand::Copy(Place { local: 1, projections })),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            1,
+            Ty::u64(),
+        )
+    }
+
+    #[test]
+    fn an_all_scalar_struct_parameter_certifies_and_its_field_read_is_typed() {
+        let facets = infer_facets(std::slice::from_ref(&field_leaf(
+            scalar_cst(),
+            vec![Projection::Field(0)],
+        )));
+        assert!(
+            facets["crate::deg"].all(),
+            "reading a scalar field of a by-value struct parameter is pure, total, \
+             deterministic and panic-free: {:?}",
+            facets["crate::deg"]
+        );
+    }
+
+    /// `Cst { degree, coeff }` built from two parameters, returned by value.
+    fn constructs(ret_ty: Ty, adt_name: &str, ops: Vec<Operand>, locals: Vec<LocalDecl>, argc: usize) -> VerifiableFunction {
+        func_with(
+            "crate::mk",
+            locals,
+            vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(0),
+                    rvalue: Rvalue::Aggregate(
+                        crate::AggregateKind::Adt {
+                            name: adt_name.into(),
+                            variant: 0,
+                            active_field: None,
+                            args: None,
+                        },
+                        ops,
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: Terminator::Return,
+            }],
+            argc,
+            ret_ty,
+        )
+    }
+
+    /// The motivating case: a body that CONSTRUCTS an all-scalar struct and
+    /// returns it is pure, total, deterministic and panic-free. Without this,
+    /// `rvalue_matches_ty`'s struct admission was unreachable — the constructed
+    /// value could never live in the return slot.
+    #[test]
+    fn a_constructed_scalar_struct_return_certifies() {
+        let f = constructs(
+            scalar_cst(),
+            "crate::Cst",
+            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+            vec![
+                LocalDecl { index: 0, ty: scalar_cst(), name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("d".into()) },
+                LocalDecl { index: 2, ty: Ty::u64(), name: Some("c".into()) },
+            ],
+            2,
+        );
+        assert!(infer_facets(std::slice::from_ref(&f))["crate::mk"].all());
+    }
+
+    /// A NESTED all-scalar struct — `Term { coeff: u64, lit: Lit }`, the shape
+    /// a per-term rule step returns. `Lit` is a struct, which is exactly why
+    /// `Term` was refused before the field check learned to recurse.
+    #[test]
+    fn a_constructed_nested_scalar_struct_return_certifies() {
+        let lit = Ty::adt("crate::Lit", vec![("var".into(), Ty::u64()), ("neg".into(), Ty::Bool)]);
+        let term = Ty::adt(
+            "crate::Term",
+            vec![("coeff".into(), Ty::u64()), ("lit".into(), lit.clone())],
+        );
+        let f = constructs(
+            term.clone(),
+            "crate::Term",
+            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+            vec![
+                LocalDecl { index: 0, ty: term, name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("coeff".into()) },
+                LocalDecl { index: 2, ty: lit, name: Some("lit".into()) },
+            ],
+            2,
+        );
+        assert!(infer_facets(std::slice::from_ref(&f))["crate::mk"].all());
+    }
+
+    /// `Option<{closure}>` as the contract lowering mints it, for `owner`.
+    fn contract_local(owner: &str) -> Ty {
+        Ty::adt(
+            "core::option::Option",
+            vec![
+                ("__tag".into(), Ty::Int { width: 64, signed: true }),
+                (
+                    "__v1_0".into(),
+                    Ty::Closure {
+                        name: format!("{owner}::{{closure#0}}"),
+                        upvars: vec![Ty::u64()],
+                        call: None,
+                    },
+                ),
+            ],
+        )
+    }
+
+    /// Writing a closure-form `ensures` must not remove the function's own
+    /// admissibility. The predicate is materialised as an `Option<{closure}>`
+    /// local of the contracted function; it is specification machinery, not a
+    /// step of the body, and it exists only under the contract cfg.
+    #[test]
+    fn a_contract_injected_closure_local_does_not_poison_the_facets() {
+        let mut f = constructs(
+            scalar_cst(),
+            "crate::Cst",
+            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+            vec![
+                LocalDecl { index: 0, ty: scalar_cst(), name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("d".into()) },
+                LocalDecl { index: 2, ty: Ty::u64(), name: Some("c".into()) },
+            ],
+            2,
+        );
+        f.body.locals.push(LocalDecl { index: 3, ty: contract_local("crate::mk"), name: None });
+        assert!(
+            infer_facets(std::slice::from_ref(&f))["crate::mk"].all(),
+            "the contract's own closure local must not decide the body's facets"
+        );
+    }
+
+    /// The FULL shape the lowering leaves behind: the contract local AND the
+    /// store into it. Exempting the local alone was not enough -- the store is
+    /// an `Option<{closure}>` destination that no rvalue rule admits, so the
+    /// firewall still declined the body for the contract's own bookkeeping.
+    #[test]
+    fn a_contract_injected_store_does_not_poison_the_facets() {
+        let mut f = constructs(
+            scalar_cst(),
+            "crate::Cst",
+            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+            vec![
+                LocalDecl { index: 0, ty: scalar_cst(), name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("d".into()) },
+                LocalDecl { index: 2, ty: Ty::u64(), name: Some("c".into()) },
+            ],
+            2,
+        );
+        f.body.locals.push(LocalDecl { index: 3, ty: contract_local("crate::mk"), name: None });
+        // …and the lowering's own store into it, ahead of the body's return.
+        f.body.blocks[0].stmts.insert(
+            0,
+            Statement::Assign {
+                place: Place::local(3),
+                rvalue: Rvalue::Use(Operand::Copy(Place::local(3))),
+                span: SourceSpan::default(),
+            },
+        );
+        assert!(
+            infer_facets(std::slice::from_ref(&f))["crate::mk"].all(),
+            "the contract's own store must not decide the body's facets"
+        );
+    }
+
+    /// The exemption is keyed to THIS function. A closure belonging to anything
+    /// else is an ordinary non-scalar local and still takes the body out.
+    #[test]
+    fn a_foreign_closure_local_still_poisons_the_facets() {
+        let mut f = constructs(
+            scalar_cst(),
+            "crate::Cst",
+            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+            vec![
+                LocalDecl { index: 0, ty: scalar_cst(), name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("d".into()) },
+                LocalDecl { index: 2, ty: Ty::u64(), name: Some("c".into()) },
+            ],
+            2,
+        );
+        f.body.locals.push(LocalDecl {
+            index: 3,
+            ty: contract_local("crate::somewhere_else"),
+            name: None,
+        });
+        assert!(
+            !infer_facets(std::slice::from_ref(&f))["crate::mk"].all(),
+            "only THIS function's contract closure is exempt"
+        );
+    }
+
+    /// A field built from an operand of the WRONG type is refused: the
+    /// admission type-checks each operand against the field it initialises.
+    #[test]
+    fn a_mistyped_struct_field_operand_is_refused() {
+        let f = constructs(
+            scalar_cst(),
+            "crate::Cst",
+            vec![Operand::Copy(Place::local(1)), Operand::Copy(Place::local(2))],
+            vec![
+                LocalDecl { index: 0, ty: scalar_cst(), name: None },
+                LocalDecl { index: 1, ty: Ty::u64(), name: Some("d".into()) },
+                // `coeff` is declared `u64`; this operand is a bool.
+                LocalDecl { index: 2, ty: Ty::Bool, name: Some("c".into()) },
+            ],
+            2,
+        );
+        assert!(!infer_facets(std::slice::from_ref(&f))["crate::mk"].all());
+    }
+
+    #[test]
+    fn the_struct_widening_reaches_parameters_only_and_scalars_only() {
+        // A NON-SCALAR field takes the whole struct back out of the fragment.
+        let with_slice = Ty::adt(
+            "crate::Cst",
+            vec![("degree".into(), Ty::u64()), ("terms".into(), Ty::Slice { elem: Box::new(Ty::u64()) })],
+        );
+        assert!(!infer_facets(std::slice::from_ref(&field_leaf(
+            with_slice,
+            vec![Projection::Field(0)]
+        )))["crate::deg"]
+            .all());
+
+        // An ENUM is refused: `fields` is the union view, so field 0 is
+        // variant-relative and does not name one value of the parameter.
+        let enum_ty = Ty::adt_enum(
+            "crate::E",
+            vec![crate::VariantDef {
+                name: "A".into(),
+                discriminant: 0,
+                fields: vec![("degree".into(), Ty::u64())],
+            }],
+        );
+        assert!(!infer_facets(std::slice::from_ref(&field_leaf(
+            enum_ty,
+            vec![Projection::Field(0)]
+        )))["crate::deg"]
+            .all());
+
+        // A struct at a NON-PARAMETER local stays out: the widening admits a
+        // field READ of an input, not aggregates in general.
+        let mut temp = field_leaf(scalar_cst(), vec![Projection::Field(0)]);
+        temp.body.locals.push(LocalDecl { index: 2, ty: scalar_cst(), name: None });
+        assert!(!infer_facets(std::slice::from_ref(&temp))["crate::deg"].all());
+
+        // A struct RETURN slot whose body does not CONSTRUCT it is still
+        // refused -- here the body still assigns a `u64` field read into a
+        // struct-typed `_0`, which `rvalue_matches_ty` rejects outright. (The
+        // slot itself may now be an all-scalar struct; what makes a body
+        // admissible is that it builds one, which
+        // `a_constructed_scalar_struct_return_certifies` covers.)
+        let mut ret = field_leaf(scalar_cst(), vec![Projection::Field(0)]);
+        ret.body.locals[0] = LocalDecl { index: 0, ty: scalar_cst(), name: None };
+        ret.body.return_ty = scalar_cst();
+        assert!(!infer_facets(std::slice::from_ref(&ret))["crate::deg"].all());
+
+        // A DEREF projection is still outside `place_ty`, so a `&Cst`-shaped
+        // read never types.
+        assert!(!infer_facets(std::slice::from_ref(&field_leaf(
+            scalar_cst(),
+            vec![Projection::Deref, Projection::Field(0)]
+        )))["crate::deg"]
+            .all());
+    }
+
+    // -----------------------------------------------------------------------
+    // Checked-arithmetic widening: the std `Option<iN>` return, the Option
+    // aggregates, and the marked checked/cold_path callees inside the closed
+    // fragment.
+    // -----------------------------------------------------------------------
+
+    fn option_of_signed(width: u32) -> Ty {
+        Ty::adt_enum_with_disc_safety(
+            "core::option::Option",
+            vec![
+                crate::VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                crate::VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), Ty::Int { width, signed: true })],
+                },
+            ],
+            true,
+        )
+    }
+
+    fn option_agg(width: u32, variant: usize) -> crate::AggregateKind {
+        crate::AggregateKind::Adt {
+            name: "core::option::Option".into(),
+            variant,
+            active_field: None,
+            args: Some(format!("core::option::Option<i{width}>")),
+        }
+    }
+
+    /// The measured `-O` Shape-B body of `fn c(a: i64, b: i64) -> Option<i64>
+    /// { a.checked_add(b) }`, with the cold-hint callee spelled `cold_callee`.
+    fn checked_diamond(cold_callee: &str) -> VerifiableFunction {
+        let int = Ty::Int { width: 64, signed: true };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        func_with(
+            "crate::cadd",
+            vec![
+                LocalDecl { index: 0, ty: option_of_signed(64), name: None },
+                LocalDecl { index: 1, ty: int.clone(), name: Some("a".into()) },
+                LocalDecl { index: 2, ty: int.clone(), name: Some("b".into()) },
+                LocalDecl { index: 3, ty: int.clone(), name: None },
+                LocalDecl { index: 4, ty: Ty::Bool, name: None },
+                LocalDecl { index: 5, ty: Ty::Tuple(vec![int, Ty::Bool]), name: None },
+                LocalDecl { index: 6, ty: Ty::Unit, name: None },
+            ],
+            vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        assign(
+                            Place::local(5),
+                            Rvalue::CheckedBinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Copy(Place::local(2)),
+                            ),
+                        ),
+                        assign(Place::local(3), Rvalue::Use(Operand::Copy(Place::field(5, 0)))),
+                        assign(Place::local(4), Rvalue::Use(Operand::Copy(Place::field(5, 1)))),
+                    ],
+                    terminator: Terminator::SwitchInt {
+                        discr: Operand::Copy(Place::local(4)),
+                        targets: vec![(0, BlockId(4))],
+                        otherwise: BlockId(2),
+                        exhaustive_enum_unreachable: false,
+                        span: SourceSpan::default(),
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                BasicBlock {
+                    id: BlockId(2),
+                    stmts: vec![],
+                    terminator: Terminator::Call {
+                        func: cold_callee.to_string(),
+                        callee_identity: None,
+                        args: vec![],
+                        dest: Place::local(6),
+                        target: Some(BlockId(3)),
+                        span: SourceSpan::default(),
+                        atomic: None,
+                        is_foreign: false,
+                        is_unsafe_sig: false,
+                        unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    stmts: vec![assign(
+                        Place::local(0),
+                        Rvalue::Aggregate(option_agg(64, 0), vec![]),
+                    )],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+                BasicBlock {
+                    id: BlockId(4),
+                    stmts: vec![assign(
+                        Place::local(0),
+                        Rvalue::Aggregate(option_agg(64, 1), vec![Operand::Copy(Place::local(3))]),
+                    )],
+                    terminator: Terminator::Goto(BlockId(1)),
+                },
+            ],
+            2,
+            option_of_signed(64),
+        )
+    }
+
+    /// The pinned Option-shape gate itself, positive and fail-closed.
+    #[test]
+    fn std_option_of_signed_shape_gate_is_exact() {
+        for width in [8u32, 16, 32, 64, 128] {
+            assert_eq!(ty_is_std_option_of_signed(&option_of_signed(width)), Some(width));
+        }
+        // Niche layout (disc_index_safe = false) refuses.
+        let mut niche = option_of_signed(64);
+        let Ty::Adt { disc_index_safe, .. } = &mut niche else { unreachable!() };
+        *disc_index_safe = false;
+        assert_eq!(ty_is_std_option_of_signed(&niche), None, "niche layout");
+        // Unsigned payload refuses.
+        let mut unsigned = option_of_signed(64);
+        let Ty::Adt { variants, .. } = &mut unsigned else { unreachable!() };
+        variants[1].fields[0].1 = Ty::Int { width: 64, signed: false };
+        assert_eq!(ty_is_std_option_of_signed(&unsigned), None, "unsigned payload");
+        // A same-shape lookalike under a different name refuses.
+        let mut lookalike = option_of_signed(64);
+        let Ty::Adt { name, .. } = &mut lookalike else { unreachable!() };
+        *name = "my_crate::MyOption".into();
+        assert_eq!(ty_is_std_option_of_signed(&lookalike), None, "lookalike name");
+        // A reference payload (the classic niche carrier) refuses even when a
+        // hostile bundle also claims disc_index_safe.
+        let mut ref_payload = option_of_signed(64);
+        let Ty::Adt { variants, .. } = &mut ref_payload else { unreachable!() };
+        variants[1].fields[0].1 =
+            Ty::Ref { mutable: false, inner: Box::new(Ty::Int { width: 64, signed: true }) };
+        assert_eq!(ty_is_std_option_of_signed(&ref_payload), None, "reference payload");
+        // Scalars and structs refuse.
+        assert_eq!(ty_is_std_option_of_signed(&Ty::u64()), None);
+        assert_eq!(ty_is_std_option_of_signed(&scalar_cst()), None);
+    }
+
+    /// The measured Shape-B checked body certifies all four facets ONLY when
+    /// the cold-hint callee carries the compiler intrinsic marker; the bare,
+    /// source-spellable spelling stays refused (the callee is not in the unit
+    /// and has no authenticated identity).
+    #[test]
+    fn checked_diamond_certifies_with_marked_cold_path_only() {
+        let marked = checked_diamond("@trust-rustc-intrinsic::core::intrinsics::cold_path");
+        let facets = inferred(marked);
+        assert!(
+            facets.all(),
+            "the checked diamond with a marked cold_path must certify: {facets:?}"
+        );
+
+        let bare = checked_diamond("core::intrinsics::cold_path");
+        assert!(
+            !inferred(bare).all(),
+            "an unmarked cold_path callee has no authenticated identity and must refuse"
+        );
+    }
+
+    /// Fail-closed mutations of the certifying Shape-B body.
+    #[test]
+    fn checked_diamond_mutations_fail_closed() {
+        let base = || checked_diamond("@trust-rustc-intrinsic::core::intrinsics::cold_path");
+        // A niche-encoded return type takes the whole body out.
+        let mut niche = base();
+        let Ty::Adt { disc_index_safe, .. } = &mut niche.body.return_ty else { unreachable!() };
+        *disc_index_safe = false;
+        niche.body.locals[0].ty = niche.body.return_ty.clone();
+        assert!(!inferred(niche).all(), "niche Option return");
+
+        // A Some aggregate with the wrong operand count refuses.
+        let mut bad_some = base();
+        bad_some.body.blocks[4].stmts = vec![Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Aggregate(option_agg(64, 1), vec![]),
+            span: SourceSpan::default(),
+        }];
+        assert!(!inferred(bad_some).all(), "payload-less Some aggregate");
+
+        // A None aggregate carrying a payload refuses.
+        let mut bad_none = base();
+        bad_none.body.blocks[3].stmts = vec![Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Aggregate(option_agg(64, 0), vec![Operand::Copy(Place::local(3))]),
+            span: SourceSpan::default(),
+        }];
+        assert!(!inferred(bad_none).all(), "None aggregate with a payload");
+
+        // An Option-typed TEMPORARY (not the return slot) refuses.
+        let mut opt_temp = base();
+        opt_temp.body.locals.push(LocalDecl { index: 7, ty: option_of_signed(64), name: None });
+        assert!(!inferred(opt_temp).all(), "Option temporary outside the return slot");
+
+        // A wrong-typed payload operand (the Bool flag where the i64 result
+        // belongs) refuses. (The generic-ARGS rendering of the aggregate is
+        // deliberately NOT this validator's concern — the destination type
+        // gives the typing; the E6 recognizer separately pins the rendering.)
+        let mut wrong_payload = base();
+        wrong_payload.body.blocks[4].stmts = vec![Statement::Assign {
+            place: Place::local(0),
+            rvalue: Rvalue::Aggregate(option_agg(64, 1), vec![Operand::Copy(Place::local(4))]),
+            span: SourceSpan::default(),
+        }];
+        assert!(!inferred(wrong_payload).all(), "Bool payload in the Some aggregate");
+    }
+
+    /// Shape A: a marked checked call certifies; the unmarked spelling and a
+    /// malformed reserved-namespace marker fail closed.
+    #[test]
+    fn a_marked_checked_primitive_method_is_usable_but_lookalikes_are_not() {
+        let int = Ty::Int { width: 64, signed: true };
+        let call_body = |callee: &str| {
+            func_with(
+                "crate::cadd",
+                vec![
+                    LocalDecl { index: 0, ty: option_of_signed(64), name: None },
+                    LocalDecl { index: 1, ty: int.clone(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: int.clone(), name: Some("b".into()) },
+                ],
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            func: callee.to_string(),
+                            callee_identity: None,
+                            args: vec![
+                                Operand::Copy(Place::local(1)),
+                                Operand::Copy(Place::local(2)),
+                            ],
+                            dest: Place::local(0),
+                            target: Some(BlockId(1)),
+                            span: SourceSpan::default(),
+                            atomic: None,
+                            is_foreign: false,
+                            is_unsafe_sig: false,
+                            unwind: UnwindEdge::Unreachable,
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                2,
+                option_of_signed(64),
+            )
+        };
+        let marked =
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_add";
+        assert!(
+            inferred(call_body(marked)).all(),
+            "a TyCtxt-confirmed checked primitive method must be usable as a callee"
+        );
+        assert!(
+            !inferred(call_body("core::num::<impl i64>::checked_add")).all(),
+            "an unmarked, source-spellable checked-method lookalike must be refused"
+        );
+        for malformed in [
+            "@trust-rustc-checked-primitive-method::core::num::<impl u64>::checked_add",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_div",
+            "@trust-rustc-checked-primitive-method::evil::num::<impl i64>::checked_add",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_add::sfx",
+        ] {
+            assert!(
+                !inferred(call_body(malformed)).all(),
+                "malformed/excluded checked marker must fail closed: {malformed}"
+            );
+        }
+        // A WIDTH-mismatched marked call (i32 method into an Option<i64>
+        // destination) refuses.
+        let mismatch =
+            "@trust-rustc-checked-primitive-method::core::num::<impl i32>::checked_add";
+        assert!(!inferred(call_body(mismatch)).all(), "width mismatch must fail closed");
     }
 }

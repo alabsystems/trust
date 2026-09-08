@@ -15,7 +15,12 @@ fn downward_loop_carries_guard_lower_bound() {
     let has_lower = generate_vcs(&func).iter().any(|vc| {
         let d = format!("{:?}", vc.formula);
         // `Ge(_t.0, 1)` — the guard-derived lower bound on the decrement result.
-        d.contains("Ge(Var(") && d.contains(".0\"") && d.contains("Int(1)")
+        // The tuple result may carry its establish token (`_t.0#s{b}_{k}`) since
+        // the write-visibility widening: the checked tuple dest is in the write
+        // domain, so the fact is stamped at its establish point — strictly
+        // sounder (it can no longer leak across a tuple reuse). Accept both
+        // spellings.
+        d.contains("Ge(Var(") && (d.contains(".0\"") || d.contains(".0#")) && d.contains("Int(1)")
     });
     assert!(has_lower, "downward loop with `j > 1` guard must emit the `_t.0 >= 1` lower bound");
 }

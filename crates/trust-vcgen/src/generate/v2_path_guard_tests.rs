@@ -632,3 +632,106 @@ fn formula_contains_or(formula: &Formula) -> bool {
         _ => formula.children().into_iter().any(formula_contains_or),
     }
 }
+
+// ── FIX A — trusted-std pointer-deref assert suppression ──────────────────
+//
+// A rustc-inserted Null/Misaligned pointer-dereference UB assert whose span
+// resolves under a canonical sysroot std root (the `vec!`-macro inlined
+// `Box::new_uninit` allocation pointer, e.g. `certify_inner`) is trusted-std
+// TCB and its safety VC is SKIPPED at generation. The SAME assert with a
+// USER-CRATE span MUST still emit its fail-closed `UnsupportedMir` obligation
+// so a genuine `unsafe { *raw_ptr }` stays refutable; an empty / `binary:`
+// span fails closed identically.
+
+fn ptr_deref_span(file: &str) -> SourceSpan {
+    SourceSpan { file: file.to_string(), line_start: 1, col_start: 1, line_end: 1, col_end: 20 }
+}
+
+fn ptr_deref_assert_func(
+    msg: trust_types::AssertMessage,
+    span: SourceSpan,
+) -> VerifiableFunction {
+    VerifiableFunction {
+        name: "ptr_deref".to_string(),
+        def_path: "ptr_deref".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: Some("_0".into()) },
+                LocalDecl { index: 1, ty: Ty::Bool, name: Some("_1".into()) },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![],
+                    terminator: Terminator::Assert {
+                        cond: Operand::Copy(Place::local(1)),
+                        expected: true,
+                        msg,
+                        target: BlockId(1),
+                        span,
+                        unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 0,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    }
+}
+
+#[test]
+fn fix_a_std_span_pointer_deref_assert_suppressed() {
+    // The `vec!`-macro Box::new_uninit pointer asserts, span at a canonical
+    // std root — both sysroot spellings (remapped bare-crate-root and the
+    // virtual `/rustc/<hash>/library/` form).
+    for span_file in ["alloc/src/macros.rs", "/rustc/e8be5c8/library/alloc/src/macros.rs"] {
+        for msg in [
+            trust_types::AssertMessage::NullPointerDereference,
+            trust_types::AssertMessage::MisalignedPointerDereference,
+        ] {
+            let func = ptr_deref_assert_func(msg, ptr_deref_span(span_file));
+            let vcs = generate_v2_safety_vcs(&func);
+            let has_unmodeled = vcs.iter().any(|vc| {
+                matches!(&vc.kind,
+                    VcKind::UnsupportedMir { kind, .. } if kind.contains("UnmodeledSafetyAssert"))
+            });
+            assert!(
+                !has_unmodeled,
+                "trusted-std pointer-deref assert ({span_file}) must be suppressed, got {:?}",
+                vcs.iter().map(|v| &v.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn fix_a_user_span_pointer_deref_assert_still_emitted() {
+    // ADVERSARIAL (mandatory): a genuine `unsafe { *raw_ptr }` in user code —
+    // a USER-CRATE span, an EMPTY span, and a `binary:` span — must KEEP its
+    // fail-closed obligation (never suppressed).
+    for span_file in ["crates/ny-cert/src/sbar.rs", "src/main.rs", "", "binary:0x1000"] {
+        for msg in [
+            trust_types::AssertMessage::NullPointerDereference,
+            trust_types::AssertMessage::MisalignedPointerDereference,
+        ] {
+            let func = ptr_deref_assert_func(msg, ptr_deref_span(span_file));
+            let vcs = generate_v2_safety_vcs(&func);
+            let has_unmodeled = vcs.iter().any(|vc| {
+                matches!(&vc.kind,
+                    VcKind::UnsupportedMir { kind, .. } if kind.contains("UnmodeledSafetyAssert"))
+            });
+            assert!(
+                has_unmodeled,
+                "user/empty/binary-span pointer-deref assert ({span_file:?}) must stay refutable, got {:?}",
+                vcs.iter().map(|v| &v.kind).collect::<Vec<_>>()
+            );
+        }
+    }
+}

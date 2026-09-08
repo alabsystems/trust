@@ -16890,6 +16890,17 @@ fn test_verifier_suite_statuses_probe_in_process_adapters() {
         assert_eq!(suite.manifest.name, suite.name);
         assert!(!suite.manifest.version.is_empty());
         assert!(!suite.manifest.api_version.is_empty());
+        // Trust (v6/D3, the engine split): trust-wp advertises and owns ZERO
+        // full-verification kinds — "TrustWP therefore advertises and owns
+        // zero full-verification kinds, and historical request/evidence wire
+        // variants remain readable but cannot authorize a verdict"
+        // (CLAUDE.md standing rulings; docs/TCB.md). An empty capability
+        // manifest is that ruling made visible, not a packaging defect, so
+        // demanding non-empty capabilities of it would test AGAINST the
+        // ratified split. Every other suite still must advertise what it owns.
+        if suite.name == "trust-wp" {
+            continue;
+        }
         assert!(
             !suite.manifest.capabilities.is_empty(),
             "{} manifest should expose owned obligation capabilities",

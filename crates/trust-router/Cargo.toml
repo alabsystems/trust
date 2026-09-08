@@ -101,6 +101,22 @@ trust-build = [
 ]
 
 [dependencies]
+# Trust: `trust-budget` is a strict-lane VERIFIED crate (`Gate: PASS`,
+# `docs/STRICT_VERIFICATION_FRAGMENT.md` §17). It owns the solver
+# resource-budget arithmetic this crate used to compute inline in three files:
+# the per-job memory split (`memory_jobserver`), the per-component timeout split
+# (`in_process_ay_backend`, whose neutrality argument is that the retry must not
+# multiply the caller's budget or it CHANGES THE VERDICT OF LATER OBLIGATIONS),
+# and the per-process RSS floor (`memory_guard`).
+#
+# COST OF THE EDGE (§16.8): a crate carrying the native `ensures` grammar is not
+# compilable by stock rustc, so this dependency makes trust-router
+# Trust-toolchain-only. Measured 2026-08-30 before the edge was taken:
+# trust-router declares no stable-channel intent in this manifest, no gate in
+# `tests/run_trust_comprehensive_harness.sh` builds it on stable, and it already
+# depends on `ay` and on `trust-vcgen` (itself Trust-only since the
+# `trust-widthconv` edge). The cost here is zero.
+trust-budget = { workspace = true }
 trust-vcgen = { workspace = true }
 trust-types = { workspace = true }
 # Trust #540 (R1): the kernel REPLAY primitive behind the sealed caller-propagation

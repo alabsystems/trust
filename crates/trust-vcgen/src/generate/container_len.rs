@@ -68,7 +68,7 @@ pub(super) fn vec_mut_borrows_only_feed_push(func: &VerifiableFunction, local: u
         }
     }
     for t in conduits {
-        if guards::whole_local_def_count(func, t) != 1 {
+        if !crate::local_defs::has_one_explicit_def(func, t) {
             return false;
         }
         for block in &func.body.blocks {
@@ -237,8 +237,7 @@ pub(super) fn operand_is_stable_bound(func: &VerifiableFunction, op: &Operand) -
         Operand::Constant(_) => true,
         Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
             crate::place_source_is_stable(func, p.local)
-                && !(is_parameter(func, p.local)
-                    && guards::whole_local_def_count(func, p.local) >= 1)
+                && crate::local_defs::never_explicitly_reseated(func, p.local)
         }
         _ => false,
     }
@@ -265,7 +264,8 @@ pub(super) fn push_guarded_bound(
             continue;
         };
         let Some(c) = operand_root_local(func, discr, fuel) else { continue };
-        let Some(Rvalue::BinaryOp(cmp, opl, opr)) = crate::unique_whole_local_def(func, c) else {
+        let Some(Rvalue::BinaryOp(cmp, opl, opr)) = crate::local_defs::unique_value_def(func, c)
+        else {
             continue;
         };
         // Identify the length side and the (stable) bound side, and which edge proves
@@ -393,7 +393,7 @@ pub(super) fn build_push_guard_elem_len_map(
         // mutated ONLY by `Vec::push` (no shrink / element overwrite / &mut escape).
         let Ty::Adt { name, .. } = &decl.ty else { continue };
         if !is_owned_slice_container_name(name)
-            || guards::whole_local_def_count(func, mi) != 1
+            || !crate::local_defs::has_one_explicit_def(func, mi)
             || !vec_created_empty(func, mi)
             || local_has_projected_write(func, mi)
             || !vec_mut_borrows_only_feed_push(func, mi)
@@ -492,7 +492,7 @@ pub(super) fn ref_target_of_local(
     func: &VerifiableFunction,
     local: usize,
 ) -> Option<(Place, bool)> {
-    match crate::unique_whole_local_def(func, local)? {
+    match crate::local_defs::unique_value_def(func, local)? {
         Rvalue::Ref { mutable, place } => Some((place.clone(), *mutable)),
         Rvalue::AddressOf(mutable, place) => Some((place.clone(), *mutable)),
         _ => None,
@@ -511,7 +511,7 @@ pub(super) fn operand_is_len_of_place(
     place: &Place,
 ) -> bool {
     let (Operand::Copy(p) | Operand::Move(p)) = op else { return false };
-    if !p.projections.is_empty() || guards::whole_local_def_count(func, p.local) != 1 {
+    if !p.projections.is_empty() || !crate::local_defs::has_one_explicit_def(func, p.local) {
         return false;
     }
     // (a) `_len = <..>::len(&place)`.
@@ -529,7 +529,7 @@ pub(super) fn operand_is_len_of_place(
         }
     }
     // (b) `_len = Len(place)` / `PtrMetadata(&place)`.
-    match crate::unique_whole_local_def(func, p.local) {
+    match crate::local_defs::unique_value_def(func, p.local) {
         Some(Rvalue::Len(lp)) => lp == place,
         Some(Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)) => matches!(
             inner,
@@ -638,7 +638,7 @@ pub(super) fn build_len_guard_field_map(
             };
             let Some(c_local) = operand_root_local(func, discr, FUEL) else { continue };
             let Some(Rvalue::BinaryOp(cmp, opl, opr)) =
-                crate::unique_whole_local_def(func, c_local)
+                crate::local_defs::unique_value_def(func, c_local)
             else {
                 continue;
             };
@@ -718,7 +718,7 @@ pub(super) fn trace_local_to_slice_iter_call(
     if fuel == 0 {
         return None;
     }
-    if let Some(rvalue) = crate::unique_whole_local_def(func, local) {
+    if let Some(rvalue) = crate::local_defs::unique_value_def(func, local) {
         return match rvalue {
             Rvalue::Ref { place, .. } if place.projections.is_empty() => {
                 trace_local_to_slice_iter_call(func, place.local, fuel - 1)

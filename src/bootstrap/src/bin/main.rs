@@ -22,6 +22,8 @@ fn is_tracing_enabled() -> bool {
 }
 
 fn main() {
+    clamp_umask_for_sysroot_authenticity();
+
     #[cfg(feature = "tracing")]
     let guard = bootstrap::setup_tracing("BOOTSTRAP_TRACING");
 
@@ -243,3 +245,41 @@ fn check_version(config: &Config) -> Option<String> {
 
     Some(msg)
 }
+
+// Trust: the sysroot we assemble must satisfy the toolchain's OWN
+// authenticity checks, and a group-writable one does not.
+//
+// `trust_router::coordinator::validate_authorized_directory_chain` refuses
+// any ancestor of `trustd` with `mode & 0o022 != 0`, because a group- or
+// world-writable directory lets another user swap the daemon binary between
+// the moment its bytes are hashed and the moment it is exec'd. That refusal
+// is correct and must not be relaxed.
+//
+// But under the common `umask 0002` (default on Debian/Ubuntu-family
+// systems with per-user groups) bootstrap creates `build/<triple>/stageN`
+// and its `bin/` as 0775, so the compiler we just built rejects its own
+// daemon and `targo trust check` cannot run at all. Measured on
+// aarch64-unknown-linux-gnu 2026-08-31: chmod'ing the chain by hand fixed
+// it, and the very next `x.py build` recreated `stage1` and `bin` as
+// `drwxrwxr-x` and broke it again — so a one-off chmod is not a fix.
+//
+// Clamp OUR file-creation mask instead. This only ever removes bits the
+// caller's umask would have granted; it cannot widen anything, it does not
+// touch files bootstrap did not create, and it leaves owner permissions
+// alone. `0o022` is what a toolchain build should have used regardless.
+#[cfg(unix)]
+fn clamp_umask_for_sysroot_authenticity() {
+    // SAFETY: `umask` is a process-global getter/setter taking a scalar, with
+    // no failure mode and no pointer arguments. This runs before bootstrap
+    // spawns a thread or creates a file, so nothing can observe a half-applied
+    // mask.
+    unsafe {
+        let previous = libc::umask(0o022);
+        // Preserve whatever the caller was ALREADY excluding: the contract is
+        // "at least as strict as 022", never "exactly 022".
+        libc::umask(previous | 0o022);
+    }
+}
+
+#[cfg(not(unix))]
+fn clamp_umask_for_sysroot_authenticity() {}

@@ -410,15 +410,40 @@ class OrdinaryAuditRemoteEvidenceTests(unittest.TestCase):
         self.assertIn("ORPHAN=0", done.stdout)
         self.assertNotIn("UNRECOVERABLE", done.stdout)
 
-    def test_local_absence_without_a_probe_is_unknown_not_unrecoverable(self) -> None:
+    def test_remote_inventory_resolves_an_anchored_pin_without_a_probe(self) -> None:
+        """The default consults the remote's REF INVENTORY, so no probe is needed.
+
+        Before 2026-08-31 the default read only this clone's remote-tracking
+        refs, so a pin held by an exact refs/pins/<sha> on the canonical remote
+        --- the durable state --anchor creates --- was reported UNKNOWN until
+        someone passed --probe.
+        """
         self._record_pin(self.anchored)
 
         done = self._audit()
 
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("REMOTE_PIN=1", done.stdout)
+        self.assertIn("(remote-verified)", done.stdout)
+        self.assertNotIn("UNRECOVERABLE", done.stdout)
+
+    def test_offline_local_absence_is_unknown_and_never_an_all_clear(self) -> None:
+        self._record_pin(self.anchored)
+
+        done = self._audit("--offline")
+
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn(f"UNKNOWN {self.anchored}", done.stdout)
-        self.assertIn("no remote verdict", done.stdout)
+        self.assertIn("FRESHNESS: UNVERIFIED", done.stdout)
+        self.assertIn("FRESHNESS UNVERIFIED for 1 submodule", done.stdout)
         self.assertNotIn("UNRECOVERABLE", done.stdout)
+
+    def test_offline_refuses_the_modes_that_must_reach_a_remote(self) -> None:
+        for flag in ("--probe", "--anchor", "--fetch", "--prepare-head-prune"):
+            with self.subTest(flag=flag):
+                done = self._audit("--offline", flag)
+                self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+                self.assertIn("--offline cannot be combined", done.stderr)
 
     def test_probe_without_a_canonical_url_fails_closed(self) -> None:
         (self.superproject / ".gitmodules").write_text(
@@ -432,6 +457,188 @@ class OrdinaryAuditRemoteEvidenceTests(unittest.TestCase):
 
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn("canonical submodule URL is missing", done.stdout)
+
+
+class StaleRemoteTrackingRefTests(unittest.TestCase):
+    """THE FAILURE THIS AUDIT USED TO HAVE, constructed rather than described.
+
+    Measured 2026-08-30 in ~/trust: three pins (first-party/trust-vc,
+    first-party/trust-wp, first-party/ty) were reported reachable because this
+    clone held stale refs/remotes/origin/* refs. After a genuine fetch they
+    were on no remote branch and unanchored --- and ``--anchor`` had reported
+    ZERO orphans, because it read the same stale refs. The all-clear was
+    confident and wrong, which is strictly worse than no audit.
+
+    Each test below builds that state deliberately and asserts BOTH verdicts:
+    the stale local evidence (still reachable, and still what ``--offline``
+    reads) and the canonical-remote evidence the audit now judges from. A fix
+    with only the second assertion would not show that the failure was real.
+    """
+
+    def _fixture(self, tmp: str) -> tuple[Path, Path, Path, str]:
+        root = Path(tmp)
+        sibling, remote, superproject = (
+            root / "sibling",
+            root / "sibling.git",
+            root / "super",
+        )
+        _git("init", "-q", "--bare", "--initial-branch=main", str(remote))
+        _git("init", "-q", "-b", "main", str(sibling))
+        _identity(sibling)
+        (sibling / "value").write_text("main\n")
+        _git("-C", str(sibling), "add", "value")
+        _git("-C", str(sibling), "commit", "-qm", "main")
+        _git("-C", str(sibling), "remote", "add", "origin", str(remote))
+        _git("-C", str(sibling), "push", "-qu", "origin", "main")
+
+        _git("-C", str(sibling), "switch", "-qc", "topic")
+        (sibling / "value").write_text("topic\n")
+        _git("-C", str(sibling), "commit", "-qam", "topic")
+        pinned = _git("-C", str(sibling), "rev-parse", "HEAD").stdout.strip()
+        _git("-C", str(sibling), "push", "-qu", "origin", "topic")
+
+        _git("init", "-q", "-b", "main", str(superproject))
+        _identity(superproject)
+        (superproject / ".gitmodules").write_text(
+            "[submodule \"first-party/example\"]\n"
+            "\tpath = first-party/example\n"
+            f"\turl = {remote}\n"
+        )
+        _git("-C", str(superproject), "add", ".gitmodules")
+        _git(
+            "-C", str(superproject), "update-index", "--add", "--cacheinfo",
+            "160000", pinned, "first-party/example",
+        )
+        _git("-C", str(superproject), "commit", "-qm", "pin the topic commit")
+        _git(
+            "-c", "protocol.file.allow=always", "-C", str(superproject),
+            "submodule", "update", "--init", "--checkout",
+        )
+        return superproject, sibling, remote, pinned
+
+    def _run(self, superproject: Path, *flags: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--repo", str(superproject), *flags],
+            capture_output=True, text=True, check=False,
+        )
+
+    def _assert_stale_ref_still_says_reachable(
+        self, superproject: Path, pinned: str
+    ) -> None:
+        """The evidence the audit USED to judge from still says the pin is fine."""
+        git_dir = audit.submodule_git_dir(superproject, "first-party/example")
+        assert git_dir is not None
+        stale, error = audit.remote_reachable_set_checked(git_dir)
+        self.assertEqual(error, "")
+        assert stale is not None
+        self.assertIn(
+            pinned,
+            stale,
+            "fixture is not exercising the defect: the stale remote-tracking "
+            "ref no longer reports the pin as reachable",
+        )
+
+    def test_deleted_remote_branch_leaves_a_lying_remote_tracking_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            superproject, _sibling, remote, pinned = self._fixture(tmp)
+
+            # The forge deletes the topic branch (a merged-branch prune). This
+            # clone is never told, and refs/remotes/origin/topic survives.
+            _git("--git-dir", str(remote), "update-ref", "-d", "refs/heads/topic")
+
+            self._assert_stale_ref_still_says_reachable(superproject, pinned)
+
+            # OLD EVIDENCE, still reachable through --offline: a clean OK, and
+            # the report says so in as many words.
+            offline = self._run(superproject, "--offline")
+            self.assertIn("OK=1", offline.stdout)
+            self.assertIn("ORPHAN=0", offline.stdout)
+            # ...but it can no longer pass while claiming it.
+            self.assertEqual(offline.returncode, 1, offline.stdout)
+            self.assertIn("FRESHNESS: UNVERIFIED", offline.stdout)
+
+            # NEW EVIDENCE: the canonical remote has no ref holding this pin.
+            fresh = self._run(superproject)
+            self.assertIn("ORPHAN=1", fresh.stdout)
+            self.assertIn(f"ORPHAN  {pinned}", fresh.stdout)
+            self.assertIn("FRAGILE pins: 1", fresh.stdout)
+            self.assertNotIn("every first-party pin is reachable", fresh.stdout)
+
+            # And --anchor, which reported nothing to do, now rescues it.
+            anchored = self._run(superproject, "--anchor")
+            self.assertEqual(anchored.returncode, 0, anchored.stdout + anchored.stderr)
+            self.assertIn("ANCHORED and exact-remote-verified: 1", anchored.stdout)
+            self.assertEqual(
+                _git(
+                    "--git-dir", str(remote), "rev-parse", f"refs/pins/{pinned}"
+                ).stdout.strip(),
+                pinned,
+            )
+
+    def test_rewound_remote_branch_is_caught_by_the_same_authority(self) -> None:
+        """A force-push is the same defect: the local ref keeps the old tip."""
+        with tempfile.TemporaryDirectory() as tmp:
+            superproject, sibling, remote, pinned = self._fixture(tmp)
+
+            _git("-C", str(sibling), "reset", "-q", "--hard", "HEAD~1")
+            _git("-C", str(sibling), "push", "-q", "--force", "origin", "topic")
+
+            self._assert_stale_ref_still_says_reachable(superproject, pinned)
+
+            fresh = self._run(superproject)
+            self.assertIn("ORPHAN=1", fresh.stdout)
+            self.assertIn(f"ORPHAN  {pinned}", fresh.stdout)
+
+    def test_the_run_leaves_no_local_ref_that_could_vouch_later(self) -> None:
+        """The fetch namespace is a means, not a record — and must not persist.
+
+        scripts/submodule_sync.sh decides ANCHORED with `for-each-ref
+        --contains` over EVERY ref in the submodule, so a lingering
+        refs/audit-remote-view/* ref would silently become durability evidence
+        for a commit the remote may since have dropped: the exact defect this
+        module exists to remove, re-introduced by its own plumbing. Measured
+        2026-08-31 before the cleanup existed: 161 leftover refs across five
+        live siblings after a handful of runs.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            superproject, sibling, remote, pinned = self._fixture(tmp)
+            git_dir = audit.submodule_git_dir(superproject, "first-party/example")
+            assert git_dir is not None
+
+            # Give the remote a tip this clone does not hold, so the fetch that
+            # creates the namespace actually fires.
+            _git("-C", str(sibling), "switch", "-q", "main")
+            _git("-C", str(sibling), "commit", "-q", "--allow-empty", "-m", "advance")
+            _git("-C", str(sibling), "push", "-q", "origin", "main")
+
+            self.assertEqual(self._run(superproject).returncode, 0)
+            self.assertEqual(
+                _git("--git-dir", str(git_dir), "for-each-ref",
+                     "--format=%(refname)", f"{audit.AUDIT_VIEW_NS}/**").stdout.strip(),
+                "",
+                "the audit left refs behind that a later run would trust",
+            )
+            # ...and the verdict still used the newly fetched tip.
+            self.assertIn("OK=1", self._run(superproject).stdout)
+            _ = pinned, remote
+
+    def test_a_missing_remote_is_an_error_not_a_pass(self) -> None:
+        """Unfetchable is REPORTED. It is never the silent all-clear it was."""
+        with tempfile.TemporaryDirectory() as tmp:
+            superproject, _sibling, _remote, _pinned = self._fixture(tmp)
+            (superproject / ".gitmodules").write_text(
+                "[submodule \"first-party/example\"]\n"
+                "\tpath = first-party/example\n"
+                f"\turl = {Path(tmp) / 'absent.git'}\n"
+            )
+            _git("-C", str(superproject), "commit", "-qam", "point at a dead remote")
+
+            done = self._run(superproject)
+
+            self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+            self.assertIn("remote ref inventory failed", done.stdout)
+            self.assertIn("AUDIT OPERATION FAILURES: 1", done.stdout)
+            self.assertNotIn("every first-party pin is reachable", done.stdout)
 
 
 if __name__ == "__main__":

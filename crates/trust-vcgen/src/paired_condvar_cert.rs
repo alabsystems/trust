@@ -1121,8 +1121,10 @@ fn analyze_function(
     }
 }
 
-/// `local` has exactly one def — the given statement — no call-dest or
-/// projected writes, and is never `&mut`/raw borrowed.
+/// `local` has exactly one VALUE, produced by the given statement — no call-dest or
+/// projected writes, and never `&mut`/raw borrowed. The value count is
+/// `local_defs::has_one_explicit_def`, so a PARAMETER (defined at ENTRY, invisibly to
+/// the scan below) whose entry value is still live does not pass on one store.
 fn single_def_unaliased(func: &VerifiableFunction, local: usize, db: usize, ds: usize) -> bool {
     let mut defs = 0usize;
     for (b, block) in func.body.blocks.iter().enumerate() {
@@ -1153,7 +1155,7 @@ fn single_def_unaliased(func: &VerifiableFunction, local: usize, db: usize, ds: 
             }
         }
     }
-    defs == 1
+    defs == 1 && crate::local_defs::has_one_explicit_def(func, local)
 }
 
 /// Locations where `local` is mentioned (any place occurrence, statement or
@@ -1434,9 +1436,7 @@ mod tests {
             name: name.into(),
             fields: fields.into_iter().map(|(n, t)| (n.to_string(), t)).collect(),
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        }
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
     }
 
     fn condvar_ty() -> Ty {

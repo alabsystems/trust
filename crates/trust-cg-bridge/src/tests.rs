@@ -54,9 +54,7 @@ fn test_map_type_fieldless_adt_fails_closed() {
         name: "core::option::Option<i32>".into(),
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     assert!(matches!(map_type(&ty), Err(BridgeError::UnsupportedType(_))));
 }
 
@@ -1203,7 +1201,7 @@ fn test_lower_call_terminator() {
         .find(|i| matches!(i.opcode, Opcode::Call { .. }))
         .expect("should have Call instruction");
     match &call_inst.opcode {
-        Opcode::Call { name } => assert_eq!(name, "callee"),
+        Opcode::Call { name, .. } => assert_eq!(name, "callee"),
         _ => panic!("expected Call opcode"),
     }
     assert_eq!(call_inst.args.len(), 1, "call should have 1 argument");
@@ -1252,7 +1250,7 @@ fn test_lower_tail_call_uses_exact_call_return_projection() {
     let lir = lower_to_lir(&func).expect("function-level TailCall must lower exactly");
     let entry = &lir.blocks[&Block(0)];
     assert!(entry.instructions.iter().any(
-        |instruction| matches!(&instruction.opcode, Opcode::Call { name } if name == "callee")
+        |instruction| matches!(&instruction.opcode, Opcode::Call { name, .. } if name == "callee")
     ));
     assert!(
         entry
@@ -1363,9 +1361,7 @@ fn test_lower_aggregate_call_result_populates_value_types() {
         name: "Pair".into(),
         fields: vec![("left".into(), Ty::i64()), ("right".into(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "call_pair".to_string(),
         def_path: "test::call_pair".to_string(),
@@ -2330,9 +2326,7 @@ fn test_lower_aggregate_adt() {
                         name: "Point".into(),
                         fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::i32())],
                         disc_index_safe: false,
-                        faithful_enum_repr: None,
-                        enum_layout: None,
-                    },
+                     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
                     name: None,
                 },
                 LocalDecl { index: 1, ty: Ty::i32(), name: Some("x".into()) },
@@ -2346,9 +2340,7 @@ fn test_lower_aggregate_adt() {
                         name: "Point".into(),
                         fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::i32())],
                         disc_index_safe: false,
-                        faithful_enum_repr: None,
-                        enum_layout: None,
-                    },
+                     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
                     name: None,
                 },
             ],
@@ -2377,9 +2369,7 @@ fn test_lower_aggregate_adt() {
                 name: "Point".into(),
                 fields: vec![("x".into(), Ty::i32()), ("y".into(), Ty::i32())],
                 disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+             faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
             datatype_defs: Default::default(),
         },
         contracts: vec![],
@@ -2411,9 +2401,7 @@ fn test_lower_aggregate_adt_enum_variant_writes_discriminant() {
         name: "Option".into(),
         fields: vec![("tag".into(), Ty::i64()), ("value".into(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "make_some".to_string(),
         def_path: "test::make_some".to_string(),
@@ -2490,9 +2478,7 @@ fn test_lower_aggregate_adt_none_variant_no_data() {
         name: "Option".into(),
         fields: vec![("tag".into(), Ty::i64()), ("value".into(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "make_none".to_string(),
         def_path: "test::make_none".to_string(),
@@ -2553,9 +2539,7 @@ fn test_lower_fieldless_option_some_fails_closed() {
         name: "core::option::Option<i32>".into(),
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "make_some_fieldless".to_string(),
         def_path: "test::make_some_fieldless".to_string(),
@@ -2605,9 +2589,7 @@ fn test_lower_checked_div_like_fieldless_option_fails_closed() {
         name: "core::option::Option<i32>".into(),
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "checked_div_like".to_string(),
         def_path: "test::checked_div_like".to_string(),
@@ -2688,9 +2670,7 @@ fn test_emit_object_struct_return_after_aggregate_construction() {
         name: "Pair".into(),
         fields: vec![("left".into(), Ty::i64()), ("right".into(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "make_pair".to_string(),
         def_path: "test::make_pair".to_string(),
@@ -2973,7 +2953,7 @@ fn test_emit_object_checked_add_overflow_linked_main_does_not_self_call() {
         .instructions
         .iter()
         .find(
-            |inst| matches!(inst.opcode, Opcode::Call { ref name } if name == "checked_add_overflowing"),
+            |inst| matches!(inst.opcode, Opcode::Call { ref name, .. } if name == "checked_add_overflowing"),
         )
         .expect("caller LIR should contain a direct checked_add_overflowing call");
     assert_eq!(
@@ -2992,7 +2972,7 @@ fn test_emit_object_checked_add_overflow_linked_main_does_not_self_call() {
         panic_block
             .instructions
             .iter()
-            .any(|inst| matches!(&inst.opcode, Opcode::Call { name } if name == "abort")),
+            .any(|inst| matches!(&inst.opcode, Opcode::Call { name, .. } if name == "abort")),
         "checked-add overflow panic block should terminate via abort"
     );
 
@@ -3075,9 +3055,7 @@ fn test_lower_drop_non_copy_adt_requires_resolved_drop_glue() {
             ("cap".into(), Ty::i64()),
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "drop_string".to_string(),
         def_path: "test::drop_string".to_string(),
@@ -3836,7 +3814,7 @@ fn test_lower_unreachable_terminator() {
         entry
             .instructions
             .iter()
-            .any(|i| matches!(&i.opcode, Opcode::Call { name } if name == "abort")),
+            .any(|i| matches!(&i.opcode, Opcode::Call { name, .. } if name == "abort")),
         "Unreachable should lower to an abort call"
     );
     assert!(
@@ -3871,7 +3849,7 @@ fn test_lower_non_void_unreachable_lowers_to_abort_call() {
     let lir = lower_to_lir(&func).expect("non-void unreachable should lower");
     let entry = &lir.blocks[&lir.entry_block];
     let abort_inst = entry.instructions.last().expect("unreachable block should end in abort");
-    assert!(matches!(&abort_inst.opcode, Opcode::Call { name } if name == "abort"));
+    assert!(matches!(&abort_inst.opcode, Opcode::Call { name, .. } if name == "abort"));
     assert!(
         abort_inst.args.is_empty() && abort_inst.results.is_empty(),
         "abort call should not carry fake return operands or results"
@@ -4000,9 +3978,7 @@ fn test_lower_discriminant_produces_struct_gep_load() {
                         name: "Option".into(),
                         fields: vec![("tag".into(), Ty::i64()), ("value".into(), Ty::i32())],
                         disc_index_safe: false,
-                        faithful_enum_repr: None,
-                        enum_layout: None,
-                    },
+                     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
                     name: Some("opt".into()),
                 },
                 LocalDecl { index: 2, ty: Ty::i64(), name: None },
@@ -4050,9 +4026,7 @@ fn test_lower_discriminant_fieldless_option_fails_closed() {
         name: "core::option::Option<i32>".into(),
         fields: vec![],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "get_fieldless_discr".to_string(),
         def_path: "test::get_fieldless_discr".to_string(),
@@ -4094,9 +4068,7 @@ fn test_lower_set_discriminant_explicit_tag_writes_tag_field() {
         name: "Tagged".into(),
         fields: vec![("payload".into(), Ty::i32()), ("__discriminant".into(), Ty::u8())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "set_discr".to_string(),
         def_path: "test::set_discr".to_string(),
@@ -4153,9 +4125,7 @@ fn test_lower_set_discriminant_untagged_adt_fails_closed() {
         name: "Untagged".into(),
         fields: vec![("payload".into(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "set_discr_untagged".to_string(),
         def_path: "test::set_discr_untagged".to_string(),
@@ -4610,7 +4580,7 @@ fn test_lower_non_void_assert_panic_block_lowers_to_abort_call() {
     let abort_inst =
         panic_block.instructions.last().expect("panic block should contain an abort call");
 
-    assert!(matches!(&abort_inst.opcode, Opcode::Call { name } if name == "abort"));
+    assert!(matches!(&abort_inst.opcode, Opcode::Call { name, .. } if name == "abort"));
     assert!(
         abort_inst.args.is_empty() && abort_inst.results.is_empty(),
         "panic block abort call should not carry fake return operands or results"
@@ -4955,9 +4925,7 @@ fn test_lower_nested_aggregate_struct_containing_tuple() {
             ("extra".to_string(), Ty::i64()),
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
 
     let func = VerifiableFunction {
         name: "nested_agg".to_string(),
@@ -5302,19 +5270,13 @@ fn test_map_type_deeply_nested_adt() {
         name: "Inner".to_string(),
         fields: vec![("x".to_string(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let outer = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+    let outer = Ty::Adt { adt_kind: None, layout: None,
         variants: Vec::new(),
         name: "Outer".to_string(),
         fields: vec![("a".to_string(), inner), ("b".to_string(), Ty::Bool)],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let mapped = map_type(&outer).unwrap();
     assert_eq!(mapped, LirType::Struct(vec![LirType::Struct(vec![LirType::I32]), LirType::B1,]));
 }
@@ -5431,39 +5393,25 @@ fn test_stress_deeply_nested_aggregate_types() {
         name: "L1".to_string(),
         fields: vec![("val".to_string(), level0)],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let level2 = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+    let level2 = Ty::Adt { adt_kind: None, layout: None,
         variants: Vec::new(),
         name: "L2".to_string(),
         fields: vec![("inner".to_string(), level1.clone())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let level3 = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+    let level3 = Ty::Adt { adt_kind: None, layout: None,
         variants: Vec::new(),
         name: "L3".to_string(),
         fields: vec![("deep".to_string(), level2.clone()), ("tag".to_string(), Ty::Bool)],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let level4 = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+    let level4 = Ty::Adt { adt_kind: None, layout: None,
         variants: Vec::new(),
         name: "L4".to_string(),
         fields: vec![("nested".to_string(), level3), ("count".to_string(), Ty::i64())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
 
     // Verify type mapping produces the right nested structure.
     let lir_ty = map_type(&level4).unwrap();
@@ -7108,7 +7056,7 @@ fn test_edge_case_closure_call() {
     let call_instr = bb0.instructions.iter().find(|i| matches!(i.opcode, Opcode::Call { .. }));
     assert!(call_instr.is_some(), "expected Call instruction for closure");
     let call = call_instr.unwrap();
-    if let Opcode::Call { name } = &call.opcode {
+    if let Opcode::Call { name, .. } = &call.opcode {
         assert_eq!(name, "closure$0::call");
     }
 }
@@ -7172,7 +7120,7 @@ fn test_edge_case_vtable_dispatch() {
     let bb0 = &lir.blocks[&Block(0)];
     let call_instr = bb0.instructions.iter().find(|i| matches!(i.opcode, Opcode::Call { .. }));
     assert!(call_instr.is_some());
-    if let Opcode::Call { name } = &call_instr.unwrap().opcode {
+    if let Opcode::Call { name, .. } = &call_instr.unwrap().opcode {
         assert_eq!(name, "<dyn Trait>::method");
     }
 }
@@ -7314,9 +7262,7 @@ fn test_edge_case_aggregate_construction_adt() {
         name: "MyStruct".to_string(),
         fields: vec![("x".to_string(), Ty::i32()), ("y".to_string(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "make_adt".to_string(),
         def_path: "test::make_adt".to_string(),
@@ -7371,9 +7317,7 @@ fn test_edge_case_downcast_and_field_access() {
         name: "MyEnum".to_string(),
         fields: vec![("data".to_string(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "downcast_field".to_string(),
         def_path: "test::downcast_field".to_string(),
@@ -7466,7 +7410,7 @@ fn test_edge_case_assert_terminator() {
         panic_block
             .instructions
             .iter()
-            .any(|i| matches!(&i.opcode, Opcode::Call { name } if name == "abort")),
+            .any(|i| matches!(&i.opcode, Opcode::Call { name, .. } if name == "abort")),
         "panic block should lower to an abort call"
     );
     assert!(
@@ -7787,7 +7731,7 @@ fn test_edge_case_unreachable_terminator() {
     let bb0 = &lir.blocks[&Block(0)];
     assert!(matches!(
         &bb0.instructions.last().unwrap().opcode,
-        Opcode::Call { name } if name == "abort"
+        Opcode::Call { name, .. } if name == "abort"
     ));
     assert!(
         !bb0.instructions.iter().any(|i| matches!(i.opcode, Opcode::Return)),
@@ -8304,9 +8248,7 @@ fn test_drop_adt_fails_without_resolved_drop_glue() {
         name: "TestStruct".to_string(),
         fields: vec![("x".to_string(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+     faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = VerifiableFunction {
         name: "drop_adt".to_string(),
         def_path: "test::drop_adt".to_string(),

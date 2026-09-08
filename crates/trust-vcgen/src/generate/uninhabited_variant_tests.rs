@@ -53,6 +53,7 @@ fn void_enum(name: &str) -> Ty {
         layout: None,
         enum_layout: None,
         adt_kind: Some(AdtKind::Enum),
+        arbitrary_precision: None,
     }
 }
 
@@ -66,6 +67,7 @@ fn struct_of(name: &str, fields: Vec<(String, Ty)>) -> Ty {
         layout: None,
         enum_layout: None,
         adt_kind: Some(AdtKind::Struct),
+        arbitrary_precision: None,
     }
 }
 
@@ -79,6 +81,7 @@ fn enum_of(name: &str, variants: Vec<VariantDef>) -> Ty {
         layout: None,
         enum_layout: None,
         adt_kind: Some(AdtKind::Enum),
+        arbitrary_precision: None,
     }
 }
 
@@ -353,6 +356,7 @@ fn union_payload_declines() {
         layout: None,
         enum_layout: None,
         adt_kind: Some(AdtKind::Union),
+        arbitrary_precision: None,
     };
     assert_eq!(result_tags(u), vec![0, 1], "a union is always inhabited");
 }
@@ -373,6 +377,7 @@ fn un_migrated_adt_kind_declines() {
         layout: None,
         enum_layout: None,
         adt_kind: None,
+        arbitrary_precision: None,
     };
     assert_eq!(result_tags(unkinded_void), vec![0, 1]);
     // A hand-built enum (the pre-existing unit fixtures' spelling) is unaffected:
@@ -389,6 +394,7 @@ fn un_migrated_adt_kind_declines() {
         layout: None,
         enum_layout: None,
         adt_kind: None,
+        arbitrary_precision: None,
     };
     assert_eq!(
         super::inhabited_enum_variant_tag_set(&hand_built),

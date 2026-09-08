@@ -59,7 +59,10 @@ pub fn is_nil() -> Term {
 /// );
 /// ```
 pub fn cons() -> Term {
-    abs!(4, app!(Var(1), Var(4), app!(abs(Var(1)), Var(3), Var(2), Var(1))))
+    abs!(
+        4,
+        app!(Var(1), Var(4), app!(abs(Var(1)), Var(3), Var(2), Var(1)))
+    )
 }
 
 /// Applied to a Church-encoded list it returns its first element.
@@ -105,7 +108,14 @@ pub fn tail() -> Term {
         app!(
             Var(1),
             app!(pair(), UD, nil()),
-            abs!(2, app!(pair(), app(snd(), Var(1)), app!(cons(), Var(2), app(snd(), Var(1)))))
+            abs!(
+                2,
+                app!(
+                    pair(),
+                    app(snd(), Var(1)),
+                    app!(cons(), Var(2), app(snd(), Var(1)))
+                )
+            )
         )
     ))
 }

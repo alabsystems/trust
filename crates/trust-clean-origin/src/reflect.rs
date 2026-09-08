@@ -779,6 +779,24 @@ pub(crate) fn producer_call_for(
             let rendering = render_arith_operand(ArithOperand::Const(value))?;
             Ok((selected, ProducerCall::ExprRendering(rendering)))
         }
+        // The E6 recognizer shapes the frozen-producer table has no row for
+        // yet (the per-field/comparison/checked-arith series). Fail closed by
+        // citing the missing row, exactly as every other unselected shape
+        // does — recognition is not emission, and a shape this table cannot
+        // emit must decline rather than guess.
+        AdmissibleBody::ConstantInt { .. }
+        | AdmissibleBody::FieldProjection { .. }
+        | AdmissibleBody::ComparisonBool { .. }
+        | AdmissibleBody::BoolBinary { .. }
+        | AdmissibleBody::CheckedArithmetic { .. }
+        | AdmissibleBody::GuardedNarrow { .. }
+        | AdmissibleBody::AggregateFields { .. }
+        | AdmissibleBody::WidenedEq { .. } => Err(RowMiss {
+            note: no_selection_row(
+                "an E6 shape outside the frozen-producer table",
+                CarrierClass::AnyExact,
+            ),
+        }),
     }
 }
 
@@ -1289,7 +1307,7 @@ mod tests {
         // demand-driven, and over-demanding refuses environments a body does
         // not need.
         let mut lean = BTreeSet::new();
-        render_rec_node(
+        let _ = render_rec_node(
             RecFamily::Structural,
             "probe",
             &RecBodyExpr::NatConst(0),

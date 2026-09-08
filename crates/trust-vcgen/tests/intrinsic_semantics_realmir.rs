@@ -226,6 +226,99 @@ fn ctlz_at_zero_is_the_width_not_zero() {
     assert_proved(include_str!("fixtures/intrinsic_cttz_u32_zero_is_32_mir.json"));
 }
 
+// --- cttz / ctlz: the EXACT definitions (§5 step 1 remainder, 2026-08-30) ---
+//
+// Every fixture here comes from the same `-Ztrust-dump=mir:` recipe as the rest
+// of this file (source quoted per test; stage1 trustc of 283d1906e6). The rows
+// need the EXACT compositions — `cttz(x) = ctpop(!x & (x-1))`, `ctlz(x)` the
+// same mask over the bit-reversed word — because the range + iff facts alone
+// leave a constant interior value open in both directions.
+//
+// THE EQUATIONS RIDE A CONSTANT-ARGUMENT GATE, and the tests below pin all
+// three sides of it (the measured table is at `intrinsic_semantics.rs`'s
+// header): a LITERAL argument gets the definition (prove + refute rows), a
+// free or merely `requires`-pinned parameter does not (gate rows), and the
+// free-argument iff+range proof that the gate protects stays fast (the
+// regression row).
+
+/// `fn cttz_u8_lit8_is_3() -> u32 ensures result == 3 { cttz(8u8) }`
+///
+/// 8 is `0b1000`: an interior value the `[0, W]` bound and the zero-iff cannot
+/// decide. Only the exact mask term pins 3 — and a mask built with `x + 1`, a
+/// dropped `BvNot`, or a reversed subtraction all give a different count here.
+/// The u32 row (`cttz(u32::MAX) == 0`) runs the same equation at the width
+/// cap; the zero row (`cttz(0u8) == 8`) is the wrap-is-the-definition edge.
+#[test]
+fn cttz_exact_definition_decides_constant_interior_values() {
+    assert_proved(include_str!("fixtures/intrinsic_cttz_u8_lit8_is_3_mir.json"));
+    assert_proved(include_str!("fixtures/intrinsic_cttz_u8_lit0_is_8_mir.json"));
+    assert_proved(include_str!("fixtures/intrinsic_cttz_u32_litmax_is_0_mir.json"));
+}
+
+/// `ensures result == 4` over `cttz(8u32)` — FALSE (`trailing_zeros == 3`).
+/// An off-by-one in the mask (counting the lowest SET bit as well) proves it.
+#[test]
+fn cttz_exact_definition_is_not_off_by_one() {
+    assert_not_proved(include_str!("fixtures/intrinsic_cttz_u32_lit8_is_not_4_mir.json"));
+}
+
+/// `ensures result == 1` over `cttz(0u8)` — FALSE (`cttz(0) == 8`).
+///
+/// The task-brief falsification row: a definition whose zero case leaks a
+/// single count — or any `_nonzero` conflation — is caught here, exactly like
+/// `count_ones(0) == 1` would be for `ctpop`.
+#[test]
+fn cttz_at_zero_is_the_width_not_one() {
+    assert_not_proved(include_str!("fixtures/intrinsic_cttz_u8_lit0_is_not_1_mir.json"));
+}
+
+/// `ensures result == 7` over `ctlz(1u8)`, and `== 15` over `ctlz(1u16)`.
+#[test]
+fn ctlz_exact_definition_decides_constant_interior_values() {
+    assert_proved(include_str!("fixtures/intrinsic_ctlz_u8_lit1_is_7_mir.json"));
+    assert_proved(include_str!("fixtures/intrinsic_ctlz_u16_lit1_is_15_mir.json"));
+}
+
+/// `ensures result == 0` over `ctlz(1u8)` — FALSE (`leading_zeros == 7`).
+///
+/// THE REVERSAL DISCRIMINATOR: `cttz(1) == 0`, so a `ctlz` accidentally built
+/// without the bit-reversal — the exact mistake the shared-mask composition
+/// invites — would prove this row. It must stay unproved.
+#[test]
+fn ctlz_is_not_cttz_in_disguise() {
+    assert_not_proved(include_str!("fixtures/intrinsic_ctlz_u8_lit1_is_not_0_mir.json"));
+}
+
+/// `fn cttz_u32_nonzero_le31(x: u32) requires x >= 1 ensures result <= 31` —
+/// the free-argument shift-definedness clause, TRUE, decided by iff + range in
+/// 8 ms (measured 2026-08-30).
+///
+/// THE REGRESSION GUARD FOR THE CONSTANT GATE. With the exact equation emitted
+/// for this FREE argument the same row TIMES OUT at 120 s (measured — the
+/// module-header table), so this test is what fails, by timeout, if someone
+/// widens the gate without solving the Int<->BV interference. Its `ctlz` twin
+/// is `ctlz_nonzero_upper_bound_is_proved` above.
+#[test]
+fn cttz_free_argument_shift_definedness_stays_fast_and_proved() {
+    assert_proved(include_str!("fixtures/intrinsic_cttz_u32_nonzero_le31_mir.json"));
+}
+
+/// `requires x == 8 ensures result == 3` with a PARAMETER argument (and the
+/// `ctlz` twin at `x == 1 -> == 31`) — TRUE of the intrinsic, but the argument
+/// operand is `Copy(x)`, not a constant, so the exact equation is deliberately
+/// NOT emitted and the rows must stay UNPROVED: range + iff bound the result
+/// without pinning it.
+///
+/// THIS IS THE GATE'S PIN, in both directions: it fails the day the gate
+/// widens to `requires`-pinned parameters. That widening must bring a fresh
+/// measurement of the free-argument rows first — the interference the gate
+/// exists to block lives exactly there.
+#[test]
+fn requires_pinned_parameters_stay_outside_the_constant_gate() {
+    assert_not_proved(include_str!("fixtures/intrinsic_cttz_u32_eight_is_3_mir.json"));
+    assert_not_proved(include_str!("fixtures/intrinsic_ctlz_u32_one_is_31_mir.json"));
+}
+
 // --- saturating intrinsics --------------------------------------------------
 
 // `ensures result >= a` / `ensures result <= a` over the INTRINSIC spelling.

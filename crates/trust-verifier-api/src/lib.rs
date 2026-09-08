@@ -536,6 +536,33 @@ pub struct TrustContract {
     pub metadata: Vec<MetadataEntry>,
 }
 
+impl TrustContract {
+    /// Validate this contract exactly as bundle validation validates it.
+    ///
+    /// This is the public accessor over the same per-record checker
+    /// [`TrustContractBundle::validate`] runs on every contract it carries:
+    /// identifier canonicality, predicate schema and structural JSON bounds
+    /// (node count, container depth, scalar bytes), source location, and the
+    /// metadata entry limits. It is the contract-level twin of
+    /// [`TrustSpecPredicate::validate`].
+    ///
+    /// Producers that MINT contracts must call it before pushing one into a
+    /// bundle. Bundle validation is ALL-OR-NOTHING: one record it would reject
+    /// invalidates the bundle, so an unvalidated mint turns a single
+    /// unrepresentable record into the loss of every claim that bundle
+    /// carries — including claims a solver has already discharged. Checking
+    /// here lets a producer decline to mint the one record instead.
+    ///
+    /// Deliberately PER-RECORD. Cross-record properties — duplicate contract
+    /// IDs, aggregate record counts, obligation-to-contract references — are
+    /// bundle-level and are NOT checked here, so `Ok(())` from this method is
+    /// a necessary and not a sufficient condition for the enclosing bundle to
+    /// validate.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_contract_record(self)
+    }
+}
+
 /// Contract role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -902,6 +929,26 @@ impl TrustSpecExpr {
             },
         }
     }
+
+    /// Conditional (`if cond { then } else { els }`) — the exact branch-merge a
+    /// clamp/select body produces. `cond` is Bool; `then` and `els` share the
+    /// result sort, which becomes this node's sort. Faithful to SMT-LIB `ite` and
+    /// to `Formula::Ite` (trust-ir-contract `formula.rs`): same-sort arms make it a
+    /// sound, sort-preserving identity — it can only carry a genuine conditional
+    /// value, never manufacture one. Built by the compiler formula lowerer
+    /// (`trust-mir-extract`); older readers reject it via `#[non_exhaustive]`, so
+    /// it is an additive capability (mirrors `bv_from_int`/`int_from_bv`).
+    #[must_use]
+    pub fn ite(cond: TrustSpecExpr, then: TrustSpecExpr, els: TrustSpecExpr) -> Self {
+        Self {
+            sort: then.sort,
+            kind: TrustSpecExprKind::Ite {
+                cond: Box::new(cond),
+                then: Box::new(then),
+                els: Box::new(els),
+            },
+        }
+    }
 }
 
 /// Stable expression node kinds for [`TrustSpecExpr`].
@@ -1002,6 +1049,16 @@ pub enum TrustSpecExprKind {
         scrutinee: Box<TrustSpecExpr>,
         variant: String,
         field: u32,
+    },
+    /// Conditional (`if cond { then } else { els }`): `cond` is Bool and both
+    /// arms share the result sort. Built via [`TrustSpecExpr::ite`]; faithful to
+    /// SMT-LIB `ite` and `Formula::Ite` (trust-ir-contract). An additive capability
+    /// under the existing schema (mirrors `BvFromInt`/`IntFromBv`) — older readers
+    /// reject it via the `#[non_exhaustive]` marker, so it fails closed there.
+    Ite {
+        cond: Box<TrustSpecExpr>,
+        then: Box<TrustSpecExpr>,
+        els: Box<TrustSpecExpr>,
     },
 }
 
@@ -3746,6 +3803,23 @@ fn validate_trust_spec_expr(
             )?;
             validate_trust_spec_expr(scrutinee, declared, bound, child_depth, nodes)
         }
+        TrustSpecExprKind::Ite { cond, then, els } => {
+            // Sound, sort-preserving branch-merge: the condition is Bool and both
+            // arms share the result sort (no array — the read-only Select fragment
+            // stays the only array shape). A sort mismatch is an ill-formed
+            // predicate and fails closed here before any solver sees it.
+            if matches!(expr.sort, TrustSpecSort::Array { .. }) {
+                return Err(
+                    "typed TrustSpec conditional cannot produce an array".to_string(),
+                );
+            }
+            require_sort(cond.sort, TrustSpecSort::Bool, "conditional condition")?;
+            require_sort(then.sort, expr.sort, "conditional then-arm")?;
+            require_sort(els.sort, expr.sort, "conditional else-arm")?;
+            validate_trust_spec_expr(cond, declared, bound, child_depth, nodes)?;
+            validate_trust_spec_expr(then, declared, bound, child_depth, nodes)?;
+            validate_trust_spec_expr(els, declared, bound, child_depth, nodes)
+        }
     }
 }
 
@@ -6255,6 +6329,62 @@ pub enum EvidenceDisposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `TrustContract::validate` is the SAME checker bundle validation runs,
+    /// not a second opinion. A producer that mints one record at a time needs
+    /// exactly this: bundle validation is all-or-nothing, so a record it would
+    /// reject has to be detectable BEFORE it is pushed.
+    #[test]
+    fn contract_validate_agrees_with_bundle_validation_record_for_record() {
+        let nested_json = |depth: usize| {
+            let mut value = serde_json::json!({ "leaf": true });
+            for _ in 0..depth {
+                value = serde_json::json!({ "next": value });
+            }
+            value
+        };
+        let contract_with = |value: serde_json::Value| TrustContract {
+            contract_id: "contract:depth-probe".to_string(),
+            kind: ContractKind::Asserts,
+            predicate: ContractPredicate::MathIr {
+                schema: "trust-mc.typed-chc-obligation.v1".to_string(),
+                value,
+            },
+            source: SourceLocation::default(),
+            metadata: Vec::new(),
+        };
+        let bundle_verdict = |contract: &TrustContract| {
+            let mut bundle = TrustContractBundle::empty(
+                "bundle-depth-probe",
+                BundleSubject::Artifact {
+                    name: "depth".to_string(),
+                    kind: "probe".to_string(),
+                },
+            );
+            bundle.contracts.push(contract.clone());
+            bundle.validate().is_ok()
+        };
+
+        // Straddle the bound in both directions so neither arm is inert.
+        let shallow = contract_with(nested_json(4));
+        assert!(shallow.validate().is_ok(), "a shallow contract validates");
+        assert!(bundle_verdict(&shallow), "and its bundle validates too");
+
+        let deep = contract_with(nested_json(MAX_CONTRACT_PREDICATE_JSON_DEPTH + 8));
+        let error = deep.validate().expect_err("a past-bound contract must be rejected");
+        assert!(error.contains("JSON depth limit"), "{error}");
+        assert!(
+            !bundle_verdict(&deep),
+            "the bundle must reject exactly what the per-record checker rejects"
+        );
+
+        // A malformed identifier is a per-record property too, so the accessor
+        // covers more than the JSON bounds.
+        let mut bad_id = shallow.clone();
+        bad_id.contract_id = String::new();
+        assert!(bad_id.validate().is_err(), "an empty contract_id is rejected per record");
+        assert!(!bundle_verdict(&bad_id), "and the bundle rejects it as well");
+    }
 
     /// R4 §1 step-2 pin: the island-citation metadata contract. The keys are
     /// stable wire strings; a clause carrying them round-trips losslessly

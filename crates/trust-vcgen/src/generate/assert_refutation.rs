@@ -524,7 +524,7 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
     // sanitize its direct precondition consumption at its own boundary too.
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
     let func = arithmetic_safe_func.as_ref();
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     // Refutations need more than the proof-facing path map: a collapsed map
     // contains an empty guard path that looks exactly like unconditional
     // reachability, and the ordinary guard lowering may weaken an unmodeled
@@ -1288,11 +1288,37 @@ pub(super) fn generate_full_assert_refutation_vcs_impl(
     out
 }
 
+// Trust (W4/spine-derives-unreachable): moved to
+// `trust_types::terminator_obligations::is_assertion_panic_call`; see the
+// delegation note on `v2_is_unreachable_panic_call`.
 pub(super) fn v2_is_assertion_panic_call(callee: &str) -> bool {
-    callee.contains("begin_panic")
-        || callee.contains("panic_fmt")
-        || callee.contains("panic_display")
-        || callee.contains("assert_failed")
+    trust_types::terminator_obligations::is_assertion_panic_call(callee)
+}
+
+/// Trust (interprocedural pf discharge — panic-callee exemption support): whether
+/// `block` is a user `assert!`/`panic!` FAILURE block the `-full` refutation lane
+/// (`generate_full_assert_refutation_vcs`) targets — the EXACT recognizer that
+/// lane's candidate loop applies (assertion-panic entrypoint call, excluding the
+/// `unreachable!()` sentinel). Exported so the compiler-side interprocedural call
+/// gate can exempt PRECISELY the blocks the refutation lane covers, and COUNT
+/// them: candidate emission additionally requires a guard-path entry and a
+/// grounded path formula (ungrounded/guardless target blocks are silently
+/// SKIPPED, never counted as unknown), so a caller MUST compare its
+/// proved-candidate count against [`assert_refutation_target_block_count`] and
+/// fail closed on ANY mismatch — a skipped target block must never be treated as
+/// proven-unreachable.
+pub fn is_assert_refutation_target_block(block: &trust_types::BasicBlock) -> bool {
+    let Terminator::Call { func: callee, args, .. } = &block.terminator else {
+        return false;
+    };
+    (v2_is_assertion_panic_call(callee) || callee.ends_with("::panic"))
+        && !v2_is_unreachable_sentinel_panic(callee, args)
+}
+
+/// The number of refutation-target failure blocks in `func` — see
+/// [`is_assert_refutation_target_block`].
+pub fn assert_refutation_target_block_count(func: &VerifiableFunction) -> usize {
+    func.body.blocks.iter().filter(|block| is_assert_refutation_target_block(block)).count()
 }
 
 /// The bare panic intrinsic `core::panicking::panic` is the lowering of BOTH
@@ -1306,12 +1332,11 @@ pub(super) fn v2_is_assertion_panic_call(callee: &str) -> bool {
 /// facts had no goal to discharge (modulo_unreachable fell back to runtime-checked).
 /// Match the well-known sentinel "entered unreachable code"; if the wording ever
 /// drifts this fails CLOSED (reverts to runtime-checked, never a false-prove).
+// Trust (W4/spine-derives-unreachable): moved to
+// `trust_types::terminator_obligations::is_unreachable_sentinel_panic`; see
+// the delegation note on `v2_is_unreachable_panic_call`.
 pub(super) fn v2_is_unreachable_sentinel_panic(callee: &str, args: &[Operand]) -> bool {
-    if !callee.ends_with("::panic") {
-        return false;
-    }
-    args.iter()
-        .any(|a| operand_str_constant(a).is_some_and(|s| s.contains("entered unreachable code")))
+    trust_types::terminator_obligations::is_unreachable_sentinel_panic(callee, args)
 }
 
 /// The UTF-8 contents of a `&str` constant operand, if `op` is one.
@@ -1673,69 +1698,22 @@ pub(super) fn contract_panic_unused_vcs(func: &VerifiableFunction) -> Vec<Verifi
         .collect()
 }
 
+// Trust (W4/spine-derives-unreachable): the four recognizers below MOVED to
+// `trust_types::terminator_obligations` — one definition, two callers (this
+// producer and the trust-ir spine), on the static_truth precedent. The bodies
+// there are the verbatim moves; these wrappers keep every in-crate spelling.
 pub(super) fn v2_is_unreachable_panic_call(callee: &str) -> bool {
-    callee.contains("unreachable_display")
+    trust_types::terminator_obligations::is_unreachable_panic_call(callee)
 }
 
 pub(super) fn v2_is_unreachable_panic_chain(func: &VerifiableFunction, block_id: BlockId) -> bool {
-    fn dfs(
-        func: &VerifiableFunction,
-        block_id: BlockId,
-        seen: &mut std::collections::HashSet<BlockId>,
-    ) -> bool {
-        if !seen.insert(block_id) {
-            return false;
-        }
-
-        for pred in func
-            .body
-            .blocks
-            .iter()
-            .filter(|bb| v2_terminator_targets(&bb.terminator).contains(&block_id))
-        {
-            match &pred.terminator {
-                Terminator::Call { func: callee, .. }
-                    if callee.contains("from_str_nonconst")
-                        || callee.contains("unreachable_display") =>
-                {
-                    return true;
-                }
-                Terminator::Call { target: Some(_), .. }
-                | Terminator::Goto(_)
-                | Terminator::Drop { .. }
-                | Terminator::Opaque { .. }
-                    if dfs(func, pred.id, seen) =>
-                {
-                    return true;
-                }
-                _ => {}
-            }
-        }
-
-        false
-    }
-
-    dfs(func, block_id, &mut std::collections::HashSet::new())
+    trust_types::terminator_obligations::is_unreachable_panic_chain(func, block_id)
 }
 
 // Trust: ungated — also used by the (ungated) `v2_may_reassigned_per_block`,
 // which the hardened profile relies on for its precondition-staleness kill.
 pub(crate) fn v2_terminator_targets(terminator: &Terminator) -> Vec<BlockId> {
-    match terminator {
-        Terminator::Goto(target) => vec![*target],
-        Terminator::SwitchInt { targets, otherwise, .. } => {
-            let mut blocks = targets.iter().map(|(_, target)| *target).collect::<Vec<_>>();
-            blocks.push(*otherwise);
-            blocks
-        }
-        Terminator::Call { target: Some(target), .. } => vec![*target],
-        Terminator::Assert { target, .. } | Terminator::Drop { target, .. } => vec![*target],
-        Terminator::Opaque { targets, .. } => targets.clone(),
-        Terminator::Return | Terminator::Call { target: None, .. } | Terminator::Unreachable => {
-            vec![]
-        }
-        _ => vec![],
-    }
+    trust_types::terminator_obligations::terminator_targets(terminator)
 }
 
 #[cfg(test)]

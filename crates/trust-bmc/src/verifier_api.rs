@@ -334,6 +334,81 @@ fn obligation_is_whole_function_panic_freedom(
         "vc:{}:assertion:panic-freedom:0",
         trust_types::canonical_artifact_id_component(path)
     );
+    // DIAGNOSTIC (pure, no behavior change): when this obligation LOOKS like the
+    // whole-function panic-freedom aggregate but the strict gate below rejects
+    // it, name the offending clause + dump metadata keys so the 339-merge drift
+    // (allowlist / schema) is identified without guessing.
+    if obligation.obligation_id.ends_with(":assertion:panic-freedom:0")
+        && std::env::var("TRUST_NATIVE_DEBUG").is_ok()
+    {
+        let key_allowed = |k: &str| {
+            matches!(
+                k,
+                trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY
+                    | TRUST_MC_PANIC_FREEDOM_OBLIGATION_METADATA_KEY
+                    | "trust.vc.kind"
+                    | TRUST_SOURCE_DIGEST_METADATA_KEY
+                    | TRUST_VC_DIGEST_METADATA_KEY
+                    | "trust-trust-mc.typed-chc-obligation.lowering_status"
+                    | TRUST_MC_TYPED_CHC_UNSUPPORTED_REASON_METADATA_KEY
+                    | TRUST_MC_TYPED_CHC_SYNTHETIC_CONTRACT_METADATA_KEY
+                    | TRUST_MC_TYPED_CHC_SOURCE_DIGEST_METADATA_KEY
+                    | TRUST_MC_TYPED_CHC_VC_DIGEST_METADATA_KEY
+                    | TRUST_MC_TYPED_CHC_SYNTHETIC_DIGEST_METADATA_KEY
+                    | TRUST_MC_TYPED_CHC_BINDING_METADATA_KEY
+                    | "trust.trust_ir.native.transport_status"
+                    | "trust.trust_ir.native.unsupported_reason"
+                    | TRUST_TRUST_IR_NATIVE_VERIFIER_SUITE_METADATA_KEY
+                    | TRUST_TRUST_IR_NATIVE_REQUEST_ID_METADATA_KEY
+                    | TRUST_TRUST_IR_NATIVE_PROOF_OBLIGATION_ID_METADATA_KEY
+                    | "trust.trust_ir.native.proof_unit.v1"
+                    | "trust.trust_ir.native.assertion_id"
+                    | "trust.trust_ir.native.trust_ir_module_digest"
+                    | "trust.trust_ir.native.request_digest"
+                    | "trust.trust_ir.native.compiler_facts_digest"
+                    | "trust.trust_ir.native.obligation_source_digest"
+                    | "trust.trust_ir.native.replay_engine"
+                    | "trust.trust_ir.native.replay_invocation"
+                    | "trust.trust_ir.native.replay_transcript_digest"
+                    | "trust.trust_ir.native.artifact_fingerprint"
+            )
+        };
+        let all_keys: Vec<&str> = obligation.metadata.iter().map(|e| e.key.as_str()).collect();
+        let offending_keys: Vec<&str> =
+            all_keys.iter().copied().filter(|k| !key_allowed(k)).collect();
+        let ctx_present = metadata_value(
+            &obligation.metadata,
+            trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY,
+        );
+        let ctx_parse = ctx_present.and_then(|encoded| {
+            trust_types::json_depth::from_str_deep::<trust_verifier_api::ObligationContext>(encoded)
+                .ok()
+        });
+        eprintln!(
+            "[PF_GATE_DIAG] id={} id_ok={} kind_ok={} contract_none={} proof_item_none={} strength_none={} summary_empty={} panic_enabled={} vckind_ok={} src_digest_ok={} vc_digest_ok={} no_formula_schema={} no_formula_payload={} ctx_present={} ctx_parses={} has_current_schema={} producer_ok={} function_ok={} origin_ok={} offending_keys={:?} all_keys={:?}",
+            obligation.obligation_id,
+            obligation.obligation_id == expected_id,
+            obligation.kind == ObligationKind::Assertion,
+            obligation.contract_id.is_none(),
+            obligation.proof_item_id.is_none(),
+            obligation.required_strength.is_none(),
+            obligation.summary_facts.is_empty(),
+            metadata_value(&obligation.metadata, TRUST_MC_PANIC_FREEDOM_OBLIGATION_METADATA_KEY) == Some("enabled"),
+            metadata_value(&obligation.metadata, "trust.vc.kind") == Some("panic_freedom"),
+            metadata_value(&obligation.metadata, TRUST_SOURCE_DIGEST_METADATA_KEY).is_some_and(is_lowercase_sha256_hex),
+            metadata_value(&obligation.metadata, TRUST_VC_DIGEST_METADATA_KEY).is_some_and(is_lowercase_sha256_hex),
+            metadata_value(&obligation.metadata, TRUST_VC_FORMULA_SCHEMA_METADATA_KEY).is_none(),
+            metadata_value(&obligation.metadata, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY).is_none(),
+            ctx_present.is_some(),
+            ctx_parse.is_some(),
+            ctx_parse.as_ref().map(|c| c.has_current_schema()).unwrap_or(false),
+            ctx_parse.as_ref().map(|c| matches!(&c.producer, trust_verifier_api::ObligationProducer::CompilerMirExtract)).unwrap_or(false),
+            ctx_parse.as_ref().and_then(|c| c.function.as_ref()).map(|f| f.crate_name == crate_name.as_str() && f.path == path.as_str()).unwrap_or(false),
+            ctx_parse.as_ref().map(|c| matches!(&c.origin, trust_verifier_api::ObligationOrigin::VerificationCondition { vc_kind, vc_index: 0, formula_schema: None } if vc_kind == "panic_freedom")).unwrap_or(false),
+            offending_keys,
+            all_keys,
+        );
+    }
     if obligation.metadata.iter().any(|entry| {
         !matches!(
             entry.key.as_str(),
@@ -448,8 +523,9 @@ fn is_typed_body_aware_e4_e5_obligation(obligation: &TrustObligation) -> bool {
         && typed_spec_predicate_envelope(obligation).is_some()
 }
 
-/// The fresh-exact receipt lane's admission: E4/E5, plus a body-aware
-/// POSTCONDITION row whose NEGATED CLAUSE references the return slot.
+/// The fresh-exact receipt lane's admission: every current compiler-authenticated
+/// standalone formula kind owned by TrustMC, plus only the body-aware
+/// POSTCONDITION rows whose NEGATED CLAUSE references the return slot.
 ///
 /// The discriminator is a deliberate scoping decision: a postcondition whose
 /// clause never mentions the post-state does not constrain the body — it is
@@ -474,63 +550,74 @@ fn is_typed_body_aware_e4_e5_obligation(obligation: &TrustObligation) -> bool {
 /// sealed-authority validation chain (canonical public-digest
 /// reconciliation, affine receipt, bundle seal).
 fn is_typed_body_aware_exact_direct_obligation(obligation: &TrustObligation) -> bool {
-    if is_typed_body_aware_e4_e5_obligation(obligation) {
-        return true;
-    }
-    if !matches!(obligation.kind, ObligationKind::Postcondition) {
+    if !is_seal_eligible_compiler_formula_obligation(obligation) {
         return false;
     }
-    typed_spec_predicate_envelope(obligation).is_some_and(|predicate| {
-        typed_spec_negated_clause_references_return_slot(&predicate.root, false)
-            || typed_spec_expr_references_result(&predicate.root)
-    })
+    if matches!(obligation.kind, ObligationKind::Postcondition) {
+        return typed_spec_predicate_envelope(obligation).is_some_and(|predicate| {
+            typed_spec_terminal_negated_clause_references_return_slot(&predicate.root)
+        });
+    }
+    true
 }
 
-/// Whether any `Not` subtree of the typed violation formula references the
-/// canonical return-slot variable (`_0`, or a versioned `_0#<token>` /
-/// projected `_0.<field>` spelling). `under_not` tracks whether the walk is
-/// already inside a negation.
-fn typed_spec_negated_clause_references_return_slot(
-    expr: &trust_verifier_api::TrustSpecExpr,
-    under_not: bool,
+/// Whether the compiler-authenticated terminal negated clause references the
+/// canonical return slot (`Result`, `_0`, a versioned `_0#<token>`, or a
+/// projected `_0.<field>` spelling).
+///
+/// Compiler formula payloads prepend body definitions along an `And` spine and
+/// put the actual negated VC at its terminal/rightmost leaf. Inspecting every
+/// `Not` subtree would let a negated body fact smuggle an otherwise result-free
+/// postcondition into the receipt lane, so only that terminal `Not(clause)` is
+/// authoritative here.
+fn typed_spec_terminal_negated_clause_references_return_slot(
+    root: &trust_verifier_api::TrustSpecExpr,
 ) -> bool {
+    use trust_verifier_api::TrustSpecExprKind as Kind;
+    let mut terminal = root;
+    while let Kind::Binary { op: trust_verifier_api::TrustSpecBinaryOp::And, rhs, .. } =
+        &terminal.kind
+    {
+        terminal = rhs;
+    }
+    let Kind::Unary { op: trust_verifier_api::TrustSpecUnaryOp::Not, expr: clause } =
+        &terminal.kind
+    else {
+        return false;
+    };
+    typed_spec_expr_references_return_slot(clause)
+}
+
+/// Return-slot search scoped to an already authenticated postcondition clause.
+fn typed_spec_expr_references_return_slot(expr: &trust_verifier_api::TrustSpecExpr) -> bool {
     use trust_verifier_api::TrustSpecExprKind as Kind;
     let is_return_slot = |name: &str| {
         let base = name.split('#').next().unwrap_or(name);
         base == "_0" || base.starts_with("_0.")
     };
     match &expr.kind {
-        Kind::Variable { name } => under_not && is_return_slot(name),
-        Kind::Result => under_not,
+        Kind::Variable { name } => is_return_slot(name),
+        Kind::Result => true,
         Kind::BoolLiteral { .. } | Kind::IntLiteral { .. } | Kind::BitVecLiteral { .. } => false,
-        Kind::Unary { op, expr } => {
-            let inside = under_not || matches!(op, trust_verifier_api::TrustSpecUnaryOp::Not);
-            typed_spec_negated_clause_references_return_slot(expr, inside)
-        }
-        Kind::Old { expr }
+        Kind::Unary { expr, .. }
+        | Kind::Old { expr }
         | Kind::BvUnary { expr, .. }
         | Kind::BvFromInt { expr, .. }
-        | Kind::IntFromBv { expr, .. } => {
-            typed_spec_negated_clause_references_return_slot(expr, under_not)
-        }
+        | Kind::IntFromBv { expr, .. } => typed_spec_expr_references_return_slot(expr),
         Kind::Binary { lhs, rhs, .. } | Kind::BvBinary { lhs, rhs, .. } => {
-            typed_spec_negated_clause_references_return_slot(lhs, under_not)
-                || typed_spec_negated_clause_references_return_slot(rhs, under_not)
+            typed_spec_expr_references_return_slot(lhs)
+                || typed_spec_expr_references_return_slot(rhs)
         }
-        Kind::Field { base, .. } => {
-            typed_spec_negated_clause_references_return_slot(base, under_not)
-        }
+        Kind::Field { base, .. } => typed_spec_expr_references_return_slot(base),
         Kind::Index { base, index } => {
-            typed_spec_negated_clause_references_return_slot(base, under_not)
-                || typed_spec_negated_clause_references_return_slot(index, under_not)
+            typed_spec_expr_references_return_slot(base)
+                || typed_spec_expr_references_return_slot(index)
         }
-        Kind::Quantifier { body, .. } => {
-            typed_spec_negated_clause_references_return_slot(body, under_not)
-        }
+        Kind::Quantifier { body, .. } => typed_spec_expr_references_return_slot(body),
         Kind::IsVariant { scrutinee, .. } | Kind::VariantField { scrutinee, .. } => {
-            typed_spec_negated_clause_references_return_slot(scrutinee, under_not)
+            typed_spec_expr_references_return_slot(scrutinee)
         }
-        // Future vocabulary fails CLOSED out of the fresh lane.
+        // Future vocabulary fails CLOSED out of the postcondition lane.
         _ => false,
     }
 }
@@ -557,35 +644,120 @@ fn typed_spec_predicate_envelope(
     .then_some(predicate)
 }
 
-/// Whether a typed spec expression tree contains a post-state `Result` node.
-fn typed_spec_expr_references_result(expr: &trust_verifier_api::TrustSpecExpr) -> bool {
-    use trust_verifier_api::TrustSpecExprKind as Kind;
-    match &expr.kind {
-        Kind::Result => true,
-        Kind::BoolLiteral { .. }
-        | Kind::IntLiteral { .. }
-        | Kind::Variable { .. }
-        | Kind::BitVecLiteral { .. } => false,
-        Kind::Unary { expr, .. }
-        | Kind::Old { expr }
-        | Kind::BvUnary { expr, .. }
-        | Kind::BvFromInt { expr, .. }
-        | Kind::IntFromBv { expr, .. } => typed_spec_expr_references_result(expr),
-        Kind::Binary { lhs, rhs, .. } | Kind::BvBinary { lhs, rhs, .. } => {
-            typed_spec_expr_references_result(lhs) || typed_spec_expr_references_result(rhs)
+/// Seal-eligible compiler-authenticated formula obligations for the exact
+/// per-obligation independent-replay mint.
+///
+/// This is [`is_typed_body_aware_e4_e5_obligation`] with the obligation-kind
+/// set widened to exactly the non-custom VC kinds for which the compiler can
+/// emit a direct typed CHC with the identical `¬formula ∧ body_defs` shape.
+/// Every non-kind
+/// authentication check below is byte-identical to the E4/E5 predicate: the
+/// current `TrustSpecPredicate` formula schema, a parseable Bool-sorted
+/// predicate that `validate()`s, and a current compiler
+/// `VerificationCondition` VC origin (`CompilerMirExtract`). A formula-less
+/// obligation of ANY of these kinds still returns `false` here, so it can never
+/// reach the mint. Widening this routing label does NOT relax the mint itself:
+/// admission still requires the unchanged fresh-exact re-lowering plus
+/// `validate_external_invariant_model == Ok(true)` independent replay on the
+/// obligation's OWN authenticated CHC. It also never enables whole-function
+/// transport substitution — a formula-carrying obligation is `Ok(Some)` on its
+/// own direct CHC, or fails closed to `Unsupported` on `Ok(None)`; it is never
+/// deferrable to the panic-freedom transport.
+fn is_seal_eligible_compiler_formula_obligation(obligation: &TrustObligation) -> bool {
+    let result = is_seal_eligible_compiler_formula_obligation_inner(obligation);
+    // DIAGNOSTIC (TRUST_SEAL_ELIG_TRACE): reads only; for the LCG cluster prints
+    // the per-check verdict so the exact ineligibility reason is observable.
+    if std::env::var_os("TRUST_SEAL_ELIG_TRACE").is_some() && !result {
+        let ctx = metadata_value(
+            &obligation.metadata,
+            trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY,
+        )
+        .unwrap_or("");
+        let schema = metadata_value(&obligation.metadata, TRUST_VC_FORMULA_SCHEMA_METADATA_KEY)
+            .unwrap_or("<none>");
+        if matches!(
+            obligation.kind,
+            ObligationKind::Postcondition
+                | ObligationKind::Precondition
+                | ObligationKind::Assertion
+                | ObligationKind::ArithmeticSafety
+        ) {
+            let ctx_digest: String = ctx.chars().take(110).collect();
+            let kind_ok = matches!(
+                obligation.kind,
+                ObligationKind::LoopInvariant
+                    | ObligationKind::Termination
+                    | ObligationKind::Assertion
+                    | ObligationKind::ArithmeticSafety
+                    | ObligationKind::Precondition
+                    | ObligationKind::Postcondition
+            );
+            let payload =
+                metadata_value(&obligation.metadata, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY);
+            let parse_ok = payload.is_some_and(|p| {
+                trust_types::json_depth::from_str_deep::<trust_verifier_api::TrustSpecPredicate>(p).is_ok()
+            });
+            let (has_sch, root_bool, valid, origin) = payload
+                .and_then(|p| {
+                    trust_types::json_depth::from_str_deep::<
+                            trust_verifier_api::TrustSpecPredicate,
+                        >(p)
+                        .ok()
+                })
+                .map(|pr| {
+                    (
+                        pr.has_current_schema(),
+                        pr.root_sort == trust_verifier_api::TrustSpecSort::Bool
+                            && pr.root.sort == trust_verifier_api::TrustSpecSort::Bool,
+                        pr.validate().is_ok(),
+                        has_current_compiler_vc_origin(obligation),
+                    )
+                })
+                .unwrap_or((false, false, false, false));
+            eprintln!(
+                "[SEAL_ELIG] ctx={ctx_digest:?} kind={:?} kind_ok={kind_ok} schema={schema:?} schema_ok={} payload={} parse_ok={parse_ok} has_current_schema={has_sch} root_bool={root_bool} validate_ok={valid} vc_origin={origin}",
+                obligation.kind,
+                schema == trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION,
+                payload.is_some(),
+            );
         }
-        Kind::Field { base, .. } => typed_spec_expr_references_result(base),
-        Kind::Index { base, index } => {
-            typed_spec_expr_references_result(base) || typed_spec_expr_references_result(index)
-        }
-        Kind::Quantifier { body, .. } => typed_spec_expr_references_result(body),
-        Kind::IsVariant { scrutinee, .. } | Kind::VariantField { scrutinee, .. } => {
-            typed_spec_expr_references_result(scrutinee)
-        }
-        // Future vocabulary fails CLOSED out of the fresh lane: an
-        // unrecognized node cannot demonstrate a post-state reference.
-        _ => false,
     }
+    result
+}
+
+fn is_seal_eligible_compiler_formula_obligation_inner(obligation: &TrustObligation) -> bool {
+    if !matches!(
+        obligation.kind,
+        ObligationKind::LoopInvariant
+            | ObligationKind::Termination
+            | ObligationKind::Assertion
+            | ObligationKind::ArithmeticSafety
+            | ObligationKind::Precondition
+            | ObligationKind::Postcondition
+    ) {
+        return false;
+    }
+    let Some(schema) = metadata_value(&obligation.metadata, TRUST_VC_FORMULA_SCHEMA_METADATA_KEY)
+    else {
+        return false;
+    };
+    if schema != trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION {
+        return false;
+    }
+    let Some(payload) = metadata_value(&obligation.metadata, TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
+    else {
+        return false;
+    };
+    let Ok(predicate) =
+        trust_types::json_depth::from_str_deep::<trust_verifier_api::TrustSpecPredicate>(payload)
+    else {
+        return false;
+    };
+    predicate.has_current_schema()
+        && predicate.root_sort == trust_verifier_api::TrustSpecSort::Bool
+        && predicate.root.sort == trust_verifier_api::TrustSpecSort::Bool
+        && predicate.validate().is_ok()
+        && has_current_compiler_vc_origin(obligation)
 }
 
 fn has_current_compiler_vc_origin(obligation: &TrustObligation) -> bool {
@@ -716,7 +888,7 @@ pub struct FreshExactDirectChcPdrDispatch {
 /// Whole-function transport rows never appear in `fresh_exact_direct_receipts`:
 /// without an exact public-row membership receipt they carry only their existing
 /// bundle authority. The map is keyed by the exact public obligation id and can
-/// contain only compiler-authenticated standalone E4/E5 rows.
+/// contain only compiler-authenticated standalone exact-formula rows.
 #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
 #[derive(Debug)]
 pub struct NativeTrustIrBundleEvidenceWithFreshReceipts {
@@ -828,7 +1000,7 @@ impl FreshExactDirectChcPdrReceipt {
         }
         if !is_typed_body_aware_exact_direct_obligation(obligation) {
             return Err(
-                "fresh exact-direct receipt requires a current compiler-authenticated body-aware typed formula (E4/E5 or result-referencing postcondition)"
+                "fresh exact-direct receipt requires an admitted current compiler-authenticated standalone typed formula"
                     .to_string(),
             );
         }
@@ -902,7 +1074,7 @@ impl FreshExactDirectChcPdrReceipt {
         }
         if !is_typed_body_aware_exact_direct_obligation(obligation) {
             return Err(
-                "fresh exact-direct receipt requires a current compiler-authenticated body-aware typed formula (E4/E5 or result-referencing postcondition)"
+                "fresh exact-direct receipt requires an admitted current compiler-authenticated standalone typed formula"
                     .to_string(),
             );
         }
@@ -947,6 +1119,12 @@ impl FreshExactDirectChcPdrReceipt {
 pub struct TrustMcVerifierApiAdapter {
     manifest: EngineManifest,
     config: TrustMcConfig,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TYPED_CHC_INPUT_LOOKUP_COUNT_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 impl TrustMcVerifierApiAdapter {
@@ -1198,10 +1376,15 @@ impl TrustMcVerifierApiAdapter {
         native_bundle: &trust_ir::NativeVerificationBundle,
         deadline: Option<Instant>,
     ) -> Vec<ObligationEvidence> {
+        // Public convenience wrapper: not on the live producer chain, so it holds
+        // no source-generation authority. `None` keeps `Inst::Assume` fail-closed;
+        // the live compiler dispatch calls `..._with_deadline_and_fresh_receipts`
+        // directly with the minted authority.
         self.evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
             bundle,
             obligations,
             native_bundle,
+            None,
             deadline,
         )
         .evidence
@@ -1221,6 +1404,10 @@ impl TrustMcVerifierApiAdapter {
         bundle: &TrustContractBundle,
         obligations: &[TrustObligation],
         native_bundle: &trust_ir::NativeVerificationBundle,
+        // Live source-generation authority for `native_bundle` (see
+        // [`trust_ir::SourceGenerationAuthority`]). `Some` only on the live
+        // compiler producer chain; `None` (fail-closed) elsewhere.
+        authority: Option<&trust_ir::SourceGenerationAuthority>,
         deadline: Option<Instant>,
     ) -> NativeTrustIrBundleEvidenceWithFreshReceipts {
         self.evidence_from_native_trust_ir_bundle_with_optional_source_authority_and_deadline_and_fresh_receipts(
@@ -1478,20 +1665,20 @@ impl TrustMcVerifierApiAdapter {
             };
 
             let exact_e4_e5_formula_lane = is_typed_body_aware_e4_e5_obligation(obligation);
-            // Additive postcondition fresh lane: a result-referencing
-            // body-aware Postcondition row ATTEMPTS the receipt-bearing fresh
-            // dispatch, and takes its evidence ONLY when the live receipt was
-            // actually delivered. On any shortfall — missing canonical
+            // Additive standalone-formula fresh lane: compiler-authenticated
+            // formula rows outside E4/E5 ATTEMPT the receipt-bearing fresh
+            // dispatch, and take its evidence ONLY when the live receipt was
+            // actually delivered. Postconditions still enter only through the
+            // result-referencing discriminator above; a post-state-free clause
+            // cannot use this branch. On any shortfall — missing canonical
             // public digest, no exact direct input, non-Proved solve, or
-            // dispatch error — the row falls through to the ordinary
-            // reject-only arm, byte-compatible with the unwidened build (the
-            // E4/E5 terminal Unsupported arms below are deliberately NOT
-            // reachable from this lane: those encode the E4/E5-specific
-            // refusal to substitute transport proofs, while a payload-bearing
-            // postcondition row keeps today's semantic-claim handling).
-            let exact_postcondition_fresh_lane = !exact_e4_e5_formula_lane
+            // dispatch error — the row preserves that first bounded outcome;
+            // it never starts a second generic solve without the caller's
+            // deadline. The E4/E5 terminal Unsupported arms below are
+            // deliberately NOT reachable from this lane.
+            let exact_standalone_formula_fresh_lane = !exact_e4_e5_formula_lane
                 && is_typed_body_aware_exact_direct_obligation(obligation);
-            let direct_outcome = if exact_postcondition_fresh_lane {
+            let direct_outcome = if exact_standalone_formula_fresh_lane {
                 let fresh_dispatch = public_claim_binding_context
                     .canonical_public_digests
                     .get(obligation.obligation_id.as_str())
@@ -1506,26 +1693,31 @@ impl TrustMcVerifierApiAdapter {
                         )
                     });
                 match fresh_dispatch {
-                    Some(Ok(Some(FreshExactDirectChcPdrDispatch {
-                        evidence,
-                        receipt: Some(receipt),
-                    }))) => {
-                        if fresh_exact_direct_receipts
-                            .insert(obligation.obligation_id.clone(), receipt)
-                            .is_some()
-                        {
-                            fresh_exact_direct_receipts.remove(&obligation.obligation_id);
-                            let mut rejected = self.unsupported_evidence(bundle, obligation);
-                            rejected.diagnostics.push(
-                                "duplicate live exact-direct receipt for one public obligation; refusing ambiguous authority"
-                                    .to_string(),
-                            );
-                            Ok(Some(rejected))
-                        } else {
-                            Ok(Some(evidence))
-                        }
-                    }
-                    _ => self.direct_typed_chc_pdr_evidence_for(bundle, obligation),
+                    Some(dispatch) => dispatch.map(|dispatch| {
+                        dispatch.map(|dispatch| {
+                            let FreshExactDirectChcPdrDispatch { evidence, receipt } = dispatch;
+                            let Some(receipt) = receipt else {
+                                return evidence;
+                            };
+                            if fresh_exact_direct_receipts
+                                .insert(obligation.obligation_id.clone(), receipt)
+                                .is_some()
+                            {
+                                fresh_exact_direct_receipts.remove(&obligation.obligation_id);
+                                let mut rejected = self.unsupported_evidence(bundle, obligation);
+                                rejected.diagnostics.push(
+                                    "duplicate live exact-direct receipt for one public obligation; refusing ambiguous authority"
+                                        .to_string(),
+                                );
+                                return rejected;
+                            }
+                            evidence
+                        })
+                    }),
+                    None => Err(format!(
+                        "canonical public semantic digest is missing for fresh exact-direct obligation `{}`",
+                        obligation.obligation_id
+                    )),
                 }
             } else if exact_e4_e5_formula_lane {
                 let Some(public_semantic_digest) = public_claim_binding_context
@@ -1609,6 +1801,22 @@ impl TrustMcVerifierApiAdapter {
             // row must have an exact standalone direct input.
             let can_defer_to_whole_function_transport =
                 obligation_is_whole_function_panic_freedom(bundle, obligation);
+            if std::env::var("TRUST_NATIVE_DEBUG").is_ok()
+                && obligation.obligation_id.ends_with(":assertion:panic-freedom:0")
+            {
+                eprintln!(
+                    "[DEFER_MATCH] obl={} outcome={} exact_e4_e5={} semantic_requires={} can_defer={}",
+                    obligation.obligation_id,
+                    match &direct_outcome {
+                        Ok(Some(e)) => format!("Ok(Some status={:?})", e.status),
+                        Ok(None) => "Ok(None)".to_string(),
+                        Err(r) => format!("Err({r})"),
+                    },
+                    exact_e4_e5_formula_lane,
+                    semantic_claim_requires_exact_direct_input,
+                    can_defer_to_whole_function_transport,
+                );
+            }
             match direct_outcome {
                 Ok(Some(mut evidence)) => {
                     if !matches!(evidence.status, EvidenceStatus::Proved | EvidenceStatus::Failed) {
@@ -1660,6 +1868,14 @@ impl TrustMcVerifierApiAdapter {
                     direct_by_id.insert(obligation.obligation_id.clone(), evidence);
                 }
             }
+        }
+        if std::env::var("TRUST_NATIVE_DEBUG").is_ok() {
+            eprintln!(
+                "[DEFER_SUM] deferred_ids.len()={} deferred={:?} direct_by_id.len()={}",
+                deferred_ids.len(),
+                deferred_ids,
+                direct_by_id.len(),
+            );
         }
         if deferred_ids.is_empty() {
             let evidence = obligations
@@ -1903,6 +2119,10 @@ impl TrustMcVerifierApiAdapter {
     fn native_trust_ir_chc_pdr_proof_transports(
         &self,
         native_bundle: &trust_ir::NativeVerificationBundle,
+        // Live source-generation authority for `native_bundle`; threaded verbatim
+        // to `solve_bundle_native_proof_grade` so its `Inst::Assume` gate can
+        // admit genuine bridge-emitted Assumes. `None` keeps them fail-closed.
+        authority: Option<&trust_ir::SourceGenerationAuthority>,
         deadline: Option<Instant>,
     ) -> Result<
         (
@@ -2452,12 +2672,24 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         self.typed_chc_pdr_obligation_for_with_contract_index(bundle, obligation, None)
     }
 
+    #[cfg(test)]
+    fn reset_typed_chc_input_lookup_count_for_current_test_thread() {
+        TYPED_CHC_INPUT_LOOKUP_COUNT_FOR_TEST.with(|count| count.set(0));
+    }
+
+    #[cfg(test)]
+    fn typed_chc_input_lookup_count_for_current_test_thread() -> usize {
+        TYPED_CHC_INPUT_LOOKUP_COUNT_FOR_TEST.with(std::cell::Cell::get)
+    }
+
     fn typed_chc_pdr_obligation_for_with_contract_index(
         &self,
         bundle: &TrustContractBundle,
         obligation: &TrustObligation,
         contract_indices: Option<&BTreeMap<String, Vec<usize>>>,
     ) -> Result<Option<DirectTypedChcPdrInput>, String> {
+        #[cfg(test)]
+        TYPED_CHC_INPUT_LOOKUP_COUNT_FOR_TEST.with(|count| count.set(count.get() + 1));
         if let Some(rejection) = owned_e4_e5_pre_solve_rejection(obligation) {
             return Err(rejection);
         }
@@ -2794,9 +3026,10 @@ direct typed CHC/PDR solving is required before this adapter emits proof evidenc
         // it solely for callers that can DELIVER the resulting live receipt
         // (the threaded `consume_exact_direct_authority` — the two dispatch
         // entries, whose admission predicate covers the compiler-authenticated
-        // E4/E5 and result-referencing postcondition lanes). Every other
-        // caller retains the generic reject-only API; it cannot turn a
-        // source-unbound CHC candidate into public evidence.
+        // LoopInvariant, Termination, Assertion, ArithmeticSafety,
+        // Precondition, and result-referencing Postcondition formula lanes).
+        // Every other caller retains the generic reject-only API; it cannot
+        // turn a source-unbound CHC candidate into public evidence.
         let solved = if consume_exact_direct_authority {
             runner.solve_full_verification_with_fresh_exact_replay(input.trust_mc_obligation)
         } else {
@@ -7806,7 +8039,7 @@ fn trust_mc_public_native_obligation_kind_matches(
     match (&public.kind, native) {
         (
             ObligationKind::Assertion | ObligationKind::ArithmeticSafety,
-            trust_ir::ObligationKind::PanicFreedom | trust_ir::ObligationKind::ArithmeticSafety,
+            trust_ir::ObligationKind::PanicFreedom,
         ) => true,
         (
             ObligationKind::Precondition | ObligationKind::Postcondition,
@@ -9014,6 +9247,54 @@ mod tests {
         add_vc_formula_payload(obligation, &predicate, "postcondition");
     }
 
+    /// The same result-free tautology with the schema-level `Result` node in
+    /// only the positive body-definition conjunct. Global `Result` presence
+    /// must not bypass the negated-clause discriminator.
+    fn add_result_node_only_in_body_definition_formula(obligation: &mut TrustObligation) {
+        use trust_verifier_api::{TrustSpecBinaryOp as Op, TrustSpecSort};
+        let predicate = trust_verifier_api::TrustSpecPredicate::new(
+            trust_verifier_api::TrustSpecExpr::binary(
+                Op::And,
+                trust_verifier_api::TrustSpecExpr::binary(
+                    Op::Eq,
+                    trust_verifier_api::TrustSpecExpr::result(TrustSpecSort::Int),
+                    spec_var("x"),
+                ),
+                trust_verifier_api::TrustSpecExpr::unary(
+                    trust_verifier_api::TrustSpecUnaryOp::Not,
+                    trust_verifier_api::TrustSpecExpr::binary(Op::Ge, spec_var("x"), spec_var("x")),
+                ),
+            ),
+            vec![spec_var_decl("x")],
+        );
+        predicate.validate().expect("schema-level result-node predicate must validate");
+        add_vc_formula_payload(obligation, &predicate, "postcondition");
+    }
+
+    /// A negated body fact references `Result`, while the terminal negated VC
+    /// remains result-free. Searching every `Not` subtree would admit this
+    /// shape even though the actual postcondition clause constrains no
+    /// post-state value.
+    fn add_negated_result_only_in_body_definition_formula(obligation: &mut TrustObligation) {
+        use trust_verifier_api::{TrustSpecBinaryOp as Op, TrustSpecSort, TrustSpecUnaryOp};
+        let predicate = trust_verifier_api::TrustSpecPredicate::new(
+            trust_verifier_api::TrustSpecExpr::binary(
+                Op::And,
+                trust_verifier_api::TrustSpecExpr::unary(
+                    TrustSpecUnaryOp::Not,
+                    trust_verifier_api::TrustSpecExpr::result(TrustSpecSort::Bool),
+                ),
+                trust_verifier_api::TrustSpecExpr::unary(
+                    TrustSpecUnaryOp::Not,
+                    trust_verifier_api::TrustSpecExpr::binary(Op::Ge, spec_var("x"), spec_var("x")),
+                ),
+            ),
+            vec![spec_var_decl("x")],
+        );
+        predicate.validate().expect("negated body-result predicate must validate");
+        add_vc_formula_payload(obligation, &predicate, "postcondition");
+    }
+
     fn add_vc_formula_payload(
         obligation: &mut TrustObligation,
         predicate: &trust_verifier_api::TrustSpecPredicate,
@@ -9044,12 +9325,12 @@ mod tests {
         ]);
     }
 
-    /// The fresh-exact postcondition admission and its two guardrails: the
-    /// discriminator admits ONLY post-state-referencing postcondition rows
-    /// (the E9 tautology tripwires stay out), and E4/E5 admission is
-    /// unchanged.
+    /// The fresh-exact standalone-formula admission and its guardrails:
+    /// compiler-authenticated TrustMC-owned kinds enter, postconditions retain
+    /// their stricter result-reference discriminator, and unrelated kinds or
+    /// formula-less rows stay out.
     #[test]
-    fn exact_direct_admission_scopes_to_result_referencing_postconditions() {
+    fn exact_direct_admission_scopes_to_authenticated_standalone_formulas() {
         let mut admitted = obligation(ObligationKind::Postcondition, "obligation:demo::f:post:0");
         add_result_referencing_vc_formula(&mut admitted);
         assert!(
@@ -9069,6 +9350,24 @@ mod tests {
              admitting it would flip the E9 citation-undischarged tripwire"
         );
 
+        let mut result_node_bypass =
+            obligation(ObligationKind::Postcondition, "obligation:demo::f:post:result-node");
+        add_result_node_only_in_body_definition_formula(&mut result_node_bypass);
+        assert!(
+            !is_typed_body_aware_exact_direct_obligation(&result_node_bypass),
+            "a Result node outside the negated clause must not bypass the E9 guard"
+        );
+
+        let mut negated_result_node_bypass = obligation(
+            ObligationKind::Postcondition,
+            "obligation:demo::f:post:negated-result-node",
+        );
+        add_negated_result_only_in_body_definition_formula(&mut negated_result_node_bypass);
+        assert!(
+            !is_typed_body_aware_exact_direct_obligation(&negated_result_node_bypass),
+            "Not(Result) in a prepended body fact must not masquerade as the terminal negated clause"
+        );
+
         let mut loop_row = obligation(ObligationKind::LoopInvariant, "obligation:demo::f:e4:0");
         add_typed_body_aware_vc_formula(&mut loop_row);
         assert!(is_typed_body_aware_e4_e5_obligation(&loop_row), "E4/E5 admission unchanged");
@@ -9077,11 +9376,51 @@ mod tests {
             "the widened predicate is a superset of E4/E5"
         );
 
-        let mut assertion = obligation(ObligationKind::Assertion, "obligation:demo::f:assert:0");
-        add_result_referencing_vc_formula(&mut assertion);
+        for (index, kind) in [
+            ObligationKind::ArithmeticSafety,
+            ObligationKind::Assertion,
+            ObligationKind::Precondition,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut standalone = obligation(kind, &format!("obligation:demo::f:formula:{index}"));
+            add_typed_body_aware_vc_formula(&mut standalone);
+            assert!(
+                is_seal_eligible_compiler_formula_obligation(&standalone),
+                "current compiler-authenticated standalone formula kind must be seal-eligible: {:?}",
+                standalone.kind
+            );
+            assert!(
+                is_typed_body_aware_exact_direct_obligation(&standalone),
+                "seal-eligible non-postcondition formula must enter the fresh-exact lane: {:?}",
+                standalone.kind
+            );
+            assert!(!is_typed_body_aware_e4_e5_obligation(&standalone));
+        }
+
+        for kind in [ObligationKind::Invariant, ObligationKind::Protocol] {
+            let mut producer_inert = obligation(kind, "obligation:demo::f:producer-inert");
+            add_typed_body_aware_vc_formula(&mut producer_inert);
+            assert!(
+                !is_seal_eligible_compiler_formula_obligation(&producer_inert)
+                    && !is_typed_body_aware_exact_direct_obligation(&producer_inert),
+                "a kind outside the compiler direct-CHC producer set stays out: {:?}",
+                producer_inert.kind
+            );
+        }
+
+        let bare = obligation(ObligationKind::ArithmeticSafety, "obligation:demo::f:bare:0");
         assert!(
-            !is_typed_body_aware_exact_direct_obligation(&assertion),
-            "non-postcondition kinds outside E4/E5 stay out regardless of payload"
+            !is_typed_body_aware_exact_direct_obligation(&bare),
+            "a formula-less safety row must not request a fresh receipt"
+        );
+
+        let mut unrelated = obligation(ObligationKind::MemorySafety, "obligation:demo::f:memory:0");
+        add_typed_body_aware_vc_formula(&mut unrelated);
+        assert!(
+            !is_typed_body_aware_exact_direct_obligation(&unrelated),
+            "a kind outside the exact direct TrustMC formula set stays out regardless of payload"
         );
     }
 
@@ -13584,9 +13923,16 @@ mod tests {
 
     #[cfg(feature = "trust-mc-native-solver")]
     #[test]
-    fn fresh_exact_direct_pdr_dispatch_retains_nonserializable_e4_e5_receipt() {
-        for (index, kind) in
-            [ObligationKind::LoopInvariant, ObligationKind::Termination].into_iter().enumerate()
+    fn fresh_exact_direct_pdr_dispatch_retains_nonserializable_formula_receipt() {
+        for (index, kind) in [
+            ObligationKind::ArithmeticSafety,
+            ObligationKind::Assertion,
+            ObligationKind::Precondition,
+            ObligationKind::LoopInvariant,
+            ObligationKind::Termination,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let native_obligation_id = native_typed_chc_obligation_id(91, index as u32);
             let contract_id = format!("contract-fresh-exact-{index}");
@@ -13616,7 +13962,7 @@ mod tests {
             assert_eq!(
                 dispatch.evidence.status,
                 EvidenceStatus::Proved,
-                "fresh exact E4/E5 dispatch was rejected: {:?}",
+                "fresh exact standalone-formula dispatch was rejected: {:?}",
                 dispatch.evidence.diagnostics
             );
             assert_eq!(
@@ -13650,7 +13996,7 @@ mod tests {
                 .metadata
                 .iter_mut()
                 .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
-                .expect("typed E4/E5 payload")
+                .expect("typed standalone-formula payload")
                 .value = serde_json::to_string(&trust_verifier_api::TrustSpecPredicate::new(
                 trust_verifier_api::TrustSpecExpr::bool_literal(true),
                 Vec::new(),
@@ -15825,6 +16171,28 @@ mod tests {
         }
     }
 
+    /// The compiler maps both public rows onto its whole-function-shaped
+    /// `PanicFreedom` native proof unit before attaching the exact direct CHC.
+    /// Pin that producer mapping pairwise; `ArithmeticSafety` is a native
+    /// vocabulary member, but is not emitted for either public row here.
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_trust_ir_public_claim_binding_pins_assertion_arithmetic_producer_pairs() {
+        for public_kind in [ObligationKind::Assertion, ObligationKind::ArithmeticSafety] {
+            let (bundle, native_bundle) = compiler_style_kind_pair_fixture(
+                public_kind.clone(),
+                trust_ir::ObligationKind::PanicFreedom,
+                false,
+            );
+            validate_compiler_style_public_claim_for_test(&bundle, &native_bundle, 0)
+                .unwrap_or_else(|reason| {
+                    panic!(
+                        "the compiler's {public_kind:?} -> PanicFreedom route must bind: {reason}"
+                    )
+                });
+        }
+    }
+
     /// The identity arms must not turn the table into "accept anything". Each
     /// row below is a pairing the producer CANNOT emit for that public
     /// obligation, and each must still fail closed at the identity gate rather
@@ -15850,6 +16218,11 @@ mod tests {
             // LoopInvariant onto itself; the two may not be swapped.
             (ObligationKind::Termination, trust_ir::ObligationKind::LoopInvariant, false),
             (ObligationKind::LoopInvariant, trust_ir::ObligationKind::TranslationValidation, false),
+            // Despite the matching vocabulary name, the compiler maps both
+            // rows above to PanicFreedom; accepting this crossed native kind
+            // would make the consumer wider than its producer.
+            (ObligationKind::Assertion, trust_ir::ObligationKind::ArithmeticSafety, false),
+            (ObligationKind::ArithmeticSafety, trust_ir::ObligationKind::ArithmeticSafety, false),
             // An unrelated native kind, and a public kind trust-mc does not
             // own at all, both remain unbindable.
             (ObligationKind::Assertion, trust_ir::ObligationKind::Postcondition, false),
@@ -15972,6 +16345,7 @@ mod tests {
                 &bundle,
                 &bundle.obligations,
                 &native_bundle,
+                None,
                 Some(Instant::now() + std::time::Duration::from_secs(10)),
             );
         assert_eq!(outcome.evidence.len(), 1);
@@ -16007,6 +16381,249 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn compiler_style_exact_formula_public_bundle(
+        kind: ObligationKind,
+        attach_formula: fn(&mut TrustObligation),
+    ) -> TrustContractBundle {
+        let (mut bundle, _canonical_id, _marker_id) = compiler_style_canonical_public_bundle();
+        bundle.obligations[0].kind = kind;
+        bundle.obligations[0].metadata.retain(|entry| {
+            !matches!(
+                entry.key.as_str(),
+                TRUST_VC_FORMULA_SCHEMA_METADATA_KEY
+                    | TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY
+                    | TRUST_VC_FORMULA_SORT_METADATA_KEY
+                    | trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY
+            )
+        });
+        attach_formula(&mut bundle.obligations[0]);
+        bundle.validate().expect("exact formula public fixture must validate");
+        bundle
+    }
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn replace_formula_context(
+        obligation: &mut TrustObligation,
+        context: trust_verifier_api::ObligationContext,
+    ) {
+        let entry = obligation
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.key == trust_verifier_api::OBLIGATION_CONTEXT_METADATA_KEY)
+            .expect("exact formula fixture context");
+        *entry = context.to_metadata_entry().expect("replacement context serializes");
+    }
+
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn assert_live_formula_receipt_refused(bundle: TrustContractBundle, label: &str) {
+        let native_bundle =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        let outcome = adapter
+            .evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
+                &bundle,
+                &bundle.obligations,
+                &native_bundle,
+                None,
+                Some(Instant::now() + std::time::Duration::from_secs(10)),
+            );
+        assert_eq!(outcome.evidence.len(), 1, "{label}");
+        assert!(
+            outcome.fresh_exact_direct_receipts.is_empty(),
+            "{label} acquired a live exact-direct receipt"
+        );
+        assert_ne!(
+            outcome.evidence[0].status,
+            EvidenceStatus::Proved,
+            "{label} was proved without an admissible live receipt: {:?}",
+            outcome.evidence[0].diagnostics
+        );
+        assert!(outcome.evidence[0].proof_strength.is_none(), "{label}");
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_bundle_producer_exact_formulas_retain_same_solve_live_receipts() {
+        let cases: [(ObligationKind, fn(&mut TrustObligation)); 4] = [
+            (ObligationKind::ArithmeticSafety, add_typed_body_aware_vc_formula),
+            (ObligationKind::Assertion, add_typed_body_aware_vc_formula),
+            (ObligationKind::Precondition, add_typed_body_aware_vc_formula),
+            (ObligationKind::Postcondition, add_result_referencing_vc_formula),
+        ];
+        for (kind, attach_formula) in cases {
+            let bundle = compiler_style_exact_formula_public_bundle(kind.clone(), attach_formula);
+            let native_bundle = bind_compiler_style_native_bundle_to_public(
+                compiler_style_safe_tmir_bundle(),
+                &bundle,
+            );
+            let adapter = TrustMcVerifierApiAdapter::new(
+                TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+            );
+            let mut outcome = adapter
+                .evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
+                    &bundle,
+                    &bundle.obligations,
+                    &native_bundle,
+                    None,
+                    Some(Instant::now() + std::time::Duration::from_secs(10)),
+                );
+            assert_eq!(outcome.evidence.len(), 1);
+            assert_eq!(
+                outcome.evidence[0].status,
+                EvidenceStatus::Proved,
+                "producer-real {kind:?} direct solve was rejected: {:?}",
+                outcome.evidence[0].diagnostics
+            );
+            let receipt = outcome
+                .fresh_exact_direct_receipts
+                .remove(&bundle.obligations[0].obligation_id)
+                .unwrap_or_else(|| panic!("producer-real {kind:?} row lost its live receipt"));
+            assert!(outcome.fresh_exact_direct_receipts.is_empty());
+            assert_eq!(
+                receipt
+                    .still_authorizes(&bundle, &bundle.obligations[0])
+                    .unwrap_or_else(|reason| panic!("{kind:?} receipt failed recheck: {reason}")),
+                outcome.evidence[0]
+                    .proof_strength
+                    .clone()
+                    .expect("proved exact evidence has proof strength")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_bundle_formula_receipt_admission_fails_closed_at_live_seam() {
+        assert_live_formula_receipt_refused(
+            compiler_style_exact_formula_public_bundle(
+                ObligationKind::Postcondition,
+                add_result_free_vc_formula,
+            ),
+            "result-free _0 postcondition",
+        );
+        assert_live_formula_receipt_refused(
+            compiler_style_exact_formula_public_bundle(
+                ObligationKind::Postcondition,
+                add_result_node_only_in_body_definition_formula,
+            ),
+            "positive-body-only Result postcondition",
+        );
+        assert_live_formula_receipt_refused(
+            compiler_style_exact_formula_public_bundle(
+                ObligationKind::Postcondition,
+                add_negated_result_only_in_body_definition_formula,
+            ),
+            "negated-body-only Result postcondition",
+        );
+
+        let mut definition_entry = compiler_style_exact_formula_public_bundle(
+            ObligationKind::Precondition,
+            add_typed_body_aware_vc_formula,
+        );
+        replace_formula_context(
+            &mut definition_entry.obligations[0],
+            trust_verifier_api::ObligationContext::new(
+                trust_verifier_api::ObligationProducer::CompilerMirExtract,
+                trust_verifier_api::ObligationOrigin::Contract {
+                    contract_id: "definition-entry-requires".to_string(),
+                    contract_kind: ContractKind::Requires,
+                    contract_index: 0,
+                    predicate_schema: Some(
+                        trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION.to_string(),
+                    ),
+                },
+            ),
+        );
+        assert_live_formula_receipt_refused(definition_entry, "definition-entry requires");
+
+        let mut non_compiler = compiler_style_exact_formula_public_bundle(
+            ObligationKind::Assertion,
+            add_typed_body_aware_vc_formula,
+        );
+        replace_formula_context(
+            &mut non_compiler.obligations[0],
+            trust_verifier_api::ObligationContext::new(
+                trust_verifier_api::ObligationProducer::VcGenerator,
+                trust_verifier_api::ObligationOrigin::VerificationCondition {
+                    vc_kind: "assertion".to_string(),
+                    vc_index: 0,
+                    formula_schema: Some(
+                        trust_verifier_api::TRUST_SPEC_PREDICATE_SCHEMA_VERSION.to_string(),
+                    ),
+                },
+            ),
+        );
+        assert_live_formula_receipt_refused(non_compiler, "non-compiler producer");
+
+        let mut malformed_schema = compiler_style_exact_formula_public_bundle(
+            ObligationKind::Assertion,
+            add_typed_body_aware_vc_formula,
+        );
+        malformed_schema.obligations[0]
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.key == TRUST_VC_FORMULA_SCHEMA_METADATA_KEY)
+            .expect("formula schema")
+            .value = "trust.vc.formula.invalid".to_string();
+        assert_live_formula_receipt_refused(malformed_schema, "malformed formula schema");
+
+        let mut malformed_payload = compiler_style_exact_formula_public_bundle(
+            ObligationKind::Assertion,
+            add_typed_body_aware_vc_formula,
+        );
+        malformed_payload.obligations[0]
+            .metadata
+            .iter_mut()
+            .find(|entry| entry.key == TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY)
+            .expect("formula payload")
+            .value = "{}".to_string();
+        assert_live_formula_receipt_refused(malformed_payload, "malformed formula payload");
+
+        let mut missing_payload = compiler_style_exact_formula_public_bundle(
+            ObligationKind::Assertion,
+            add_typed_body_aware_vc_formula,
+        );
+        missing_payload.obligations[0]
+            .metadata
+            .retain(|entry| entry.key != TRUST_VC_FORMULA_PAYLOAD_METADATA_KEY);
+        assert_live_formula_receipt_refused(missing_payload, "missing formula payload");
+    }
+
+    #[test]
+    #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
+    fn native_bundle_missing_exact_input_does_not_start_a_second_generic_solve() {
+        let mut bundle = compiler_style_safe_public_bundle();
+        bundle.obligations[0].kind = ObligationKind::ArithmeticSafety;
+        add_typed_body_aware_vc_formula(&mut bundle.obligations[0]);
+        bundle.validate().expect("formula-only public fixture must validate");
+        let native_bundle =
+            bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
+        let adapter = TrustMcVerifierApiAdapter::new(
+            TrustMcConfig::new().with_proof_mode(TrustMcProofMode::PdrIc3).with_timeout(10_000),
+        );
+        TrustMcVerifierApiAdapter::reset_typed_chc_input_lookup_count_for_current_test_thread();
+        let outcome = adapter
+            .evidence_from_native_trust_ir_bundle_with_deadline_and_fresh_receipts(
+                &bundle,
+                &bundle.obligations,
+                &native_bundle,
+                None,
+                Some(Instant::now() + std::time::Duration::from_secs(10)),
+            );
+        assert_eq!(
+            TrustMcVerifierApiAdapter::typed_chc_input_lookup_count_for_current_test_thread(),
+            1,
+            "the fresh-dispatch miss must be the only exact-input lookup"
+        );
+        assert!(outcome.fresh_exact_direct_receipts.is_empty());
+        assert_eq!(outcome.evidence.len(), 1);
+        assert_ne!(outcome.evidence[0].status, EvidenceStatus::Proved);
+        assert!(outcome.evidence[0].proof_strength.is_none());
+    }
+
     #[test]
     #[cfg(feature = "trust-mc-native-trust-ir-bundle")]
     fn native_trust_ir_bundle_evidence_converts_pdr_transport() {
@@ -16022,6 +16639,7 @@ mod tests {
                 &bundle,
                 &bundle.obligations,
                 &native_bundle,
+                None,
                 None,
             );
         assert!(
@@ -16647,7 +17265,7 @@ mod tests {
             &bundle,
         );
         let (_, _, refuted) = adapter
-            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None)
+            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None, None)
             .expect("loop fixture solves");
         let row = refuted.values().next().expect("loop fixture refutes with a witness");
 
@@ -16784,7 +17402,7 @@ mod tests {
             &bundle,
         );
         let (transports, not_proved, refuted) = adapter
-            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None)
+            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None, None)
             .expect("mixed bundle must return independent producer rows");
         assert!(refuted.is_empty(), "acyclic rows keep their historical delivery: {refuted:?}");
         assert_eq!(transports.len(), 1, "the safe sibling must retain its proof transport");
@@ -16824,7 +17442,7 @@ mod tests {
         let native_bundle =
             bind_compiler_style_native_bundle_to_public(compiler_style_safe_tmir_bundle(), &bundle);
         let (transports, not_proved, refuted) = adapter
-            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None)
+            .native_trust_ir_chc_pdr_proof_transports(&native_bundle, None, None)
             .expect("safe bundle must solve");
         assert!(refuted.is_empty(), "fully proved bundle must not report refuted rows");
         assert_eq!(transports.len(), 1);

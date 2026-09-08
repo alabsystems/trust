@@ -346,6 +346,7 @@ fn reserved_direct_trust_vc_namespace_stays_receipt_exclusive_when_artifacts_are
                 &bundle,
                 &bundle.obligations,
                 None,
+                None,
                 &context,
             );
         assert!(
@@ -411,6 +412,7 @@ fn direct_trust_vc_live_api_preserves_no_native_affine_receipt() {
         &bundle,
         &bundle.obligations,
         None,
+        None,
         &context,
     );
 
@@ -467,14 +469,26 @@ fn direct_trust_vc_receipt_rejects_byte_identical_cross_dispatch_transplant() {
         &bundle,
         &bundle.obligations,
         None,
-        &context,
-    );
-    let second = engine.verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
-        &bundle,
-        &bundle.obligations,
         None,
         &context,
     );
+    // The public batch diagnostic includes measured elapsed milliseconds. Run
+    // a few independent calls until that diagnostic also matches, so this
+    // regression genuinely exercises byte-identical public carriers rather
+    // than obtaining rejection from an incidental timing difference.
+    let second = (0..64)
+        .find_map(|_| {
+            let candidate = engine
+                .verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
+                    &bundle,
+                    &bundle.obligations,
+                    None,
+                    None,
+                    &context,
+                );
+            (candidate.result() == first.result()).then_some(candidate)
+        })
+        .expect("fixture must produce a byte-identical independent public run");
     let (first_run, mut first_live_receipts) = first.into_parts();
     let (second_run, second_live_receipts) = second.into_parts();
     let mut first_receipts = first_live_receipts.take_direct_trust_vc_receipts();
@@ -564,6 +578,7 @@ fn direct_trust_vc_public_result_round_trip_carries_no_receipt_authority() {
         &bundle,
         &bundle.obligations,
         None,
+        None,
         &context,
     );
     assert_eq!(live.direct_trust_vc_receipts().len(), 1, "{live:#?}");
@@ -583,6 +598,7 @@ fn direct_trust_vc_receipt_rejects_final_row_and_carrier_mutation() {
     let live = engine.verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
         &bundle,
         &bundle.obligations,
+        None,
         None,
         &context,
     );
@@ -685,7 +701,7 @@ fn direct_trust_vc_duplicate_request_inventory_cannot_retain_receipts() {
     let context = VerifierExecutionContext::new("direct-trust-vc-duplicate-request");
 
     let live = engine.verify_obligations_with_optional_native_trust_ir_bundle_and_live_receipts(
-        &bundle, &duplicate, None, &context,
+        &bundle, &duplicate, None, None, &context,
     );
 
     assert!(live.direct_trust_vc_receipts().is_empty(), "{live:#?}");

@@ -31,6 +31,31 @@ pub(crate) const TARGO_TRUST_EXCLUSION_DEFERRED_DOCTEST: &str = "deferred-doctes
 pub(crate) const TARGO_TRUST_EXCLUSION_COMPILE_TIME_DEPS_FILTERED: &str =
     "compile-time-deps-filtered";
 pub(crate) const TARGO_TRUST_EXCLUSION_DOCUMENTATION: &str = "documentation-generation";
+/// A Unit no requested root reaches without crossing a build script: a
+/// build-script target, a `[build-dependencies]` library, or their transitive
+/// closure. Such a Unit contributes no code to a verified artifact, so its
+/// obligations are trusted rather than discharged. Valid only under
+/// include-dependencies — without that flag the dependency-policy reason owns
+/// every excluded dependency.
+pub(crate) const TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY: &str = "build-support-only";
+/// The audited Trust spec proc-macro provider: a `proc-macro` Unit whose exact
+/// (package, version) is on Targo's audited allowlist and whose manifest and
+/// `src/lib.rs` sha256 match the pinned digests.
+///
+/// Deliberately a DISTINCT reason from build-support-only, because the argument
+/// is different and weaker. A build-support Unit contributes no code to the
+/// artifact; a proc macro shapes the tokens of the units it annotates and runs
+/// inside the verifying compiler. It is trusted because its source bytes are
+/// pinned and audited to expand to the identity, not because it is absent from
+/// the artifact. Separate spellings keep the exclusion ledger honest about which
+/// argument was used.
+///
+/// This side cannot re-check the audit: the allowlist and the hashes live in
+/// authenticated Targo. What is checked here is that the reason names a Unit
+/// SHAPE the audit could apply to (a proc-macro compile carrying the dependency
+/// graph role, under include-dependencies), so the spelling cannot become a
+/// general-purpose way to trust an ordinary library away.
+pub(crate) const TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC: &str = "audited-trust-spec";
 
 #[derive(Default)]
 pub(crate) struct ParsedCompilerOutput {
@@ -2111,6 +2136,73 @@ fn validate_cargo_exclusion_reason(
             if !matches!(graph_role, "primary" | "dependency") {
                 return Err(format!(
                     "Targo documentation exclusion carried invalid Cargo graph role {graph_role:?}: {}",
+                    target.report_label()
+                ));
+            }
+        }
+        TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY => {
+            // Unlike the dependency-policy reason, this one is valid ONLY under
+            // include-dependencies: without that flag every excluded dependency
+            // is owned by the dependency-policy reason instead.
+            if !include_dependencies {
+                return Err(format!(
+                    "Targo excluded Cargo unit `{}` as build-support-only without include-dependencies=true",
+                    target.report_label()
+                ));
+            }
+            // A build-support unit is a real rustc job that simply was not asked
+            // to verify — not a Cargo control job. Naming a non-compiler mode
+            // here would be redundant with an intrinsic mode reason.
+            if !cargo_unit_mode_emits_queued_compiler_evidence(&target.proof_unit_mode) {
+                return Err(format!(
+                    "Targo build-support-only exclusion redundantly named a non-proof Cargo mode: {}",
+                    target.report_label()
+                ));
+            }
+            // Fail-closed anti-scope-collapse check: a resolved root or a
+            // test-execution subject can never be trusted away as build support.
+            if graph_role != "dependency" {
+                return Err(format!(
+                    "Targo build-support-only exclusion carried Cargo graph role {graph_role:?} instead of dependency: {}",
+                    target.report_label()
+                ));
+            }
+        }
+        TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC => {
+            // Like build-support-only, this reason exists only under
+            // include-dependencies: without that flag the dependency-policy
+            // reason already owns every excluded dependency, and a second
+            // spelling for the same exclusion would be a second thing to audit.
+            if !include_dependencies {
+                return Err(format!(
+                    "Targo excluded Cargo unit `{}` as an audited trust-spec proc macro without include-dependencies=true",
+                    target.report_label()
+                ));
+            }
+            // Anti-scope-collapse, on the Unit's own shape: only a proc-macro
+            // compile can carry this reason. `ny-cert` and the `num-*` crates
+            // are `lib`/`rlib` Units and would be rejected here if this reason
+            // were ever stamped onto them, whatever the producer believed.
+            if target.target_kinds.as_slice() != ["proc-macro"] {
+                return Err(format!(
+                    "Targo audited trust-spec exclusion did not name a proc-macro Unit: {}",
+                    target.report_label()
+                ));
+            }
+            // A proc macro is a real rustc job that simply was not asked to
+            // verify, not a Cargo control job.
+            if !cargo_unit_mode_emits_queued_compiler_evidence(&target.proof_unit_mode) {
+                return Err(format!(
+                    "Targo audited trust-spec exclusion redundantly named a non-proof Cargo mode: {}",
+                    target.report_label()
+                ));
+            }
+            // Anti-scope-collapse, on the graph role: a resolved root or a
+            // test-execution subject can never be trusted away as a spec
+            // provider, even if the root itself is a proc-macro crate.
+            if graph_role != "dependency" {
+                return Err(format!(
+                    "Targo audited trust-spec exclusion carried Cargo graph role {graph_role:?} instead of dependency: {}",
                     target.report_label()
                 ));
             }
@@ -5073,6 +5165,21 @@ mod tests {
                 serde_json::json!(TARGO_TRUST_EXCLUSION_COMPILE_TIME_DEPS_FILTERED),
                 "redundantly named a non-proof Cargo mode",
             ),
+            // Build-support-only is a scoping decision that exists only under
+            // include-dependencies. Without that flag, every excluded dependency
+            // belongs to the dependency-policy reason, so this spelling must not
+            // become a second way to trust a unit away.
+            (
+                serde_json::json!(TARGO_TRUST_EXCLUSION_BUILD_SUPPORT_ONLY),
+                "as build-support-only without include-dependencies=true",
+            ),
+            // Same for the audited spec provider: it is a scoping decision that
+            // exists only under include-dependencies, and the audit that
+            // justifies it applies to a proc-macro Unit, never to this `lib`.
+            (
+                serde_json::json!(TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC),
+                "as an audited trust-spec proc macro without include-dependencies=true",
+            ),
         ];
         for (reason, expected) in mutations {
             values[0]["excluded_units"][0]["exclusion_reason"] = reason;
@@ -5171,6 +5278,120 @@ mod tests {
             .err()
             .expect("test-execution graph role requires exact executable Build unit shape");
         assert!(error.contains("was not a Build-mode library or binary"), "{error}");
+    }
+
+    #[test]
+    fn audited_trust_spec_exclusion_is_shape_bound_and_include_dependencies_only() {
+        let package_id = "path+file:///fixture#demo@0.1.0";
+        let selected: BTreeMap<String, String> =
+            [(package_id.to_string(), "demo".to_string())].into_iter().collect();
+        let mut lines = Vec::new();
+        append_complete_proof_unit(
+            &mut lines, package_id, "demo", "demo", "lib", 86, "build", "primary", true,
+        );
+        let mut values = successful_cargo_input(lines)
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        // The audited spec provider exactly as authenticated Targo reports it: a
+        // `proc-macro` Unit whose lib target is named `trust`, compiled as an
+        // ordinary rustc `build` job, carrying the `dependency` graph role.
+        let mut spec_provider = serde_json::json!({
+            "index": 1,
+            "mode": "build",
+            "package_id": "path+file:///fixture/ny-contracts#ny-contracts@0.2.0",
+            "package_name": "ny-contracts",
+            "target_name": "trust",
+            "target_kinds": ["proc-macro"],
+            "compile_target": TEST_COMPILE_TARGET,
+            "exclusion_reason": TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC,
+            "graph_role": "dependency",
+        });
+        set_excluded_unit_semantics(&mut spec_provider, "build");
+        values[0]["excluded_units"] = serde_json::json!([spec_provider]);
+        values[0]["include_dependencies"] = serde_json::json!(true);
+        let baseline = values;
+        let render =
+            |values: &[serde_json::Value]| -> String {
+                values.iter().map(|line| format!("{line}\n")).collect()
+            };
+
+        let evidence = parse_cargo_json_stdout(
+            Cursor::new(render(&baseline)),
+            &selected,
+            TEST_SESSION,
+            true,
+        )
+        .expect("the audited spec provider is admitted as an explicitly reasoned exclusion");
+        let inventory = evidence.declared_inventory.expect("inventory");
+        assert_eq!(inventory.excluded_targets.len(), 1);
+        let excluded = inventory.excluded_targets.iter().next().expect("excluded target");
+        assert_eq!(excluded.package_name, "ny-contracts");
+        assert_eq!(
+            inventory.excluded_reasons.get(excluded).map(String::as_str),
+            Some(TARGO_TRUST_EXCLUSION_AUDITED_TRUST_SPEC),
+            "the provider must be trusted under its OWN reason, not folded into build-support-only"
+        );
+        // Scope-collapse guard on the whole envelope: the selected root is still
+        // a declared proof subject, and the provider is not.
+        assert_eq!(inventory.proof_targets.len(), 1);
+        assert_eq!(
+            inventory.proof_targets.iter().next().expect("proof target").package_name,
+            "demo"
+        );
+
+        let mutations: [(&str, fn(&mut Vec<serde_json::Value>), &str); 5] = [
+            // Without the flag, the dependency-policy reason already owns every
+            // excluded dependency; this spelling must not become a second way to
+            // trust a Unit away.
+            (
+                "include-dependencies off",
+                |values| values[0]["include_dependencies"] = serde_json::json!(false),
+                "as an audited trust-spec proc macro without include-dependencies=true",
+            ),
+            // SCOPE COLLAPSE guard: this is exactly what stamping the reason
+            // onto `ny-cert` or a `num-*` library would look like on the wire.
+            // The audit admits a proc macro and nothing else.
+            (
+                "ordinary library shape",
+                |values| values[0]["excluded_units"][0]["target_kinds"] = serde_json::json!(["lib"]),
+                "did not name a proc-macro Unit",
+            ),
+            (
+                "proc macro mixed with a linkable crate type",
+                |values| {
+                    values[0]["excluded_units"][0]["target_kinds"] =
+                        serde_json::json!(["proc-macro", "rlib"])
+                },
+                "did not name a proc-macro Unit",
+            ),
+            // A Cargo control job has its own intrinsic reason; naming this one
+            // would be redundant and would hide the real exclusion.
+            (
+                "non-compiler Cargo mode",
+                |values| {
+                    values[0]["excluded_units"][0]["mode"] = serde_json::json!("doc");
+                    set_excluded_unit_semantics(&mut values[0]["excluded_units"][0], "doc");
+                },
+                "redundantly named a non-proof Cargo mode",
+            ),
+            // Anti-scope-collapse on the graph role: only a dependency can be
+            // trusted away here, never a root or an execution subject.
+            (
+                "non-dependency graph role",
+                |values| values[0]["excluded_units"][0]["graph_role"] = serde_json::json!("control"),
+                "carried Cargo graph role \"control\" instead of dependency",
+            ),
+        ];
+        for (label, mutate, expected) in mutations {
+            let mut mutated = baseline.clone();
+            mutate(&mut mutated);
+            let error =
+                parse_cargo_json_stdout(Cursor::new(render(&mutated)), &selected, TEST_SESSION, true)
+                    .err()
+                    .unwrap_or_else(|| panic!("{label} must fail closed"));
+            assert!(error.contains(expected), "{label}: expected {expected:?}, got {error:?}");
+        }
     }
 
     #[test]

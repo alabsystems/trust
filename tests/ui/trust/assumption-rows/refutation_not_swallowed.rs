@@ -27,6 +27,17 @@
 // demotion did not absorb `mid`. The falsifiable half lives in the sibling
 // `refutation_not_swallowed_strict.rs`, which puts the division INSIDE the coroutine body
 // and separates the two outcomes by diagnostic kind.
+//
+// RE-MEASURED 2026-08-30 on stage1 at fb48832dc9. THE GUARD THIS FILE OWNS STILL HOLDS:
+// `mid` is refuted with a live model — "[divzero] FAILED (ay-in-process); counterexample:
+// _3 = true, a = 0, b = 0", "1 failed" — and its warning below is unchanged. The
+// coroutine body's count moved 3 -> 1: the two sentinel-family rows that measured FAILED
+// on ec4783d80 decide UNSAT under the exactly-grounded resume-state entry premise and
+// report as CONDITIONALLY DISCHARGED (NOT proved) — "3 conditionally discharged (NOT
+// proved), 0 failed, ... 1 runtime-checked, 1 skipped out of 5". Root cause:
+// trust-vcgen's 2026-08-28 assert-refutation grounding family (e7a2860143 and siblings).
+// The demotion still absorbed nothing: divzero refutations ride a kind the bridge's
+// assertion-polarity hold does not touch.
 //@ edition: 2021
 //@ needs-trust-verify
 //@ compile-flags: -Ztrust-verify=on
@@ -34,7 +45,7 @@
 //@ build-pass
 //@ dont-check-compiler-stderr
 pub async fn helper(x: u32) -> u32 {
-    //~^ WARN Trust Level 0 safety verification incomplete for `refutation_not_swallowed::helper::{closure#0}`: 3 obligation(s) were not proved
+    //~^ WARN Trust Level 0 safety verification incomplete for `refutation_not_swallowed::helper::{closure#0}`: 1 obligation(s) were not proved
     x
 }
 pub fn mid(a: u64, b: u64) -> u64 {

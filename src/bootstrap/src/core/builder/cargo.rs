@@ -125,8 +125,25 @@ impl HostFlags {
 }
 
 fn is_trust_verifier_unstable_option(option: &str) -> bool {
-    let name = option.split_once('=').map_or(option, |(name, _)| name);
-    matches!(name, "trust-verify" | "trust-policy") || name.starts_with("trust-verify-")
+    // `-Z` option names accept `_` and `-` interchangeably (rustc normalizes
+    // before lookup), so the underscore spellings are THE SAME OPTIONS and must
+    // be recognized here. Before this normalization `-Ztrust_policy=advisory`
+    // in RUSTFLAGS walked past both the self-proof refusal and the suppression
+    // check — harmless on an ordinary unit, where the appended off-switch still
+    // wins by last-value, but on a unit named by the per-unit `library/` opt-in
+    // the shim replaces only the on/off switch, so a policy downgrade in the
+    // underscore spelling would have SURVIVED into the one verifying compile:
+    // a green that means `advisory` while the lane reads as full verification.
+    let name = option.split_once('=').map_or(option, |(name, _)| name).replace('_', "-");
+    matches!(name.as_str(), "trust-verify" | "trust-policy") || name.starts_with("trust-verify-")
+}
+
+/// [`TRUST_BOOTSTRAP_NO_VERIFY_OPTION`] equality on the option's CANONICAL
+/// spelling: `-Z` names accept `_` for `-`, so `trust_verify=off` is the same
+/// off-switch and must suppress the default (one off-switch, either spelling)
+/// rather than being refused as a verification request.
+fn is_bootstrap_no_verify_option(option: &str) -> bool {
+    option.replace('_', "-") == TRUST_BOOTSTRAP_NO_VERIFY_OPTION
 }
 
 /// Every Trust verifier control in `rustflags`, in order, in both token shapes
@@ -188,15 +205,15 @@ fn trust_verifier_controls(rustflags: &str) -> Vec<&str> {
 }
 
 fn rustflags_request_bootstrap_verification(rustflags: &str) -> bool {
-    trust_verifier_controls(rustflags)
-        .iter()
-        .any(|option| *option != TRUST_BOOTSTRAP_NO_VERIFY_OPTION)
+    trust_verifier_controls(rustflags).iter().any(|option| !is_bootstrap_no_verify_option(option))
 }
 
 /// Does bootstrap still owe this invocation its default off-switch?
 ///
 /// FAIL-CLOSED, and deliberately not coupled to the self-proof refusal. Only
-/// the EXACT off-switch already being present suppresses the default; every
+/// the EXACT off-switch already being present — the same name+value identity
+/// the driver resolves, so either `-`/`_` spelling — suppresses the default;
+/// every
 /// other verifier control leaves the default in place, so the composed rustflags
 /// still end in `-Ztrust-verify=off` (last value wins) and the unit still has an
 /// off-switch.
@@ -217,7 +234,7 @@ fn bootstrap_disables_default_trust_verification(
     build_compiler_stage != 0
         && !trust_verifier_controls(rustflags)
             .iter()
-            .any(|option| *option == TRUST_BOOTSTRAP_NO_VERIFY_OPTION)
+            .any(|option| is_bootstrap_no_verify_option(option))
 }
 
 pub(super) const TRUST_BOOTSTRAP_NO_VERIFY_FLAG: &str = "-Ztrust-verify=off";

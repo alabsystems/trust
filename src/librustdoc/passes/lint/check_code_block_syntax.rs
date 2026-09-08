@@ -45,13 +45,19 @@ fn check_rust_syntax(
         fn into_diag(self, dcx: DiagCtxtHandle<'a>, level: Level) -> Diag<'a, ()> {
             let Self { buffer, code_block, span, is_precise_span } = self;
 
+            // Trust: the LANGUAGE of a doc code block is Rust (the tool is Trust). The
+            // initial-commit rebrand renamed it to "Trust code" here alone — the lint keeps
+            // its upstream name `invalid_rust_codeblocks`, src/doc/rustdoc/src/lints.md still
+            // documents "Rust code", and every other diagnostic in the tree calls the language
+            // Rust. Upstream wording restored 2026-08-29 (rustdoc-ui vanilla triage); only the
+            // tool name in `BufferEmitter` below is a rebrand, and that one is ledgered.
             let mut lint = Diag::new(
                 dcx,
                 level,
                 if buffer.has_errors {
-                    "could not parse code block as Trust code"
+                    "could not parse code block as Rust code"
                 } else {
-                    "Trust code block is empty"
+                    "Rust code block is empty"
                 },
             );
 
@@ -59,10 +65,10 @@ fn check_rust_syntax(
             let is_ignore = code_block.lang_string.ignore != markdown::Ignore::None;
 
             let explanation = if is_ignore {
-                "`ignore` code blocks require valid Trust code for syntax highlighting; \
-                 mark blocks that do not contain Trust code as text"
+                "`ignore` code blocks require valid Rust code for syntax highlighting; \
+                 mark blocks that do not contain Rust code as text"
             } else {
-                "mark blocks that do not contain Trust code as text"
+                "mark blocks that do not contain Rust code as text"
             };
 
             if is_precise_span {
@@ -174,6 +180,8 @@ impl Emitter for BufferEmitter {
 
         let translated_main_message = format_diag_message(&diag.messages[0].0, &diag.args);
 
+        // Trust: tool-name rebrand (rustc -> trustc), kept deliberately; ledgered per test in
+        // tests/upstream-rust/patches.toml (trust.divergence.rustdoc-codeblock-note-tool-name.*).
         buffer.messages.push(format!("error from trustc: {translated_main_message}"));
         if diag.is_error() {
             buffer.has_errors = true;

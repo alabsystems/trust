@@ -99,9 +99,8 @@ fn mut_ref_base_declines() {
 }
 
 /// A RESEATED base param (`ps = other;` between the reads) must emit NOTHING:
-/// the two reads may see two DIFFERENT arrays. This is the hole neither
-/// `whole_local_def_count` (param entry def invisible) nor
-/// `is_single_static_assignment` (a once-reassigned param counts 1) catches.
+/// the two reads may see two DIFFERENT arrays. `root_is_never_reseated` is what
+/// rejects it — a parameter with ANY body definition, in any position, is out.
 #[test]
 fn reseated_param_base_declines() {
     let mut func = two_read_func();

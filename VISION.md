@@ -17,7 +17,9 @@ actually got. Where the two differ, the difference is stated.
   superiority over Rust is unclaimed unless a fresh exact-commit domination
   report passes. Evidence ledger: `docs/DAILY_DRIVER_LAUNCH.md`; the measured
   answer to "usable yet / publishable yet", with the command behind each claim,
-  is the internal `READINESS.md`.
+  is the internal `READINESS.md`. The active conjunctive completion target —
+  including what 100% means for lowering, proofs, mixed-language linking, and
+  Trust-IR codegen — is `docs/TWO_LANGUAGE_100_PERCENT_GOAL.md`.
 
 ## Thesis
 
@@ -72,9 +74,11 @@ feature:
   still trust an engine and its bounds — that residual trust is exactly what
   those grade names disclose, and why none of them licenses UB-check elision.
 - **Engines are invisible.** ay, trust-wp, trust-mc, trust-vc, ty, clean-auto sit
-  behind `trust-router`. Users pick properties, not provers. Each engine's native
-  format — SMT-LIB, TLA+, VNN-LIB, RustHorn prophecy, Alethe/LRAT — is
-  engine-internal and never a user surface.
+  behind `trust-router`. Users pick properties, not provers. SMT-LIB, VNN-LIB,
+  RustHorn prophecy, Alethe/LRAT, and backend-native TLA+ remain engine-internal.
+  The separately supported TLA+-shaped compatibility input is a zero-authority
+  elaboration into canonical Lean temporal propositions; it is not a way to
+  select or trust the `ty` engine.
 
 Rust and Lean are the only **authoritative** languages for program objects,
 specifications, and proofs. TrustJS, TrustPy, and TrustZig admit

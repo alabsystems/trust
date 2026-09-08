@@ -256,6 +256,78 @@ pub fn canonicalize_trust_verify_on(args: &mut Vec<OsString>) {
     args.insert(option_boundary, OsString::from("-Ztrust-verify=on"));
 }
 
+/// A verifier control the per-unit `library/` lane must never carry: everything
+/// in the `-Ztrust-*` verifier surface EXCEPT the plain on/off switch, which
+/// [`canonicalize_trust_verify_on`] owns. Name-matched after `_` -> `-`
+/// normalization, exactly like the driver resolves `-Z` options.
+fn is_trust_verifier_scope_or_identity_option(option: &OsStr) -> bool {
+    option.to_str().is_some_and(|option| {
+        let name = option.split_once('=').map_or(option, |(name, _)| name).replace('_', "-");
+        name == "trust-policy" || name.starts_with("trust-verify-")
+    })
+}
+
+/// Refuse any verifier control besides the plain on/off switch on a unit the
+/// per-unit `library/` opt-in authorized. `None` means the argv is clean.
+///
+/// WHY, because this is the lane's SEPARATE NAME made checkable: the opt-in is
+/// the one bootstrap-driven path where the verifier runs, and it runs
+/// UNAUTHENTICATED and UNSCOPED — `-Ztrust-verify=on` with no proof-session
+/// identity. Every other verifier control is one of:
+///
+///  * an authenticated proof-session identity — `-Ztrust-verify-session`,
+///    whose PRESENCE the driver reads as "requests authenticated verification
+///    coverage" (`rustc_driver_impl/src/lib.rs`) and whose value the
+///    self-verify harness mints as `self-verify-<nonce>`
+///    (`targo-trust/src/self_verify_cli.rs`), plus the Targo-reserved metadata
+///    that requires it (`-Ztrust-verify-package-name`,
+///    `-Ztrust-verify-crate-role`);
+///  * a policy or scope control — `-Ztrust-policy=advisory` alone would
+///    silently change what this lane's green MEANS while every banner still
+///    reads full verification.
+///
+/// A library unit carrying the former would masquerade as the authenticated
+/// self-verify lane — the exact confusion the separately-named lane exists to
+/// prevent — and one carrying the latter would verify at a weaker policy than
+/// it reports. Bootstrap's rustflags refusal
+/// (`core/builder/cargo.rs::refuse_bootstrap_verification_request`) already
+/// aborts these invocation-wide; this is the per-unit half, at the one boundary
+/// that sees the FINAL argv, so no other flag source can smuggle one in.
+/// Refused, not stripped: a control that is silently discarded is
+/// indistinguishable from one that worked.
+pub fn trust_bootstrap_verify_unit_argv_refusal(args: &[OsString]) -> Option<String> {
+    let mut iter = args.iter().take_while(|arg| *arg != "--").peekable();
+    while let Some(arg) = iter.next() {
+        let option = if arg == "-Z" {
+            iter.peek().map(|option| option.as_os_str())
+        } else {
+            arg.to_str()
+                .and_then(|arg| arg.strip_prefix("-Z"))
+                .filter(|option| !option.is_empty())
+                .map(OsStr::new)
+        };
+        if let Some(option) = option
+            && is_trust_verifier_scope_or_identity_option(option)
+        {
+            return Some(format!(
+                "trust: the per-unit library verification lane refuses the verifier control \
+                 `-Z{}` on this unit. The lane compiles a `library/` unit with exactly \
+                 `-Ztrust-verify=on` and nothing else from the verifier surface: it is \
+                 unauthenticated and unscoped, so a proof-session identity \
+                 (`trust-verify-session`, `trust-verify-package-name`, \
+                 `trust-verify-crate-role`) would masquerade as the authenticated \
+                 self-verify lane, and a policy control (`trust-policy`) would silently \
+                 change what this lane's green means. Options: drop the flag; unset \
+                 TRUST_BOOTSTRAP_VERIFY_LIBRARY so the unit keeps the default \
+                 `-Ztrust-verify=off`; or use the authenticated lanes that own these \
+                 controls (`targo trust check|build`, scripts/stage2_verify_self_build.sh).",
+                option.to_string_lossy()
+            ));
+        }
+    }
+    None
+}
+
 /// Enforce Trust's verification switch at the final driver boundary. An
 /// unsupported driver sees no spelling of the Trust-only option. A supported
 /// real compile for which bootstrap requested isolation sees exactly one

@@ -357,7 +357,7 @@ pub(super) fn build_semantic_guard_map_impl(
     let mut visited = vec![NOT_VISITED; func.body.blocks.len()];
     // Statement-granular version oracle, built once: used to version each threaded
     // block-def at its establish point (replacing the deref-store-havoc kill).
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     // BFS: (block_id, accumulated_path_assumptions)
     let mut queue: VecDeque<(BlockId, Vec<Formula>)> = VecDeque::new();
     queue.push_back((BlockId(0), Vec::new()));
@@ -716,28 +716,59 @@ pub(super) fn build_semantic_guard_map_impl(
             // never implied — the sound polarity for the "SAT iff violation"
             // convention (design 2026-06-25 §2/§4).
             //
-            // SOUNDNESS gates: (1) `summary.proved` — an unproved/speculative
-            // contract is never assumed; (2) `is_single_static_assignment(dest)` +
-            // empty projections — the same gate the min/max facts use, so a
-            // `&mut`-reassigned dest cannot leave a stale bound; (3) arity match —
-            // otherwise the formal->arg rebinding would be ill-formed.
+            // SOUNDNESS gates — the list lives in
+            // `callee_postcondition_is_injectable`, which is the authority; this
+            // is its index, corrected 2026-08-31 after it named a gate that does
+            // not exist. `summary.proved` is NOT one of them: it is read by no
+            // production code on this path (only `postconditions_are_definitional`,
+            // via `has_reusable_postcondition_evidence`, which is strictly
+            // stronger — a `proved` dyn or sealed-contract summary still injects
+            // nothing). The seven are (1) the definitional/reusable evidence bit;
+            // (2) empty `dest` projections; (3) arity match — otherwise the
+            // formal->arg rebinding would be ill-formed; (4)
+            // `local_defs::dest_fact_is_version_pinnable(dest)` — NOT the gate the
+            // min/max facts use, and it stopped being that on 2026-08-31. Those
+            // facts are keyed on the dest's BARE name and need
+            // `is_single_static_assignment`, which a PARAMETER's entry definition
+            // refutes; this lane pins its clause to `{dest}#s{b}_t` just below and
+            // needs only that this call be the dest's one whole write. Both refuse a
+            // `&mut`-reassigned dest, so neither can leave a stale bound; (5) the
+            // shared guard-ride predicate for a PRECONDITIONED summary; (6) at
+            // least one clause machine-arithmetic-free and rebindable; and (7) the
+            // TIME AXIS — no argument of this call may render to the dest's name,
+            // or the retiming below reads it at the wrong time
+            // (`terminator_args_read_name`).
+            //
+            // What is NOT a gate, and is the thing to look at first when a wrong
+            // clause is suspected: the callee's IDENTITY. `summaries.get(callee)`
+            // is a string lookup, `modular::FunctionSummary` carries no def-path
+            // and no `CalleeIdentity`, and the `..` in the pattern above discards
+            // the un-forgeable one the terminator does carry. The whole defence is
+            // in the PRODUCER (`trust_verify.rs`'s `identity:name-collision`
+            // DefId prescan and the `identity:generic` instantiation conjunct);
+            // see `generate/summary_key_collision_tests.rs` for what that means
+            // here.
             if let Some(summaries) = summaries
                 && let Some(summary) = summaries.get(callee)
-                && callee_postcondition_is_injectable(func, dest, summary, args.len())
+                && callee_postcondition_is_injectable(func, dest, summary, args)
             {
                 for post in rebind_callee_postconditions(func, args, dest, summary) {
                     term_facts.push(post);
                 }
             }
 
+            // `version_terminator_dest_fact` answers `None` — no fact at all —
+            // when this call's own ARGUMENTS read the destination's name, the one
+            // shape whose blanket post-call retiming would turn a pre-call read
+            // into a post-call one. Fail closed for the WHOLE batch: every
+            // producer above pins the dest against the arguments, so they share
+            // one precondition (see `terminator_args_read_name`).
             for f in term_facts {
-                next_guards.push(version_terminator_dest_fact(
-                    &sv,
-                    func,
-                    block,
-                    &term_dest_name,
-                    f,
-                ));
+                if let Some(versioned) =
+                    version_terminator_dest_fact(&sv, func, block, &term_dest_name, f)
+                {
+                    next_guards.push(versioned);
+                }
             }
 
             // Trust (derived trivial-setter summary): a recognized trivial-setter

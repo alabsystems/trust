@@ -881,7 +881,21 @@ fn test_stage2_fn_def_mismatched_signature_reification_fails_closed() {
 }
 
 #[test]
-fn test_stage2_unsupported_pointer_to_int_cast_does_not_inject_identity_definition() {
+fn test_stage2_pointer_to_int_cast_is_the_alloc_model_expose_identity() {
+    // Trust (verified-sysroot §5 step 3, slice 1). HISTORY, kept because this
+    // test used to assert the OPPOSITE: until step 3 the pointer's `Sort::Int`
+    // model value carried NO committed interpretation, so equating `addr` with
+    // `src` would have related a runtime address to an uninterpreted integer —
+    // and this test ("...does_not_inject_identity_definition") rightly pinned
+    // the cast dest as UNCONSTRAINED. `trust_types::alloc_model` now COMMITS
+    // the interpretation (a thin pointer's model value IS `base(A) + offset`,
+    // i.e. its address), under which the expose cast `src as usize` is value-
+    // preserving and `addr == src` is a theorem of the model, not an injected
+    // assumption. The soundness guard this test protected is preserved and
+    // still asserted below: the derived null-check OBLIGATION must survive —
+    // the identity may connect `addr` to `src`, but nothing may prove
+    // `addr != 0` at generation time (an unconstrained `src` still refutes it
+    // at `src == 0`; only a real caller-side nonnull fact can discharge it).
     let src_ptr_ty = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
     let func = make_func(
         "stage2_pointer_to_int_cast",
@@ -914,7 +928,9 @@ fn test_stage2_unsupported_pointer_to_int_cast_does_not_inject_identity_definiti
                     unwind: trust_types::UnwindEdge::Unreachable,
                     cond: Operand::Copy(Place::local(3)),
                     expected: false,
-                    msg: AssertMessage::Custom("ptr-to-int cast has no identity semantics".into()),
+                    msg: AssertMessage::Custom(
+                        "null-check obligation must survive the expose identity".into(),
+                    ),
                     target: BlockId(1),
                     span: SourceSpan::default(),
                 },
@@ -925,8 +941,7 @@ fn test_stage2_unsupported_pointer_to_int_cast_does_not_inject_identity_definiti
     );
 
     let vcs = generate_vcs(&func);
-    // ptr-to-int casts are now ACCEPTED (no UnsupportedMir cast VC). Exposing a pointer's
-    // address yields an arbitrary integer; we do not refuse the cast.
+    // ptr-to-int casts are ACCEPTED (no UnsupportedMir cast VC) — unchanged.
     assert!(
         !vcs.iter().any(|vc| matches!(
             &vc.kind,
@@ -934,12 +949,12 @@ fn test_stage2_unsupported_pointer_to_int_cast_does_not_inject_identity_definiti
         )),
         "ptr-to-int casts are accepted, not refused as UnsupportedMir: {vcs:#?}"
     );
-    // The soundness guard that gives this test its name still holds: accepting the cast must
-    // leave the dest UNCONSTRAINED -- it must NOT inject an identity `addr == src` definition
-    // (that would let `addr` be reasoned about as the pointer's provenance and could falsely
-    // discharge the derived null check).
+    // Step-3 capability: the expose cast IS the identity over the pointer's
+    // model value. FALSIFYING — red if the cast regresses to an unconstrained
+    // fresh dest (the pre-step-3 model), which would make every
+    // `precondition_check`-shaped address obligation unstatable again.
     assert!(
-        !vcs.iter().any(|vc| {
+        vcs.iter().any(|vc| {
             formula_contains(&vc.formula, &|f| {
                 matches!(
                     f,
@@ -949,7 +964,18 @@ fn test_stage2_unsupported_pointer_to_int_cast_does_not_inject_identity_definiti
                 )
             })
         }),
-        "ptr-to-int casts must not inject addr == src: {vcs:#?}"
+        "the expose cast must state `addr == src` (alloc_model identity): {vcs:#?}"
+    );
+    // Soundness half, PRESERVED from this test's previous life: the derived
+    // null-check obligation must still EXIST — the identity connects terms, it
+    // must never swallow or generation-time-discharge the assertion itself.
+    assert!(
+        vcs.iter().any(|vc| matches!(
+            &vc.kind,
+            VcKind::Assertion { message }
+                if message.contains("null-check obligation must survive")
+        )),
+        "the derived null-check obligation must survive the expose identity: {vcs:#?}"
     );
 }
 

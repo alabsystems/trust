@@ -2227,7 +2227,7 @@ fn apply_crate_memory_coordination(
                 resolved_target_dir,
                 inherited_token.as_deref(),
                 true,
-                |_| true,
+                |_| Ok::<(), std::convert::Infallible>(()),
             );
         }
         if trustd_disabled() {
@@ -2254,7 +2254,7 @@ fn apply_crate_memory_coordination(
             resolved_target_dir,
             inherited_token.as_deref(),
             false,
-            |_| false,
+            |_| Err::<(), _>("trustd is unavailable on non-Unix"),
         )
     }
 }
@@ -2287,7 +2287,7 @@ pub(super) fn with_test_memory_coordinator_ready<T>(body: impl FnOnce() -> T) ->
     })
 }
 
-fn apply_crate_memory_coordination_with<F>(
+fn apply_crate_memory_coordination_with<F, E>(
     cmd: &mut Command,
     _args: &[String],
     _resolved_target_dir: Option<&Path>,
@@ -2296,7 +2296,8 @@ fn apply_crate_memory_coordination_with<F>(
     ensure_daemon: F,
 ) -> Result<(), String>
 where
-    F: FnOnce(&Path) -> bool,
+    F: FnOnce(&Path) -> Result<(), E>,
+    E: std::fmt::Display,
 {
     cmd.env_remove(TRUST_MEMORY_JOBSERVER_SOCK_ENV);
     cmd.env_remove(TRUST_MEMORY_JOBSERVER_ENV);
@@ -2314,10 +2315,10 @@ where
             ));
         }
         let socket_path = memory_jobserver_socket_path()?;
-        if !ensure_daemon(&socket_path) {
+        if let Err(provision_error) = ensure_daemon(&socket_path) {
             let recovery_trustd = recovery_trustd_for_selected_targo(cmd.get_program())?;
             return Err(format!(
-                "could not establish the selected same-sysroot trustd memory authority at {}; refusing to launch a split-authority Cargo fan-out. Confirm the sibling trustd at `{}` is installed/executable and stop any incompatible live daemon. If the prior trustd exited uncleanly, first establish that every solver it admitted is gone, then invoke the absolute executable `{}` with arguments `--recover-after-crash --confirm-no-solvers --socket {}` and retry. This absolute sibling path avoids ambient PATH selection; path derivation alone does not prove distribution provenance, packaged byte identity, or execution identity",
+                "could not establish the selected same-sysroot trustd memory authority at {}: {provision_error}; refusing to launch a split-authority Cargo fan-out. Confirm the sibling trustd at `{}` is installed/executable and stop any incompatible live daemon. If the prior trustd exited uncleanly, first establish that every solver it admitted is gone, then invoke the absolute executable `{}` with arguments `--recover-after-crash --confirm-no-solvers --socket {}` and retry. This absolute sibling path avoids ambient PATH selection; path derivation alone does not prove distribution provenance, packaged byte identity, or execution identity",
                 socket_path.display(),
                 recovery_trustd.display(),
                 recovery_trustd.display(),
@@ -5395,11 +5396,17 @@ mod selection_and_control_tests {
         let mut command = std::process::Command::new("unused");
         command.env(TRUST_MEMORY_JOBSERVER_SOCK_ENV, "/tmp/attacker.sock");
         command.env(TRUST_MEMORY_JOBSERVER_ENV, "/tmp/attacker.tokens");
-        let error =
-            apply_crate_memory_coordination_with(&mut command, &args, None, None, false, |_| {
+        let error = apply_crate_memory_coordination_with(
+            &mut command,
+            &args,
+            None,
+            None,
+            false,
+            |_| -> Result<(), &'static str> {
                 panic!("disabled lane must not probe or start a daemon")
-            })
-            .expect_err("Unix file-only mode must fail closed");
+            },
+        )
+        .expect_err("Unix file-only mode must fail closed");
 
         let envs = command.get_envs().collect::<Vec<_>>();
         assert!(envs.iter().any(|(name, value)| {
@@ -5437,7 +5444,11 @@ mod selection_and_control_tests {
             Some(&target),
             Some(std::ffi::OsStr::new("/tmp/inherited.tokens")),
             true,
-            |socket| socket == expected,
+            |socket| {
+                (socket == expected)
+                    .then_some(())
+                    .ok_or("coordinator selected an unexpected socket")
+            },
         )
         .expect("exact daemon is ready");
         assert!(command.get_envs().any(|(name, value)| {
@@ -5463,7 +5474,11 @@ mod selection_and_control_tests {
             Some(&other_target),
             None,
             true,
-            |socket| socket == expected,
+            |socket| {
+                (socket == expected)
+                    .then_some(())
+                    .ok_or("coordinator selected an unexpected socket")
+            },
         )
         .expect("independent target reuses exact host daemon");
         assert!(other_command.get_envs().any(|(name, value)| {
@@ -5494,11 +5509,15 @@ mod selection_and_control_tests {
             None,
             Some(std::ffi::OsStr::new("/tmp/inherited.tokens")),
             true,
-            |_| false,
+            |_| Err("injected startup sentinel"),
         )
         .expect_err("identity/start failure must block Cargo launch");
 
         assert!(error.contains("refusing to launch a split-authority Cargo fan-out"));
+        assert!(
+            error.contains("injected startup sentinel"),
+            "the exact startup cause must survive the Targo boundary: {error}"
+        );
         assert!(
             error.contains(
                 "executable `/validated/toolchain/bin/trustd` with arguments `--recover-after-crash --confirm-no-solvers"
@@ -5529,11 +5548,15 @@ mod selection_and_control_tests {
         let mut command = std::process::Command::new("unused");
         command.env(TRUST_MEMORY_JOBSERVER_ENV, "inherited.tokens");
         command.env(TRUST_MEMORY_JOBSERVER_SOCK_ENV, "inherited.sock");
-        let error =
-            apply_crate_memory_coordination_with(&mut command, &args, None, None, false, |_| {
-                panic!("non-Unix has no daemon transport")
-            })
-            .expect_err("non-Unix must fail before uncoordinated worker fan-out");
+        let error = apply_crate_memory_coordination_with(
+            &mut command,
+            &args,
+            None,
+            None,
+            false,
+            |_| -> Result<(), &'static str> { panic!("non-Unix has no daemon transport") },
+        )
+        .expect_err("non-Unix must fail before uncoordinated worker fan-out");
         assert!(error.contains("unsupported"));
         for authority in [TRUST_MEMORY_JOBSERVER_ENV, TRUST_MEMORY_JOBSERVER_SOCK_ENV] {
             assert!(command.get_envs().any(|(name, value)| {

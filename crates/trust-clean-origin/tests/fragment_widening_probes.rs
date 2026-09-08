@@ -124,7 +124,8 @@ use trust_clean_origin::{
 };
 use trust_spec_elab::{Domain, MachineUIntWidth};
 use trust_types::admissible_body::{
-    AdmissibleBody, ArithBinOp, ArithExpr, ArithOperand, RawBinOpKind, recognize_admissible_body,
+    AdmissibleBody, ArithBinOp, ArithExpr, ArithOperand, CmpOperand, RawBinOpKind, SelectCmp,
+    recognize_admissible_body,
 };
 use trust_types::{
     BasicBlock, BinOp, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
@@ -1184,6 +1185,23 @@ fn probe_f_nested_arithmetic_admits() {
 /// exists to block.
 #[test]
 fn probe_f2_composed_depth_cap_measured() {
+    // MEASURED (2026-09-01): the cap-depth walk overflows the 2 MiB
+    // default test-thread stack at this tree and completes on 16 MiB; the
+    // cap SEMANTICS are unchanged (32 admits, 33 refuses, mutation at depth
+    // caught). The probe measures the capability boundary, not the stack
+    // budget, so it runs on an explicit stack. If 16 MiB ever overflows
+    // again, treat that as a frame-weight regression to investigate, not a
+    // number to raise.
+    std::thread::Builder::new()
+        .name("probe_f2_composed_depth_cap_measured".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(probe_f2_composed_depth_cap_measured_body)
+        .expect("spawn the measured-stack probe thread")
+        .join()
+        .expect("the probe body panicked");
+}
+
+fn probe_f2_composed_depth_cap_measured_body() {
     let mut env = env_uint();
     // fun a => ((((a + 1) + 1) …) + 1), `ops` ops, carrier spelling.
     let carrier_chain = |ops: usize| {
@@ -1263,20 +1281,30 @@ fn probe_f2_composed_depth_cap_measured() {
 
 // ═════════════════════════ (f) comparison to Bool ═════════════════════════
 
-/// `def lt (a b : UInt64) : Bool := a < b` — NEITHER side-B producer exists:
-/// the recognizer has no Bool-comparison shape (an `Rvalue::BinaryOp` body
-/// matches nothing), and `admit_expr_function` rejects `<` in term position.
-/// This is a "no reflection path" finding, categorically different from a
-/// kernel refusal: there is nothing to put to the kernel yet.
+/// `def lt (a b : UInt64) : Bool := a < b` — the Bool-comparison shape HAS
+/// landed on the recognizer side (the E6 per-field campaign's
+/// `ComparisonBool`), so this probe now measures the landed verdicts, as its
+/// pre-landing text prescribed. What landed and what did not: recognition is
+/// the E6 kernel-import direction's food (`trust_certify::clean_island`
+/// consumes it, measured in that crate's suite); THIS crate's frozen-producer
+/// table still has NO row for it and fails closed with the named RowMiss
+/// (`reflect::producer_call_for`, pinned by the exhaustive vocabulary matches
+/// in `control_12`/`landing3`); and `admit_expr_function` still rejects `<`
+/// in term position — the term-fragment boundary is unmoved.
 #[test]
 fn probe_g_bool_comparison_has_no_reflection_path() {
-    // Half 1: the body a comparison emitter would produce is NOT recognized.
+    // Half 1: the body a comparison emitter would produce IS recognized, as
+    // exactly the landed shape — cmp and operands read faithfully.
     assert_eq!(
         recognize_admissible_body(&emitted_lt_bool()),
-        None,
-        "no AdmissibleBody variant covers `_0 = Lt(_1, _2)`; if this ever recognizes, \
-         a Bool-comparison shape has landed and this probe must be rewritten to \
-         measure its kernel verdict"
+        Some(AdmissibleBody::ComparisonBool {
+            cmp: SelectCmp::Lt,
+            left: CmpOperand::Param(0),
+            right: CmpOperand::Param(1),
+        }),
+        "`_0 = Lt(_1, _2)` is the ComparisonBool shape; if this stops recognizing, \
+         the E6 comparison lane has regressed — if it recognizes DIFFERENTLY, the \
+         reading itself has drifted"
     );
 
     // Half 2: the expr reflection refuses `<` in term position — over the
@@ -1301,8 +1329,9 @@ fn probe_g_bool_comparison_has_no_reflection_path() {
     // stated), and admit_select_function returns a PARAMETER, never the
     // comparison itself. No admit_* function can mint this side B today.
     eprintln!(
-        "PROBE-ROW | a < b : Bool              | side B: NO (no recognizer arm, no \
-         admit path) | kernel: unreachable"
+        "PROBE-ROW | a < b : Bool              | side A: RECOGNIZED (ComparisonBool) | \
+         side B here: NO (frozen-producer RowMiss, term fragment refuses `<`); the \
+         admitting direction is trust-certify's"
     );
 }
 

@@ -25,6 +25,7 @@ Design rules this file obeys:
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import hashlib
 import json
@@ -200,6 +201,10 @@ def run(cmd: list[str], cwd: Path | None = None, timeout: int = 60) -> tuple[int
 _TOML_CACHE: dict[str, tuple] = {}
 
 
+class BootstrapConfigError(Exception):
+    """The effective bootstrap configuration could not be resolved exactly."""
+
+
 def load_toml(path: Path):
     """Parse a TOML file, memoized for the lifetime of the run.
 
@@ -220,6 +225,173 @@ def load_toml(path: Path):
         res = (None, f"{type(e).__name__}: {e}")
     _TOML_CACHE[key] = res
     return res
+
+
+def _merge_missing(current: dict, fallback: dict) -> None:
+    """Merge `fallback` as bootstrap's `IgnoreDuplicate` merge does."""
+    for key, value in fallback.items():
+        if key not in current:
+            current[key] = copy.deepcopy(value)
+        elif isinstance(current[key], dict) and isinstance(value, dict):
+            _merge_missing(current[key], value)
+
+
+def _merge_override(current: dict, override: dict) -> None:
+    """Merge `override` as bootstrap's final `--set` merge does."""
+    for key, value in override.items():
+        if isinstance(current.get(key), dict) and isinstance(value, dict):
+            _merge_override(current[key], value)
+        else:
+            current[key] = copy.deepcopy(value)
+
+
+def _merge_unique(current: dict, addition: dict, prefix: str = "") -> None:
+    """Collect repeated `--set`s while rejecting duplicate leaf settings."""
+    for key, value in addition.items():
+        dotted = f"{prefix}.{key}" if prefix else key
+        if key not in current:
+            current[key] = copy.deepcopy(value)
+        elif isinstance(current[key], dict) and isinstance(value, dict):
+            _merge_unique(current[key], value, dotted)
+        else:
+            raise BootstrapConfigError(f"duplicate --set value for {dotted}")
+
+
+def _read_bootstrap_toml(path: Path) -> dict:
+    cfg, err = load_toml(path)
+    if err:
+        raise BootstrapConfigError(f"cannot read {path}: {err}")
+    if not isinstance(cfg, dict):
+        raise BootstrapConfigError(f"{path} does not contain a TOML table")
+    return copy.deepcopy(cfg)
+
+
+def _canonical_bootstrap_path(path: Path) -> Path:
+    """Canonicalize a config path exactly where bootstrap does."""
+    try:
+        return path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise BootstrapConfigError(f"cannot canonicalize {path}: {error}") from error
+
+
+def _with_includes(
+    cfg: dict,
+    cfg_path: Path,
+    stack: tuple[Path, ...],
+    *,
+    canonicalize_children: bool,
+) -> dict:
+    """Apply includes with bootstrap's top-level/recursive path asymmetry."""
+    includes = cfg.get("include", [])
+    if not isinstance(includes, list) or not all(isinstance(path, str) for path in includes):
+        raise BootstrapConfigError(f"{cfg_path}: `include` must be a list of paths")
+
+    effective = copy.deepcopy(cfg)
+    for include in reversed(includes):
+        include_path = Path(include)
+        if not include_path.is_absolute():
+            include_path = cfg_path.parent / include_path
+        child_stack = stack
+        if canonicalize_children:
+            include_path = _canonical_bootstrap_path(include_path)
+            if include_path in stack:
+                chain = " -> ".join(str(path) for path in (*stack, include_path))
+                raise BootstrapConfigError(f"cyclic bootstrap include: {chain}")
+            child_stack = (*stack, include_path)
+        included = _with_includes(
+            _read_bootstrap_toml(include_path),
+            include_path,
+            child_stack,
+            canonicalize_children=True,
+        )
+        _merge_missing(effective, included)
+    return effective
+
+
+def _parse_bootstrap_set(option: str) -> dict:
+    try:
+        value = tomllib.loads(option)
+    except Exception as first_error:
+        if "=" in option:
+            key, raw = option.split("=", 1)
+            if '"' not in raw:
+                try:
+                    value = tomllib.loads(f'{key}="{raw}"')
+                except Exception:
+                    raise BootstrapConfigError(
+                        f"failed to parse --set {option!r}: {first_error}"
+                    ) from first_error
+            else:
+                raise BootstrapConfigError(
+                    f"failed to parse --set {option!r}: {first_error}"
+                ) from first_error
+        else:
+            raise BootstrapConfigError(
+                f"failed to parse --set {option!r}: {first_error}"
+            ) from first_error
+    if not isinstance(value, dict):
+        raise BootstrapConfigError(f"--set {option!r} does not describe a TOML setting")
+    return value
+
+
+def resolve_bootstrap_config(
+    root: Path,
+    explicit_path: str | None,
+    override_set: list[str],
+    invocation_cwd: Path,
+    environment: dict[str, str] | None = None,
+) -> tuple[dict, Path, str | None]:
+    """Resolve the config sources in the same precedence order as bootstrap."""
+    environment = os.environ if environment is None else environment
+    selected = explicit_path or environment.get("RUST_BOOTSTRAP_CONFIG")
+    required = selected is not None
+    if selected is not None:
+        cfg_path = Path(selected)
+        if not cfg_path.is_absolute():
+            cfg_path = invocation_cwd / cfg_path
+    else:
+        candidates = [
+            invocation_cwd / "bootstrap.toml",
+            root / "bootstrap.toml",
+            invocation_cwd / "config.toml",
+            root / "config.toml",
+        ]
+        cfg_path = next((path for path in candidates if path.exists()), candidates[1])
+
+    if not cfg_path.exists():
+        # Preserve preflight's existing fail-closed local-config requirement.
+        why = "explicit config file not found" if required else "file not found"
+        return {}, cfg_path, why
+
+    try:
+        cfg_path = _canonical_bootstrap_path(cfg_path)
+        effective = _with_includes(
+            _read_bootstrap_toml(cfg_path),
+            cfg_path,
+            (),
+            canonicalize_children=False,
+        )
+        profile = effective.get("profile")
+        if profile is not None:
+            if not isinstance(profile, str):
+                raise BootstrapConfigError("`profile` must be a string")
+            profile = {"user": "dist"}.get(profile, profile)
+            profile_path = root / "src" / "bootstrap" / "defaults" / f"bootstrap.{profile}.toml"
+            profile_cfg = _with_includes(
+                _read_bootstrap_toml(profile_path),
+                profile_path,
+                (),
+                canonicalize_children=False,
+            )
+            _merge_missing(effective, profile_cfg)
+
+        overrides: dict = {}
+        for option in override_set:
+            _merge_unique(overrides, _parse_bootstrap_set(option))
+        _merge_override(effective, overrides)
+    except BootstrapConfigError as error:
+        return {}, cfg_path, str(error)
+    return effective, cfg_path, None
 
 
 def sha256(path: Path) -> str:
@@ -2603,6 +2775,10 @@ def main() -> int:
     ap.add_argument("--repo-root", default=str(Path(__file__).resolve().parent.parent))
     ap.add_argument("--bootstrap-toml", default=None,
                     help="audit a candidate config instead of <repo>/bootstrap.toml")
+    ap.add_argument("--bootstrap-cwd", default=None,
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--set", dest="bootstrap_set", action="append", default=[],
+                    help="apply a bootstrap --set override before auditing")
     ap.add_argument("--deep", action="store_true",
                     help="also run the authoritative `targo metadata --locked` probe")
     ap.add_argument("--deep-if-cached", action="store_true",
@@ -2632,13 +2808,13 @@ def main() -> int:
     only = set(args.only.split(",")) if args.only else {"submodules", "lockfiles", "tools", "env"}
     checks_run: list[str] = []
 
-    cfg_path = Path(args.bootstrap_toml) if args.bootstrap_toml else root / "bootstrap.toml"
-    cfg, cfg_err = ({}, None)
-    if cfg_path.exists():
-        cfg, cfg_err = load_toml(cfg_path)
-        cfg = cfg or {}
-    else:
-        cfg_err = "file not found"
+    bootstrap_cwd = Path(args.bootstrap_cwd).resolve() if args.bootstrap_cwd else Path.cwd()
+    cfg, cfg_path, cfg_err = resolve_bootstrap_config(
+        root,
+        args.bootstrap_toml,
+        args.bootstrap_set,
+        bootstrap_cwd,
+    )
 
     facts = read_bootstrap_facts(root)
 

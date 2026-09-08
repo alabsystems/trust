@@ -16,7 +16,11 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TRUSTC="${TRUSTC:-$REPO_ROOT/build/aarch64-apple-darwin/stage2/bin/trustc}"
+# Trust: `build/host` symlinks to `build/<host-triple>`, so this resolves on every
+# platform. Naming `aarch64-apple-darwin` literally made this line dead on any
+# non-Apple host (measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
+# directory does not exist). The env/arg override above is unchanged.
+TRUSTC="${TRUSTC:-$REPO_ROOT/build/host/stage2/bin/trustc}"
 export LIBRARY_PATH="${LIBRARY_PATH:-/opt/homebrew/lib}"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 

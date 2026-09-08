@@ -66,6 +66,13 @@ INDIRECT: dict[str, str] = {
     # the real checker (not a synthetic copy) inside the corpus lane.
     # tests/e2e_certified_monitor_lock_source_gate.sh runs "$ROOT/scripts/...".
     "scripts/check_lockfile_no_git_sources.sh": "scripts/run_e2e_shell_corpus.sh",
+    # The shell is deliberately payload-only and rejects direct callers. The
+    # Rust-native release parent performs the controlled-Git authority checks,
+    # invokes this exact payload, reopens its sealed output, and alone publishes
+    # the native-authority receipt.
+    "scripts/stage2_certified_monitor_e2e.sh": (
+        "targo-trust trust release validate certified-monitors"
+    ),
     # --- classified 2026-08-26, from the catch-all sweep ---
     # compat_check.sh is a 35-line entry point whose last statement is
     # `exec "$PYTHON_BIN" ... compat_check.py`, so the shell row's exit status
@@ -101,6 +108,14 @@ INDIRECT: dict[str, str] = {
 # widening a glob past it would make it invisible again, which is the failure
 # this whole file exists to catch.
 MANUAL_ONLY: dict[str, str] = {
+    "scripts/refresh_two_language_claim_bases.py": (
+        "publication tool, not a check: --publish PUSHES a ledger child and its "
+        "claim mirrors, and the property a gate would assert (the ledger's active "
+        "bases are coherent) is already the fast.two-language-claim-ledger row. "
+        "Running it as a lane would make every push mutate shared coordination "
+        "refs; its own candidate is validated by that same checker before it "
+        "publishes anything"
+    ),
     "scripts/trust_dualoracle.sh": (
         "manual single-witness triage: takes <name> <lib.rs> <driver.rs> and "
         "classifies that one witness, so it carries no corpus a gate could run; "
@@ -290,6 +305,8 @@ TOOLING_ROLES: tuple[tuple[str, str], ...] = (
     ("scripts/__init__.py", "package marker"),
     ("scripts/harvest_mir_corpus.sh", "builds a measurement corpus; produces no verdict"),
     ("scripts/fetch-first-party.sh", "materializes sibling repos for a standalone clone; no verdict"),
+    ("scripts/promote-toolchain.sh", "seals and channel-flips a built stage2; mutating promotion, no verdict"),
+    ("scripts/trust_clean_corpus_scorecard.py", "measurement scorecard: writes JSON and prints a summary; no pass/fail"),
     ("scripts/harvest_mir_corpus_closed.sh", "corpus builder; produces no verdict"),
     ("scripts/trust_ir_b4_classifier.py", "takes a data_json argument; classifies a wave, judges nothing"),
     # --- classified 2026-08-26, from the catch-all sweep ---
@@ -330,7 +347,17 @@ TOOLING_ROLES: tuple[tuple[str, str], ...] = (
     ("scripts/trust_ir_flip_frontier.py", "analysis report; nonzero only on bad input, never a verdict"),
     ("scripts/trust_ir_marginal_conversion.py", "analysis report; nonzero only on bad input, never a verdict"),
     ("scripts/trust_ir_scc_populations.py", "analysis report; nonzero only on bad input, never a verdict"),
+    (
+        "scripts/trust_ir_scorecard_diff.py",
+        "A/B scorecard diagnostic; reports population deltas and vanished bodies "
+        "but defines no pass/fail acceptance threshold",
+    ),
     ("scripts/trust_upstream_test_inventory.py", "analysis report; nonzero only on bad input, never a verdict"),
+    (
+        "scripts/toolchain-provenance-probe.sh",
+        "manual post-hoc sealed-toolchain consistency report; prints classifications "
+        "but has no pass/fail exit contract or acceptance threshold",
+    ),
     # The rest, one role each.
     ("scripts/cutover_gate/gate_schema.py", "importable schema module; no entry point, cannot run"),
     ("scripts/generate_mir_fixtures.sh", "regenerates checked-in MIR fixtures; a generator, not a verdict"),
@@ -340,7 +367,10 @@ TOOLING_ROLES: tuple[tuple[str, str], ...] = (
 
 
 def _is_tooling(rel: str) -> bool:
-    return any(rel.startswith(prefix) for prefix, _reason in TOOLING_ROLES)
+    return any(
+        rel.startswith(pattern) if pattern.endswith(("/", "-")) else rel == pattern
+        for pattern, _reason in TOOLING_ROLES
+    )
 
 
 def _named_by(rel: str, commands: str) -> bool:
@@ -388,6 +418,49 @@ def check() -> tuple[list[str], list[str]]:
                         f"{gate_id}: last_green {last_green} is in the future; a gate "
                         "cannot have passed on a day that has not happened"
                     )
+
+    # This is the product-completion claim, not merely a script covered by the
+    # script-test aggregate. Keep its release invocation exact enough that a
+    # renamed profile, optional row, or omitted external trust root cannot make
+    # the production gate disappear while lane coverage stays green.
+    completion_rows = [
+        row for row in rows if len(row) == 6 and row[0] == "release.two-language-completion"
+    ]
+    if len(completion_rows) != 1:
+        errors.append(
+            "release.two-language-completion: must have exactly one manifest row"
+        )
+    else:
+        _gate_id, profiles, category, required, _last_green, command = completion_rows[0]
+        if profiles != "release":
+            errors.append(
+                "release.two-language-completion: profiles must be exactly `release`"
+            )
+        if category != "soundness":
+            errors.append(
+                "release.two-language-completion: category must be `soundness`"
+            )
+        if required != "true":
+            errors.append("release.two-language-completion: must be required")
+        expected_command = (
+            'TRUST_TOP_VERIFIER_PATH="${TRUST_TWO_LANGUAGE_TOP_VERIFIER:-'
+            '/etc/trust/two_language_completion_gate.py}" && '
+            'test -n "${TRUST_TWO_LANGUAGE_TOP_VERIFIER_SHA256:-}" && '
+            'TRUST_TOP_VERIFIER_ACTUAL="$(/usr/bin/shasum -a 256 '
+            '"$TRUST_TOP_VERIFIER_PATH")" && '
+            'test "${TRUST_TOP_VERIFIER_ACTUAL%% *}" = '
+            '"${TRUST_TWO_LANGUAGE_TOP_VERIFIER_SHA256}" && '
+            'python3 "$TRUST_TOP_VERIFIER_PATH" --candidate-verifier '
+            'scripts/two_language_completion_gate.py --receipt '
+            '"${TRUST_TWO_LANGUAGE_COMPLETION_RECEIPT:-build/two-language-completion/receipt.json}" '
+            '--root . --trusted-owner-key '
+            '"${TRUST_TWO_LANGUAGE_OWNER_KEY:-/etc/trust/two-language-owner.pub}"'
+        )
+        if command != expected_command:
+            errors.append(
+                "release.two-language-completion: command must be exactly the "
+                "externally pinned, owner-keyed production completion invocation"
+            )
 
     # scripts/hooks/pre-push derives its whole lane set from `--list push`, so an
     # empty push profile is a gate that reports GREEN having run nothing, and a

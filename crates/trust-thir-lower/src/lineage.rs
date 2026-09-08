@@ -65,12 +65,12 @@
 //! [`trust_ir::ProofDigest::sha256_domain`] hasher with this module's own domain, so a
 //! lineage digest can never be confused with a bare module digest.
 //!
-//! `DefId`/`CrateNum` raw indices still appear in the callee framing. They are stable
-//! within one compiler session (the only scope where registry/artifact/flip matching
-//! happens) and reproducible across identical clean builds (deterministic crate loading),
-//! which is the current acceptance scope for the ledger. They are NOT stable across
-//! compiler versions or changed dependency graphs; a future ledger-identity widening
-//! must therefore bump this domain again.
+//! Raw `DefId`/`CrateNum` indices still enter the framing because the flip consumes them,
+//! but they are never used as a callee identity. Concrete callees carry a
+//! [`ConcreteCalleeKey`] made from collision-checked [`DefinitionIdentity`] values and a
+//! typed, region-erased encoding of their normalized generic arguments. This distinction
+//! is load-bearing: raw indices are session-local reconstruction data; the concrete key is
+//! the cross-body declaration/interning identity.
 //!
 //! # Where the value surfaces
 //!
@@ -123,9 +123,10 @@ use trust_ir::{Module, ProofDigest};
 use crate::{CalleeRef, SiteArg, SiteConst, SiteTy, SiteValTree};
 
 /// Domain tag for the lineage digest. Versioned: any change to the framing below MUST
-/// bump the suffix so old and new digests can never collide silently. `v2` adds the
-/// body's `DefId` ahead of the module digest (see the module docs' measured collision).
-pub const BODY_LINEAGE_DOMAIN: &str = "trust_thir_lower.body_lineage.v2";
+/// bump the suffix so old and new digests can never collide silently. `v3` adds the
+/// stable concrete-callee key and replaces DefIndex-derived callee ids with body-local
+/// interned ids.
+pub const BODY_LINEAGE_DOMAIN: &str = "trust_thir_lower.body_lineage.v3";
 
 /// Collision-checked, cross-session identity of the definition whose body is
 /// being attested. The components are exactly rustc's `DefPathHash` halves.
@@ -147,9 +148,265 @@ impl DefinitionIdentity {
         }
     }
 
+    pub(crate) fn symbol_suffix(self) -> String {
+        format!("{:016x}{:016x}", self.stable_crate_id, self.local_hash)
+    }
+
     #[cfg(test)]
     pub(crate) const fn test_only(stable_crate_id: u64, local_hash: u64) -> Self {
         Self { stable_crate_id, local_hash }
+    }
+}
+
+/// The rustc instance category whose semantics a concrete callee key denotes.
+///
+/// `Item` and `ReifyShim` are deliberately distinct even when they forward to the same
+/// definition and carry equal args: taking the address of a reify shim is a different
+/// codegen object from calling the item directly. Every unsupported `InstanceKind` stays
+/// outside this enum and therefore cannot accidentally acquire a concrete key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConcreteInstanceKind {
+    Item,
+    ReifyShim,
+}
+
+/// Stable, typed generic-argument identity for one concrete rustc instance.
+///
+/// This intentionally does not reuse [`SiteArg`]. `SiteArg` is reconstruction data and
+/// therefore contains raw `DefId`s for ADTs; an inter-body declaration key must instead
+/// use collision-checked definition identities. Regions are absent/erased by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcreteInstanceArg {
+    ErasedRegion,
+    Ty(ConcreteInstanceTy),
+    Const(ConcreteInstanceConst),
+}
+
+/// Trust (wave-DY): the stable-identity mirror of `SiteExistentialPredicate`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcreteExistentialPredicate {
+    Trait(DefinitionIdentity, Vec<ConcreteInstanceArg>),
+    Projection(DefinitionIdentity, Vec<ConcreteInstanceArg>, Box<ConcreteTerm>),
+    AutoTrait(DefinitionIdentity),
+}
+
+/// Trust (wave-DY): the stable-identity mirror of `SiteTerm`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcreteTerm {
+    Ty(ConcreteInstanceTy),
+    Const(ConcreteInstanceConst),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcreteInstanceConst {
+    Value(ConcreteInstanceTy, ConcreteInstanceValTree),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcreteInstanceValTree {
+    Leaf(u128, u64),
+    Branch(Vec<ConcreteInstanceConst>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcreteInstanceTy {
+    Bool,
+    Char,
+    Str,
+    Int(rustc_middle::ty::IntTy),
+    Uint(rustc_middle::ty::UintTy),
+    Float(rustc_middle::ty::FloatTy),
+    /// Trust (wave-AA): args are POSITIONAL and kind-tagged, mirroring `SiteTy::Adt` — a
+    /// `Vec<ConcreteInstanceTy>` could not record that arg *k* was a lifetime or a const, and
+    /// two instances differing only there must not digest equal.
+    Adt(DefinitionIdentity, Vec<ConcreteInstanceArg>),
+    Tuple(Vec<ConcreteInstanceTy>),
+    Array(Box<ConcreteInstanceTy>, u64),
+    Slice(Box<ConcreteInstanceTy>),
+    Ref(Box<ConcreteInstanceTy>, rustc_middle::ty::Mutability),
+    /// Trust (wave-RP): the raw-pointer counterpart of [`ConcreteInstanceTy::Ref`]. A distinct
+    /// variant, never folded into `Ref`: `*const T` and `&T` are different types and two
+    /// instances differing only in that must not digest equal.
+    RawPtr(Box<ConcreteInstanceTy>, rustc_middle::ty::Mutability),
+    /// Trust (wave-FD): a fn ITEM — `DefinitionIdentity` + positional args, the `Adt` shape.
+    FnDef(DefinitionIdentity, Vec<ConcreteInstanceArg>),
+    /// Trust (wave-FP): a fn POINTER — binder-erased signature plus the header's observable
+    /// facts (see `SiteTy::FnPtr`). The header is part of the identity: two fn pointers that
+    /// differ only in ABI or safety are different types and must not digest equal.
+    /// Trust (wave-CL): a closure-family type — kind + identity + positional args.
+    ClosureLike(crate::SiteClosureKind, DefinitionIdentity, Vec<ConcreteInstanceArg>),
+    /// Trust (wave-DY): a trait object as its predicate list, region erased.
+    Dynamic(Vec<ConcreteExistentialPredicate>),
+    FnPtr {
+        inputs_and_output: Vec<ConcreteInstanceTy>,
+        abi: String,
+        safe: bool,
+        c_variadic: bool,
+        splatted: Option<u8>,
+    },
+}
+
+/// Collision-checked identity of one concrete callee instance.
+///
+/// Signatures and display names are facts checked against this key, never constituents of
+/// it. In particular, `pick::<1>` and `pick::<2>` remain different keys even when their
+/// lowered `FuncTy`s are byte-identical.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConcreteCalleeKey {
+    definition: DefinitionIdentity,
+    kind: ConcreteInstanceKind,
+    args: Vec<ConcreteInstanceArg>,
+}
+
+impl ConcreteCalleeKey {
+    /// Convert the already-normalized, region-erased reconstruction encoding into a stable
+    /// declaration key. The caller must pass args from the resolved rustc `Instance`, not
+    /// the raw MIR site spelling.
+    pub(crate) fn from_site_args(
+        tcx: TyCtxt<'_>,
+        def: DefId,
+        kind: ConcreteInstanceKind,
+        args: &[SiteArg],
+    ) -> Self {
+        Self {
+            definition: DefinitionIdentity::from_def_id(tcx, def),
+            kind,
+            args: args.iter().map(|arg| stable_arg(tcx, arg)).collect(),
+        }
+    }
+
+    /// An injective, canonical symbol suffix. This is the full typed key encoded as hex,
+    /// not a display path, `Debug` rendering, raw `DefId`, or truncated hash. Distinct keys
+    /// therefore cannot silently retain one display name when assembly must emit both.
+    pub(crate) fn symbol_suffix(&self) -> String {
+        let mut bytes = Vec::new();
+        encode_concrete_callee_key(&mut bytes, self);
+        let mut out = String::with_capacity(bytes.len() * 2);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    pub(crate) fn has_generic_args(&self) -> bool {
+        !self.args.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only(
+        definition: DefinitionIdentity,
+        kind: ConcreteInstanceKind,
+        args: Vec<ConcreteInstanceArg>,
+    ) -> Self {
+        Self {
+            definition,
+            kind,
+            args,
+        }
+    }
+}
+
+fn stable_arg(tcx: TyCtxt<'_>, arg: &SiteArg) -> ConcreteInstanceArg {
+    match arg {
+        SiteArg::ErasedRegion => ConcreteInstanceArg::ErasedRegion,
+        SiteArg::Ty(ty) => ConcreteInstanceArg::Ty(stable_ty(tcx, ty)),
+        SiteArg::Const(c) => ConcreteInstanceArg::Const(stable_const(tcx, c)),
+    }
+}
+
+fn stable_const(tcx: TyCtxt<'_>, c: &SiteConst) -> ConcreteInstanceConst {
+    let SiteConst::Value(ty, value) = c;
+    ConcreteInstanceConst::Value(stable_ty(tcx, ty), stable_valtree(tcx, value))
+}
+
+fn stable_valtree(tcx: TyCtxt<'_>, value: &SiteValTree) -> ConcreteInstanceValTree {
+    match value {
+        SiteValTree::Leaf(bits, size) => ConcreteInstanceValTree::Leaf(*bits, *size),
+        SiteValTree::Branch(values) => ConcreteInstanceValTree::Branch(
+            values
+                .iter()
+                .map(|value| stable_const(tcx, value))
+                .collect(),
+        ),
+    }
+}
+
+fn stable_ty(tcx: TyCtxt<'_>, ty: &SiteTy) -> ConcreteInstanceTy {
+    match ty {
+        SiteTy::Bool => ConcreteInstanceTy::Bool,
+        SiteTy::Char => ConcreteInstanceTy::Char,
+        SiteTy::Str => ConcreteInstanceTy::Str,
+        SiteTy::Int(value) => ConcreteInstanceTy::Int(*value),
+        SiteTy::Uint(value) => ConcreteInstanceTy::Uint(*value),
+        SiteTy::Float(value) => ConcreteInstanceTy::Float(*value),
+        SiteTy::Adt(def, args) => ConcreteInstanceTy::Adt(
+            DefinitionIdentity::from_def_id(tcx, *def),
+            args.iter().map(|arg| stable_arg(tcx, arg)).collect(),
+        ),
+        SiteTy::FnPtr { inputs_and_output, abi, safe, c_variadic, splatted } => {
+            ConcreteInstanceTy::FnPtr {
+                inputs_and_output: inputs_and_output
+                    .iter()
+                    .map(|t| stable_ty(tcx, t))
+                    .collect(),
+                abi: abi.clone(),
+                safe: *safe,
+                c_variadic: *c_variadic,
+                splatted: *splatted,
+            }
+        }
+        SiteTy::Dynamic(preds) => ConcreteInstanceTy::Dynamic(
+            preds
+                .iter()
+                .map(|p| match p {
+                    crate::SiteExistentialPredicate::Trait(did, args) => {
+                        ConcreteExistentialPredicate::Trait(
+                            DefinitionIdentity::from_def_id(tcx, *did),
+                            args.iter().map(|a| stable_arg(tcx, a)).collect(),
+                        )
+                    }
+                    crate::SiteExistentialPredicate::Projection(did, args, term) => {
+                        ConcreteExistentialPredicate::Projection(
+                            DefinitionIdentity::from_def_id(tcx, *did),
+                            args.iter().map(|a| stable_arg(tcx, a)).collect(),
+                            Box::new(match &**term {
+                                crate::SiteTerm::Ty(t) => ConcreteTerm::Ty(stable_ty(tcx, t)),
+                                crate::SiteTerm::Const(c) => {
+                                    ConcreteTerm::Const(stable_const(tcx, c))
+                                }
+                            }),
+                        )
+                    }
+                    crate::SiteExistentialPredicate::AutoTrait(did) => {
+                        ConcreteExistentialPredicate::AutoTrait(DefinitionIdentity::from_def_id(
+                            tcx, *did,
+                        ))
+                    }
+                })
+                .collect(),
+        ),
+        SiteTy::ClosureLike(kind, def, args) => ConcreteInstanceTy::ClosureLike(
+            *kind,
+            DefinitionIdentity::from_def_id(tcx, *def),
+            args.iter().map(|arg| stable_arg(tcx, arg)).collect(),
+        ),
+        SiteTy::FnDef(def, args) => ConcreteInstanceTy::FnDef(
+            DefinitionIdentity::from_def_id(tcx, *def),
+            args.iter().map(|arg| stable_arg(tcx, arg)).collect(),
+        ),
+        SiteTy::Tuple(values) => {
+            ConcreteInstanceTy::Tuple(values.iter().map(|value| stable_ty(tcx, value)).collect())
+        }
+        SiteTy::Array(elem, len) => ConcreteInstanceTy::Array(Box::new(stable_ty(tcx, elem)), *len),
+        SiteTy::Slice(elem) => ConcreteInstanceTy::Slice(Box::new(stable_ty(tcx, elem))),
+        SiteTy::Ref(pointee, mutability) => {
+            ConcreteInstanceTy::Ref(Box::new(stable_ty(tcx, pointee)), *mutability)
+        }
+        SiteTy::RawPtr(pointee, mutability) => {
+            ConcreteInstanceTy::RawPtr(Box::new(stable_ty(tcx, pointee)), *mutability)
+        }
     }
 }
 
@@ -214,6 +471,242 @@ fn encode_def_id(out: &mut Vec<u8>, def_id: DefId) {
     encode_u32(out, def_id.index.as_u32());
 }
 
+fn encode_definition_identity(out: &mut Vec<u8>, identity: DefinitionIdentity) {
+    encode_u64(out, identity.stable_crate_id);
+    encode_u64(out, identity.local_hash);
+}
+
+fn encode_concrete_callee_key(out: &mut Vec<u8>, key: &ConcreteCalleeKey) {
+    // Version byte for the standalone/injective symbol encoding. The enclosing lineage
+    // domain is independently versioned.
+    out.push(1);
+    encode_definition_identity(out, key.definition);
+    out.push(match key.kind {
+        ConcreteInstanceKind::Item => 0,
+        ConcreteInstanceKind::ReifyShim => 1,
+    });
+    encode_u64(out, key.args.len() as u64);
+    for arg in &key.args {
+        encode_concrete_arg(out, arg);
+    }
+}
+
+fn encode_concrete_arg(out: &mut Vec<u8>, arg: &ConcreteInstanceArg) {
+    match arg {
+        ConcreteInstanceArg::ErasedRegion => out.push(0),
+        ConcreteInstanceArg::Ty(ty) => {
+            out.push(1);
+            encode_concrete_ty(out, ty);
+        }
+        ConcreteInstanceArg::Const(value) => {
+            out.push(2);
+            encode_concrete_const(out, value);
+        }
+    }
+}
+
+fn encode_concrete_const(out: &mut Vec<u8>, value: &ConcreteInstanceConst) {
+    let ConcreteInstanceConst::Value(ty, tree) = value;
+    encode_concrete_ty(out, ty);
+    encode_concrete_valtree(out, tree);
+}
+
+fn encode_concrete_valtree(out: &mut Vec<u8>, tree: &ConcreteInstanceValTree) {
+    match tree {
+        ConcreteInstanceValTree::Leaf(bits, size) => {
+            out.push(0);
+            out.extend_from_slice(&bits.to_be_bytes());
+            encode_u64(out, *size);
+        }
+        ConcreteInstanceValTree::Branch(values) => {
+            out.push(1);
+            encode_u64(out, values.len() as u64);
+            for value in values {
+                encode_concrete_const(out, value);
+            }
+        }
+    }
+}
+
+fn encode_concrete_ty(out: &mut Vec<u8>, ty: &ConcreteInstanceTy) {
+    match ty {
+        ConcreteInstanceTy::Bool => out.push(0),
+        ConcreteInstanceTy::Char => out.push(1),
+        ConcreteInstanceTy::Str => out.push(2),
+        ConcreteInstanceTy::Int(value) => {
+            out.push(3);
+            encode_str(out, value.name_str());
+        }
+        ConcreteInstanceTy::Uint(value) => {
+            out.push(4);
+            encode_str(out, value.name_str());
+        }
+        ConcreteInstanceTy::Float(value) => {
+            out.push(5);
+            encode_str(out, value.name_str());
+        }
+        // Trust (wave-AA): the arg stream is SELF-DISCRIMINATING and byte-compatible. A TYPE
+        // arg emits its own `encode_concrete_ty` bytes, whose first byte is a type tag in
+        // 0..=11 — so an ADT whose args are all types encodes BYTE-IDENTICALLY to before this
+        // wave and its lineage digest does not move (the wave-CRT discipline, which link 2c's
+        // pinned digests depend on). A lifetime emits the reserved tag 12 and a const the
+        // reserved tag 13, neither of which any `encode_concrete_ty` can produce.
+        ConcreteInstanceTy::Adt(definition, args) => {
+            out.push(6);
+            encode_definition_identity(out, *definition);
+            encode_u64(out, args.len() as u64);
+            for arg in args {
+                match arg {
+                    ConcreteInstanceArg::Ty(ty) => encode_concrete_ty(out, ty),
+                    ConcreteInstanceArg::ErasedRegion => out.push(12),
+                    ConcreteInstanceArg::Const(value) => {
+                        out.push(13);
+                        encode_concrete_const(out, value);
+                    }
+                }
+            }
+        }
+        ConcreteInstanceTy::Tuple(values) => {
+            out.push(7);
+            encode_u64(out, values.len() as u64);
+            for value in values {
+                encode_concrete_ty(out, value);
+            }
+        }
+        ConcreteInstanceTy::Array(elem, len) => {
+            out.push(8);
+            encode_concrete_ty(out, elem);
+            encode_u64(out, *len);
+        }
+        ConcreteInstanceTy::Slice(elem) => {
+            out.push(9);
+            encode_concrete_ty(out, elem);
+        }
+        ConcreteInstanceTy::Ref(pointee, mutability) => {
+            out.push(10);
+            out.push(match mutability {
+                rustc_middle::ty::Mutability::Not => 0,
+                rustc_middle::ty::Mutability::Mut => 1,
+            });
+            encode_concrete_ty(out, pointee);
+        }
+        // Trust (wave-RP): tag 11, APPENDED on the wave-CRT discipline — tags 0..=10 keep
+        // their meaning, so a body whose instance args contain no raw pointer encodes
+        // BYTE-IDENTICALLY to before this wave and its lineage digest does not move. A
+        // distinct tag from `Ref`'s 10 is what keeps `*const T` and `&T` from digesting equal.
+        // Trust (wave-FD): tag 14. Tags 12 and 13 are PERMANENTLY RESERVED as the ADT/FnDef
+        // arg-stream markers for a lifetime and a const (see the Adt arm) — a type tag may
+        // never take either, or an arg that is itself a fn item would be indistinguishable
+        // from a region marker.
+        // Trust (wave-FP): tag 15. Every header fact is framed — two fn pointers differing
+        // only in ABI or safety are different types and must not share a lineage.
+        ConcreteInstanceTy::FnPtr { inputs_and_output, abi, safe, c_variadic, splatted } => {
+            out.push(15);
+            encode_str(out, abi);
+            out.push(u8::from(*safe));
+            out.push(u8::from(*c_variadic));
+            match splatted {
+                None => out.push(0),
+                Some(i) => {
+                    out.push(1);
+                    out.push(*i);
+                }
+            }
+            encode_u64(out, inputs_and_output.len() as u64);
+            for t in inputs_and_output {
+                encode_concrete_ty(out, t);
+            }
+        }
+        // Trust (wave-DY): tag 17. Every predicate is framed with its own discriminator, and
+        // the LIST ORDER is preserved — rustc keeps an object's predicates in a canonical
+        // order, so two objects that differ only in that order are different types.
+        ConcreteInstanceTy::Dynamic(preds) => {
+            out.push(17);
+            encode_u64(out, preds.len() as u64);
+            for p in preds {
+                match p {
+                    ConcreteExistentialPredicate::Trait(definition, args) => {
+                        out.push(0);
+                        encode_definition_identity(out, *definition);
+                        encode_u64(out, args.len() as u64);
+                        for a in args {
+                            encode_concrete_arg(out, a);
+                        }
+                    }
+                    ConcreteExistentialPredicate::Projection(definition, args, term) => {
+                        out.push(1);
+                        encode_definition_identity(out, *definition);
+                        encode_u64(out, args.len() as u64);
+                        for a in args {
+                            encode_concrete_arg(out, a);
+                        }
+                        match &**term {
+                            ConcreteTerm::Ty(t) => {
+                                out.push(0);
+                                encode_concrete_ty(out, t);
+                            }
+                            ConcreteTerm::Const(c) => {
+                                out.push(1);
+                                encode_concrete_const(out, c);
+                            }
+                        }
+                    }
+                    ConcreteExistentialPredicate::AutoTrait(definition) => {
+                        out.push(2);
+                        encode_definition_identity(out, *definition);
+                    }
+                }
+            }
+        }
+        // Trust (wave-CL): tag 16 plus a KIND byte — a closure and a coroutine sharing a
+        // DefId (they cannot, but the encoding does not rely on that) stay distinguishable.
+        ConcreteInstanceTy::ClosureLike(kind, definition, args) => {
+            out.push(16);
+            out.push(match kind {
+                crate::SiteClosureKind::Closure => 0,
+                crate::SiteClosureKind::CoroutineClosure => 1,
+                crate::SiteClosureKind::Coroutine => 2,
+                crate::SiteClosureKind::CoroutineWitness => 3,
+            });
+            encode_definition_identity(out, *definition);
+            encode_u64(out, args.len() as u64);
+            for arg in args {
+                match arg {
+                    ConcreteInstanceArg::Ty(ty) => encode_concrete_ty(out, ty),
+                    ConcreteInstanceArg::ErasedRegion => out.push(12),
+                    ConcreteInstanceArg::Const(value) => {
+                        out.push(13);
+                        encode_concrete_const(out, value);
+                    }
+                }
+            }
+        }
+        ConcreteInstanceTy::FnDef(definition, args) => {
+            out.push(14);
+            encode_definition_identity(out, *definition);
+            encode_u64(out, args.len() as u64);
+            for arg in args {
+                match arg {
+                    ConcreteInstanceArg::Ty(ty) => encode_concrete_ty(out, ty),
+                    ConcreteInstanceArg::ErasedRegion => out.push(12),
+                    ConcreteInstanceArg::Const(value) => {
+                        out.push(13);
+                        encode_concrete_const(out, value);
+                    }
+                }
+            }
+        }
+        ConcreteInstanceTy::RawPtr(pointee, mutability) => {
+            out.push(11);
+            out.push(match mutability {
+                rustc_middle::ty::Mutability::Not => 0,
+                rustc_middle::ty::Mutability::Mut => 1,
+            });
+            encode_concrete_ty(out, pointee);
+        }
+    }
+}
+
 /// Every field of [`CalleeRef`] enters the framing — the ledger decides how the shim
 /// spells calls at flip time, so omitting a field would let two different compile
 /// inputs share a digest. Field order is struct declaration order; bind by full
@@ -224,6 +717,8 @@ fn encode_callee(out: &mut Vec<u8>, callee: &CalleeRef) {
         is_local,
         def_index,
         def_id,
+        definition,
+        concrete_key,
         def_path,
         force_havoc,
         site_def_id,
@@ -236,6 +731,14 @@ fn encode_callee(out: &mut Vec<u8>, callee: &CalleeRef) {
     encode_bool(out, *is_local);
     encode_u32(out, *def_index);
     encode_def_id(out, *def_id);
+    encode_definition_identity(out, *definition);
+    match concrete_key {
+        None => out.push(0),
+        Some(key) => {
+            out.push(1);
+            encode_concrete_callee_key(out, key);
+        }
+    }
     encode_str(out, def_path);
     encode_bool(out, *force_havoc);
     encode_def_id(out, *site_def_id);
@@ -330,12 +833,22 @@ fn encode_site_ty(out: &mut Vec<u8>, t: &SiteTy) {
             out.push(5);
             encode_str(out, f.name_str());
         }
+        // Trust (wave-AA): same self-discriminating arg stream as the concrete encoder — a
+        // type arg keeps its own tag (0..=11, so all-type ADTs stay byte-identical), a
+        // lifetime is the reserved 12, a const the reserved 13.
         SiteTy::Adt(did, args) => {
             out.push(6);
             encode_def_id(out, *did);
             encode_u64(out, args.len() as u64);
             for a in args {
-                encode_site_ty(out, a);
+                match a {
+                    SiteArg::Ty(t) => encode_site_ty(out, t),
+                    SiteArg::ErasedRegion => out.push(12),
+                    SiteArg::Const(c) => {
+                        out.push(13);
+                        encode_site_const(out, c);
+                    }
+                }
             }
         }
         SiteTy::Tuple(ts) => {
@@ -370,6 +883,111 @@ fn encode_site_ty(out: &mut Vec<u8>, t: &SiteTy) {
             });
             encode_site_ty(out, pointee);
         }
+        // Trust (wave-RP): tag 11, appended on the same discipline. Unlike `Ref` this encoding
+        // is EXACT rather than region-blind — a raw pointer carries no region at all.
+        // Trust (wave-FD): tag 14; 12/13 stay reserved as the arg-stream markers.
+        // Trust (wave-FP): tag 15, same framing as the concrete encoder.
+        SiteTy::FnPtr { inputs_and_output, abi, safe, c_variadic, splatted } => {
+            out.push(15);
+            encode_str(out, abi);
+            out.push(u8::from(*safe));
+            out.push(u8::from(*c_variadic));
+            match splatted {
+                None => out.push(0),
+                Some(i) => {
+                    out.push(1);
+                    out.push(*i);
+                }
+            }
+            encode_u64(out, inputs_and_output.len() as u64);
+            for t in inputs_and_output {
+                encode_site_ty(out, t);
+            }
+        }
+        // Trust (wave-DY): tag 17, same framing as the concrete encoder.
+        SiteTy::Dynamic(preds) => {
+            out.push(17);
+            encode_u64(out, preds.len() as u64);
+            for p in preds {
+                match p {
+                    crate::SiteExistentialPredicate::Trait(did, args) => {
+                        out.push(0);
+                        encode_def_id(out, *did);
+                        encode_u64(out, args.len() as u64);
+                        for a in args {
+                            encode_site_arg(out, a);
+                        }
+                    }
+                    crate::SiteExistentialPredicate::Projection(did, args, term) => {
+                        out.push(1);
+                        encode_def_id(out, *did);
+                        encode_u64(out, args.len() as u64);
+                        for a in args {
+                            encode_site_arg(out, a);
+                        }
+                        match &**term {
+                            crate::SiteTerm::Ty(t) => {
+                                out.push(0);
+                                encode_site_ty(out, t);
+                            }
+                            crate::SiteTerm::Const(c) => {
+                                out.push(1);
+                                encode_site_const(out, c);
+                            }
+                        }
+                    }
+                    crate::SiteExistentialPredicate::AutoTrait(did) => {
+                        out.push(2);
+                        encode_def_id(out, *did);
+                    }
+                }
+            }
+        }
+        // Trust (wave-CL): tag 16 + kind byte, same framing as the concrete encoder.
+        SiteTy::ClosureLike(kind, did, args) => {
+            out.push(16);
+            out.push(match kind {
+                crate::SiteClosureKind::Closure => 0,
+                crate::SiteClosureKind::CoroutineClosure => 1,
+                crate::SiteClosureKind::Coroutine => 2,
+                crate::SiteClosureKind::CoroutineWitness => 3,
+            });
+            encode_def_id(out, *did);
+            encode_u64(out, args.len() as u64);
+            for a in args {
+                match a {
+                    SiteArg::Ty(t) => encode_site_ty(out, t),
+                    SiteArg::ErasedRegion => out.push(12),
+                    SiteArg::Const(c) => {
+                        out.push(13);
+                        encode_site_const(out, c);
+                    }
+                }
+            }
+        }
+        SiteTy::FnDef(did, args) => {
+            out.push(14);
+            encode_def_id(out, *did);
+            encode_u64(out, args.len() as u64);
+            for a in args {
+                match a {
+                    SiteArg::Ty(t) => encode_site_ty(out, t),
+                    SiteArg::ErasedRegion => out.push(12),
+                    SiteArg::Const(c) => {
+                        out.push(13);
+                        encode_site_const(out, c);
+                    }
+                }
+            }
+        }
+        SiteTy::RawPtr(pointee, mutbl) => {
+            out.push(11);
+            out.push(match mutbl {
+                rustc_middle::ty::Mutability::Not => 0,
+                rustc_middle::ty::Mutability::Mut => 1,
+            });
+            encode_site_ty(out, pointee);
+        }
     }
 }
 
@@ -378,7 +996,10 @@ mod tests {
     use rustc_span::def_id::{CrateNum, DefId, DefIndex};
     use trust_ir::{BlockId, FuncId, FuncTy, Function, Module};
 
-    use super::{DefinitionIdentity, body_lineage_digest};
+    use super::{
+        ConcreteCalleeKey, ConcreteInstanceArg, ConcreteInstanceConst, ConcreteInstanceKind,
+        ConcreteInstanceTy, ConcreteInstanceValTree, DefinitionIdentity, body_lineage_digest,
+    };
     use crate::CalleeRef;
 
     fn probe_module(fn_name: &str) -> Module {
@@ -399,12 +1020,22 @@ mod tests {
     }
 
     fn probe_callee(force_havoc: bool) -> CalleeRef {
-        let def_id = DefId { krate: CrateNum::from_u32(0), index: DefIndex::from_u32(7) };
+        let def_id = DefId {
+            krate: CrateNum::from_u32(0),
+            index: DefIndex::from_u32(7),
+        };
+        let definition = probe_definition(7);
         CalleeRef {
             func_id: FuncId::new(1),
             is_local: true,
             def_index: 7,
             def_id,
+            definition,
+            concrete_key: Some(ConcreteCalleeKey::test_only(
+                definition,
+                ConcreteInstanceKind::Item,
+                Vec::new(),
+            )),
             def_path: "lineage_probe::callee".to_string(),
             force_havoc,
             site_def_id: def_id,
@@ -421,6 +1052,40 @@ mod tests {
             // here too — the probe must not invent an ABI the digest depends on.
             is_rust_abi: false,
         }
+    }
+
+    fn const_u32_key(value: u128) -> ConcreteCalleeKey {
+        ConcreteCalleeKey::test_only(
+            probe_definition(11),
+            ConcreteInstanceKind::Item,
+            vec![ConcreteInstanceArg::Const(ConcreteInstanceConst::Value(
+                ConcreteInstanceTy::Uint(rustc_middle::ty::UintTy::U32),
+                ConcreteInstanceValTree::Leaf(value, 4),
+            ))],
+        )
+    }
+
+    /// `pick::<1>` and `pick::<2>` have identical function types but are different semantic
+    /// instances. Their canonical declaration identity must bind the typed const payload.
+    #[test]
+    fn test_concrete_key_distinguishes_same_signature_const_instances() {
+        let one = const_u32_key(1);
+        let two = const_u32_key(2);
+        assert_ne!(one, two);
+        assert_ne!(one.symbol_suffix(), two.symbol_suffix());
+        assert_eq!(one.symbol_suffix(), const_u32_key(1).symbol_suffix());
+    }
+
+    /// A reify shim is a different codegen object from the underlying item even with the same
+    /// definition and normalized args; the instance-kind discriminator is part of the key.
+    #[test]
+    fn test_concrete_key_distinguishes_item_from_reify_shim() {
+        let definition = probe_definition(12);
+        let item = ConcreteCalleeKey::test_only(definition, ConcreteInstanceKind::Item, Vec::new());
+        let shim =
+            ConcreteCalleeKey::test_only(definition, ConcreteInstanceKind::ReifyShim, Vec::new());
+        assert_ne!(item, shim);
+        assert_ne!(item.symbol_suffix(), shim.symbol_suffix());
     }
 
     /// Determinism at this seam: the same body (module + ledger), digested twice from

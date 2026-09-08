@@ -16,6 +16,8 @@ macro_rules! arena_types {
             [] steal_mir: rustc_data_structures::steal::Steal<rustc_middle::mir::Body<'tcx>>,
             [decode] mir: rustc_middle::mir::Body<'tcx>,
             [] trust_contract_bundle: rustc_middle::mir::trust_contract::TrustContractBundle<'tcx>,
+            // Trust: the `trust_mir_once_body_facts` query returns an arena-allocated value.
+            [] trust_once_body_facts: rustc_middle::mir::trust_once::TrustOnceBodyFacts,
             [] steal_promoted:
                 rustc_data_structures::steal::Steal<
                     rustc_index::IndexVec<

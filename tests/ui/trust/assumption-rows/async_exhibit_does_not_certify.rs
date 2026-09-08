@@ -69,6 +69,22 @@
 // "1 conditionally discharged (NOT proved), 2 failed, 0 unknown, 0 timed out,
 // 1 runtime-checked, 1 skipped out of 5 obligation(s)".
 //
+// RE-MEASURED 2026-08-30 on stage1 at fb48832dc9. THE EXHIBIT STILL DOES NOT CERTIFY:
+// exit 1, both strict errors below still fire, the ASSUMPTION row is still published, and
+// the whole-function panic-freedom row stays runtime-checked with `certify_vc=false` —
+// no row for this body reports an unconditional proof. The Level-0 accounting moved: the
+// two sentinel-family rows that measured FAILED on ec4783d80 now decide UNSAT under the
+// exactly-grounded resume-state entry premise and report as CONDITIONALLY DISCHARGED
+// (NOT proved) — "3 conditionally discharged (NOT proved), 0 failed, ... 1
+// runtime-checked, 1 skipped out of 5". Root cause: trust-vcgen's 2026-08-28
+// assert-refutation grounding family (e7a2860143 and siblings), which bound the sentinel
+// candidates' entry-precondition conjunct to the exact versioned selector read. With
+// `failed 2 -> 0` the ratified completeness-gap policy reports the one remaining
+// runtime-checked gap as a WARNING; the abort rides the two dedicated strict errors, so
+// the pin below now spells WARN for the Level-0 header and keeps both ERRORs. This is a
+// severity-accounting drift, not a certification: if this file ever COMPILES, the D2
+// regression is back — that pin is unchanged.
+//
 // Sibling `full_lane_abort_unchanged.rs` pins the same abort as a policy
 // contract; this file exists to carry the exhibit and its runtime evidence, so
 // the reason the abort must stay can never be lost again.
@@ -79,7 +95,7 @@
 //@ check-fail
 //@ dont-check-compiler-stderr
 pub async fn tick(x: u32) -> u32 { x }
-//~^ ERROR Trust Level 0 safety verification incomplete
+//~^ WARN Trust Level 0 safety verification incomplete
 //~| ERROR coroutine executor-protocol premise is unproved
 //~| ERROR obligation(s) were not fully verified
 //~? RAW Trust: ASSUMPTION [coroutine] `async_exhibit_does_not_certify::tick::{closure#0}`

@@ -799,16 +799,46 @@ impl VersionCtx {
 /// returning `None`). Cannot collide with a real OUT token (those start with `s`).
 pub(crate) const ENTRY_VERSION_SENTINEL: &str = "e";
 
+/// Token PREFIX for a pinned in-place-update read whose entry-denotation the
+/// full-graph mint gate could NOT establish (`full_graph_union_is_entry_only`
+/// false at the minting block): the read is stamped `#pre_s{block}_{k}` instead
+/// of `#e`. A fresh, block-local, NEVER-TIEABLE spelling — `entry_sentinel_ties`
+/// matches the token `e` exactly — so it still prevents the `x#t == f(x#t)`
+/// recurrence without ever asserting the pre-write value is the entry value.
+/// Distinct by construction from real establish tokens (`s{b}_{k}`), the phantom
+/// entry-havoc token (`s{b}_pre`), mixed joins (`e_s{b}_t`), and the loop
+/// transition havoc prefix (`e45_`).
+pub(crate) const PRE_WRITE_SENTINEL_PREFIX: &str = "pre";
+
 /// Statement-granular version oracle: the version of a place name at a precise
 /// `(block, stmt_idx)` program point, distinguishing reads that straddle a
 /// same-block write.
 pub(crate) struct StmtVersionCtx {
     entry: FxHashMap<BlockId, FxHashMap<String, std::collections::BTreeSet<String>>>,
+    /// UNWIND-INCLUSIVE sibling of `entry` (see `block_entry_versions_full_graph`):
+    /// predecessor edges additionally include every `UnwindEdge::cleanup_target()`
+    /// edge, mirroring `v2_path_def_fixpoint`'s enqueue set. Consulted ONLY by the
+    /// `#e` mint gate; `None` = the fixpoint did not converge, and the gate fails
+    /// closed (no `#e` anywhere in this function).
+    entry_full: Option<FxHashMap<BlockId, FxHashMap<String, std::collections::BTreeSet<String>>>>,
 }
 
 impl StmtVersionCtx {
-    pub(crate) fn build(func: &VerifiableFunction) -> Self {
-        StmtVersionCtx { entry: block_entry_versions(func) }
+    /// Build (or reuse) this function's version oracle.
+    ///
+    /// verifier-perf: this runs TWO whole-function dataflow fixpoints, and it is
+    /// called from ~20 sites — several of them once per OBLIGATION rather than
+    /// once per function — which is the dominant term in VC-generation time (see
+    /// `crate::havoc_memo::version_oracle`). Memoized per function, so every
+    /// site now shares one build. The oracle is immutable after construction and
+    /// a pure function of `func`, so this is observationally identical to each
+    /// caller building its own; `Rc` deref-coercion keeps every existing
+    /// `sv.version_token_at(..)` / `&sv` call site source-compatible.
+    pub(crate) fn build(func: &VerifiableFunction) -> std::rc::Rc<Self> {
+        crate::havoc_memo::version_oracle(func, || StmtVersionCtx {
+            entry: block_entry_versions(func),
+            entry_full: path_defs::block_entry_versions_full_graph(func),
+        })
     }
 
     /// `#token` for `name` read at `(block, stmt_idx)`, or `None` when the value
@@ -912,16 +942,44 @@ impl StmtVersionCtx {
     /// True iff `block`'s entry-version map TRACKS a name overlapping `name`.
     ///
     /// Where it does NOT, [`Self::version_token_at`]'s `None` does not mean "the
-    /// entry value". `block_entry_versions` builds its predecessor lists from
-    /// `v2_terminator_targets`, which has no unwind arm, so a block reached only by
-    /// a cleanup edge gets an EMPTY map and every name renders bare there
-    /// regardless of its real version — while `v2_path_def_fixpoint` DOES transport
-    /// facts across those same edges. A caller that reads a bare (or `#e`) spelling
-    /// AS the entry value must consult this first.
+    /// entry value". Since 2026-08-30 `block_entry_versions` builds its
+    /// predecessor lists from `full_graph_terminator_targets` (unwind-inclusive,
+    /// matching the fact-transport graph), so a cleanup-only-reachable block now
+    /// versions its reads like any other; but a block unreachable from bb0 across
+    /// full-graph edges still gets an EMPTY map, and a never-written name is
+    /// simply untracked. A caller that reads a bare (or `#e`) spelling AS the
+    /// entry value must consult this first.
+    // MERGE NOTE (integrate-e6-perfield-20260831): the non-test caller went with
+    // the other line; the tie-subsumption tests still exercise it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "test-only since the merge"))]
     pub(crate) fn entry_map_covers(&self, block: BlockId, name: &str) -> bool {
         self.entry
             .get(&block)
             .is_some_and(|em| em.keys().any(|tracked| place_names_overlap(tracked, name)))
+    }
+
+    /// THE `#e` MINT GATE's oracle: true iff EVERY runtime path into `block` —
+    /// normal or unwind — delivers `name`'s function-ENTRY value, i.e. the
+    /// UNWIND-INCLUSIVE reaching-version union at `block`'s entry is exactly
+    /// `{e}`. Same overlap-union lookup as `version_token_at`'s inter-block arm,
+    /// but over the full-graph map: `{e}` tokens are seeded only at bb0 and any
+    /// gen replaces them, so with unwind edges IN the predecessor relation an
+    /// exactly-`{e}` union means no writer of `name` on ANY path into the block.
+    ///
+    /// Fails closed three ways, each toward "not entry" (no `#e` mint):
+    ///  * the full-graph fixpoint hit its step cap (`entry_full` is `None`);
+    ///  * `block` is unreachable from bb0 across full-graph edges (empty union);
+    ///  * ANY overlapping tracked name contributes a non-`e` token.
+    pub(crate) fn full_graph_union_is_entry_only(&self, block: BlockId, name: &str) -> bool {
+        let Some(full) = &self.entry_full else { return false };
+        let Some(em) = full.get(&block) else { return false };
+        let mut toks: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (tracked, s) in em {
+            if place_names_overlap(tracked, name) {
+                toks.extend(s.iter().map(String::as_str));
+            }
+        }
+        toks.len() == 1 && toks.contains(ENTRY_VERSION_SENTINEL)
     }
 
     /// Overlap-aware staleness at a precise point: is a fact whose sole free var is
@@ -941,12 +999,176 @@ impl StmtVersionCtx {
         let Some(bb) = func.body.blocks.get(block.0).filter(|b| b.id == block) else {
             return false;
         };
-        let mut redefined = writes_until(func, bb, stmt_idx);
+        let mut redefined = writes_until(func, bb, stmt_idx).as_ref().clone();
         if let Some(em) = self.entry.get(&block) {
             redefined.extend(em.iter().filter(|(_, v)| **v != entry_only).map(|(k, _)| k.clone()));
         }
         redefined.iter().any(|n| place_names_overlap(n, name))
     }
+}
+
+/// The per-block path-guard map produced by
+/// [`safety::v2_build_path_guard_map`]: for each block, the list of enumerated
+/// incoming paths, each a list of `(source block, guard)` pairs.
+pub(crate) type PathGuardMap = FxHashMap<BlockId, Vec<Vec<(BlockId, GuardCondition)>>>;
+
+thread_local! {
+    /// Per-function memo frames for the current thread, innermost LAST.
+    ///
+    /// A STACK rather than a single slot because generation nests: a callee's
+    /// body is analyzed inside a caller's generation (`FloatRangeCtx::for_callee`,
+    /// `callsite_replay`'s `func_view`, `with_tail_calls_expanded`'s `Cow`
+    /// clone). Only the innermost frame is ever consulted, so a nested analysis
+    /// of a DIFFERENT body can never be served the outer body's answer — it
+    /// simply misses and rebuilds.
+    static FUNC_ANALYSIS_MEMO: std::cell::RefCell<Vec<FuncAnalysisFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+struct FuncAnalysisFrame {
+    /// Identity of the `VerifiableFunction` this frame memoizes. Sound as an
+    /// identity key ONLY because [`FuncAnalysisScope`] holds a live shared
+    /// borrow of that function for the frame's whole lifetime: the storage
+    /// cannot be freed and reused underneath it, so no other live
+    /// `VerifiableFunction` can share the address.
+    func_addr: usize,
+    stmt_versions: Option<std::rc::Rc<StmtVersionCtx>>,
+    guard_map: Option<std::rc::Rc<PathGuardMap>>,
+}
+
+/// Per-function memo for the two whole-CFG analyses that are PURE FUNCTIONS of
+/// `func` and were previously rebuilt at EVERY obligation point:
+/// [`StmtVersionCtx::build`] (two whole-CFG dataflow fixpoints) and
+/// [`safety::v2_build_path_guard_map`] (the path-enumeration walk).
+///
+/// # Why the memo cannot go stale
+///
+/// The scope HOLDS `&'f VerifiableFunction`. That shared borrow is live for the
+/// scope's whole lifetime, so no `&mut VerifiableFunction` to the same value can
+/// exist while a memoized result derived from it is reachable — the mutating
+/// entry points (`contracts::bind_compiler_loop_contracts` and
+/// `bind_compiler_loop_contract_bundle`, the only ones in this crate) do not
+/// compile against a borrowed `func`. Invalidation is discharged by the borrow
+/// checker, not by a comment. The same borrow is what licenses the address as an
+/// identity key: the storage is pinned live for exactly as long as the key is
+/// used.
+///
+/// # Why a scope and not a threaded parameter
+///
+/// A threaded `&FuncGuardCache` was implemented first and is strictly nicer, but
+/// reaching the hot consumers needs the parameter carried through 19 call sites
+/// across `safety`, `checked_vcs`, `overflow_vc`, `block_defs` and `path_defs` —
+/// each an edit to a verdict-bearing signature. This is the same RAII +
+/// `thread_local!` shape the crate already uses for exactly this reason
+/// (`VcgenContextGuard`, and `FAITHFUL_SCALARS` in `trust-mir-extract`), and the
+/// borrow above keeps the lifetime and the invalidation rule visible in the type.
+///
+/// # Fail-safe by construction
+///
+/// A MISS costs only time: the analysis is rebuilt exactly as before. There is
+/// no path on which a miss produces a different answer, because the memoized
+/// value is the same pure function of the same `func`.
+#[must_use]
+pub(crate) struct FuncAnalysisScope<'f> {
+    /// The borrow that forbids mutation for this scope's lifetime. Never read —
+    /// its job is to exist.
+    _func: &'f VerifiableFunction,
+    /// Stack depth this scope owns, so `Drop` truncates exactly its own frame
+    /// even under an unwind or an out-of-order drop.
+    depth: usize,
+    _thread_affine: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl<'f> FuncAnalysisScope<'f> {
+    pub(crate) fn enter(func: &'f VerifiableFunction) -> Self {
+        let depth = FUNC_ANALYSIS_MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            memo.push(FuncAnalysisFrame {
+                func_addr: std::ptr::from_ref(func) as usize,
+                stmt_versions: None,
+                guard_map: None,
+            });
+            memo.len()
+        });
+        FuncAnalysisScope { _func: func, depth, _thread_affine: std::marker::PhantomData }
+    }
+}
+
+impl Drop for FuncAnalysisScope<'_> {
+    fn drop(&mut self) {
+        FUNC_ANALYSIS_MEMO.with(|memo| memo.borrow_mut().truncate(self.depth - 1));
+    }
+}
+
+/// The statement-version oracle for `func`, memoized for the innermost
+/// [`FuncAnalysisScope`] bound to the same function. Falls back to building it
+/// (today's behaviour) when there is no matching scope.
+pub(crate) fn stmt_versions_for(func: &VerifiableFunction) -> std::rc::Rc<StmtVersionCtx> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .last()
+            .filter(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.stmt_versions.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    // Built OUTSIDE the `RefCell` borrow: the analysis is deep code and must be
+    // free to re-enter this module without tripping a borrow panic.
+    // NOT `Rc::new(..)`: on this base `StmtVersionCtx::build` ALREADY returns an
+    // `Rc<Self>`, because it is itself memoized behind `havoc_memo::version_oracle`
+    // (which is inert outside a `gen_work` scope). This memo is therefore a second
+    // layer over that one for the statement-version half, and the sole novel layer
+    // for the guard-map half below.
+    let built = StmtVersionCtx::build(func);
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo.borrow_mut().last_mut()
+            && frame.func_addr == addr
+        {
+            frame.stmt_versions = Some(std::rc::Rc::clone(&built));
+        }
+    });
+    built
+}
+
+/// Trust (W4/spine-derives-unreachable): the block population over which arm 1b
+/// (`safety.rs`) mints TERMINATOR VCs — the keys of the path-guard map, i.e.
+/// the blocks the guard walk reached from the entry. Exposed so a second
+/// producer that must agree with this one on the `Unreachable` obligation
+/// ENUMERATION (the trust-ir spine, via
+/// `trust_types::terminator_obligations`) can take the same reachability gate
+/// as an INPUT instead of re-deriving a walk that carries budgets and collapse
+/// modes. This is analysis-output disclosure, not proof authority: a caller
+/// holding this set can only mint obligations this producer also mints.
+#[must_use]
+pub fn terminator_vc_block_set(
+    func: &VerifiableFunction,
+) -> std::collections::HashSet<BlockId> {
+    guard_map_for(func).keys().copied().collect()
+}
+
+/// The path-guard map for `func`, memoized exactly like [`stmt_versions_for`].
+pub(crate) fn guard_map_for(func: &VerifiableFunction) -> std::rc::Rc<PathGuardMap> {
+    let addr = std::ptr::from_ref(func) as usize;
+    let hit = FUNC_ANALYSIS_MEMO.with(|memo| {
+        memo.borrow()
+            .last()
+            .filter(|frame| frame.func_addr == addr)
+            .and_then(|frame| frame.guard_map.clone())
+    });
+    if let Some(hit) = hit {
+        return hit;
+    }
+    let built = std::rc::Rc::new(safety::v2_build_path_guard_map(func));
+    FUNC_ANALYSIS_MEMO.with(|memo| {
+        if let Some(frame) = memo.borrow_mut().last_mut()
+            && frame.func_addr == addr
+        {
+            frame.guard_map = Some(std::rc::Rc::clone(&built));
+        }
+    });
+    built
 }
 
 /// Which modeled std wrapper enum a return-slot aggregate constructs. The two
@@ -1376,6 +1598,16 @@ mod intrinsic_semantics_tests;
 mod recursion_decreases_production_variant_tests;
 #[cfg(test)]
 mod summary_callsite_tests;
+// The terminator-fact channel's TIME AXIS: `version_terminator_dest_fact` retimes
+// every variable whose base name is the subject's, so an ARGUMENT that renders to
+// that name would be read at the post-call token — `result > n` injected as
+// `n#s0_t > n#s0_t`, and the sibling value producers' `dest == f(arg)` as the
+// fixpoint `d == f(d)`. Only the guarded branch's ANTECEDENT refused it until
+// 2026-08-31; `terminator_args_read_name` now refuses the whole batch, with the
+// same conjunct on the ADMIT gate. Latent when found (0 of 105,703 corpus call
+// sites present the shape), zero measured cost — see the file header.
+#[cfg(test)]
+mod summary_dest_retiming_tests;
 // Callsite L0 replay (refutation-only): the substitution filter's
 // caller-scoped-only invariant and the composed-candidate producer's
 // fail-closed gates (sentinels, residual callee locals, σ-fresh vars,
@@ -1390,6 +1622,11 @@ mod v2_path_guard_tests;
 // that exercise them.
 #[cfg(test)]
 mod path_guard_collapse_tests;
+// `FuncAnalysisScope` equivalence/identity-binding, and the ambient-budget polls:
+// the memoization must be verdict-neutral, and a budget trip must only ever
+// REMOVE hypotheses.
+#[cfg(test)]
+mod func_analysis_memo_tests;
 // A `bool` contract clause could never equal the re-parse of its own source
 // text, because `parse_spec_expr` has no type environment and defaults every
 // leaf to `Sort::Int`. That minted a duplicate ill-sorted postcondition VC and
@@ -1412,6 +1649,14 @@ mod bounds_const_index_tests;
 mod bounds_exact_binding_tests;
 #[cfg(test)]
 mod early_return_postcondition_tests;
+// The RETURN-SLOT twin of the join-token defect above (probe f53): an
+// Eq-shaped `ensures result == …` over an `&&`-diamond body was negated at the
+// Return block's MERGED `_0` token while the pin carried the predecessor's
+// single token, and `return_slot_pin_version`'s everywhere-walk counted the
+// clause's own equality as a second "pin" — so the unifier bailed and the
+// clause was refuted as a free-variable query.
+#[cfg(test)]
+mod return_slot_join_version_tests;
 // The AGGREGATE-FIELD twin of the two defects above, and the one still OPEN: a
 // clause over a FIELD of the returned struct, whose source local is written in
 // two select arms. The clause is negated at `_0.0#s3_0` while the field pin
@@ -1454,6 +1699,8 @@ mod ordering_witness_grounding_tests;
 mod ptr_metadata_tests;
 #[cfg(test)]
 mod result_return_grounding_tests;
+#[cfg(test)]
+mod return_walk_preservation_tests;
 // a `SwitchInt` join followed by a guard
 // (`let m = if a < b { a } else { b }; if m < 1000 { m + 1 }`) used to false-FAIL
 // the guarded overflow VC: the path-definition BFS weakened the join to `true`,
@@ -1651,6 +1898,14 @@ mod known_panicking_method_tests;
 // so proof behavior never depends on process-global environment state.
 #[cfg(test)]
 mod gen_work_budget_tests;
+// The overflow-elision JOIN TABLE replay: byte-exactness of the memoized path against
+// the unmemoized one, and the completeness property that makes `Unique` sound.
+#[cfg(test)]
+mod overflow_origins_replay_tests;
+// The ENUM VARIANT PAYLOAD range fact: resolution-layer pins for the shapes a
+// verdict cannot see. The verdict matrix is `tests/enum_payload_range.rs`.
+#[cfg(test)]
+mod enum_payload_range_tests;
 // Trust (UNINHABITED MATCH ARM, false REFUTATION): `inhabited_enum_variant_tag_set`
 // drops the tag of a variant whose payload is PROVABLY uninhabited, so the dead
 // `Err` arm of a `Result<u8, Infallible>` match stops being accused. Every `true`
@@ -1671,6 +1926,11 @@ mod const_param_fold_tests;
 // shape keeps the row (fail-closed, never silently dropped).
 #[cfg(test)]
 mod unwrap_panic_freedom_tests;
+// Trust (R20 Front A): the index-panicking container-mutator recognizer must
+// key on the RECEIVER path, never on text inside a turbofish generic-argument
+// group (`serde_json::Map::<std::string::String, …>::insert` is TOTAL).
+#[cfg(test)]
+mod container_mutator_path_tests;
 // Trust (return-discriminant summary): the callee-summary recognizer
 // (`function_return_disc_summary` — UNCONDITIONAL / GUARD-CONDITIONED, both
 // fail-closed) and its use site — the unwrap panic-freedom lane's
@@ -1718,3 +1978,25 @@ mod entry_hypothesis_tests;
 // suite notices when that stops holding.
 #[cfg(test)]
 mod entry_sentinel_tie_subsumption_tests;
+
+// Trust (postcondition composition — the key-collision trust boundary): the
+// injection lane matches a callee by its RENDERED NAME and `modular::
+// FunctionSummary` carries no identity at all, so the "one name, one callee"
+// obligation is entirely the producer's. These tests pin the mechanism and
+// enumerate what does NOT discriminate (`CalleeIdentity`, `param_types`, the
+// destination type) so none of them is later mistaken for a defence.
+#[cfg(test)]
+mod summary_key_collision_tests;
+// The merged-local vacuity class: a global fact keyed on a local the program can
+// REDEFINE binds that local's terminal version exactly and empties the violating
+// path. These rows reach the two recognizers whose contracts only an in-crate test
+// can name — `is_nonzero_get_call`'s definition-path match and
+// `checked_result_field0_consumer`'s uniqueness bail.
+#[cfg(test)]
+mod merged_local_vacuity_tests;
+// The parameter-entry-def budget: a parameter is defined at ENTRY, invisibly to a
+// `body.blocks` def scan, so its explicit-def budget is ZERO and every other local's
+// is one. Held at the predicate because a wrong budget is only visible at a verdict
+// when some producer happens to key that local.
+#[cfg(test)]
+mod param_entry_gate_tests;

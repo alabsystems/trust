@@ -1,0 +1,16 @@
+
+=== Trust Verification Report (zero_obligation_registry_call_gate) ===
+
+note: Trust verification: 0 proved, 0 failed, 0 unknown, 0 timed out, 2 runtime-checked out of 2 obligation(s)
+  --> $DIR/zero_obligation_registry_call_gate.rs:23:1
+   |
+LL | / pub fn failing() {
+LL | |     panic!("deliberate failing function-pointer target");
+LL | | }
+   | |_^
+   |
+   = note: 2× [assert] runtime-checked: compiler retained the existing assertion because the proof is not yet static
+
+ INFO rustc_mir_transform::trust_verify Trust zero-obligation registry gate: fn=zero_obligation_registry_call_gate::indirect calls_authenticated=false accepted=false
+ INFO rustc_mir_transform::trust_verify Trust zero-obligation registry gate: fn=zero_obligation_registry_call_gate::leaf calls_authenticated=true accepted=true
+ INFO rustc_mir_transform::trust_verify Trust zero-obligation registry gate: fn=zero_obligation_registry_call_gate::leaf_wrapper calls_authenticated=true accepted=true

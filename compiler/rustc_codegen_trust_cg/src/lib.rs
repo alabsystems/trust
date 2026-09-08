@@ -498,11 +498,13 @@ impl TrustCgCodegenBackend {
 
         // (3) THE SAME INVENTORY the production path compiles — same collection,
         // same linkage/visibility gate, same ordering.
-        let instances = collect_production_mono_instances(tcx).unwrap_or_else(|reason| {
-            tcx.dcx().fatal(format!(
-                "trust-cg cannot faithfully materialize rustc's reachable mono-item graph: {reason}"
-            ))
-        });
+        let (instances, reachable_statics) =
+            collect_production_mono_instances(tcx).unwrap_or_else(|reason| {
+                tcx.dcx().fatal(format!(
+                    "trust-cg cannot faithfully materialize rustc's reachable mono-item graph: \
+                     {reason}"
+                ))
+            });
         let reachable = instances.len();
 
         // (4) The allocator shim is SYNTHESIZED by the backend from a rustc
@@ -573,7 +575,16 @@ impl TrustCgCodegenBackend {
 
         let function_count = lowered.len();
         let (module, gate_sources) =
-            trust_ir_frontend::compiled_module(&crate_name, lowered, linkage).unwrap_or_else(
+            trust_ir_frontend::compiled_module(
+                &crate_name,
+                lowered,
+                linkage,
+                reachable_statics
+                    .into_iter()
+                    .map(ProductionStatic::into_object_global)
+                    .collect(),
+            )
+            .unwrap_or_else(
                 |reason| {
                     tcx.dcx().fatal(format!(
                         "trust-cg: refusing to emit a trust-ir codegen unit for `{crate_name}`: \
@@ -616,7 +627,9 @@ impl TrustCgCodegenBackend {
         outputs: &OutputFilenames,
     ) -> CompiledModule {
         use trust_cg_bridge::verify_output::EmitPolicy;
-        use trust_cg_bridge::verify_output_trust_ir::emit_trust_ir_module_object_verified;
+        use trust_cg_bridge::verify_output_trust_ir::{
+            emit_trust_ir_module_object_unverified, emit_trust_ir_module_object_verified,
+        };
 
         let gate_mode = output_gate_mode(sess);
 
@@ -648,13 +661,14 @@ impl TrustCgCodegenBackend {
             // itself refuses to combine with batteries-on strict verification)
             // is the only way to get bytes out of this path unproven, and it
             // says so on every such compilation.
-            let emitted = match bridge.emit_module_object(bridge_module) {
-                Ok(emitted) => emitted,
-                Err(e) => sess.dcx().fatal(format!(
-                    "trust-cg: failed to emit object for trust-ir module `{}`: {e}",
-                    bridge_module.name
-                )),
-            };
+            let emitted =
+                match emit_trust_ir_module_object_unverified(sources, bridge_module, bridge) {
+                    Ok(emitted) => emitted,
+                    Err(e) => sess.dcx().fatal(format!(
+                        "trust-cg: failed to emit object for trust-ir module `{}`: {e}",
+                        bridge_module.name
+                    )),
+                };
             sess.dcx().note(format!(
                 "trust-cg: module `{}` was emitted by the TRUST-IR FRONTEND with the \
                  proven-output gate explicitly DISABLED (-Ztrust-cg-output-gate=off) — its {} \
@@ -665,12 +679,13 @@ impl TrustCgCodegenBackend {
         } else {
             let policy = match gate_mode {
                 OutputGateMode::Strict => EmitPolicy::StrictProvenOnly,
-                // AllowUnknown is the default; Off returned above.
+                // This arm is an explicit allow-unknown opt-in; Off returned above.
                 _ => EmitPolicy::AllowUnknown,
             };
             match emit_trust_ir_module_object_verified(
                 sources,
                 &bridge_module.linkage,
+                &bridge_module.statics,
                 policy,
                 bridge,
             ) {
@@ -948,7 +963,7 @@ fn run_module_output_preservation_gate(
 
     let policy = match mode {
         OutputGateMode::Strict => EmitPolicy::StrictProvenOnly,
-        // AllowUnknown is the default; Off returned above.
+        // This arm is an explicit allow-unknown opt-in; Off returned above.
         _ => EmitPolicy::AllowUnknown,
     };
 
@@ -968,6 +983,7 @@ fn run_module_output_preservation_gate(
     match emit_module_object_verified_reported_with_backend(
         sources,
         &bridge_module.linkage,
+        &bridge_module.statics,
         policy,
         bridge,
     ) {
@@ -998,7 +1014,7 @@ fn policy_label(policy: trust_cg_bridge::verify_output::EmitPolicy) -> &'static 
     match policy {
         EmitPolicy::StrictProvenOnly => "policy: strict (certified-fragment: only [PROVED] ships)",
         EmitPolicy::AllowUnknown => {
-            "policy: allow-unknown (default: emits unproven, Refuted fatal)"
+            "policy: allow-unknown (explicit opt-in: emits unproven, Refuted fatal)"
         }
     }
 }
@@ -1159,6 +1175,169 @@ fn ignored_return_abi_ty_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
         }
 }
 
+/// A `bool` RETURN, admitted with its `Zext` extension contract — RETURN
+/// POSITION ONLY.
+///
+/// `scalar_register_abi_ty_supported` refuses every `arg_ext != None` because
+/// the extension is an observable caller/callee contract the bridge does not
+/// carry as an attribute. For a `bool` RETURN specifically, the contract is
+/// DISCHARGED BY PROOF rather than carried: the trust-ir gate models a `Bool`
+/// return at 32 bits (`verify_output_trust_ir::scalar_reg_width` — "cset
+/// writes exactly 0 or 1 into the whole register, so reading it at 32 bits is
+/// exact"), so the byte-level equality obligation REQUIRES the emitted
+/// function to leave 0/1 zero-extended in w0 — an emission that violated the
+/// Zext contract would be Refuted, not shipped. The converter's side of the
+/// slot is pinned too (`module_to_lir::map_scalar_int_ty` maps `Ty::Bool` to
+/// the byte-wide `LirType::I8` whose value-production set — cset, movz 0/1,
+/// csel of 0/1, byte ldrb — is zero-extended by construction on AArch64).
+///
+/// Bool PARAMETERS stay refused: the gate's spec side deliberately rejects
+/// `Bool` in parameter position (`sig_position_width`), so admitting them here
+/// would create an admission the prover cannot speak about — the exact
+/// mismatch this validator exists to prevent.
+/// A SHARED SLICE REFERENCE argument (`&[T]`), admitted in ARGUMENT position
+/// on the trust-ir lane only.
+///
+/// MEASURED on aarch64-apple-darwin (stage1 trustc, trust-index
+/// `capped_len(&[u8], ..)`): `&[u8]` arrives as `PassMode::Pair(ArgAttributes
+/// { regular: NonNull | NoUndef, arg_ext: None, .. }, ..)` — a ScalarPair of
+/// (data pointer, length) in two consecutive GPR slots, bit-for-bit the
+/// (data, len) split the trust-ir converter emits for a `FatPtr(Slice)`
+/// formal. (An older note on the `&T` arm records `&[u64]` arriving as
+/// `PassMode::Cast`/Uniform — the mode rustc picks has drifted; this helper
+/// matches what THIS tree emits.) The NonNull/NoUndef attributes are value
+/// metadata, not placement contracts, exactly as the admitted `&T` arm
+/// argues; `InReg` or any integer extension refuses. `&mut [T]` is
+/// deliberately NOT admitted (writes through the pointer are outside the
+/// read-only incoming-root memory lane), and `&str` waits for its own
+/// measurement.
+fn slice_ref_arg_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+    let ty::Ref(_, inner, mir::Mutability::Not) = arg.layout.ty.kind() else {
+        return false;
+    };
+    if !matches!(inner.kind(), ty::Slice(_)) {
+        return false;
+    }
+    let PassMode::Pair(a, b) = &arg.mode else {
+        return false;
+    };
+    let attrs_ok = |attrs: &rustc_target::callconv::ArgAttributes| {
+        !attrs.contains(ArgAttribute::InReg) && attrs.arg_ext == ArgExtension::None
+    };
+    attrs_ok(a) && attrs_ok(b) && arg.layout.size.bits() == 128
+}
+
+/// A BY-VALUE struct argument passed INDIRECTLY (rustc's hidden pointer),
+/// as the trust-ir converter's >16-byte struct-formal lane expects: the
+/// formal is one I64 (the pointer), and field reads go through it at the
+/// producer-recorded offsets. Admitted only when rustc's mode is a plain
+/// non-stack `Indirect` with no metadata — the exact shape whose machine
+/// calling convention IS "one pointer in the next GPR". The converter
+/// independently refuses any instance whose struct lacks the full recorded
+/// layout, so admission here can never outrun the layout evidence.
+fn indirect_by_value_struct_arg_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+    let ty::Adt(adt, _) = arg.layout.ty.kind() else {
+        return false;
+    };
+    if !adt.is_struct() {
+        return false;
+    }
+    let PassMode::Indirect { attrs, meta_attrs: None, on_stack: false } = &arg.mode else {
+        return false;
+    };
+    !attrs.contains(ArgAttribute::InReg)
+        && attrs.arg_ext == ArgExtension::None
+        && arg.layout.size.bytes() > 16
+}
+
+/// A BY-VALUE 2-scalar-field struct argument riding `PassMode::Pair` — the
+/// `Range<usize>` shape. The converter emits two register formals in layout
+/// order and maps extracts by declaration index; admission here mirrors the
+/// slice pair's plain-attribute checks and additionally demands a genuine
+/// ScalarPair repr, so the two register scalars ARE the two fields.
+fn pair_struct_arg_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+    let ty::Adt(adt, _) = arg.layout.ty.kind() else {
+        return false;
+    };
+    if !adt.is_struct() {
+        return false;
+    }
+    let PassMode::Pair(a, b) = &arg.mode else {
+        return false;
+    };
+    let attrs_ok = |attrs: &rustc_target::callconv::ArgAttributes| {
+        !attrs.contains(ArgAttribute::InReg) && attrs.arg_ext == ArgExtension::None
+    };
+    attrs_ok(a)
+        && attrs_ok(b)
+        && matches!(arg.layout.backend_repr, BackendRepr::ScalarPair(..))
+        && arg.layout.size.bytes() <= 16
+}
+
+/// A BY-VALUE single-field newtype struct riding `PassMode::Direct` as its
+/// field scalar — the `RangeFrom<usize>`/`RangeTo<usize>` argument shape. The
+/// converter binds one formal of the field's type; a genuine Scalar repr with
+/// plain attributes is demanded so the register value IS the field.
+fn direct_newtype_struct_arg_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+    let ty::Adt(adt, _) = arg.layout.ty.kind() else {
+        return false;
+    };
+    if !adt.is_struct() {
+        return false;
+    }
+    let PassMode::Direct(attrs) = &arg.mode else {
+        return false;
+    };
+    !attrs.contains(ArgAttribute::InReg)
+        && attrs.arg_ext == ArgExtension::None
+        && matches!(arg.layout.backend_repr, BackendRepr::Scalar(_))
+}
+
+/// A small Direct-tagged enum riding `PassMode::Pair` — `Option<u64>`-class
+/// values as (tag, payload) register pairs, argument or return. The converter
+/// splits the value into two lanes with the producer-recorded Direct{0}
+/// descriptor; a genuine ScalarPair repr with plain attributes is demanded so
+/// the two register scalars ARE (tag, payload) in that order. Niche-encoded
+/// Options (`Option<&T>`) are NOT ScalarPair-with-a-tag — their single-scalar
+/// or niched pair modes fail these checks and stay refused.
+fn pair_enum_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+    let ty::Adt(adt, _) = arg.layout.ty.kind() else {
+        return false;
+    };
+    if !adt.is_enum() {
+        return false;
+    }
+    let PassMode::Pair(a, b) = &arg.mode else {
+        return false;
+    };
+    let attrs_ok = |attrs: &rustc_target::callconv::ArgAttributes| {
+        !attrs.contains(ArgAttribute::InReg) && attrs.arg_ext == ArgExtension::None
+    };
+    // A niche encoding never yields `Variants::Multiple` with a plain
+    // ScalarPair(Initialized tag, payload); require an INITIALIZED first
+    // scalar so a niched pair (whose "tag" lane is the payload itself) is
+    // refused. The converter's own Direct{tag_offset:0} descriptor check is
+    // the second, independent guard.
+    let tag_initialized = match arg.layout.backend_repr {
+        BackendRepr::ScalarPair(t, _) => {
+            matches!(t, rustc_abi::Scalar::Initialized { .. })
+        }
+        _ => false,
+    };
+    attrs_ok(a) && attrs_ok(b) && tag_initialized && arg.layout.size.bytes() <= 16
+}
+
+fn zext_bool_return_abi_supported<'tcx>(arg: &ArgAbi<'tcx, Ty<'tcx>>) -> bool {
+    let PassMode::Direct(attrs) = &arg.mode else {
+        return false;
+    };
+    matches!(arg.layout.ty.kind(), ty::Bool)
+        && !attrs.contains(ArgAttribute::InReg)
+        && attrs.arg_ext == ArgExtension::Zext
+        && arg.layout.size.bits() == 8
+        && matches!(arg.layout.backend_repr, BackendRepr::Scalar(_))
+}
+
 fn codegen_attrs_issue(attrs: &CodegenFnAttrs) -> Option<String> {
     if attrs.flags.intersects(
         CodegenFnAttrFlags::TRACK_CALLER
@@ -1290,22 +1469,71 @@ fn validate_codegen_instance_abi_with<'tcx>(
             "target `{target_triple}` has no audited scalar-register argument assignment"
         ));
     };
-    if fn_abi.args.len() > register_arg_limit {
+    // The register-count cap is a MIR-lane boundary only. The AArch64 ISel
+    // implements incoming AND outgoing stack-argument placement for scalars
+    // (`AppleAArch64ABI::classify_params_with` -> `ArgLocation::Stack`, with
+    // the Darwin natural-packing vs AAPCS64 8-byte-slot rule localized in
+    // `place_scalar_stack_arg`, and the formal side loading via
+    // `IncomingArg(offset)`), so on the F1 lane a 9th scalar argument is a
+    // represented placement, not a guess. The trust-ir gate's argument binding
+    // still models the 8-register fragment only and fail-closes (Unknown) on
+    // more — so a stack-arg function is emitted UNCERTIFIED under
+    // allow-unknown and refused under strict until the gate learns to bind
+    // spec parameters 9+ to the machine's initial memory at the classifier's
+    // own offsets. Completeness now, proof coverage next; never a silent
+    // wrong-ABI emission (the MIR lane keeps its cap — its evidence lanes
+    // never measured stack placement).
+    if fn_abi.args.len() > register_arg_limit && !matches!(enum_abi, EnumAbi::Admit) {
         return Err(format!(
-            "{} arguments exceed target `{target_triple}`'s {register_arg_limit} scalar integer argument registers; stack-argument placement is not represented by trust-cg",
+            "{} arguments exceed target `{target_triple}`'s {register_arg_limit} scalar integer argument registers; stack-argument placement is not represented on this lane",
             fn_abi.args.len()
         ));
     }
     for (index, arg) in fn_abi.args.iter().enumerate() {
-        if !scalar_register_abi_ty_supported(arg, enum_abi) {
+        // The `&[T]` widening rides the trust-ir lane only: the converter
+        // splits a slice formal into (data, len) I64 params at the same two
+        // GPR slots the Cast/Uniform ABI assigns, and reads through the data
+        // pointer are the read-only incoming-root memory lane. The MIR lane
+        // keeps refusing (its converter has no fat-param story).
+        let slice_ok = matches!(enum_abi, EnumAbi::Admit) && slice_ref_arg_abi_supported(arg);
+        // The by-value indirect struct formal rides the trust-ir lane only,
+        // like the slice split: the converter binds the hidden pointer as one
+        // I64 formal and reads fields at recorded offsets.
+        let indirect_struct_ok = matches!(enum_abi, EnumAbi::Admit)
+            && indirect_by_value_struct_arg_abi_supported(arg);
+        let pair_struct_ok =
+            matches!(enum_abi, EnumAbi::Admit) && pair_struct_arg_abi_supported(arg);
+        let newtype_struct_ok =
+            matches!(enum_abi, EnumAbi::Admit) && direct_newtype_struct_arg_abi_supported(arg);
+        let pair_enum_ok = matches!(enum_abi, EnumAbi::Admit) && pair_enum_abi_supported(arg);
+        if !scalar_register_abi_ty_supported(arg, enum_abi)
+            && !slice_ok
+            && !indirect_struct_ok
+            && !pair_struct_ok
+            && !newtype_struct_ok
+            && !pair_enum_ok
+        {
             return Err(format!(
                 "argument {index} uses unsupported ABI type/pass mode `{}` / {:?}",
                 arg.layout.ty, arg.mode
             ));
         }
     }
+    // The `bool` RETURN widening rides the trust-ir lane only (`EnumAbi::Admit`
+    // is that lane's selector): its Zext contract is discharged by the trust-ir
+    // gate's 32-bit byte-proof (see `zext_bool_return_abi_supported`), and the
+    // MIR path's gate carries no such model, so admitting it there would be an
+    // unproven ABI claim.
+    let bool_ret_ok =
+        matches!(enum_abi, EnumAbi::Admit) && zext_bool_return_abi_supported(&fn_abi.ret);
+    // The pair-enum RETURN rides x0/x1 exactly as the converter's two-lane
+    // signature declares.
+    let pair_enum_ret_ok =
+        matches!(enum_abi, EnumAbi::Admit) && pair_enum_abi_supported(&fn_abi.ret);
     if !scalar_register_abi_ty_supported(&fn_abi.ret, enum_abi)
         && !ignored_return_abi_ty_supported(&fn_abi.ret)
+        && !bool_ret_ok
+        && !pair_enum_ret_ok
     {
         return Err(format!(
             "return value uses unsupported ABI type/pass mode `{}` / {:?}",
@@ -1418,34 +1646,67 @@ fn production_function_symbol_contract_supported(linkage: Linkage, visibility: V
     //
     // Weak/link-once/common are still refused: they are not strong definitions.
     //
-    // VISIBILITY stays `Default`-only. The object writers carry no `N_PEXT` /
-    // `STV_HIDDEN` / `STV_PROTECTED` channel, so promoting a Hidden symbol or
-    // making a Protected symbol interposable would silently change dynamic-link
-    // behavior. This costs nothing for the case at hand: rustc's internalization
-    // pass sets `visibility = Default` alongside `linkage = Internal`
-    // (`rustc_monomorphize::partitioning`), so internalized mono-items land in
-    // the admitted quadrant.
-    matches!(linkage, Linkage::External | Linkage::Internal) && visibility == Visibility::Default
+    // VISIBILITY. `Default` is always expressible. `Hidden` is expressible for
+    // an `External` DEFINITION on the Mach-O path (private extern,
+    // `N_EXT | N_PEXT`: external for static linking, demoted to a local by the
+    // final link) — the exact quadrant rustc assigns a `pub(crate)` definition
+    // promoted for cross-CGU reachability. `Hidden` on an `Internal` symbol
+    // would be redundant (a local is already invisible) and rustc does not
+    // emit it; `Protected` stays refused — making a symbol non-interposable
+    // has dynamic-link semantics the writers do not model. The ELF emission
+    // path refuses any non-global binding wholesale, so an admitted Hidden
+    // item still fails closed there rather than silently exporting.
+    match (linkage, visibility) {
+        (Linkage::External | Linkage::Internal, Visibility::Default) => true,
+        (Linkage::External, Visibility::Hidden) => true,
+        _ => false,
+    }
 }
 
 /// Map rustc's `Linkage` onto the two definition shapes trust-cg emits.
 ///
 /// Only linkages the gate above admits reach this function; anything else is a
 /// bug in the gate and fails closed rather than being silently exported.
-fn bridge_function_linkage(linkage: Linkage) -> Result<bridge_backend::FunctionLinkage, String> {
-    match linkage {
-        Linkage::External => Ok(bridge_backend::FunctionLinkage::External),
-        Linkage::Internal => Ok(bridge_backend::FunctionLinkage::Internal),
+fn bridge_function_linkage(
+    linkage: Linkage,
+    visibility: Visibility,
+) -> Result<bridge_backend::FunctionLinkage, String> {
+    match (linkage, visibility) {
+        (Linkage::External, Visibility::Default) => Ok(bridge_backend::FunctionLinkage::External),
+        (Linkage::External, Visibility::Hidden) => Ok(bridge_backend::FunctionLinkage::Hidden),
+        (Linkage::Internal, Visibility::Default) => Ok(bridge_backend::FunctionLinkage::Internal),
         other => Err(format!(
-            "{other:?} linkage reached symbol emission despite the mono-item gate (fail-closed)"
+            "{other:?} linkage/visibility reached symbol emission despite the mono-item gate              (fail-closed)"
         )),
     }
 }
 
-fn extract_mono_verifiable_function<'tcx>(
+pub(crate) fn extract_mono_verifiable_function<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::Instance<'tcx>,
 ) -> Result<VerifiableFunction, String> {
+    extract_mono_verifiable_function_with_abi(tcx, instance, false, &|tcx, instance, arg_count| {
+        validate_codegen_instance_abi(tcx, instance, arg_count)
+    })
+}
+
+/// [`extract_mono_verifiable_function`] with a caller-supplied ABI validator.
+///
+/// The MIR path validates against its own emission constraints
+/// (`validate_codegen_instance_abi`); the trust-ir frontend's upstream lane
+/// validates against the F1 fragment's admission
+/// (`validate_codegen_instance_abi_trust_ir`) — the same validator every
+/// source-first artifact passes — so an upstream body is not refused by
+/// constraints belonging to the path it does not take.
+pub(crate) fn extract_mono_verifiable_function_with_abi<'tcx, V>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    trust_ir_upstream: bool,
+    validate_abi: &V,
+) -> Result<VerifiableFunction, String>
+where
+    V: Fn(TyCtxt<'tcx>, ty::Instance<'tcx>, usize) -> Result<(), String>,
+{
     let symbol_name = tcx.symbol_name(instance).name.to_string();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
         || -> Result<VerifiableFunction, String> {
@@ -1458,11 +1719,21 @@ fn extract_mono_verifiable_function<'tcx>(
                 )
                 .map_err(|error| format!("MIR monomorphization failed: {error:?}"))?;
 
-            validate_codegen_instance_abi(tcx, instance, mono_body.arg_count)
+            validate_abi(tcx, instance, mono_body.arg_count)
                 .map_err(|reason| format!("unsupported definition ABI: {reason}"))?;
 
-            let mut func = trust_mir_extract::extract_function_for_codegen(tcx, &mono_body)
-                .map_err(|error| error.to_string())?;
+            // The trust-ir upstream lane extracts under the faithful-scalars
+            // guard with the faithful-ADT ty policy — the differential
+            // oracle's spellings, which the trust-ir bridge and the
+            // converter's pair-enum/recorded-layout lanes consume. The MIR
+            // lane keeps the strict extraction.
+            let mut func = if trust_ir_upstream {
+                trust_mir_extract::extract_function_for_trust_ir_upstream(tcx, &mono_body)
+                    .map_err(|error| error.to_string())?
+            } else {
+                trust_mir_extract::extract_function_for_codegen(tcx, &mono_body)
+                    .map_err(|error| error.to_string())?
+            };
             let overrides = mono_body
                 .basic_blocks
                 .iter()
@@ -1492,12 +1763,44 @@ fn extract_mono_verifiable_function<'tcx>(
 /// linkage/visibility gate, same collision check, same ordering — and the two
 /// paths differ ONLY in where each function's IR comes from. A second inventory
 /// would make any comparison between them meaningless.
+/// A reachable `MonoItem::Static`, evaluated to its concrete byte image and
+/// carried to object emission as a plain data definition. Only the
+/// fail-closed slice is admitted at collection: non-thread-local,
+/// default-visibility, relocation-free, fully-initialized allocations.
+struct ProductionStatic {
+    symbol: String,
+    bytes: Vec<u8>,
+    mutable: bool,
+    is_external: bool,
+    align: u32,
+}
+
+impl ProductionStatic {
+    fn into_object_global(self) -> trust_cg_bridge::codegen_backend::ObjectGlobal {
+        trust_cg_bridge::codegen_backend::ObjectGlobal {
+            name: self.symbol,
+            data: self.bytes,
+            mutable: self.mutable,
+            symbol_refs: vec![],
+            is_external: self.is_external,
+            is_thread_local: false,
+            is_import: false,
+            is_weak: false,
+            align: self.align,
+        }
+    }
+}
+
 fn collect_production_mono_instances<'tcx>(
     tcx: TyCtxt<'tcx>,
-) -> Result<Vec<(String, ty::Instance<'tcx>, bridge_backend::FunctionLinkage)>, String> {
+) -> Result<
+    (Vec<(String, ty::Instance<'tcx>, bridge_backend::FunctionLinkage)>, Vec<ProductionStatic>),
+    String,
+> {
     use rustc_middle::mono::MonoItem;
 
     let mut instances = Vec::new();
+    let mut statics = Vec::new();
     let mut symbols = FxHashMap::default();
     let partitions = tcx.collect_and_partition_mono_items(());
 
@@ -1514,7 +1817,7 @@ fn collect_production_mono_instances<'tcx>(
                             data.visibility,
                         ));
                     }
-                    let linkage = bridge_function_linkage(data.linkage)?;
+                    let linkage = bridge_function_linkage(data.linkage, data.visibility)?;
                     let symbol = tcx.symbol_name(instance).name.to_string();
                     if let Some(previous) = symbols.insert(symbol.clone(), instance) {
                         if previous != instance {
@@ -1528,10 +1831,75 @@ fn collect_production_mono_instances<'tcx>(
                     instances.push((symbol, instance, linkage));
                 }
                 MonoItem::Static(def_id) => {
-                    return Err(format!(
-                        "reachable static `{}` is not wired into trust-cg object emission",
-                        tcx.def_path_str(def_id)
-                    ));
+                    // Admit the fail-closed data slice: a non-thread-local,
+                    // default-visibility static whose evaluated allocation is
+                    // fully initialized and carries NO relocations (no embedded
+                    // pointers). Everything else is refused with its own name.
+                    let path = tcx.def_path_str(def_id);
+                    let attrs = tcx.codegen_fn_attrs(def_id);
+                    if attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL) {
+                        return Err(format!(
+                            "reachable static `{path}` is #[thread_local]; TLS data is not                              wired into trust-cg object emission"
+                        ));
+                    }
+                    if data.visibility != Visibility::Default {
+                        return Err(format!(
+                            "reachable static `{path}` requires {:?} visibility; data symbols                              carry no hidden/protected channel",
+                            data.visibility,
+                        ));
+                    }
+                    let is_external = match data.linkage {
+                        Linkage::External => true,
+                        Linkage::Internal => false,
+                        other => {
+                            return Err(format!(
+                                "reachable static `{path}` requires unsupported {other:?} linkage"
+                            ));
+                        }
+                    };
+                    let alloc = tcx.eval_static_initializer(def_id).map_err(|e| {
+                        format!("reachable static `{path}` failed to evaluate: {e:?}")
+                    })?;
+                    let alloc = alloc.inner();
+                    if !alloc.provenance().ptrs().is_empty() {
+                        return Err(format!(
+                            "reachable static `{path}` embeds {} pointer(s); relocated static                              data is not wired into trust-cg object emission",
+                            alloc.provenance().ptrs().len()
+                        ));
+                    }
+                    let len = alloc.len();
+                    let range = rustc_middle::mir::interpret::AllocRange {
+                        start: rustc_abi::Size::ZERO,
+                        size: rustc_abi::Size::from_bytes(len as u64),
+                    };
+                    let mut bytes =
+                        alloc.inspect_with_uninit_and_ptr_outside_interpreter(0..len).to_vec();
+                    // UNINITIALIZED ranges (enum payload padding, struct
+                    // padding) are materialized as ZERO. Sound: a Rust program
+                    // cannot rely on the contents of padding, and rustc's own
+                    // backends pick an arbitrary concrete image for them; zero
+                    // is the deterministic choice.
+                    for chunk in alloc.init_mask().range_as_init_chunks(range) {
+                        if !chunk.is_init() {
+                            let r = chunk.range();
+                            let (start, end) = (r.start.bytes() as usize, r.end.bytes() as usize);
+                            bytes[start..end].fill(0);
+                        }
+                    }
+                    let align = u32::try_from(alloc.align.bytes()).map_err(|_| {
+                        format!("reachable static `{path}` alignment exceeds u32")
+                    })?;
+                    let symbol = tcx
+                        .symbol_name(ty::Instance::mono(tcx, def_id))
+                        .name
+                        .to_string();
+                    statics.push(ProductionStatic {
+                        symbol,
+                        bytes,
+                        mutable: alloc.mutability.is_mut(),
+                        is_external,
+                        align,
+                    });
                 }
                 MonoItem::GlobalAsm(item_id) => {
                     return Err(format!(
@@ -1543,7 +1911,8 @@ fn collect_production_mono_instances<'tcx>(
     }
 
     instances.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
-    Ok(instances)
+    statics.sort_by(|a: &ProductionStatic, b: &ProductionStatic| a.symbol.cmp(&b.symbol));
+    Ok((instances, statics))
 }
 
 /// Build the single deterministic production inventory used by every output
@@ -1551,8 +1920,15 @@ fn collect_production_mono_instances<'tcx>(
 /// artifact whose behavior differs from rustc's mono-item graph.
 fn build_production_mono_functions<'tcx>(
     tcx: TyCtxt<'tcx>,
-) -> Result<(Vec<VerifiableFunction>, Vec<bridge_backend::FunctionLinkage>), String> {
-    let instances = collect_production_mono_instances(tcx)?;
+) -> Result<
+    (
+        Vec<VerifiableFunction>,
+        Vec<bridge_backend::FunctionLinkage>,
+        Vec<bridge_backend::ObjectGlobal>,
+    ),
+    String,
+> {
+    let (instances, statics) = collect_production_mono_instances(tcx)?;
     // The linkage vector is built in the SAME order as the function vector and
     // returned beside it; the two are consumed strictly index-aligned.
     let linkage = instances.iter().map(|(_, _, linkage)| *linkage).collect::<Vec<_>>();
@@ -1570,7 +1946,9 @@ fn build_production_mono_functions<'tcx>(
         internal_linkage = internal,
         "[trust_cg] reachable monomorphic extraction complete"
     );
-    Ok((functions, linkage))
+    let statics =
+        statics.into_iter().map(ProductionStatic::into_object_global).collect::<Vec<_>>();
+    Ok((functions, linkage, statics))
 }
 
 fn lang_item_symbol<'tcx>(tcx: TyCtxt<'tcx>, lang_item: LangItem) -> Result<String, String> {
@@ -2076,7 +2454,7 @@ impl CodegenBackend for TrustCgCodegenBackend {
             return self.codegen_crate_from_trust_ir(tcx, crate_name);
         }
 
-        let (functions, linkage) = build_production_mono_functions(tcx).unwrap_or_else(|reason| {
+        let (functions, linkage, statics) = build_production_mono_functions(tcx).unwrap_or_else(|reason| {
             tcx.dcx().fatal(format!(
                 "trust-cg cannot faithfully materialize rustc's reachable mono-item graph: {reason}"
             ))
@@ -2141,7 +2519,7 @@ impl CodegenBackend for TrustCgCodegenBackend {
         };
 
         let bridge_crate_info =
-            bridge_backend::CrateInfo { crate_name: crate_name.clone(), functions, linkage };
+            bridge_backend::CrateInfo { crate_name: crate_name.clone(), functions, linkage, statics };
 
         let mut bridge_ongoing =
             match BridgeCodegenBackend::codegen_crate(&bridge, &bridge_crate_info) {

@@ -1552,6 +1552,65 @@ fn symbolic_array_pointer_remains_thin_outside_tls_native_model() {
     }
 }
 
+/// FALSIFYING (adversarial probe from the step-3 verification, made permanent):
+/// an ADT whose LAST field is unsized is a FAT pointee — the pointer carries the
+/// tail's metadata — even though it spells `Ty::Adt`. The original negative gate
+/// (`!matches!(Slice|Str|Dynamic|Unsupported)`) classified it thin, which would
+/// admit `*const S -> usize` as an identity expose-cast and silently drop the
+/// metadata word. Red if the tail recursion is ever removed. The sized-tail ADT
+/// arm guards the other direction: tightening must NOT reject genuinely thin
+/// pointees, or every Box-like newtype stops lowering.
+#[test]
+fn test_unsized_tail_adt_pointee_is_fat_not_thin() {
+    let unsized_tail = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new(),
+        name: "UnsizedTail".to_string(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+        fields: vec![
+            ("len".to_string(), Ty::usize()),
+            ("tail".to_string(), Ty::Slice { elem: Box::new(Ty::u8()) }),
+        ],
+        arbitrary_precision: None,
+    };
+    let nested = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new(),
+        name: "Nested".to_string(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+        fields: vec![("inner".to_string(), unsized_tail.clone())],
+        arbitrary_precision: None,
+    };
+    let sized_tail = Ty::Adt {
+        adt_kind: None,
+        layout: None,
+        variants: Vec::new(),
+        name: "SizedTail".to_string(),
+        disc_index_safe: false,
+        faithful_enum_repr: None,
+        enum_layout: None,
+        fields: vec![
+            ("head".to_string(), Ty::Slice { elem: Box::new(Ty::u8()) }),
+            ("tail".to_string(), Ty::usize()),
+        ],
+        arbitrary_precision: None,
+    };
+    for (pointee, thin, why) in [
+        (unsized_tail, false, "unsized-tail ADT pointee must be FAT"),
+        (nested, false, "unsized tail through one nesting level must be FAT"),
+        (sized_tail, true, "a SIZED last field keeps the pointee thin (only the tail carries metadata)"),
+    ] {
+        let pointer = Ty::RawPtr { mutable: false, pointee: Box::new(pointee) };
+        assert_eq!(crate::is_thin_pointer_ty(&pointer), thin, "{why}");
+    }
+}
+
 #[test]
 fn test_ptr_to_int_cast_is_modeled_not_fail_closed() {
     // pointer->int `as` casts are now ACCEPTED, not refused as UnsupportedMir. Exposing
@@ -1571,6 +1630,143 @@ fn test_ptr_to_int_cast_is_modeled_not_fail_closed() {
                 if kind == "Rvalue::Cast" && detail.contains("unsupported cast")
         )),
         "ptr->int cast must be modeled as unconstrained, not a fail-closed UnsupportedMir VC: {vcs:?}"
+    );
+}
+
+/// Trust (verified-sysroot §5 step 3, slice 1): the `*mut T::add::
+/// precondition_check` SHAPE — expose the pointer's address, checked-multiply
+/// the element count by the element size, checked-add the byte offset to the
+/// address — must be fully STATABLE: zero fail-closed `UnsupportedMir` rows,
+/// and the add-overflow obligation must range over the POINTER'S OWN term
+/// (the expose cast is identity over the collapsed allocation model's value,
+/// `trust_types::alloc_model`), not over a fresh unconstrained integer.
+/// FALSIFYING: red if the expose cast regresses to opaque (the formula stops
+/// naming `ptr_arg`) or back to a fail-closed refusal.
+#[test]
+fn ptr_add_precondition_shape_is_statable_over_the_pointer_term() {
+    let span = SourceSpan::default();
+    let thin = Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) };
+    let func = VerifiableFunction {
+        name: "ptr_add_precheck_shape".to_string(),
+        def_path: "test::ptr_add_precheck_shape".to_string(),
+        span: span.clone(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: Ty::Unit, name: None },
+                LocalDecl { index: 1, ty: thin, name: Some("ptr_arg".into()) },
+                LocalDecl { index: 2, ty: Ty::usize(), name: Some("count_arg".into()) },
+                LocalDecl { index: 3, ty: Ty::usize(), name: Some("size_arg".into()) },
+                LocalDecl { index: 4, ty: Ty::usize(), name: Some("addr_word".into()) },
+                LocalDecl {
+                    index: 5,
+                    ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]),
+                    name: None,
+                },
+                LocalDecl { index: 6, ty: Ty::usize(), name: Some("byte_off".into()) },
+                LocalDecl {
+                    index: 7,
+                    ty: Ty::Tuple(vec![Ty::usize(), Ty::Bool]),
+                    name: None,
+                },
+            ],
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        // addr_word = ptr_arg as usize   (the `addr()` expose)
+                        Statement::Assign {
+                            place: Place::local(4),
+                            rvalue: Rvalue::Cast(Operand::Copy(Place::local(1)), Ty::usize()),
+                            span: span.clone(),
+                        },
+                        // (byte_off, o1) = count_arg checked* size_arg
+                        Statement::Assign {
+                            place: Place::local(5),
+                            rvalue: Rvalue::CheckedBinaryOp(
+                                BinOp::Mul,
+                                Operand::Copy(Place::local(2)),
+                                Operand::Copy(Place::local(3)),
+                            ),
+                            span: span.clone(),
+                        },
+                    ],
+                    terminator: Terminator::Assert {
+                        cond: Operand::Move(Place::field(5, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Mul),
+                        target: BlockId(1),
+                        span: span.clone(),
+                        unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    stmts: vec![
+                        Statement::Assign {
+                            place: Place::local(6),
+                            rvalue: Rvalue::Use(Operand::Copy(Place::field(5, 0))),
+                            span: span.clone(),
+                        },
+                        // (sum, o2) = addr_word checked+ byte_off  (the no-wrap leg)
+                        Statement::Assign {
+                            place: Place::local(7),
+                            rvalue: Rvalue::CheckedBinaryOp(
+                                BinOp::Add,
+                                Operand::Copy(Place::local(4)),
+                                Operand::Copy(Place::local(6)),
+                            ),
+                            span: span.clone(),
+                        },
+                    ],
+                    terminator: Terminator::Assert {
+                        cond: Operand::Move(Place::field(7, 1)),
+                        expected: false,
+                        msg: AssertMessage::Overflow(BinOp::Add),
+                        target: BlockId(2),
+                        span: span.clone(),
+                        unwind: UnwindEdge::Unreachable,
+                    },
+                },
+                BasicBlock { id: BlockId(2), stmts: vec![], terminator: Terminator::Return },
+            ],
+            arg_count: 3,
+            return_ty: Ty::Unit,
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
+    };
+    let vcs = generate_vcs(&func);
+    assert!(
+        !vcs.iter().any(|vc| matches!(&vc.kind, VcKind::UnsupportedMir { .. })),
+        "the ptr::add precondition shape must lower with no fail-closed rows: {vcs:#?}"
+    );
+    assert!(
+        vcs.iter().any(|vc| format!("{:?}", vc.formula).contains("ptr_arg")),
+        "an obligation must be STATED over the pointer's own term (`addr_word == ptr_arg`          conjoined by the expose identity); none of the emitted formulas name ptr_arg: {vcs:#?}"
+    );
+}
+
+/// Trust (verified-sysroot §5 step 3, slice 1) — FALSIFYING twin: the RECOVER
+/// direction (`usize -> *const u8`) manufactures provenance and must KEEP its
+/// fail-closed `UnsupportedMir` refusal. Red if the expose acceptance is ever
+/// symmetrized to integer->pointer.
+#[test]
+fn ptr_recover_cast_stays_fail_closed() {
+    let vcs = generate_vcs(&unsupported_cast_function(
+        "int_to_ptr_cast",
+        Ty::usize(),
+        Ty::RawPtr { mutable: false, pointee: Box::new(Ty::u8()) },
+    ));
+    assert!(
+        vcs.iter().any(|vc| matches!(
+            &vc.kind,
+            VcKind::UnsupportedMir { kind, detail }
+                if kind == "Rvalue::Cast" && detail.contains("unsupported cast")
+        )),
+        "int->ptr (provenance recover) must remain a fail-closed UnsupportedMir VC: {vcs:#?}"
     );
 }
 
@@ -1732,9 +1928,7 @@ fn tagged_adt_with_field(field_name: &str, field_ty: Ty) -> Ty {
         name: "Tagged".to_string(),
         fields: vec![(field_name.to_string(), field_ty), ("payload".to_string(), Ty::i32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    }
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
 }
 
 fn set_discriminant_function(name: &str, local_ty: Ty, variant_index: usize) -> VerifiableFunction {
@@ -1830,9 +2024,7 @@ fn test_set_discriminant_without_explicit_tag_fails_closed() {
             name: "Untagged".to_string(),
             fields: vec![("payload".to_string(), Ty::i32())],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        },
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
         1,
     );
 
@@ -3477,9 +3669,7 @@ fn match_exhaustive_function() -> VerifiableFunction {
                         name: "Status".into(),
                         fields: vec![("discriminant".into(), Ty::u32())],
                         disc_index_safe: false,
-                        faithful_enum_repr: None,
-                        enum_layout: None,
-                    },
+                        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
                     name: Some("status".into()),
                 },
                 LocalDecl { index: 2, ty: Ty::u32(), name: Some("x".into()) },
@@ -9079,19 +9269,13 @@ fn place_ty_resolves_nested_enum_variant_payload() {
         name: "Option".into(),
         fields: vec![("__tag".into(), tag()), ("__v1_0".into(), Ty::u32())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
-    let outer_opt = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+    let outer_opt = Ty::Adt { adt_kind: None, layout: None,
         variants: Vec::new(),
         name: "Option".into(),
         fields: vec![("__tag".into(), tag()), ("__v1_0".into(), inner_opt.clone())],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::u32(), name: None },
@@ -9154,16 +9338,11 @@ fn operand_ty_cow_is_byte_identical_to_operand_ty() {
                     name: "ExprKind".into(),
                     fields: vec![("x".into(), Ty::u32())],
                     disc_index_safe: false,
-                    faithful_enum_repr: None,
-                    enum_layout: None,
-                },
+                    faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
             ),
             ("flag".into(), Ty::Bool),
         ],
-        disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+        disc_index_safe: false, faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::Unit, name: None },
@@ -9217,9 +9396,7 @@ fn deref_of_reborrowed_payload_converges_to_referent_name() {
             ("__v1_0".into(), Ty::u32()),
         ],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let opt_ref = Ty::Ref { mutable: false, inner: Box::new(opt) };
     let payload = Place {
         local: 1,
@@ -9316,9 +9493,7 @@ fn place_ty_struct_field_without_downcast_stays_flat() {
         name: "S".into(),
         fields: vec![("x".into(), Ty::u32()), ("y".into(), Ty::Bool)],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let func = single_block_func(
         vec![
             LocalDecl { index: 0, ty: Ty::u32(), name: None },
@@ -9535,9 +9710,7 @@ fn deref_shared_struct_field_array_const_index_converges() {
         name: "Buf".to_string(),
         fields: vec![("data".to_string(), arr)],
         disc_index_safe: false,
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
     let bref = Ty::Ref { mutable: false, inner: Box::new(buf) };
     let func = single_block_func(
         vec![
@@ -9694,7 +9867,7 @@ fn struct_payload_fold_blocked_by_projected_store_to_source() {
 #[test]
 fn struct_payload_fold_blocked_by_second_def_of_alias() {
     // Soundness: a second whole-store to `_3` means it no longer uniquely holds the
-    // moved payload; `unique_whole_local_def` returns None and the fold is refused.
+    // moved payload; `unique_value_def` returns None and the fold is refused.
     let func = struct_payload_alias_fn(vec![Statement::Assign {
         place: Place::local(3),
         rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(0, 32))),
@@ -10013,18 +10186,25 @@ fn const_folding_index_store_is_a_counted_array_element_store() {
     // counted array-theory element store. The scalar `[c;min=len]` path is
     // bypassed for an eligible array, so if such a store were dropped it would
     // vanish entirely and a same-slot read would go stale -> false-PROVE.
+    // The index is the BODY TEMP `_4`, not the parameter `_2`. `index_local_const`
+    // resolves a local to the one constant it holds EVERYWHERE, and a parameter's
+    // first value is written at ENTRY — no statement in `body.blocks` carries it — so
+    // agreeing constants in the body are its SECOND..Nth values, never its first. The
+    // fixture that used `_2` was asserting the shape `p5` exploited
+    // (`entry_def_structural.rs` § W5), not the const-folding hole this row is about.
     let set_idx = Statement::Assign {
-        place: Place::local(2),
+        place: Place::local(4),
         rvalue: Rvalue::Use(Operand::Constant(ConstValue::Uint(5, 64))),
         span: SourceSpan::default(),
     };
     let store = Statement::Assign {
-        place: Place { local: 1, projections: vec![Projection::Index(2)] },
+        place: Place { local: 1, projections: vec![Projection::Index(4)] },
         rvalue: Rvalue::Use(Operand::Copy(Place::local(3))),
         span: SourceSpan::default(),
     };
-    let func = array_param_fn(8, vec![set_idx, store]);
-    assert!(index_local_const(&func, 2).is_some(), "index const-folds to 5");
+    let mut func = array_param_fn(8, vec![set_idx, store]);
+    func.body.locals.push(LocalDecl { index: 4, ty: Ty::usize(), name: Some("j".into()) });
+    assert!(index_local_const(&func, 4).is_some(), "index const-folds to 5");
     assert!(
         is_array_theory_element_store(&func, 1, &func.body.blocks[0].stmts[1]),
         "a const-folding index store must be a counted array element store"
@@ -10612,7 +10792,7 @@ fn store_through_pointer_havocs_referent_fact() {
 
 // SOUNDNESS regression (staleness class, cast-laundered pointer channel). A store
 // `*p = v` through `p = &mut x as *mut u32` gives `p` a UNIQUE def (the Cast) — so
-// the OLD havoc gate (`unique_whole_local_def(p).is_none()`) did NOT fire — and
+// the OLD havoc gate (`crate::local_defs::unique_value_def(p).is_none()`) did NOT fire — and
 // `resolve_referent` cannot fold the Cast, so `*p` names the opaque `p*` (never
 // overlapping `x`). The stale `x == 5` thus leaked into the `x + x` overflow VC,
 // vacuously PROVING no-overflow while live `x = 4e9` overflows u32.
@@ -10755,7 +10935,7 @@ fn reseated_ptr_deref_store_havocs_referent_fact() {
             },
         ];
         if reseated {
-            // second whole-local def of `r` -> unique_whole_local_def(r) = None
+            // second whole-local def of `r` -> crate::local_defs::unique_value_def(r) = None
             stmts.push(Statement::Assign {
                 place: Place::local(2),
                 rvalue: Rvalue::Ref { mutable: true, place: Place::local(1) },

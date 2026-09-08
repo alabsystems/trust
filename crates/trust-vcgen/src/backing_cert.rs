@@ -221,24 +221,12 @@ fn lt_is_unsat_modulo_copies(
 }
 
 /// Build the constructor's copy-canonicalization map `dst_local -> src_local` for
-/// `dst = Use(Copy|Move(src))` (both unprojected), gated on `dst` being assigned
-/// at most once (SSA-stable) so a reassigned local never aliases unsoundly.
+/// `dst = Use(Copy|Move(src))` (both unprojected), gated on `dst` holding AT MOST
+/// ONE VALUE so a reassigned local never aliases unsoundly. `local_defs::value_count`
+/// and not a block tally: a PARAMETER is defined at ENTRY, so `mut d` copied over once
+/// would otherwise canonicalize the parameter's name to `src` on the edge that still
+/// holds the incoming argument.
 fn build_copy_canon(func: &VerifiableFunction) -> FxHashMap<usize, usize> {
-    let mut assign_count: FxHashMap<usize, usize> = FxHashMap::default();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, .. } = stmt
-                && place.projections.is_empty()
-            {
-                *assign_count.entry(place.local).or_insert(0) += 1;
-            }
-        }
-        if let trust_types::Terminator::Call { dest, .. } = &block.terminator
-            && dest.projections.is_empty()
-        {
-            *assign_count.entry(dest.local).or_insert(0) += 1;
-        }
-    }
     let mut canon = FxHashMap::default();
     for block in &func.body.blocks {
         for stmt in &block.stmts {
@@ -248,7 +236,7 @@ fn build_copy_canon(func: &VerifiableFunction) -> FxHashMap<usize, usize> {
             };
             if place.projections.is_empty()
                 && src.projections.is_empty()
-                && assign_count.get(&place.local).copied().unwrap_or(0) <= 1
+                && crate::local_defs::value_count(func, place.local).is_at_most(1)
             {
                 canon.insert(place.local, src.local);
             }
@@ -311,9 +299,7 @@ mod tests {
                 ("len".into(), Ty::Int { width: 64, signed: false }),
             ],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        }
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
     }
 
     fn func(
@@ -836,7 +822,7 @@ mod tests {
             ],
             disc_index_safe: false,
             faithful_enum_repr: None,
-            enum_layout: None,
+            enum_layout: None, arbitrary_precision: None,
         };
         // Mutates `Buf::len`, but `Other` occupies an earlier local.
         let hidden_mutator = func(

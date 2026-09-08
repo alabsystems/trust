@@ -1882,11 +1882,34 @@ pub(crate) fn is_authenticated_targo_process_authority_env(name: &str) -> bool {
 /// prefix, so a new authority channel can never be smuggled in behind it.
 ///
 /// Concretely these are emitted by `trust-mc-driver/build.rs` (git SHA + dirty
-/// flag for its `--version` output and the `cargo-trust-mc` staleness shim).
+/// flag for its `--version` output and the `cargo-trust-mc` staleness shim),
+/// `clean-mathverse/build.rs` (`RUSTC_VERSION` — the building toolchain's
+/// `rustc --version` string, folded into clean-mathverse's PARAGON
+/// incremental-import cache key via `option_env!("RUSTC_VERSION")` so a
+/// toolchain bump re-keys the cache; never read by trustc/Targo from the
+/// environment — the sole rustc "RUSTC_VERSION" consumer, the incremental
+/// header check in `rustc_incremental::persist::file_format`, compares the
+/// version stored IN the artifact against the compiler's own `sess` version,
+/// never `std::env::var`), and `cargo-trust-vc/build.rs`
+/// (`TRUST_VC_BUILD_GIT_HEAD` — its own build git head, baked via
+/// `env!(..)`/`const` and used only by cargo-trust-vc's runtime SELF-provenance
+/// gate; `cargo::rustc-env` scopes it to cargo-trust-vc's own compilation, and
+/// no trustc/Targo/rustc code reads it from the environment as authority). All
+/// three are self-provenance stamps that the `TRUST_`/`RUSTC_`-prefix
+/// default-deny is over-broad for; admitting them by EXACT name cannot disable
+/// verification, redirect the compiler, or subvert the authenticated toolchain.
 pub(crate) fn is_benign_build_script_provenance_env(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "TRUST_MC_GIT_SHA" | "TRUST_MC_GIT_DIRTY"
+        "TRUST_MC_GIT_SHA"
+            | "TRUST_MC_GIT_DIRTY"
+            | "RUSTC_VERSION"
+            | "TRUST_VC_BUILD_GIT_HEAD"
+            // tippy's `rustc_tools_util` bakes the toolchain release channel into its
+            // own `--version` via `option_env!("RUSTC_RELEASE_CHANNEL")` (rustc_tools_util
+            // lib.rs) — a compile-time self-provenance stamp, never read by trustc/Targo
+            // from the environment as authority.
+            | "RUSTC_RELEASE_CHANNEL"
     )
 }
 
@@ -2872,16 +2895,30 @@ mod tests {
 
     #[test]
     fn benign_provenance_allowlist_is_exact_and_does_not_admit_authority() {
-        // The two provenance stamps are admitted (any ASCII case).
+        // The provenance stamps are admitted (any ASCII case).
         assert!(is_benign_build_script_provenance_env("TRUST_MC_GIT_SHA"));
         assert!(is_benign_build_script_provenance_env("trust_mc_git_dirty"));
-        // No authority channel is admitted by prefix or lookalike.
+        // clean-mathverse's toolchain-version cache-key stamp and cargo-trust-vc's
+        // own build-git-head self-provenance stamp: exact-name benign (never read by
+        // trustc/Targo from the environment as authority).
+        assert!(is_benign_build_script_provenance_env("RUSTC_VERSION"));
+        assert!(is_benign_build_script_provenance_env("rustc_version"));
+        assert!(is_benign_build_script_provenance_env("TRUST_VC_BUILD_GIT_HEAD"));
+        assert!(is_benign_build_script_provenance_env("RUSTC_RELEASE_CHANNEL"));
+        // No authority channel is admitted by prefix or lookalike — the allowlist is
+        // EXACT-name, so neither the real `RUSTC_`/`TRUST_` authority vars nor any
+        // near-miss of an admitted stamp slips through.
         for name in [
             "TRUST_NO_VERIFY",
             "TRUST_MC_GIT_SHA_EVIL",
             "TRUST_TARGO_BIN",
             "TRUSTC",
             "TRUST_MC",
+            "RUSTC_VERSION_EVIL",
+            "RUSTC_WRAPPER",
+            "RUSTC",
+            "TRUST_VC_BUILD_GIT_HEAD_EVIL",
+            "TRUST_VC",
         ] {
             assert!(
                 !is_benign_build_script_provenance_env(name),

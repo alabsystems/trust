@@ -143,6 +143,15 @@ pub fn const_eq_truth(lhs: &ConstValue, rhs: &ConstValue) -> Option<bool> {
         // decidable value — so its equality is UNKNOWN. Return `None` (verify BOTH
         // branches), never `Some(false)`, for the same false-PROVE hazard as above.
         (ConstValue::UnitVariantRef { .. }, _) | (_, ConstValue::UnitVariantRef { .. }) => None,
+        // Trust: EFHT-P — a `StructScalarFieldsRef` (promoted `&Struct(k)` reference
+        // constant) value-lowers exactly like `OpaqueConst` (fresh symbolic ref), so its
+        // equality is UNKNOWN: `None`, never `Some(false)` — the same false-PROVE hazard
+        // as the arms above. The recovered field values are transport-lane evidence,
+        // never a decidable identity here (two distinct promoteds of equal fields ARE
+        // equal referents-by-value; two occurrences of one promoted may or may not be
+        // one allocation — neither direction is decidable at this boundary).
+        (ConstValue::StructScalarFieldsRef { .. }, _)
+        | (_, ConstValue::StructScalarFieldsRef { .. }) => None,
         (ConstValue::OpaqueScalar { .. }, _) | (_, ConstValue::OpaqueScalar { .. }) => None,
         // Trust: piece #7a — a const-generic PARAM value carries no decidable
         // value, so its equality is UNKNOWN. Return `None` (verify BOTH branches),

@@ -146,17 +146,45 @@ gate_selected() {
 # eight ids until 2026-08-27; the two lists could drift by eye, and one of them
 # bundled ten checks behind a single id (`fast.pr-gate`), so a red inside the
 # bundle could only be quarantined by darkening all ten. Adding `push` to a row
-# is now the entire act of adding a pre-push lane. Measured 2026-08-27, 19 lanes,
+# is now the entire act of adding a pre-push lane. Measured 2026-08-27 (19 lanes then; the set grows —
 # 15.7s wall on a docs-only push: toolchain-coherence 2.7s, pin-coherence 2.6s,
 # tag-families-selftest 1.6s, measurement-provenance-selftest 1.4s,
 # pin-regression-selftest 1.3s, oracle-freeze-selftest 0.87s, the rest <0.4s
 # each, with `scoped.compiler-check` skipping instantly. Nothing enforces that
 # ceiling; a row that costs minutes is how a gate teaches people --no-verify.
 #
-# Three push lanes need the refs git is pushing, which a fixed command string
+# Four push lanes need the refs git is pushing, which a fixed command string
 # cannot receive. They take `--push-context`: the hook exports
 # TRUST_PUSHED_REFS, and with it UNSET the same command widens to its history
 # reading, so the row stays runnable standalone.
+#
+# `fast.dependency-constellation` joined them 2026-08-29 and is the reason the
+# ceiling note above matters. It resolved its exclusion policy at whatever the
+# CLONE's HEAD happened to be, so in a shared checkout sitting behind
+# `origin/main` — where the policy had not landed yet — it was red for every
+# push regardless of what was being pushed, and three commits went out under
+# `--no-verify` in one day. The lane asks about the revision being PUBLISHED;
+# now it reads that revision. The `test -f` conditional this row used to carry
+# was a third revision again (the WORKING TREE) and moved into the tool as
+# `--derive-when-receipt-absent`, so receipt presence is asked of the same
+# revision as everything else.
+#
+# EVERY PIN LANE ABOVE IS A PUSH LANE, and that is the gap
+# `supply-chain.fleet-pin-drift-sweep` closes. `fast.dependency-constellation`
+# and `fast.submodule-remote-reachability` judge the revision in flight, so
+# drift lands, sits, and is discovered by whoever pushes NEXT — never by the
+# lane that created it. Measured 2026-08-30: four distinct pin failures in one
+# day, each caught by an unrelated lane, one of them blocking the compiler repo
+# for hours. `scripts/sweep_pin_drift.py` is the same questions with the
+# subject changed from "what I am pushing" to "every submodule-bearing repo on
+# this machine, at what it has PUBLISHED". Measured 2026-08-31: 21.1s for four
+# superprojects and 17 gitlinks — one `git ls-remote` per distinct remote, no
+# object transfer, no build, no build-tree lock, so it is safe beside a build
+# and cheap enough for a timer. It is a `release` row rather than a `push` one
+# on purpose: adding 21s of NETWORK to every push is how a gate teaches people
+# --no-verify, and the sweep's whole point is that it does not need a push.
+# `--constellation` adds one check_dependency_cycle_anchor.py run per repo
+# (36.2s for Trust) against the published revision.
 #
 # `scripts/check_all.sh` (release.check-all) is the only runner for three gates:
 # the temporal-fixture boundary, G19 build determinism, and stage2
@@ -171,6 +199,31 @@ gate_selected() {
 # The FULL producer measurement (scripts/run_measurement_sweep.sh) is covered by
 # no row; `fast.trust-ir-seam-blockers*` pin only the taxonomy.
 #
+# `fast.cfg-test-caller-skew` (2026-09-01) is here because `scoped.compiler-check`
+# is the ONLY lane in this manifest that type-checks a `crates/**` TEST target, and
+# it is also the most expensive thing in the repo — `x.py check --stage 1`, 9-11
+# minutes, and it takes the exclusive build-tree lock. So the one lane that can see
+# this class is exactly the lane a clone will not be running: `scripts/hooks-pin/`,
+# which this repo's own CLAUDE.md tells shared machines to install, compiles nothing
+# at all, and `--no-verify` leaves the same trace as a narrow hook, which is none.
+# Measured cost of that gap, twice in eighteen hours and both from the same
+# producer machine: `d26cb8c40e` (E0063, a `#[cfg(test)]` initializer missing
+# `PendingConst::promoted_global`, repaired by `cf89d447db`) and `78a0bef5ff`
+# (E0061, 45 `#[cfg(test)]` call sites left at the old arity, still red on
+# `origin/main` at `ad074447848d29974bec329d7e3587bb92dc4d38` while this row was
+# written). Both trees BUILT: `x.py build` and `x.py test tests/ui` compile lib
+# targets, and a `#[cfg(test)]` body is not in a lib target, so the producer's own
+# measurement loop cannot see this class however carefully it is run.
+#
+# The new row is not a second slow lane and must never become one. It reads the
+# blobs in the pushed range with `git show` — no cargo, no x.py, no build tree, no
+# lock, no network — which is what lets it also join the hand-listed narrow set in
+# `scripts/hooks-pin/pre-push`, so the check no longer depends on which hook
+# directory a clone happened to install. It judges only definitions the range
+# CHANGED, and it declines rather than guesses: measured over the 300 single-commit
+# ranges ending at `ad07444784` it reports exactly the three commits above and
+# nothing else.
+#
 # Columns: gate_id|profiles|category|required|last_green|command
 #
 # `last_green` is the ISO date of the most recent observed PASS, or `never`
@@ -178,6 +231,16 @@ gate_selected() {
 # a lane that has run green somewhere untracked still reads `never` here, which
 # is the honest statement that the manifest has no evidence. A run prints a
 # `LAST-GREEN` line for every gate whose recorded date it just superseded.
+#
+# `release.certified-monitor-e2e` must enter through the Rust-native
+# `targo-trust` parent. The stage2 shell is a payload-only child with a deliberate
+# direct-caller guard; invoking it here would make the release lane permanently
+# red and, more importantly, could never mint native source authority.
+#
+# The intbound, widthconv, budget, and floatbits lanes are the authenticated
+# native strict population used by the semantic-track release result. Their
+# scripts retain stage1 defaults for historical developer probes, so the
+# release manifest must bind each one to the canonical stage2 Targo explicitly.
 emit_gate_manifest() {
     cat <<'EOF'
 manifest.syntax.comprehensive|all|harness|true|2026-07-25|bash -n tests/run_trust_comprehensive_harness.sh
@@ -190,6 +253,8 @@ manifest.syntax.gate-scripts|all|harness|true|2026-07-25|bash scripts/check_gate
 manifest.ledgers|all|harness|true|2026-07-25|test -f tests/upstream-rust/test-exceptions.toml && test -f tests/upstream-rust/patches.toml && test -f tests/upstream-rust/divergence-audit.toml && test -f tests/trust-added/compiletest-exceptions.toml && test -f tests/trust-added/manifest.toml && test -f tests/trust-comprehensive/divergences.toml
 manifest.canonical-targo-e2e-names|all|harness|true|2026-07-25|test -x tests/e2e_targo_trust_cli.sh && test -x tests/e2e_targo_trust_root_resolution.sh && test ! -e tests/e2e_cargo_trust_cli.sh && test ! -e tests/e2e_cargo_trust_root_resolution.sh
 manifest.lane-coverage|all|harness|true|2026-07-25|python3 scripts/check_gate_lane_coverage.py
+fast.two-language-claim-ledger|fast,push,release|soundness|true|2026-09-01|python3 scripts/check_two_language_claim_ledger.py --ledger-ref refs/remotes/origin/goals/TRUST-TWO-LANGUAGE-100 --integration-ref refs/remotes/origin/main --push-context --require-mirrors --mirror-ref-prefix refs/remotes/origin/claims
+fast.two-language-claim-ledger-selftest|fast,push,release|soundness|true|2026-09-01|python3 scripts/tests/two_language_claim_ledger_test.py
 fast.ledger-expirations|fast,push|ledger|true|2026-08-27|python3 scripts/check_ledger_expirations.py --warn-days 14
 fast.toolchain-coherence|fast,push|drift|true|2026-08-27|python3 scripts/check_toolchain_coherence.py
 fast.seed-freshness|fast,push|bootstrap|true|2026-08-27|python3 scripts/check_seed_freshness.py
@@ -200,8 +265,11 @@ fast.trust-ir-seam-blockers-selftest|fast,push,release|drift|true|2026-08-27|pyt
 fast.mir-transform-ratchet-selftest|fast,push,release|drift|true|2026-08-27|bash scripts/check_trust_verify_suite_ratchet.sh --selftest
 fast.call-summary-labels|fast,push|drift|true|2026-08-29|python3 scripts/check_call_summary_labels.py
 fast.call-summary-labels-selftest|fast,push|drift|true|2026-08-29|python3 scripts/check_call_summary_labels.py --selftest
+fast.cfg-test-caller-skew|fast,push|compile|true|2026-09-01|python3 scripts/check_cfg_test_caller_skew.py --push-context
+fast.cfg-test-caller-skew-selftest|fast,push|compile|true|2026-09-01|python3 scripts/check_cfg_test_caller_skew.py --selftest
 fast.pin-coherence|fast,push|supply-chain|true|2026-08-27|bash scripts/check_pin_coherence.sh
-fast.dependency-constellation|fast,push,release|supply-chain|true|never|if test -f docs/audits/first-party-constellation-v2.json; then scripts/check_dependency_cycle_anchor.py; else scripts/check_dependency_cycle_anchor.py --print-receipt >/dev/null; fi
+fast.dependency-constellation|fast,push,release|supply-chain|true|never|scripts/check_dependency_cycle_anchor.py --push-context --derive-when-receipt-absent
+fast.dependency-constellation-selftest|fast,push,release|supply-chain|true|2026-08-29|scripts/check_dependency_cycle_anchor.py --selftest
 fast.oracle-freeze|fast,push|soundness|true|2026-08-27|bash scripts/check_frozen_files.sh
 fast.oracle-freeze-selftest|fast,push|soundness|true|2026-08-27|bash scripts/check_frozen_files.sh --selftest
 fast.revert-rationale|fast,push|soundness|true|never|bash scripts/check_revert_rationale.sh --push-context
@@ -211,7 +279,8 @@ fast.bridge-pin|fast,push|supply-chain|true|2026-08-27|bash scripts/check_bridge
 fast.patch-binds|fast,push|supply-chain|true|2026-08-27|python3 scripts/check_patch_binds.py
 fast.cargo-lock-hygiene|fast|supply-chain|true|never|python3 scripts/check_cargo_lock_hygiene.py
 fast.cargo-manifest-alignment|fast|supply-chain|true|never|python3 scripts/check_cargo_manifest_alignment.py
-fast.submodule-remote-reachability|fast,push|supply-chain|true|2026-08-28|python3 scripts/check_submodule_remote_reachability.py
+fast.submodule-remote-reachability|fast,push|supply-chain|true|2026-08-28|python3 scripts/check_submodule_remote_reachability.py --push-context
+fast.submodule-remote-reachability-selftest|fast,push|supply-chain|true|2026-08-30|python3 scripts/check_submodule_remote_reachability.py --self-check
 fast.doc-counts|fast|docs|true|never|bash scripts/check_doc_counts.sh
 slow.frontier-ratchet|slow|frontier|true|never|bash scripts/check_frontier_ratchet.sh
 slow.call-summary-census|slow|frontier|true|2026-08-29|bash scripts/call_summary_census.sh --out reports/call-summary-census-gate
@@ -219,6 +288,7 @@ slow.call-summary-census-aggregator|slow|frontier|true|2026-08-29|bash scripts/c
 slow.upstream-rust-test-toolchain|slow|upstream|true|never|bash scripts/check_upstream_rust_test_toolchain.sh
 release.ay-projection-certificate|release|supply-chain|true|never|bash scripts/check_ay_projection_certificate.sh
 release.trust-mir-extract|release|compile|true|never|bash scripts/check_trust_mir_extract.sh
+release.two-language-completion|release|soundness|true|never|TRUST_TOP_VERIFIER_PATH="${TRUST_TWO_LANGUAGE_TOP_VERIFIER:-/etc/trust/two_language_completion_gate.py}" && test -n "${TRUST_TWO_LANGUAGE_TOP_VERIFIER_SHA256:-}" && TRUST_TOP_VERIFIER_ACTUAL="$(/usr/bin/shasum -a 256 "$TRUST_TOP_VERIFIER_PATH")" && test "${TRUST_TOP_VERIFIER_ACTUAL%% *}" = "${TRUST_TWO_LANGUAGE_TOP_VERIFIER_SHA256}" && python3 "$TRUST_TOP_VERIFIER_PATH" --candidate-verifier scripts/two_language_completion_gate.py --receipt "${TRUST_TWO_LANGUAGE_COMPLETION_RECEIPT:-build/two-language-completion/receipt.json}" --root . --trusted-owner-key "${TRUST_TWO_LANGUAGE_OWNER_KEY:-/etc/trust/two-language-owner.pub}"
 scoped.compiler-check|all,push|supply-chain|true|never|bash scripts/check_compiler_targets_build.sh
 fast.tcb-panic-freedom|fast|soundness|true|2026-07-25|bash scripts/check_tcb_panic_freedom.sh
 fast.tcb-document-exhaustiveness|fast|soundness|true|never|RUSTC_BOOTSTRAP=1 cargo test --manifest-path crates/Cargo.toml -p trust-integration-tests --test tcb_document_exhaustiveness --locked
@@ -265,8 +335,8 @@ verify.ownership|release|soundness|true|never|bash scripts/trust_ownership_gate.
 verify.superiority|release|soundness|true|never|bash scripts/trust_superiority_gate.sh
 verify.temporal|release|soundness|true|never|bash scripts/trust_temporal_gate.sh
 verify.clean-certification|release|soundness|true|never|bash scripts/trust_clean_certification_gate.sh
-oracle.array-bounds-soundness|fast,release|soundness|true|2026-08-26|python3 scripts/trustc_array_bounds_soundness_oracle.py
-oracle.generics-soundness|fast,release|soundness|true|2026-08-26|python3 scripts/trustc_generics_soundness_oracle.py
+oracle.array-bounds-soundness|release|soundness|true|2026-08-26|python3 scripts/trustc_array_bounds_soundness_oracle.py
+oracle.generics-soundness|release|soundness|true|2026-08-26|python3 scripts/trustc_generics_soundness_oracle.py
 oracle.falseproof-search|slow,release|soundness|true|never|python3 scripts/trust_falseproof_search.py
 witness.replay-regression|release|witness|true|never|python3 tests/trust-witness/replay_regression.py
 witness.auto-router-smoke|release|witness|true|never|python3 tests/trust-witness/auto_router_smoke.py
@@ -316,7 +386,7 @@ slow.showcase-demo|slow|demo|true|never|bash scripts/showcase-demo.sh --quick
 slow.submodule-coherence|slow,release|supply-chain|true|never|bash scripts/submodule-coherence-gate.sh
 slow.win-cross-check|slow,release|compatibility|true|never|bash scripts/win_cross_check.sh
 release.assumption-ledger-stage1|release|soundness|true|never|bash scripts/gate_assumption_ledger_stage1.sh
-release.certified-monitor-e2e|release|harness|true|never|bash scripts/stage2_certified_monitor_e2e.sh
+release.certified-monitor-e2e|release|harness|true|never|build/host/stage2/bin/targo-trust trust release validate certified-monitors --stage2-sysroot build/host/stage2
 release.certified-scoreboard|release|soundness|true|never|python3 scripts/trust_certified_scoreboard.py --baseline tests/self-proof/certified-scoreboard.baseline
 release.cite-discharge|release|soundness|true|never|python3 scripts/trust_cite_discharge.py --structural target/trust/survey/ny-cert-structural.json --contracts target/trust/survey/ny-cert-contracts.json --cite-map first-party/ny/crates/ny-cert/proofs/cite-map.json --corpus first-party/clean
 release.crates-io-native-compat|release|compatibility|true|never|bash scripts/compat_check.sh
@@ -367,11 +437,19 @@ release.fixed-strict|release|soundness|true|never|bash scripts/trust_fixed_stric
 release.interval-strict|release|soundness|true|never|bash scripts/trust_interval_strict_gate.sh
 release.timearith-strict|release|soundness|true|never|bash scripts/trust_timearith_strict_gate.sh
 release.bits-strict|release|soundness|true|never|bash scripts/trust_bits_strict_gate.sh
+release.modular-strict|release|soundness|true|never|bash scripts/trust_modular_strict_gate.sh
+release.intbound-strict|release|soundness|true|never|TARGO="$(pwd -P)/build/host/stage2/bin/targo" bash scripts/trust_intbound_strict_gate.sh
+release.widthconv-strict|release|soundness|true|never|TARGO="$(pwd -P)/build/host/stage2/bin/targo" bash scripts/trust_widthconv_strict_gate.sh
+release.budget-strict|release|soundness|true|never|TARGO="$(pwd -P)/build/host/stage2/bin/targo" bash scripts/trust_budget_strict_gate.sh
+release.bitfield-strict|release|soundness|true|never|bash scripts/trust_bitfield_strict_gate.sh
+release.floatbits-strict|release|soundness|true|never|TARGO="$(pwd -P)/build/host/stage2/bin/targo" bash scripts/trust_floatbits_strict_gate.sh
+fast.floatbits-twin-parity|fast,release|soundness|true|2026-08-31|python3 scripts/trust_floatbits_twin_parity.py crates/trust-floatbits/src/lib.rs crates/trust-floatbits/src/contracts.rs
 release.strict-pass-frontier|release|soundness|true|never|bash scripts/trust_strict_pass_frontier.sh
 fast.kernel-authority-vacuity|fast,release|soundness|true|2026-08-28|python3 scripts/check_kernel_authority_vacuity.py
 release.check-all|release|harness|true|never|bash scripts/check_all.sh
 acceptance.b4-slot-distinguishability|release|acceptance|false|never|bash scripts/b4_slot_acceptance.sh build/host/stage2/bin/rustc
 supply-chain.first-party-pin-reachability|release|supply-chain|true|never|python3 scripts/audit_first_party_pins.py --fetch --probe
+supply-chain.fleet-pin-drift-sweep|release|supply-chain|true|2026-08-31|python3 scripts/sweep_pin_drift.py
 EOF
 }
 
@@ -394,6 +472,33 @@ fi
 
 mkdir -p "$LOG_DIR"
 printf 'gate_id\tcategory\trequired\tlast_green\tstarted_at\tended_at\tduration_seconds\texit_code\tcommand\tlog_path\n' >"$RESULTS_TSV"
+
+# A PASSING LANE COULD SAY NOTHING AT ALL, AND THAT IS HOW A DATED FLEET STOP
+# ARRIVES UNANNOUNCED.
+#
+# run_gate writes every lane's stdout and stderr to a log and, on PASS, printed
+# one word: PASS. Nobody opens the log of a lane that passed. So a lane that
+# KNOWS something is coming -- `fast.two-language-claim-ledger` knows the exact
+# instant a claim lease lapses and takes the whole fleet's pushes with it -- had
+# no channel to say so, and the first news of the stop was the stop.
+#
+# This is that channel, and it is deliberately one line of contract: a lane
+# announces by printing a line beginning `WARN:`, and this surfaces those lines
+# on the harness's own stdout even when the lane passed. It is not a status: the
+# lane still PASSES, the exit code is untouched, and nothing here can fail a run.
+# Controlled end-to-end against the real run_gate by
+# scripts/tests/gate_warning_surface_test.sh, in both directions -- a WARN line
+# is surfaced, and a lane that emits none produces no output here.
+surface_gate_warnings() {
+    local gate_id="$1" log_path="$2" line found=0
+    [ -f "$log_path" ] || return 0
+    while IFS= read -r line; do
+        found=1
+        echo "$line"
+    done < <(grep -E '^[[:space:]]*WARN: ' "$log_path" || true)
+    [ "$found" -eq 1 ] && echo "warnings: $gate_id passed and reported the above"
+    return 0
+}
 
 run_gate() {
     local gate_id="$1"
@@ -433,6 +538,7 @@ run_gate() {
 
     if [ "$status" -eq 0 ]; then
         echo "status:   PASS (${duration}s)"
+        surface_gate_warnings "$gate_id" "$log_path"
         if [ "$last_green" != "${started_at%%T*}" ]; then
             echo "LAST-GREEN: update the manifest row for $gate_id to ${started_at%%T*}"
         fi

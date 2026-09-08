@@ -3,7 +3,7 @@
 //@ failure-status: 101
 
 //@ normalize-stderr: "note: compiler flags.*\n\n" -> ""
-//@ normalize-stderr: "note: rustc.*running on.*" -> "note: rustc {version} running on {platform}"
+//@ normalize-stderr: "note: trustdoc.*running on.*" -> "note: trustdoc {version} running on {platform}"
 //@ normalize-stderr: "thread 'rustc'.*panicked.*:\n.*\n" -> ""
 //@ normalize-stderr: " +\d{1,}: .*\n" -> ""
 //@ normalize-stderr: " + at .*\n" -> ""
@@ -13,4 +13,4 @@ fn wrong()
 //~^ ERROR expected one of
 
 //~? RAW aborting due to
-//~? RAW we would appreciate a bug report: https://github.com/rust-lang/rust/issues/new?labels=C-bug%2C+I-ICE%2C+T-rustdoc&template=ice.md
+//~? RAW we would appreciate a bug report: https://github.com/alabsystems/Trust/issues/new?labels=C-bug%2C+I-ICE%2C+T-trustdoc

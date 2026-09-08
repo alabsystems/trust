@@ -16,6 +16,11 @@ workspace = true
 
 [features]
 default = []
+# Trust: goal-scoreboard — the `tir_scoreboard` example loads `-Ztrust-dump=ir:`
+# binary Modules and replays the WORKING-TREE `lower_module_to_lir` over every
+# function, classifying refusals. Measurement only; nothing in the library uses
+# the binary codec, so the trust-ir feature stays example-scoped.
+tir-scoreboard = ["trust-ir/binary"]
 # Trust: M-POS — the proven-output gate (verify_output module) needs the
 # disassembler + machine semantics in the library, not just dev-deps.
 ay-proofs = ["dep:ay", "dep:ay-proof", "dep:trust-disasm", "dep:trust-machine-sem"]
@@ -39,6 +44,10 @@ kernel-recheck = ["ay-proofs", "dep:clean-auto", "dep:clean-kernel"]
 [[example]]
 name = "ccc_probe"
 required-features = ["ay-proofs"]
+
+[[example]]
+name = "tir_scoreboard"
+required-features = ["tir-scoreboard"]
 
 [dependencies]
 trust-types = { workspace = true }

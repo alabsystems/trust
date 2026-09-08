@@ -112,8 +112,11 @@ fn lowered_text(
             body,
             kind,
             origin,
+            ClauseCitation::Absent,
             domains,
             &ProjectionEnvironment::default(),
+            &mut None,
+            &mut None,
         )? {
             TrustContractPredicateKind::Typed { text, .. }
             | TrustContractPredicateKind::Opaque { text } => {
@@ -152,8 +155,11 @@ fn projected_text(kind: TrustContractKind, body: &str) -> Option<String> {
             body,
             kind,
             ContractClauseOrigin::Native,
+            ClauseCitation::Absent,
             &domains,
             &projection_fixture(),
+            &mut None,
+            &mut None,
         )? {
             TrustContractPredicateKind::Typed { text, .. }
             | TrustContractPredicateKind::Opaque { text } => {
@@ -184,6 +190,84 @@ fn native_field_projection_lowers_to_the_canonical_place_spelling() {
         projected_text(TrustContractKind::Ensures, "result == s.n").as_deref(),
         Some("(result) == (s.0)")
     );
+}
+
+/// §13.1 of `docs/STRICT_VERIFICATION_FRAGMENT.md`: every one of these spellings
+/// used to make the WHOLE clause unparseable, silently, while the identical
+/// constant in the function body was fine. They are the same integer written
+/// four ways, and all four must now lower to the same canonical bare-decimal
+/// text — which is what the downstream formula parser reads.
+#[test]
+fn every_rust_integer_literal_spelling_lowers_to_the_same_bare_decimal() {
+    let lowered = |body: &str| {
+        lowered_text(TrustContractKind::Ensures, ContractClauseOrigin::Native, body)
+    };
+    let bare = lowered("result <= 999999999");
+    assert_eq!(bare.as_deref(), Some("(result) <= (999999999)"));
+    for spelling in ["999_999_999", "0x3B9AC9FF", "999999999u32", "999_999_999usize"] {
+        assert_eq!(
+            lowered(&format!("result <= {spelling}")),
+            bare,
+            "`{spelling}` must lower exactly as the bare decimal does"
+        );
+    }
+    // Not about magnitude: a separator in a two-digit literal was equally fatal.
+    assert_eq!(
+        lowered("result <= 1_0").as_deref(),
+        Some("(result) <= (10)"),
+        "a separator in a two-digit literal"
+    );
+    assert_eq!(lowered("result <= 0b111").as_deref(), Some("(result) <= (7)"));
+    assert_eq!(lowered("result <= 0o17").as_deref(), Some("(result) <= (15)"));
+    // The respelling is not specific to `ensures`: the same tokenizer serves
+    // every clause kind that reaches the snippet lane.
+    assert_eq!(
+        lowered_text(TrustContractKind::Requires, ContractClauseOrigin::Native, "x <= 1_000")
+            .as_deref(),
+        Some("(x) <= (1000)")
+    );
+}
+
+/// A widened literal grammar must not widen what is ACCEPTED as true. Each of
+/// these is a spelling Rust's own lexer tolerates in some context but which
+/// denotes no readable bound here, and each must keep failing closed — most of
+/// all `300u8`, which would otherwise become the bound `result <= 300` that
+/// every `u8` satisfies.
+#[test]
+fn a_literal_that_cannot_be_read_still_fails_the_whole_clause() {
+    for body in [
+        "result <= 300u8",
+        "result <= 129i8",
+        "result <= 123abc",
+        "result <= 0x",
+        "result <= 0b2",
+        "result <= 0X1",
+        // Above the `i128` the formula language carries an integer literal in.
+        "result <= 999999999999999999999999999999999999999999",
+        // No floating-point literal exists on this lane in either direction.
+        "result <= 1.5",
+    ] {
+        assert_eq!(
+            lowered_text(TrustContractKind::Ensures, ContractClauseOrigin::Native, body),
+            None,
+            "`{body}` must fail closed"
+        );
+    }
+}
+
+/// A tuple-field index is the canonical bare-decimal spelling and nothing else.
+/// Respelling one would mint a place name `spec_parse` and
+/// `trust_vcgen::place_to_var_name` do not agree on, and the clause would die
+/// at a boundary that could no longer say why.
+#[test]
+fn a_projection_index_is_not_respelled() {
+    assert_eq!(
+        projected_text(TrustContractKind::Ensures, "result == s.n").as_deref(),
+        Some("(result) == (s.0)")
+    );
+    for body in ["result == s.0_0", "result == s.0x0", "result == s.0usize"] {
+        assert_eq!(projected_text(TrustContractKind::Ensures, body), None, "`{body}`");
+    }
 }
 
 /// Every shape without a sound positional name must keep failing closed. A
@@ -232,8 +316,11 @@ fn native_function_clauses_fail_closed_on_unknown_source_names() {
                 "result == ghost",
                 TrustContractKind::Ensures,
                 ContractClauseOrigin::Native,
+                ClauseCitation::Absent,
                 &domains,
                 &ProjectionEnvironment::default(),
+                &mut None,
+                &mut None,
             ),
             None,
         );
@@ -242,8 +329,11 @@ fn native_function_clauses_fail_closed_on_unknown_source_names() {
                 "result == x",
                 TrustContractKind::Ensures,
                 ContractClauseOrigin::Native,
+                ClauseCitation::Absent,
                 &domains,
                 &ProjectionEnvironment::default(),
+                &mut None,
+                &mut None,
             )
             .is_some()
         );
@@ -1239,15 +1329,87 @@ fn native_collection_loop_clause_mints_exact_literal_projection_domains() {
     });
 }
 
+/// An UNCITED attribute `ensures` written in the `result` spelling is the SAME
+/// clause as the native `ensures result == ...`, and must lower to the same
+/// formula.
+///
+/// It did not. `ensures_closure_snippet_body` accepted only the migration
+/// closure spelling and its `?` propagated straight into `Unsupported`, so
+/// `#[trust::ensures(result == x + 1)]` left a pair of fail-closed sentinel
+/// obligations that a non-strict policy downgrades to warnings — while the
+/// byte-identical `ensures result == x + 1` in signature position lowered into a
+/// real Postcondition VC and was proved or REFUTED. Measured on
+/// `veripb-core-proved`: an uncited attribute `result >= x` over
+/// `x.wrapping_sub(1)` reported `0 proved, 0 failed, 2 unknown` and the build
+/// stayed green.
+///
+/// The equality is asserted against the native lowering of the same text rather
+/// than a literal, so the two spellings cannot drift apart silently.
 #[test]
-fn attribute_ensures_never_acquires_native_bare_result_semantics() {
+fn uncited_attribute_ensures_lowers_exactly_as_the_native_result_spelling() {
+    use rustc_middle::mir::trust_contract::TrustContractPropositionDomain as Domain;
+
+    // The signature environment of `fn f(x: u64) -> u64`; `_0` is the return
+    // place that `result` denotes.
+    let domains = [
+        LoweredVariableDomain {
+            name: "_0".to_string(),
+            domain: Domain::MachineInt { width: 64, signed: false },
+        },
+        LoweredVariableDomain {
+            name: "x".to_string(),
+            domain: Domain::MachineInt { width: 64, signed: false },
+        },
+    ];
+    let lower = |origin, citation, body: &str| {
+        with_test_session_globals(|| {
+            lower_contract_snippet_body_with_domains(
+                body,
+                TrustContractKind::Ensures,
+                origin,
+                citation,
+                &domains,
+                &ProjectionEnvironment::default(),
+                &mut None,
+                &mut None,
+            )
+        })
+    };
+
+    let native = lower(ContractClauseOrigin::Native, ClauseCitation::Absent, "result == x + 1");
+    assert!(native.is_some(), "the native `result` spelling must lower");
     assert_eq!(
-        lower_contract_snippet_body(
-            "result == x + 1",
-            TrustContractKind::Ensures,
-            ContractClauseOrigin::Attribute
-        ),
+        lower(ContractClauseOrigin::Attribute, ClauseCitation::Absent, "result == x + 1"),
+        native,
+        "the attribute and native spellings of one clause must be one predicate"
+    );
+
+    // A CITED clause keeps the established treatment: the citation lane owns it
+    // end to end and mints its own obligation inventory, so the snippet lane
+    // must not add rows underneath it.
+    assert_eq!(
+        lower(ContractClauseOrigin::Attribute, ClauseCitation::Present, "result == x + 1"),
         None
+    );
+
+    // Still fail-closed on a name the signature environment cannot ground: the
+    // new path runs the SAME source-typing gate native clauses must pass, which
+    // is what keeps an island-definition call (`eqOkW(machine, truth)`) out of
+    // this lane and with the uncited island-defeq lane that owns it.
+    assert_eq!(
+        lower(ContractClauseOrigin::Attribute, ClauseCitation::Absent, "result == ghost"),
+        None
+    );
+
+    // The migration closure spelling is untouched, in both directions.
+    assert_eq!(
+        lower(ContractClauseOrigin::Attribute, ClauseCitation::Absent, "|ret| *ret >= 0"),
+        lower(ContractClauseOrigin::Attribute, ClauseCitation::Present, "|ret| *ret >= 0"),
+    );
+    assert!(
+        lower(ContractClauseOrigin::Attribute, ClauseCitation::Absent, "|ret| ret == ret")
+            .is_none(),
+        "a bare closure binding still denotes no value"
     );
 }
 

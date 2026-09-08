@@ -1,0 +1,53 @@
+error: the initializer of `LOGGER` can wait on `LOGGER` itself: a `std::sync::OnceLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/deferred_callback_registration_flagged.rs:23:13
+   |
+LL |        *LOGGER.get_or_init(|| {
+   |  ______________^
+LL | |
+LL | |          std::panic::set_hook(Box::new(|_| {
+   | | _______________________________________-
+LL | ||             let _ = logger();
+   | ||                     -------- the initializer reaches the re-entrant wait through this call
+LL | ||         }));
+   | ||_________- the initializer reaches the re-entrant wait through this call
+LL | |          1
+LL | |      })
+   | |_______^ the initializer of `LOGGER` reaches this call, which waits on `LOGGER` again
+   |
+   = note: call path: `logger::{closure#0}` -> `logger::{closure#0}::{closure#0}` -> `logger` -> `LOGGER.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `logger` — read the input it needs directly instead of asking `LOGGER` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `LOGGER.get_or_init(|| v)` (or `LOGGER.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `LOGGER`, read `LOGGER.get()` there — it never waits
+note: `LOGGER` is declared here
+  --> $DIR/deferred_callback_registration_flagged.rs:20:1
+   |
+LL | static LOGGER: OnceLock<u32> = OnceLock::new();
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: the initializer of `CFG` can wait on `CFG` itself: a `std::sync::OnceLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/deferred_callback_registration_flagged.rs:44:10
+   |
+LL |       let _ = cfg();
+   |               ----- the initializer reaches the re-entrant wait through this call
+...
+LL |       *CFG.get_or_init(|| {
+   |  __________^
+LL | |
+LL | |         register(on_exit);
+   | |                  ------- the initializer reaches the re-entrant wait through this call
+LL | |         7
+LL | |     })
+   | |______^ the initializer of `CFG` reaches this call, which waits on `CFG` again
+   |
+   = note: call path: `cfg::{closure#0}` -> `on_exit` -> `cfg` -> `CFG.get_or_init(..)`
+   = help: compute the value inside the initializer without calling `cfg` — read the input it needs directly instead of asking `CFG` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then `CFG.get_or_init(|| v)` (or `CFG.set(v)` before any reader)
+   = help: or, if the initializer can legitimately observe an uninitialized `CFG`, read `CFG.get()` there — it never waits
+note: `CFG` is declared here
+  --> $DIR/deferred_callback_registration_flagged.rs:33:1
+   |
+LL | static CFG: OnceLock<u32> = OnceLock::new();
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

@@ -11,10 +11,20 @@ use super::*;
 /// be UNSOUND to assume — are distinguished from `min`). Matches only the `Ord`
 /// trait (integer/ordered types; floats have no `Ord`), so `a <= min(a,b)` holds.
 pub(super) fn ord_method(callee: &str) -> Option<&str> {
-    // Method = last path segment, minus any turbofish generics. Exact match so
+    // Method = final path segment, minus turbofish generics. Exact match so
     // `min_by`/`min_by_key` (comparator-dependent — unsound to bound) are excluded.
-    let last = callee.rsplit("::").next()?;
-    let method = last.split('<').next().unwrap_or(last).trim();
+    // The robust `method_tail` strips a TRAILING monomorphization turbofish group
+    // (`…::min::<__trust_args@HASH>`) that a naive `rsplit("::")` returns INSTEAD of
+    // `min` — leaving `method` empty so a real `<u32 as core::cmp::Ord>::min::<…>`
+    // matched nothing, and its `min(x,31) <= 31` result-fact was never emitted →
+    // `corner_count`'s `shift < 32` precondition at `(n as u32).min(31)` was falsely
+    // refuted. Recognition-only fix (same fact set); gated TRUST_ORD_MIN_TAG_FIX for A/B.
+    let method = if std::env::var_os("TRUST_ORD_MIN_TAG_FIX").is_some() {
+        method_tail(callee)
+    } else {
+        let last = callee.rsplit("::").next()?;
+        last.split('<').next().unwrap_or(last).trim()
+    };
     if !matches!(method, "min" | "max" | "clamp") {
         return None;
     }
@@ -66,6 +76,65 @@ pub(super) fn is_bool_from_call(callee: &str) -> bool {
 /// a same-named user function must leave the destination unconstrained.
 pub(super) fn is_std_num_intrinsic(callee: &str) -> bool {
     (callee.starts_with("core::") || callee.starts_with("std::")) && callee.contains("::num::")
+}
+
+/// The std `NonZero<T>::get` accessor — `core::num::nonzero::NonZero::<u32>::get`
+/// and every `T` sibling — whose result is the wrapped value of a `NonZero<T>`.
+///
+/// The extractor lowers `NonZero`'s field `pattern_type!(T is 1..)` to the bare
+/// carrier `T` (`ty_convert`'s `TyKind::Pat` arm), and the accessor is an opaque
+/// `Terminator::Call`, so the destination is otherwise a free integer and every
+/// `a / d.get()` false-refutes at `d.get() == 0`.
+///
+/// AUTHORITY / SOUNDNESS: `NonZero<T>`'s VALIDITY INVARIANT — no defined
+/// execution ever holds a zero `NonZero<T>` (`new_unchecked(0)` is declared
+/// immediate UB) — plus `get`'s definition as the identity projection of the
+/// wrapped value. Same shape as the `saturating_*` / `wrapping_neg` / `to_bits`
+/// recognizers below: a trusted model of a NAMED std function, CRATE-ORIGIN
+/// anchored so a user-defined `mymod::NonZero::get` cannot inject it.
+///
+/// THE MATCH IS ON THE DEFINITION PATH, NOT ON SUBSTRINGS. Every conjunct of the
+/// substring form (`::num::`, `NonZero`) is satisfiable by a GENERIC ARGUMENT of an
+/// unrelated function: real compiler output for `let d: NonZeroU32 = c.get();` on a
+/// `&Cell<NonZeroU32>` is the callee
+/// `core::cell::Cell::<core::num::nonzero::NonZero<u32>>::get`, which satisfies all
+/// of them and is not `NonZero::get`. `strip_generic_args` erases every balanced
+/// `<…>` group first, reducing that path to `core::cell::Cell::get` and the genuine
+/// one to `core::num::nonzero::NonZero::get`; the OWNER segment is then required to
+/// be exactly `NonZero`, which no generic argument can supply.
+/// `cell_of_nonzero_get_is_not_nonzero_get` is the row that fails when the check is
+/// returned to substrings.
+pub(super) fn is_nonzero_get_call(callee: &str) -> bool {
+    let path = strip_generic_args(callee);
+    let mut segs = path.rsplit("::");
+    let (Some("get"), Some("NonZero")) = (segs.next(), segs.next()) else {
+        return false;
+    };
+    (path.starts_with("core::") || path.starts_with("std::")) && path.contains("::num::")
+}
+
+/// `callee` with every BALANCED `<…>` group removed, so what remains is the
+/// definition path: `core::cell::Cell::<core::num::nonzero::NonZero<u32>>::get`
+/// becomes `core::cell::Cell::get`. Nesting is handled by depth, and an UNBALANCED
+/// `<` truncates the rest (fail-closed: a path a recognizer cannot parse must not
+/// match one that it can).
+fn strip_generic_args(callee: &str) -> String {
+    let mut out = String::with_capacity(callee.len());
+    let mut depth = 0u32;
+    for ch in callee.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => out.push(ch),
+            _ => {}
+        }
+    }
+    // `Cell::<T>::get` leaves a `::::` seam once `<T>` is gone; collapse it so the
+    // segment split sees `Cell`/`get` adjacent rather than an empty segment.
+    while let Some(i) = out.find("::::") {
+        out.replace_range(i..i + 2, "");
+    }
+    out
 }
 
 /// The std integer `wrapping_neg` inherent method (`core::num::<impl i128>::
@@ -201,6 +270,28 @@ pub(super) fn wrapping_neg_call_dest_value<'a>(
             Ty::Int { width, signed } => Some((*width, *signed)),
             _ => None,
         })?;
+    // The receiver's DECLARED width (from the callee path) must AGREE with the operand's
+    // resolved width, or no fact is emitted (fail-closed).
+    //
+    // WITNESS — a live false proof before this check:
+    //
+    //     const K: i128 = i64::MIN as i128;
+    //     let n = K.wrapping_neg();      // truly +2^63
+    //
+    // `operand_ty`'s `ConstValue::Int(v)` arm picks its width from the VALUE
+    // (`i64` when `v` fits `i64`, else `i128`) because trust-types' `Int(i128)` carries
+    // no width. `i64::MIN` fits `i64`, so an `i128` receiver resolved to width 64 and the
+    // model emitted `ite(x == i64::MIN, i64::MIN, 0 - x)` — asserting the NEGATIVE
+    // `i64::MIN` where the true `i128` result is the POSITIVE `+2^63`. Unlike the
+    // bit-count bound (an inequality, where the wider width is the weaker and therefore
+    // safe resolution — see `bitcount_receiver_width`), this is an EXACT VALUE
+    // definition: a wrong width is wrong in BOTH directions, so only exact agreement is
+    // admissible and disagreement must emit nothing. Pinned by
+    // `wrapping_neg_declines_when_the_path_width_disagrees_with_the_operand`.
+    match super::callee_summaries::std_num_impl_receiver_width(callee) {
+        Some(declared) if declared == width => {}
+        _ => return None,
+    }
     let x = crate::operand_to_formula(func, &args[0]);
     let neg = Formula::Sub(Box::new(Formula::Int(0)), Box::new(x.clone()));
     let value = if signed {

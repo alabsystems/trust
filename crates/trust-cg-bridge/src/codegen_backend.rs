@@ -46,6 +46,10 @@
 use std::any::Any;
 use std::path::PathBuf;
 
+/// Public for rustc-side callers that build data definitions
+/// (`MonoItem::Static` materialization) without depending on trust-cg-codegen
+/// directly.
+pub use trust_cg_codegen::pipeline::ObjectGlobal;
 use trust_cg_ir::{AArch64Opcode, BlockId as MachBlockId, MachFunction, MachOperand};
 // Trust: the element type of the PUBLIC `CompiledModule::lir_functions` field.
 // It was reachable only through this crate's private import, so an out-of-crate
@@ -53,7 +57,7 @@ use trust_cg_ir::{AArch64Opcode, BlockId as MachBlockId, MachFunction, MachOpera
 // one. The trust-ir codegen frontend in `rustc_codegen_trust_cg` does both.
 pub use trust_cg_lower::function::Function as LirFunction;
 use trust_cg_lower::function::{BasicBlock as LirBasicBlock, Signature as LirSignature};
-use trust_cg_lower::instructions::{Block, Instruction as LirInstruction, Opcode, Value};
+use trust_cg_lower::instructions::{Block, DirectCallBinding, Instruction as LirInstruction, Opcode, Value};
 use trust_cg_lower::types::Type as LirType;
 use trust_types::VerifiableFunction;
 use trust_types::fx::FxHashSet;
@@ -144,6 +148,13 @@ pub enum FunctionLinkage {
     /// A definition private to the object that contains it. SOUND ONLY when
     /// every call to this function is emitted into that same object.
     Internal,
+    /// A strong definition with HIDDEN visibility: external for static
+    /// linking (callers in other objects of the same link resolve it), but
+    /// demoted to a local by the final link so it never enters a linked
+    /// image's export surface. rustc's `External` linkage + `Hidden`
+    /// visibility quadrant — the `pub(crate)` definition promoted for
+    /// cross-CGU reachability. Mach-O: `N_EXT | N_PEXT` private extern.
+    Hidden,
 }
 
 impl FunctionLinkage {
@@ -151,6 +162,7 @@ impl FunctionLinkage {
         match self {
             Self::External => trust_cg_codegen::pipeline::FunctionSymbolBinding::Global,
             Self::Internal => trust_cg_codegen::pipeline::FunctionSymbolBinding::Local,
+            Self::Hidden => trust_cg_codegen::pipeline::FunctionSymbolBinding::Hidden,
         }
     }
 }
@@ -171,6 +183,9 @@ pub struct CrateInfo {
     /// historical contract every non-rustc caller relies on. A non-empty vector
     /// of the wrong length is a caller bug and fails closed at emission.
     pub linkage: Vec<FunctionLinkage>,
+    /// Reachable STATIC data items (rustc `MonoItem::Static`s) to materialize
+    /// beside the functions. EMPTY for every non-rustc caller.
+    pub statics: Vec<trust_cg_codegen::pipeline::ObjectGlobal>,
 }
 
 /// A single compiled module (one codegen unit).
@@ -198,6 +213,11 @@ pub struct CompiledModule {
     /// in lockstep with `lir_functions` / `source_functions` when a function
     /// fails to lower, so the three vectors stay index-aligned.
     pub linkage: Vec<FunctionLinkage>,
+    /// Reachable STATIC data items to materialize into the emitted object
+    /// beside the functions (rustc `MonoItem::Static`s: immutable,
+    /// relocation-free, fully-initialized byte blobs — anything else was
+    /// refused at collection). EMPTY for every non-rustc caller.
+    pub statics: Vec<trust_cg_codegen::pipeline::ObjectGlobal>,
 }
 
 /// Collection of all compiled modules for a crate.
@@ -860,6 +880,37 @@ impl TrustCgCodegenBackend {
         Self::require_non_empty_object(bytes, &source_name)
     }
 
+    /// Emit one lowered Trust-IR function together with the exact initialized
+    /// module-global definitions that its `GlobalRef` relocations name.
+    ///
+    /// This entry point is deliberately separate from [`Self::emit_object`]:
+    /// callers which do not possess the source [`trust_ir::Module`] cannot
+    /// accidentally claim to have preserved its globals. Unsupported global
+    /// shapes fail before any function-only object can be returned.
+    pub fn emit_object_with_trust_ir_globals(
+        &self,
+        functions: &[LirFunction],
+        source_module: &trust_ir::Module,
+    ) -> Result<Vec<u8>, CodegenBackendError> {
+        if functions.is_empty() {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: "empty module: no functions to emit".to_string(),
+            });
+        }
+        if functions.len() > 1 {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: "multi-function modules are not accepted by the isolated Trust-IR \
+                         emission path"
+                    .to_string(),
+            });
+        }
+
+        let globals = assembled_internal_object_globals(source_module)?;
+        let source_name = functions[0].name.clone();
+        let emission = self.emit_target_module(functions, &[], &globals)?;
+        Self::require_non_empty_object(emission.object, &source_name)
+    }
+
     /// Emit one object file per function.
     ///
     /// Each function is emitted through the same target-triple-aware object path
@@ -901,6 +952,29 @@ impl TrustCgCodegenBackend {
         &self,
         module: &CompiledModule,
     ) -> Result<EmittedModuleObject, CodegenBackendError> {
+        self.emit_module_object_with_globals(module, &[])
+    }
+
+    /// Emit one whole Trust-IR codegen unit together with the canonical object
+    /// definitions for its assembled globals.
+    ///
+    /// The source module is required even though the functions are already LIR:
+    /// global initializer bytes, alignment, linkage, and relocation payloads are
+    /// semantic input that LIR does not carry.
+    pub fn emit_module_object_with_trust_ir_globals(
+        &self,
+        module: &CompiledModule,
+        source_module: &trust_ir::Module,
+    ) -> Result<EmittedModuleObject, CodegenBackendError> {
+        let globals = assembled_internal_object_globals(source_module)?;
+        self.emit_module_object_with_globals(module, &globals)
+    }
+
+    fn emit_module_object_with_globals(
+        &self,
+        module: &CompiledModule,
+        globals: &[ObjectGlobal],
+    ) -> Result<EmittedModuleObject, CodegenBackendError> {
         if module.lir_functions.is_empty() {
             return Err(CodegenBackendError::EmitFailed {
                 reason: format!(
@@ -923,7 +997,14 @@ impl TrustCgCodegenBackend {
 
         let bindings =
             module.linkage.iter().map(|linkage| linkage.symbol_binding()).collect::<Vec<_>>();
-        let emission = self.emit_target_module(&module.lir_functions, &bindings)?;
+        // Two data sources ride beside the functions: the caller's semantic
+        // globals (assembled trust-ir global definitions) and the module's
+        // reachable rustc statics (`MonoItem::Static`s). Both are plain
+        // ObjectGlobal definitions; merge them here so either channel works
+        // alone and the emitters see one list.
+        let mut semantic = globals.to_vec();
+        semantic.extend(module.statics.iter().cloned());
+        let emission = self.emit_target_module(&module.lir_functions, &bindings, &semantic)?;
         let bytes = Self::require_non_empty_object(emission.object, &module.name)?;
         Ok(EmittedModuleObject {
             artifact_name: module.name.clone(),
@@ -1025,7 +1106,7 @@ impl TrustCgCodegenBackend {
 
         let mut entry = LirBasicBlock::default();
         entry.instructions.push(LirInstruction {
-            opcode: Opcode::Call { name: spec.callee_symbol_name.clone() },
+            opcode: Opcode::Call { name: spec.callee_symbol_name.clone(), binding: DirectCallBinding::Interposable },
             args: (0..param_count).map(Value).collect(),
             results: call_result.into_iter().collect(),
         });
@@ -1072,6 +1153,7 @@ impl TrustCgCodegenBackend {
             // verify: None.
             source_functions: None,
             linkage: Vec::new(),
+            statics: Vec::new(),
         })
     }
 
@@ -1247,7 +1329,7 @@ impl TrustCgCodegenBackend {
         &self,
         functions: &[LirFunction],
     ) -> Result<Vec<u8>, CodegenBackendError> {
-        self.emit_target_module(functions, &[]).map(|emission| emission.object)
+        self.emit_target_module(functions, &[], &[]).map(|emission| emission.object)
     }
 
     /// [`Self::emit_target_object`] plus per-function symbol bindings and the
@@ -1259,11 +1341,21 @@ impl TrustCgCodegenBackend {
         &self,
         functions: &[LirFunction],
         bindings: &[trust_cg_codegen::pipeline::FunctionSymbolBinding],
+        semantic_globals: &[ObjectGlobal],
     ) -> Result<trust_cg_codegen::pipeline::ModuleEmission, CodegenBackendError> {
+        let globals = merge_object_globals(functions, semantic_globals)?;
         // x86-64 has its OWN backend (`trust_cg_codegen::x86_64::X86Pipeline`); the
         // generic pipeline below is AArch64-only and would silently emit AArch64
         // bytes for an x86 target. Route x86 through its real backend.
         if self.target_arch == TrustCgTargetArch::X86_64 {
+            if !semantic_globals.is_empty() {
+                return Err(CodegenBackendError::EmitFailed {
+                    reason: format!(
+                        "{} semantic global(s)/static(s) are not wired into the x86-64 emission                          path",
+                        semantic_globals.len()
+                    ),
+                });
+            }
             // The x86-64 emitters still hardcode a global binding for every
             // function definition and derive relocation symbol indices from
             // insertion order, so a local definition there would either be
@@ -1284,7 +1376,7 @@ impl TrustCgCodegenBackend {
             // PRIMARY check reads offsets back from the shipped object's own
             // symbol table and still runs; only the redundant
             // emitter-report-vs-object cross-check is unavailable here.
-            return self.emit_x86_object(functions).map(|object| {
+            return self.emit_x86_object(functions, &globals).map(|object| {
                 trust_cg_codegen::pipeline::ModuleEmission { object, text_extents: Vec::new() }
             });
         }
@@ -1307,7 +1399,6 @@ impl TrustCgCodegenBackend {
             prepared.push(prepared_func);
         }
 
-        let globals = collect_trust_location_globals(functions);
         pipeline.compile_module_emission(&prepared, &globals, &[], bindings).map_err(|e| {
             CodegenBackendError::Pipeline {
                 func_name: functions
@@ -1323,7 +1414,11 @@ impl TrustCgCodegenBackend {
     /// compiler's `compile_x86_64` dispatch (per-function x86 ISel -> X86Pipeline).
     /// This is what `emit_target_object` should have called for the `X86_64` target
     /// all along; the generic pipeline is AArch64-only.
-    fn emit_x86_object(&self, functions: &[LirFunction]) -> Result<Vec<u8>, CodegenBackendError> {
+    fn emit_x86_object(
+        &self,
+        functions: &[LirFunction],
+        globals: &[ObjectGlobal],
+    ) -> Result<Vec<u8>, CodegenBackendError> {
         use trust_cg_codegen::x86_64::{X86OutputFormat, X86Pipeline, X86PipelineConfig};
         use trust_cg_lower::function::Signature;
         use trust_cg_lower::x86_64_isel::{X86CallAbi, X86InstructionSelector};
@@ -1378,7 +1473,6 @@ impl TrustCgCodegenBackend {
             isel_funcs.push(isel_func);
         }
 
-        let globals = collect_trust_location_globals(functions);
         let opt_level = self.optimization_level.x86_pipeline_level();
         X86Pipeline::new(X86PipelineConfig {
             opt_level,
@@ -1387,7 +1481,7 @@ impl TrustCgCodegenBackend {
             call_abi,
             ..X86PipelineConfig::generic_x86_64()
         })
-        .compile_module_with_globals(&isel_funcs, &globals)
+        .compile_module_with_globals(&isel_funcs, globals)
         .map_err(|e| CodegenBackendError::Pipeline {
             func_name: functions
                 .first()
@@ -1475,6 +1569,7 @@ impl TrustCgCodegenBackend {
             // Synthesized allocator shim — no source IR to verify.
             source_functions: None,
             linkage: Vec::new(),
+            statics: Vec::new(),
         }))
     }
 
@@ -1542,9 +1637,206 @@ fn sorted_lir_block_ids(func: &LirFunction) -> Vec<Block> {
     blocks
 }
 
-fn collect_trust_location_globals(
+/// Canonically encode the first fail-closed assembled-global codegen slice.
+///
+/// This rung intentionally accepts only immutable initialized `u64` objects
+/// with module-local linkage. That is the producer's anonymous scalar-promotion
+/// shape (`&42u64`) and is enough to make its `GlobalAddr` relocation resolve to
+/// real storage without pretending that source-static identity, TLS, BSS,
+/// mutable state, aggregates, or embedded symbol addresses are solved.
+pub fn assembled_internal_object_globals(
+    module: &trust_ir::Module,
+) -> Result<Vec<ObjectGlobal>, CodegenBackendError> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut data_globals = Vec::new();
+    for global in &module.globals {
+        if global.name.is_empty() {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: "Trust-IR global has an empty symbol name".to_string(),
+            });
+        }
+        if !names.insert(global.name.as_str()) {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "Trust-IR module contains duplicate global symbol `{}`; refusing an \
+                     ambiguous relocation target",
+                    global.name
+                ),
+            });
+        }
+        // A GlobalAddr is also the established Trust-IR spelling for taking a
+        // function's address. That table row is a symbol proxy, not an object
+        // data definition: its matching Function supplies the definition (or
+        // declaration), and emitting the row as initializer-less data would
+        // create a conflicting/undefined twin. Keep this provenance lane
+        // separate before applying the assembled-data checks below.
+        if function_symbol_proxy(module, global) {
+            continue;
+        }
+        if global.mutable {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "Trust-IR global `{}` is mutable; assembled-global emission currently \
+                     admits immutable promotions only",
+                    global.name
+                ),
+            });
+        }
+        if global.initializer.is_none() {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "Trust-IR global `{}` has no initializer; imports and BSS/zero-fill \
+                     definitions are outside the assembled-global slice",
+                    global.name
+                ),
+            });
+        }
+        if global.tls.is_some() {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "Trust-IR global `{}` is thread-local; TLS is outside the \
+                     assembled-global slice",
+                    global.name
+                ),
+            });
+        }
+        if !matches!(global.linkage, trust_ir::Linkage::Internal | trust_ir::Linkage::Private) {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "Trust-IR global `{}` has {} linkage; only Internal/Private assembled \
+                     definitions are admitted",
+                    global.name, global.linkage
+                ),
+            });
+        }
+        if global.ty != trust_ir::Ty::U64 {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "Trust-IR global `{}` has type {:?}; this first assembled-global rung \
+                     admits only u64 scalar promotions",
+                    global.name, global.ty
+                ),
+            });
+        }
+        if let Some(align) = global.align
+            && (align < 8 || !align.is_power_of_two())
+        {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "Trust-IR u64 global `{}` requests unsupported alignment {align}; \
+                     expected no override or a power of two at least 8",
+                    global.name
+                ),
+            });
+        }
+        data_globals.push(global.clone());
+    }
+
+    // GlobalIds are not part of initializer encoding. Canonicalize the checked
+    // data subset through the real compiler encoder while leaving function
+    // proxies to the function symbol table.
+    let mut data_module = module.clone();
+    data_module.globals = data_globals;
+    let encoded =
+        trust_cg_codegen::compiler::module_object_globals(&data_module).map_err(|error| {
+            CodegenBackendError::EmitFailed {
+                reason: format!("canonical Trust-IR global encoding failed: {error}"),
+            }
+        })?;
+    if encoded.len() != data_module.globals.len() {
+        return Err(CodegenBackendError::EmitFailed {
+            reason: format!(
+                "canonical Trust-IR global encoder returned {} object definition(s) for {} \
+                 source global(s)",
+                encoded.len(),
+                data_module.globals.len()
+            ),
+        });
+    }
+    for global in &encoded {
+        if global.data.len() != 8
+            || global.mutable
+            || global.is_external
+            || global.is_thread_local
+            || global.is_import
+            || global.is_weak
+            || global.align < 8
+        {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "canonical object global `{}` escaped the immutable local u64 contract: \
+                     data={} mutable={} external={} tls={} import={} weak={} align={}",
+                    global.name,
+                    global.data.len(),
+                    global.mutable,
+                    global.is_external,
+                    global.is_thread_local,
+                    global.is_import,
+                    global.is_weak,
+                    global.align
+                ),
+            });
+        }
+        if !global.symbol_refs.is_empty() {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "Trust-IR global `{}` contains {} embedded symbol relocation(s); that \
+                     initializer form is outside the assembled-global slice",
+                    global.name,
+                    global.symbol_refs.len()
+                ),
+            });
+        }
+    }
+    Ok(encoded)
+}
+
+/// Whether a Global row is the legacy symbol-address proxy for a real
+/// Function row rather than an object data definition.
+pub(crate) fn function_symbol_proxy(module: &trust_ir::Module, global: &trust_ir::Global) -> bool {
+    !global.mutable
+        && global.initializer.is_none()
+        && global.tls.is_none()
+        && global.ty == trust_ir::Ty::Ptr
+        && module.functions.iter().any(|function| function.name == global.name)
+}
+
+/// Merge semantic data definitions with source-location helper globals through
+/// one deterministic, collision-rejecting funnel.
+fn merge_object_globals(
     functions: &[LirFunction],
-) -> Vec<trust_cg_codegen::pipeline::ObjectGlobal> {
+    semantic_globals: &[ObjectGlobal],
+) -> Result<Vec<ObjectGlobal>, CodegenBackendError> {
+    let function_names: std::collections::BTreeSet<&str> =
+        functions.iter().map(|function| function.name.as_str()).collect();
+    let location_globals = collect_trust_location_globals(functions);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut merged = Vec::with_capacity(semantic_globals.len() + location_globals.len());
+
+    for global in semantic_globals.iter().chain(location_globals.iter()) {
+        if function_names.contains(global.name.as_str()) {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "data global `{}` collides with a function definition in the same object",
+                    global.name
+                ),
+            });
+        }
+        if !seen.insert(global.name.as_str()) {
+            return Err(CodegenBackendError::EmitFailed {
+                reason: format!(
+                    "duplicate object-global symbol `{}` after merging semantic and \
+                     source-location globals",
+                    global.name
+                ),
+            });
+        }
+        merged.push(global.clone());
+    }
+    Ok(merged)
+}
+
+fn collect_trust_location_globals(functions: &[LirFunction]) -> Vec<ObjectGlobal> {
     let mut names = std::collections::BTreeSet::new();
 
     for func in functions {
@@ -1564,7 +1856,7 @@ fn collect_trust_location_globals(
         .into_iter()
         .filter_map(|name| {
             trust_location_file_global_data(&name).map(|data| {
-                trust_cg_codegen::pipeline::ObjectGlobal {
+                ObjectGlobal {
                     name,
                     data,
                     mutable: false,
@@ -1684,6 +1976,7 @@ impl RustcCodegenBackend for TrustCgCodegenBackend {
             function_count,
             source_functions: Some(source_functions),
             linkage,
+            statics: crate_info.statics.clone(),
         });
 
         Ok(Box::new(OngoingCodegen {
@@ -1896,7 +2189,7 @@ mod tests {
         let mut caller = LirFunction::new("_Rshim_caller".to_string(), LirSignature::default());
         let mut caller_entry = LirBasicBlock::default();
         caller_entry.instructions.push(LirInstruction {
-            opcode: Opcode::Call { name: "_Rshim_callee".to_string() },
+            opcode: Opcode::Call { name: "_Rshim_callee".to_string(), binding: DirectCallBinding::Interposable },
             args: vec![],
             results: vec![],
         });
@@ -1923,6 +2216,7 @@ mod tests {
             object_path: None,
             source_functions: None,
             linkage: Vec::new(),
+            statics: Vec::new(),
         }
     }
 
@@ -2327,6 +2621,7 @@ mod tests {
             crate_name: "test_crate".to_string(),
             functions: vec![make_add()],
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
 
         let ongoing = backend.codegen_crate(&info).expect("codegen_crate should succeed");
@@ -2347,6 +2642,7 @@ mod tests {
             crate_name: "multi".to_string(),
             functions: vec![make_add(), make_identity()],
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
 
         let ongoing = backend.codegen_crate(&info).expect("codegen_crate should succeed");
@@ -2360,8 +2656,12 @@ mod tests {
     #[test]
     fn test_codegen_crate_empty() {
         let backend = TrustCgCodegenBackend::host();
-        let info =
-            CrateInfo { crate_name: "empty".to_string(), functions: vec![], linkage: Vec::new() };
+        let info = CrateInfo {
+            crate_name: "empty".to_string(),
+            functions: vec![],
+            linkage: Vec::new(),
+            statics: Vec::new(),
+        };
 
         let ongoing = backend.codegen_crate(&info).expect("empty crate should succeed");
 
@@ -2377,6 +2677,7 @@ mod tests {
             crate_name: "test".to_string(),
             functions: vec![make_add()],
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
@@ -2401,6 +2702,7 @@ mod tests {
             function_count: 0,
             source_functions: None,
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
 
         let err = backend
@@ -2423,6 +2725,7 @@ mod tests {
             function_count: 0,
             source_functions: None,
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
 
         let err = backend
@@ -2442,6 +2745,7 @@ mod tests {
             crate_name: "test".to_string(),
             functions: vec![make_add()],
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
@@ -2501,7 +2805,7 @@ mod tests {
         assert_eq!(
             alloc_entry.instructions[0],
             LirInstruction {
-                opcode: Opcode::Call { name: "_Rdefault_alloc".to_string() },
+                opcode: Opcode::Call { name: "_Rdefault_alloc".to_string(), binding: DirectCallBinding::Interposable },
                 args: vec![Value(0), Value(1)],
                 results: vec![Value(2)],
             }
@@ -2519,7 +2823,7 @@ mod tests {
         assert_eq!(
             oom_entry.instructions[0],
             LirInstruction {
-                opcode: Opcode::Call { name: "_Rdefault_alloc_error_handler".to_string() },
+                opcode: Opcode::Call { name: "_Rdefault_alloc_error_handler".to_string(), binding: DirectCallBinding::Interposable },
                 args: vec![Value(0), Value(1)],
                 results: vec![],
             }
@@ -2769,6 +3073,7 @@ mod tests {
             function_count: 1,
             source_functions: None,
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
 
         let emitted = backend
@@ -2805,6 +3110,7 @@ mod tests {
             crate_name: "test".to_string(),
             functions: vec![make_add()],
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
         let outputs =
             OutputFilenames { out_dir: PathBuf::from("/tmp"), crate_stem: "test".to_string() };
@@ -2864,6 +3170,7 @@ mod tests {
             crate_name: "pipeline_test".to_string(),
             functions: vec![make_add(), make_identity()],
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
         let outputs = OutputFilenames {
             out_dir: PathBuf::from("/tmp"),
@@ -2892,6 +3199,7 @@ mod tests {
                 function_count: 0,
                 source_functions: None,
                 linkage: Vec::new(),
+                statics: Vec::new(),
             }],
             allocator_module: None,
         };
@@ -2936,6 +3244,7 @@ mod tests {
             crate_name: "lir_check".to_string(),
             functions: vec![make_add()],
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
 
         let ongoing = backend.codegen_crate(&info).expect("codegen should succeed");
@@ -3111,6 +3420,7 @@ mod tests {
             function_count: 2,
             source_functions: None,
             linkage: Vec::new(),
+            statics: Vec::new(),
         };
 
         let objects =
@@ -3510,6 +3820,7 @@ mod tests {
                     function_count: 3,
                     source_functions: None,
                     linkage: Vec::new(),
+                    statics: Vec::new(),
                 },
                 CompiledModule {
                     name: "m2".to_string(),
@@ -3518,6 +3829,7 @@ mod tests {
                     function_count: 2,
                     source_functions: None,
                     linkage: Vec::new(),
+                    statics: Vec::new(),
                 },
             ],
             allocator_module: Some(CompiledModule {
@@ -3527,6 +3839,7 @@ mod tests {
                 function_count: 1,
                 source_functions: None,
                 linkage: Vec::new(),
+                statics: Vec::new(),
             }),
             allocator_module_spec: Some(AllocatorModuleSpec {
                 module_name: "alloc.spec".to_string(),

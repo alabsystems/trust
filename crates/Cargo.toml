@@ -337,6 +337,32 @@ members = [
     # `compiler/rustc_index/src/bit_set.rs:1751` computes
     # `WORD_BITS - 1 - word.leading_zeros()`, which underflows at zero.
     "trust-bits",
+    "trust-modular",
+    # Sixteenth on the same discipline, and the FIRST EXTRACTED FROM Trust's own
+    # verification stack rather than written beside it. Two's-complement bounds
+    # for machine integer widths 1..=64 — the arithmetic that decides the range
+    # facts the verifier conjoins onto its OWN VCs. `(1i128 << (width - 1)) - 1`
+    # is written by hand at least NINE times across `trust-router`,
+    # `trust-ir-bridge`, `trust-certify`, `trust-types`, `trust-mir-extract` and
+    # `trust-spec-elab`; three of those nine disagree about the domain of the
+    # same question (`1..=128` vs `== 128` vs `>= 127`) and six panic at
+    # `width == 0`. `trust-ir-bridge::native_int_min_max` was DELETED and
+    # rebuilt on this crate — a real edge, pinned by the gate's mutation G.
+    # See docs/STRICT_VERIFICATION_FRAGMENT.md §16.
+    "trust-intbound",
+    "trust-widthconv",
+    "trust-budget",
+    "trust-floatbits",
+    # Fifteenth on the same discipline, and the FIRST that is not a leaf: it
+    # DEPENDS on `trust-bits`. Fixed-width bit fields as descriptors — the
+    # `(lo, width)` pair, its mask, and whether a value, a field or a pair of
+    # fields actually fits. `trust-disasm/src/aarch64/decode.rs:21` decides
+    # none of that: a field running off the top of the word is silently
+    # TRUNCATED and reads exactly like a correct answer. Until 850147d402
+    # depending on a verified crate was verdict-NEGATIVE, so this is also the
+    # measurement of what composition costs — zero rows, against an inline
+    # twin (docs/STRICT_VERIFICATION_FRAGMENT.md §15).
+    "trust-bitfield",
     # Ninth component on the same discipline: total, `no_std`, zero-dependency
     # alignment / padding / layout-offset arithmetic, written to PASS the
     # authenticated strict lane. It exists because the round-up-to-a-power-of-two
@@ -458,6 +484,9 @@ members = [
     # `CleanOriginPlan`, so the two authoritative languages meet in TrustIR
     # rather than in MIR.
     "trust-clean-ir",
+    # Independent actual-Function reflector and private digest-bound carrier
+    # permission for the bounded Clean-origin TrustIR fragment.
+    "trust-clean-ir-gate",
     "trust-certify",
     "trust-semantics",
     "trust-decompile",
@@ -565,6 +594,7 @@ trust-release = { path = "trust-release" }
 trust-clean = { path = "trust-clean" }
 trust-clean-origin = { path = "trust-clean-origin" }
 trust-clean-ir = { path = "trust-clean-ir" }
+trust-clean-ir-gate = { path = "trust-clean-ir-gate" }
 trust-bignum = { path = "trust-bignum" }
 # Phase 1 crypto replacement. trust-hmac consumes trust-sha2's `Digest`; no
 # consumer crate points at either yet.
@@ -603,6 +633,12 @@ trust-fixed = { path = "trust-fixed" }
 trust-interval = { path = "trust-interval" }
 trust-timearith = { path = "trust-timearith" }
 trust-bits = { path = "trust-bits" }
+trust-modular = { path = "trust-modular" }
+trust-intbound = { path = "trust-intbound" }
+trust-widthconv = { path = "trust-widthconv" }
+trust-budget = { path = "trust-budget" }
+trust-floatbits = { path = "trust-floatbits" }
+trust-bitfield = { path = "trust-bitfield" }
 trust-convergence = { path = "trust-convergence" }
 trust-temporal = { path = "trust-temporal" }
 trust-proof-cert = { path = "trust-proof-cert" }

@@ -723,6 +723,14 @@ impl Session {
         self.opts.unstable_opts.trust_cg_frontend == "trust-ir"
     }
 
+    /// Whether the trust-ir frontend's UPSTREAM-INSTANCE lane is enabled:
+    /// monomorphized upstream bodies bridged MIR -> trust-ir into the same
+    /// converter and gate. Meaningful only under
+    /// [`Self::trust_cg_frontend_is_trust_ir`]; off by default.
+    pub fn trust_ir_upstream_mir(&self) -> bool {
+        self.opts.unstable_opts.trust_ir_upstream_mir
+    }
+
     /// Structured reporting role. Unknown callback-injected values are handled
     /// as `Unscoped`; the driver rejects them before work.
     pub fn trust_crate_role(&self) -> TrustCrateRole {

@@ -32,7 +32,8 @@ fn read_and_assert_direct_ir_artifacts(
     let coverage: serde_json::Value =
         serde_json::from_slice(&coverage_bytes).expect("parse TrustIr coverage");
     assert_eq!(coverage["schema"], "trust.thir-lower.crate-module.coverage.v2");
-    assert_eq!(coverage["direct_obligation_capability"], "structural-parity-only-v1");
+    // Trust: the owner-signed tier move (c2ac761224) — authority axes stay false.
+    assert_eq!(coverage["direct_obligation_capability"], "obligation-bearing-pending-v2");
     assert_eq!(coverage["proof_authority"], false);
     assert_eq!(coverage["native_verification_requests"], false);
     for field in ["bodies", "lowered", "spliced"] {

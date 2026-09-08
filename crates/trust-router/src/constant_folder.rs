@@ -28,9 +28,11 @@ use crate::{BackendRole, VerificationBackend};
 // `fuel=32` does not save it (the fan-out happens within the depth budget), and the
 // per-fn/solver timeouts do not catch it (this is in-process folding, not a solver).
 //
-// FIX: a thread-local TOTAL-work budget counting cumulative `prop_unsat_conjuncts`
-// invocations across one top-level check. When exhausted the recursion returns the
-// conservative `false` (formula NOT proven UNSAT here).
+// FIX (2026-08-31 note: this paragraph describes the ORIGINAL fix and is kept
+// because the layer below it is only legible against it): a thread-local
+// TOTAL-work budget counting cumulative `prop_unsat_conjuncts` invocations across
+// one top-level check. When exhausted the recursion returns the conservative
+// `false` (formula NOT proven UNSAT here).
 //
 // SOUNDNESS (paramount): this discharge is a sound UNDER-approximation — it returns
 // `true` only for a genuinely-UNSAT formula and is purely an OPTIMIZATION (a
@@ -39,15 +41,178 @@ use crate::{BackendRole, VerificationBackend};
 // path unchanged. So the bound can only LOSE a structural discharge (turning a would-be
 // structural-Proved into a solver-decided verdict), never manufacture a false
 // `true`/UNSAT. The result-level Proved gate is unchanged. DROP-ONLY.
-const PROP_UNSAT_WORK_BUDGET: u64 = 200_000;
+//
+// ── 2026-08-31: THE BOUND WAS ON CALLS, AND THE COST IS NOT PER-CALL ─────────
+//
+// The budget above counts CALLS. Every call, before it splits anything, runs eight
+// `conjuncts_carry_*` scans over the whole conjunct list; each is at least one linear
+// pass and two of them (`index_len_eq`, `booltemp`) are quadratic in the list with
+// heap-allocating, deep-structural-equality inner work. A call is therefore Θ(n) at
+// best and Θ(n²) at worst in `n = conjuncts.len()` — never Θ(1) — so a CALL budget
+// bounds the number of steps and not the work, and the wall time of a single
+// "bounded" check still grows without limit as the guard conjunction gets wider.
+//
+// MEASURED (release build, `prop_unsat_work_ladder`, 8 atom conjuncts + k `Or`
+// bound conjuncts, no contradiction present so the search runs to exhaustion):
+//
+//   n=12  k=4      0 ms       65 calls     search completed
+//   n=14  k=6      1 ms    1,957 calls     search completed
+//   n=16  k=8     60 ms  109,601 calls     search completed
+//   n=18  k=10   130 ms  200,000 calls     CALL BUDGET HIT
+//   n=26  k=10   170 ms  200,000 calls     CALL BUDGET HIT
+//   n=42  k=10   255 ms  200,000 calls     CALL BUDGET HIT
+//   n=74  k=10   436 ms  200,000 calls     CALL BUDGET HIT
+//
+// Read the last four rows: at a SATURATED budget the wall clock is linear in `n`
+// (130 -> 436 ms as n goes 18 -> 74, ≈ 5.3 ms per 10 conjuncts) and nothing caps it.
+// The first three rows are the case-split explosion itself — 65 -> 1,957 -> 109,601
+// for k = 4 -> 6 -> 8, i.e. the `k! · branches^k` fan-out the paragraph above
+// predicts. So the 2026-08-31 nn-core stack sample that put `prop_unsat_conjuncts`
+// at the top of a 31-frame self-recursion was reading a real cost layer, but NOT an
+// unbounded one: the search terminates, and what was missing is a bound on WORK.
+//
+// FIX, part 1 — METER THE SCAN WIDTH. `step(units)` charges `conjuncts.len()` per
+// call instead of 1, so the budget bounds Σ n over the whole search: wall time
+// becomes FLAT in the conjunct count instead of linear in it.
+//
+//     PROP_UNSAT_WORK_BUDGET = 6_400_000 scan units
+//
+// THE CROSSOVER IS n ≈ 15.5, AND IT WAS MEASURED, NOT DERIVED. The first draft of
+// this block asserted n = 32, reasoning that a call over n conjuncts costs n units
+// so 6.4M/n = 200_000 at n = 32. That reasoning is wrong and the harness caught it:
+// the charge attributable to ONE `prop_unsat_conjuncts` call is `2n+1`, not `n`,
+// because the call also drives n `prop_unsat_by_discriminant` sub-calls that part 2
+// now charges 1 unit each, plus its own n. Measured `units/conj_call` on the ladder
+// is exactly 25, 29, 33, 37, 53, 85, 149 at n = 12, 14, 16, 18, 26, 42, 74 — that
+// is `2n+1` on every row. So the permitted call count is `6_400_000 / (2n+1)`, which
+// equals the old 200_000 at `2n+1 = 32`, i.e. n = 15.5.
+//
+//   n <= 15  WIDER than the old bound (n=12 buys 256_000 calls, was 200_000)
+//   n >= 16  NARROWER — and no width pays for that in wall clock, which is the
+//            point: the old bound's saturated wall time was ≈ 5.5·n + 32 ms, so it
+//            crossed the new flat ≈ 110 ms ceiling at n ≈ 14. The crossover in
+//            SEARCH WIDTH therefore sits within a conjunct or two of the crossover
+//            in COST. Below it the search is wider and no slower; above it the
+//            search is narrower and strictly faster. Nothing is both.
+//
+// MEASURED A/B, same harness, same release build, BEFORE = the 200_000-call budget:
+//
+//   n     conj_calls BEFORE   conj_calls AFTER      wall BEFORE   wall AFTER
+//   12         65                  65                    0 ms        0 ms
+//   14      1,957               1,957                    1 ms        1 ms
+//   16    109,601             109,601                   60 ms       65 ms
+//   18    200,000  (bound)    172,972  (bound)         130 ms      123 ms
+//   26    200,000  (bound)    120,754  (bound)         170 ms      111 ms
+//   42    200,000  (bound)     75,294  (bound)         255 ms      104 ms
+//   74    200,000  (bound)     42,953  (bound)         436 ms       99 ms
+//
+// EQUIVALENCE: on every row whose search COMPLETES — n = 12, 14, 16 — the call count
+// is identical to the digit and so is the verdict. That is the whole equivalence
+// claim and it is exact, because when neither budget binds the meter is invisible:
+// it changes when the traversal stops and nothing about what it does. Divergence is
+// confined to the rows that print `bound`, where by construction no proof existed to
+// lose (a completed search on those shapes finds nothing — they are SAT).
+//
+// DISCLOSED BEHAVIOURAL CHANGE, stated as a loss and not dressed up: for n >= 16 this
+// searches LESS than before, so a structural discharge that needed between
+// `6_400_000/(2n+1)` and `200_000` calls at a width of 16 or more is no longer found
+// and falls to the solver. It is completeness-negative in that band and
+// completeness-positive below it. It is sound in both directions — see the soundness
+// note at the bottom of this block — and the wall-clock table is the reason to take
+// the trade: the old bound had no ceiling at all as `n` grew.
+//
+// FIX, part 2 — METER THE `Or` DESCENT. `prop_unsat_by_discriminant` recursed over
+// `Or` disjuncts with only `fuel` (depth 32) bounding it and NO work meter at all:
+// the total-work budget covered the `And` re-entry only. A nest of `Or`s whose
+// disjuncts are individually UNSAT (so `all` does not short-circuit) fans out
+// `branches^32` unmetered. That path is now charged one unit per call, so the bound
+// covers the whole traversal rather than one of its two recursive edges.
+//
+// FIX, part 3 — REPORT IT. Exhaustion used to return the same bare `false` as a
+// completed search, so "no contradiction exists" and "we stopped looking" were
+// indistinguishable to every caller and to every log. `PropUnsatVerdict` now
+// separates them and `formula_is_propositionally_unsat_reported` returns it.
+//
+// STILL DETERMINISTIC, and deliberately so: the meter is a step count, never a
+// clock. Exhaustion decides whether this backend returns a structural proof or
+// delegates to the solver, so a wall-clock bound would make a verdict depend on
+// machine load. That property is why part 1 is a re-metering and not a timeout.
+//
+// SOUNDNESS of all three parts: unchanged and DROP-ONLY. Nothing here can make the
+// search return `true`; a charge can only make it stop EARLIER, and stopping early
+// only declines the shortcut. The `n <= 15` widening does admit `false -> true`
+// flips, but only by running MORE of the same resolution steps that were already
+// there — a `true` is produced by exactly the same code, so it is as sound as it
+// was before, and it is the completeness-positive direction.
+const PROP_UNSAT_WORK_BUDGET: u64 = 6_400_000;
+
+/// The budget the pre-2026-08-31 meter enforced, in ITS unit: `prop_unsat_conjuncts`
+/// calls. Kept so the crossover is pinned against the real historical number rather
+/// than against a comment.
+#[cfg(test)]
+const LEGACY_PROP_UNSAT_CALL_BUDGET: u64 = 200_000;
+
+/// Scan units charged by one `prop_unsat_conjuncts` call over `n` conjuncts: its own
+/// `n`, plus one per `prop_unsat_by_discriminant` sub-call it drives over those same
+/// conjuncts. MEASURED exactly on every ladder row — see the header block; the first
+/// draft of this file assumed `n` and was wrong by that factor of two.
+#[cfg(test)]
+const fn scan_units_per_call(n: u64) -> u64 {
+    2 * n + 1
+}
+
+/// The verdict of the bounded structural-UNSAT search.
+///
+/// The point of the third variant is that it is NOT a statement about the formula.
+/// Collapsing it into `false` — which is what this lane did until 2026-08-31 — makes
+/// a declined search look exactly like a completed one that found nothing, so a
+/// future blowup degrades silently instead of reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropUnsatVerdict {
+    /// Proven UNSAT by resolution over opaque atoms. Sound; carries the proof claim.
+    Unsat,
+    /// The search COMPLETED and found no contradiction. A genuine negative: the
+    /// structural lane declines and the obligation keeps its solver verdict.
+    NotProven,
+    /// The deterministic work bound was reached before the search completed. The
+    /// shortcut was declined UNDECIDED — say so rather than record a silent miss.
+    SearchBoundReached,
+}
+
+impl PropUnsatVerdict {
+    /// True only for a genuine proof. `SearchBoundReached` is not a proof and is
+    /// not a refutation, so it maps to `false` on the boolean surface — the same
+    /// conservative answer the old code gave, minus the ambiguity.
+    #[must_use]
+    pub fn is_unsat(self) -> bool {
+        matches!(self, Self::Unsat)
+    }
+}
 
 mod prop_work {
     //! Thread-local total-work meter for the propositional-UNSAT case-split. Reset at
-    //! each top-level entry; decremented per `prop_unsat_conjuncts` call.
+    //! each top-level entry; charged the SCAN WIDTH per `prop_unsat_conjuncts` call
+    //! (and one unit per `prop_unsat_by_discriminant` call), because per-call cost is
+    //! Θ(n) in the conjunct count and never Θ(1). See the header block.
     use std::cell::Cell;
 
     thread_local! {
         static REMAINING: Cell<u64> = const { Cell::new(0) };
+        /// MEASUREMENT ONLY: calls charged since the last `reset`, so a harness can
+        /// report the AVERAGE scan width (units / calls) — the quantity the
+        /// crossover is actually defined on. See `PROP_UNSAT_CROSSOVER_WIDTH`.
+        #[cfg(test)]
+        static CALLS: Cell<u64> = const { Cell::new(0) };
+        /// MEASUREMENT ONLY: charged calls that were `prop_unsat_conjuncts` (charge
+        /// > 1). This is the population the OLD call budget metered, and the only
+        /// one an A/B against it may be read off.
+        #[cfg(test)]
+        static WIDE_CALLS: Cell<u64> = const { Cell::new(0) };
+        /// Set when a charge is refused. Sticky until the next `reset`, so a bound
+        /// reached anywhere in the traversal is visible at the top-level entry —
+        /// the recursion discards intermediate results, so the flag is the only
+        /// way the fact survives back up.
+        static BOUND_REACHED: Cell<bool> = const { Cell::new(false) };
     }
 
     /// The production work budget is deterministic because exhaustion changes
@@ -59,19 +224,62 @@ mod prop_work {
     /// Reset the meter to the deterministic budget at a top-level entry.
     pub(super) fn reset() {
         REMAINING.with(|r| r.set(budget()));
+        BOUND_REACHED.with(|b| b.set(false));
+        #[cfg(test)]
+        CALLS.with(|c| c.set(0));
+        #[cfg(test)]
+        WIDE_CALLS.with(|c| c.set(0));
     }
 
-    /// Consume one unit of work; returns `false` once the budget is exhausted (the
-    /// caller must then return the conservative `false`). Saturating at 0.
-    pub(super) fn step() -> bool {
+    /// Consume `units` of work; returns `false` once the budget cannot cover the
+    /// charge (the caller must then return the conservative `false`). Saturating
+    /// at 0, and a refusal latches [`bound_reached`].
+    ///
+    /// A charge of 0 is treated as 1: every call does SOME work, and a free step
+    /// would reopen an unmetered path, which is the defect this meter exists to
+    /// close.
+    pub(super) fn step(units: u64) -> bool {
+        let units = units.max(1);
         REMAINING.with(|r| {
             let n = r.get();
-            if n == 0 {
+            if n < units {
+                r.set(0);
+                BOUND_REACHED.with(|b| b.set(true));
                 return false;
             }
-            r.set(n - 1);
+            r.set(n - units);
+            #[cfg(test)]
+            CALLS.with(|c| c.set(c.get() + 1));
+            #[cfg(test)]
+            if units > 1 {
+                WIDE_CALLS.with(|c| c.set(c.get() + 1));
+            }
             true
         })
+    }
+
+    /// MEASUREMENT ONLY (test builds): charged calls since the last `reset`.
+    #[cfg(test)]
+    pub(super) fn calls() -> u64 {
+        CALLS.with(std::cell::Cell::get)
+    }
+
+    /// MEASUREMENT ONLY (test builds): `prop_unsat_conjuncts` calls since the last
+    /// `reset` — the population the pre-2026-08-31 call budget metered.
+    #[cfg(test)]
+    pub(super) fn wide_calls() -> u64 {
+        WIDE_CALLS.with(std::cell::Cell::get)
+    }
+
+    /// Whether the work bound was reached during the search since the last `reset`.
+    pub(super) fn bound_reached() -> bool {
+        BOUND_REACHED.with(std::cell::Cell::get)
+    }
+
+    /// MEASUREMENT ONLY (test builds): units consumed since the last `reset`.
+    #[cfg(test)]
+    pub(super) fn consumed() -> u64 {
+        REMAINING.with(|r| budget().saturating_sub(r.get()))
     }
 }
 
@@ -329,6 +537,14 @@ fn prop_unsat_by_discriminant(formula: &Formula, fuel: u32) -> bool {
     if fuel == 0 {
         return false;
     }
+    // verifier-perf: the `Or` descent below was metered by DEPTH only, so a nest of
+    // `Or`s whose disjuncts are individually UNSAT (`all` does not short-circuit)
+    // fanned out `branches^32` with nothing counting it — the total-work budget
+    // covered the `And` re-entry alone. One unit per call closes that edge.
+    // SOUNDNESS: refusing the charge returns the conservative `false`, DROP-ONLY.
+    if !prop_work::step(1) {
+        return false;
+    }
     match formula {
         // Trust (R2 family 1): a LITERAL false is UNSAT — the shape a VC takes when
         // vcgen discharges the violation STRUCTURALLY at emission (e.g. the
@@ -362,12 +578,14 @@ fn prop_unsat_conjuncts(conjuncts: &[&Formula], fuel: u32) -> bool {
     if fuel == 0 {
         return false;
     }
-    // verifier-perf: bound the TOTAL case-split work (breadth × depth), not just depth.
-    // Once the per-check work budget is spent, decline the structural shortcut
-    // (conservative `false`) so a fan-out explosion over a huge guard conjunction cannot
-    // stall the compiler thread. SOUNDNESS: DROP-ONLY — only declines a structural-UNSAT
+    // verifier-perf: bound the TOTAL case-split WORK (breadth × depth × scan width),
+    // not just depth and not just the call count. The charge is the conjunct count
+    // because the eight `conjuncts_carry_*` scans below are each at least one linear
+    // pass over this list — a call is Θ(n), never Θ(1), so charging 1 bounded steps
+    // and not work. See the header block for the measurement and the calibration.
+    // SOUNDNESS: DROP-ONLY — refusing the charge only declines a structural-UNSAT
     // discharge; the obligation falls through to the solver. See `PROP_UNSAT_WORK_BUDGET`.
-    if !prop_work::step() {
+    if !prop_work::step(conjuncts.len() as u64) {
         return false;
     }
     if conjuncts.iter().any(|c| prop_unsat_by_discriminant(c, fuel - 1))
@@ -708,8 +926,35 @@ fn conjuncts_carry_index_len_eq_contradiction(conjuncts: &[&Formula]) -> bool {
 /// proved (drop-in).
 #[must_use]
 pub fn formula_is_propositionally_unsat(formula: &Formula) -> bool {
+    formula_is_propositionally_unsat_reported(formula).is_unsat()
+}
+
+/// The same bounded structural-UNSAT search as [`formula_is_propositionally_unsat`],
+/// returning WHY it said no.
+///
+/// Use this at any site that records or logs a decline. The boolean form cannot tell
+/// "the search completed and there is no contradiction" from "the deterministic work
+/// bound stopped the search", and those are different facts: the first is a statement
+/// about the formula, the second is a statement about this backend. Reporting the
+/// second is what keeps a future fan-out blowup from degrading silently — the failure
+/// mode this lane shipped with until 2026-08-31.
+///
+/// Determinism: identical inputs give an identical verdict on any machine, because
+/// the bound is a step count and not a clock.
+#[must_use]
+pub fn formula_is_propositionally_unsat_reported(formula: &Formula) -> PropUnsatVerdict {
     prop_work::reset();
-    prop_unsat_by_discriminant(formula, 32)
+    if prop_unsat_by_discriminant(formula, 32) {
+        // A `true` is a real proof even if the bound was reached elsewhere in the
+        // search: the resolution steps that produced it all ran. The bound can only
+        // have suppressed OTHER branches, and a suppressed branch cannot license a
+        // discharge — it can only withhold one.
+        PropUnsatVerdict::Unsat
+    } else if prop_work::bound_reached() {
+        PropUnsatVerdict::SearchBoundReached
+    } else {
+        PropUnsatVerdict::NotProven
+    }
 }
 
 /// True iff the conjuncts contain a direct complementary pair `X ∧ ¬X` — some
@@ -1564,5 +1809,143 @@ mod tests {
 
         let result = backend.verify(&vc);
         assert!(matches!(result, VerificationResult::Unknown { .. }));
+    }
+
+    // ── LAYER-4 MEASUREMENT HARNESS ────────────────────────────────────────
+    //
+    // Builds the shape the 2026-08-31 nn-core stack sample caught: a large guard
+    // conjunction carrying several `Or` bound conjuncts and no contradiction, so
+    // the resolution case-split runs to exhaustion instead of short-circuiting on
+    // a proof. Reports (n conjuncts, k Or conjuncts, wall ms, work units charged).
+    //
+    // `cargo test -p trust-router -- --ignored --nocapture prop_unsat_work_ladder`
+    fn ladder_formula(atoms: usize, ors: usize) -> Formula {
+        let mut cs: Vec<Formula> = Vec::new();
+        for i in 0..atoms {
+            cs.push(Formula::Lt(
+                Box::new(Formula::Var(format!("x{i}"), Sort::Int)),
+                Box::new(Formula::Int(i as i128)),
+            ));
+        }
+        for j in 0..ors {
+            let a = Formula::Var(format!("a{j}"), Sort::Int);
+            cs.push(Formula::Or(vec![
+                Formula::Lt(Box::new(a.clone()), Box::new(Formula::Int(0))),
+                Formula::Gt(Box::new(a), Box::new(Formula::Int(i128::from(i64::MAX)))),
+            ]));
+        }
+        Formula::And(cs)
+    }
+
+    #[test]
+    #[ignore = "measurement harness, not an assertion"]
+    fn prop_unsat_work_ladder() {
+        println!(
+            "atoms  ors  n    verdict             wall_ms   work_units     calls  conj_calls  units/conj"
+        );
+        for (atoms, ors) in [(8, 4), (8, 6), (8, 8), (8, 10), (16, 10), (32, 10), (64, 10)] {
+            let f = ladder_formula(atoms, ors);
+            let t0 = std::time::Instant::now();
+            let v = formula_is_propositionally_unsat_reported(&f);
+            let ms = t0.elapsed().as_millis();
+            let (units, calls) = (prop_work::consumed(), prop_work::calls());
+            let wide = prop_work::wide_calls();
+            #[allow(clippy::cast_precision_loss)]
+            let mean_width = units as f64 / wide.max(1) as f64;
+            println!(
+                "{atoms:5}  {ors:3}  {:<4} {:<19} {ms:7}   {units:>9} {calls:>9} {wide:>9}   {mean_width:>8.2}",
+                atoms + ors,
+                format!("{v:?}"),
+            );
+        }
+    }
+
+    /// The re-metering is CALIBRATED against the real historical bound, and the
+    /// crossover is where this file SAYS it is. Pinned because the first draft put it
+    /// at n = 32 by assuming a call costs `n` units; it costs `2n+1`, and only the
+    /// harness caught that. If someone re-tunes the budget, this fails and names the
+    /// width that moved rather than letting the prose drift.
+    #[test]
+    fn prop_unsat_budget_crossover_is_where_the_header_says() {
+        let calls_at = |n: u64| PROP_UNSAT_WORK_BUDGET / scan_units_per_call(n);
+        assert!(
+            calls_at(15) >= LEGACY_PROP_UNSAT_CALL_BUDGET,
+            "n=15 must still buy at least the legacy search: {} calls",
+            calls_at(15)
+        );
+        assert!(
+            calls_at(16) < LEGACY_PROP_UNSAT_CALL_BUDGET,
+            "n=16 must be the first NARROWER width: {} calls",
+            calls_at(16)
+        );
+    }
+
+    /// The measured charge law. `scan_units_per_call` is used by the calibration
+    /// above, so it is not allowed to be a guess: this re-derives it from the meter
+    /// on the real search, at three widths.
+    #[test]
+    fn prop_unsat_charge_law_is_two_n_plus_one() {
+        for (atoms, ors, n) in [(8_usize, 4_usize, 12_u64), (8, 6, 14), (8, 8, 16)] {
+            let f = ladder_formula(atoms, ors);
+            let _ = formula_is_propositionally_unsat(&f);
+            let (units, wide) = (prop_work::consumed(), prop_work::wide_calls());
+            assert!(wide > 0, "n={n}: the harness shape must reach the case split");
+            assert_eq!(
+                units / wide,
+                scan_units_per_call(n),
+                "n={n}: measured {units} units over {wide} calls"
+            );
+        }
+    }
+
+    /// A declined search is DISTINGUISHABLE from a completed one. Before 2026-08-31
+    /// both were a bare `false`, so a fan-out blowup degraded with nothing said.
+    #[test]
+    fn prop_unsat_reports_why_it_said_no() {
+        // Proof: the guarded-division contradiction `b ≠ 0 ∧ b = 0`.
+        let b = Formula::Var("b".into(), Sort::Int);
+        let eq0 = Formula::Eq(Box::new(b.clone()), Box::new(Formula::Int(0)));
+        let proved = Formula::And(vec![Formula::Not(Box::new(eq0.clone())), eq0]);
+        assert_eq!(formula_is_propositionally_unsat_reported(&proved), PropUnsatVerdict::Unsat);
+
+        // Completed search, no contradiction: small enough that the bound cannot bite.
+        let small = ladder_formula(4, 2);
+        assert_eq!(
+            formula_is_propositionally_unsat_reported(&small),
+            PropUnsatVerdict::NotProven,
+            "a small exhaustive search must report NotProven, not a bound"
+        );
+
+        // Bound reached: the fan-out shape from the ladder, wide enough to saturate.
+        let wide = ladder_formula(64, 10);
+        assert_eq!(
+            formula_is_propositionally_unsat_reported(&wide),
+            PropUnsatVerdict::SearchBoundReached,
+            "a saturating search must SAY it was cut short"
+        );
+        // ...and the boolean surface still answers conservatively, unchanged.
+        assert!(!formula_is_propositionally_unsat(&wide));
+    }
+
+    /// The `Or` descent in `prop_unsat_by_discriminant` used to carry NO work meter
+    /// (depth-32 fuel only), so the total-work budget covered one of the two
+    /// recursive edges. This pins that it is charged now: a wide `Or` nest must
+    /// terminate against the meter rather than against the fuel alone.
+    #[test]
+    fn prop_unsat_or_descent_is_metered() {
+        // Or of Ors, each leaf a distinct SAT atom, 8 deep × 4 wide.
+        fn nest(depth: u32, wide: usize, tag: &mut u64) -> Formula {
+            if depth == 0 {
+                *tag += 1;
+                return Formula::Var(format!("v{tag}"), Sort::Bool);
+            }
+            Formula::Or((0..wide).map(|_| nest(depth - 1, wide, tag)).collect())
+        }
+        let mut tag = 0;
+        let f = nest(8, 4, &mut tag);
+        let t0 = std::time::Instant::now();
+        assert!(!formula_is_propositionally_unsat(&f));
+        // Not a wall-clock verdict — just a tripwire that the traversal is bounded.
+        assert!(t0.elapsed().as_secs() < 10, "Or descent ran unbounded");
     }
 }

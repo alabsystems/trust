@@ -163,15 +163,17 @@ declare_rustdoc_lint! {
 }
 
 declare_rustdoc_lint! {
-   /// The `invalid_rust_codeblocks` lint detects Trust code blocks in
+   /// The `invalid_rust_codeblocks` lint detects Rust code blocks in
    /// documentation examples that are invalid (e.g. empty, not parsable as
-   /// Trust code). This is a trustdoc-only lint, see the documentation in the
+   /// Rust code). This is a trustdoc-only lint, see the documentation in the
    /// [Trust documentation].
    ///
    /// [Trust documentation]: ../../../rustdoc/lints.html#invalid_rust_codeblocks
+   // Trust: the language is Rust; only the tool (trustdoc) is rebranded. See
+   // passes/lint/check_code_block_syntax.rs for the same correction.
    INVALID_RUST_CODEBLOCKS,
    Warn,
-   "codeblock could not be parsed as valid Trust or is empty"
+   "codeblock could not be parsed as valid Rust or is empty"
 }
 
 declare_rustdoc_lint! {

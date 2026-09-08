@@ -1,7 +1,6 @@
 # targo-trust
 
 **Author:** Andrew Yates <andrewyates.name@gmail.com>
-**Version:** 0.1.0
 **License:** MIT OR Apache-2.0
 
 <!--

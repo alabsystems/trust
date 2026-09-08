@@ -14,24 +14,18 @@
 //! and the DIVERGENCE IS THE FINDING. Do not "fix" this file to match the
 //! mapper's output; fix the mapper, or record the refusal.
 //!
-//! HARNESS FURNITURE, byte-identical to ../proposed/: the `clean { .. }`
-//! island and the `by u64_ge_refl` citations (the v1 artifact renders goals
-//! for cited ensures only). Identical furniture cancels in the comparison.
-
-clean {
-    theorem u64_ge_refl : forall (x : UInt64),
-        Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
-        fun x => Nat.le.refl (UInt64.toNat x)
-}
+//! There is deliberately no proof citation here. Schema-v2 spec-clean emits
+//! the uncited clause's zero-authority canonical denotation, so this remains
+//! a genuinely independent statement of the pearlite meaning.
 
 pub fn observe(x: u64) -> u64
-    ensures x >= x by u64_ge_refl
+    ensures x >= x
 {
     x
 }
 
 pub fn keep(lo: u64) -> u64
-    ensures lo <= lo by u64_ge_refl
+    ensures lo <= lo
 {
     lo
 }

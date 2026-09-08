@@ -1124,6 +1124,22 @@ const AUDITED_TRUST_SPEC_SOURCES: &[AuditedTrustSpecSource] = &[
         manifest_sha256: "83569caf993ba8a93f6cd7af9d3ba23440f69baa23e6fe1cf053679eb82f42aa",
         lib_sha256: "af8f868e0706b3084e4ee0911aa9256b8c46ba8c0d0db50f44703d4013380a29",
     },
+    // MERGE (b62-merge-redo <- origin/main, 2026-08-22): our explicit ny-contracts
+    // 0.2.0 (6906ae2948) and 0.3.0 (0360a02a10) entries are REMOVED, because upstream
+    // solved the same recurring failure mode better and their entry above subsumes
+    // both - same package, byte-identical manifest/lib digests, and `version: None`.
+    //
+    // Those two commits were patching an enumerate-the-resolved-version key one bump
+    // at a time; our own note here called it "a RECURRING failure mode (0.1.0 -> 0.2.0
+    // -> 0.3.0)". It also warned: "do NOT relax the key to a version range, which would
+    // admit an unaudited future rewrite under an already-blessed major." Upstream's
+    // `version: None` is NOT a version range - it drops the version as a LOOKUP KEY
+    // while still requiring BOTH exact digests, which our own note called "the real
+    // authority". An unaudited rewrite changes those digests and is still refused, so
+    // the concern that warning names is answered, not relaxed.
+    //
+    // Keeping our entries was not an option regardless: upstream changed the field to
+    // `Option<&'static str>`, so `version: "0.2.0"` no longer type-checks.
 ];
 
 fn audited_trust_spec_source(
@@ -1376,6 +1392,16 @@ fn prepare_rustc(
     // matching `trust_unit_protocol_args`'s own off-switch decision: scoped-out
     // derives compile, while a proc-macro that is a direct dep of a verified
     // unit is still refused.
+    //
+    // Scoping the audited spec provider out of verification therefore also takes
+    // ITS OWN compilation out of this refusal (nothing to forge: it emits no
+    // TRUSTJSON). That loses no protection, because admission via
+    // `capture_audited_trust_spec_proc_macro` — already performed unconditionally
+    // above, with its error propagated — requires the provider to have NO
+    // dependencies at all, so the dependency set this refusal would scan is
+    // provably empty for exactly the units this newly skips. Every unit that
+    // still verifies, including every unit that USES the macro, keeps the full
+    // refusal.
         let include_dependencies = resolve_trust_include_dependencies(
             &unit.rustflags,
             build_runner
@@ -1389,6 +1415,8 @@ fn prepare_rustc(
             unit.target.is_custom_build(),
             is_resolved_root_unit(unit, &build_runner.bcx.roots),
             is_trust_test_execution_subject,
+            trust_unit_build_support_only(build_runner, unit),
+            trust_unit_audited_trust_spec_proc_macro(unit),
             include_dependencies,
         )
     });
@@ -1583,6 +1611,8 @@ fn prepare_rustc(
             is_trust_primary_unit,
             is_trust_test_execution_subject,
             is_trust_certified_monitor_subject,
+            trust_unit_build_support_only(build_runner, unit),
+            trust_unit_audited_trust_spec_proc_macro(unit),
             &unit.pkg.name().to_string(),
             include_dependencies,
         );
@@ -1590,6 +1620,30 @@ fn prepare_rustc(
             protocol_args.extend([
                 "-Z".to_string(),
                 "trust-targo-test-monitor".to_string(),
+            ]);
+        }
+        // Trust (cross-crate composition): declare the foreign bundling scope
+        // for THIS unit — the workspace-internal library dependencies this same
+        // build compiled itself.
+        //
+        // The compiler uses the list to decide whether a foreign callee's BODY
+        // may be pulled into this unit's lowered verification bundle and its
+        // obligations re-derived here. It transports no verdict and cannot: a
+        // foreign proof result is not readable in any compilation, because
+        // `trust_proof_results` has no extern provider and no disk cache.
+        //
+        // It is a CALLER-side declaration on purpose. The cross-crate admission
+        // hole this repo closed in August keyed on `#[automatically_derived]`,
+        // a callee SELF-CLAIM that is stable, ungated and user-writable. "Units
+        // this build compiled from a path source in this workspace" is not a
+        // claim the callee makes about itself, and it keeps registry code —
+        // where the bundle ceilings and the `core::fmt` wall bind immediately —
+        // out of scope.
+        let bundle_scope = trust_unit_foreign_bundle_scope(build_runner, unit);
+        if !bundle_scope.is_empty() {
+            protocol_args.extend([
+                "-Z".to_string(),
+                format!("trust-bundle-foreign-crate={}", bundle_scope.join(",")),
             ]);
         }
         // Bind the exact bytes rustc parses, not merely the mutable path Cargo
@@ -3334,6 +3388,7 @@ fn trust_non_proof_mode_exclusion_reason(mode: CompileMode) -> Option<&'static s
 }
 
 fn trust_excluded_unit_reason(
+    build_runner: &BuildRunner<'_, '_>,
     unit: &Unit,
     include_dependencies: bool,
 ) -> CargoResult<&'static str> {
@@ -3342,6 +3397,27 @@ fn trust_excluded_unit_reason(
     }
     if !include_dependencies {
         return Ok(machine_message::TRUST_EXCLUSION_DEPENDENCY_POLICY);
+    }
+    // A unit no requested root can reach without crossing a build script
+    // contributes no code to any artifact this certificate is about. Name that
+    // exactly, so the dependency-TCB ledger records WHY it was trusted rather
+    // than proved instead of silently omitting it.
+    // The build-script target itself is named here too: it is build support by
+    // definition, and this keeps the `bail!` below reachable only for a genuine
+    // producer inconsistency rather than for a shape the policy seam allows.
+    if unit.target.is_custom_build() || trust_unit_build_support_only(build_runner, unit) {
+        return Ok(machine_message::TRUST_EXCLUSION_BUILD_SUPPORT_ONLY);
+    }
+    // The audited spec provider is trusted on a DIFFERENT and weaker ground than
+    // the build-support units above: it is not absent from the artifact, it is
+    // content-hash pinned and source-audited to expand to the identity (see
+    // `trust_unit_verification_enabled`). It therefore gets its own reason
+    // string, so the dependency-TCB ledger records which of the two arguments
+    // was used. The build-support test runs first on purpose: a provider that is
+    // ALSO unreachable except through a build script has the stronger property,
+    // and should be reported under it.
+    if trust_unit_audited_trust_spec_proc_macro(unit) {
+        return Ok(machine_message::TRUST_EXCLUSION_AUDITED_TRUST_SPEC);
     }
     anyhow::bail!(
         "proof-capable Cargo Unit {} target {:?} mode {} was excluded despite include-dependencies=true",
@@ -3377,6 +3453,37 @@ fn trust_proof_unit_role_for_policy(
     }
     let role = trust_unit_graph_role(build_runner, unit);
     if role == "dependency" && !include_dependencies {
+        return None;
+    }
+    // Keep the declared proof subject in exact agreement with the compiler
+    // off-switch. `trust_unit_protocol_args` appends `-Ztrust-verify=off` to a
+    // build-support-only unit, so declaring it here as a proof unit would
+    // promise evidence that the unit will never emit — the inventory would
+    // assert coverage of something that was never verified. Excluding it here
+    // instead routes it to `excluded_units` with an explicit reason.
+    //
+    // Restricted to `dependency`: a root or a test-execution subject can never
+    // be demoted by the graph fact, which is the same re-admission guard the
+    // policy seam uses.
+    // `role == "dependency"` already implies neither primary nor
+    // test-execution (see `trust_unit_graph_role`'s if/else chain), so those two
+    // inputs are exactly `false` here. Deferring to the same function the
+    // off-switch uses — rather than restating the rule — is what keeps the
+    // declared subject and the compiler flag from drifting apart. The audited
+    // spec proc macro joins this branch through the same call for the same
+    // reason: it is scoped out by the switch, so it must not be declared as a
+    // proof unit whose evidence will never arrive.
+    if include_dependencies
+        && role == "dependency"
+        && !trust_unit_verification_enabled(
+            unit.target.is_custom_build(),
+            false,
+            false,
+            trust_unit_build_support_only(build_runner, unit),
+            trust_unit_audited_trust_spec_proc_macro(unit),
+            include_dependencies,
+        )
+    {
         return None;
     }
     debug_assert_ne!(
@@ -3562,7 +3669,8 @@ pub(super) fn trust_proof_inventory(
         )?;
         let Some(role) = trust_proof_unit_role_for_policy(build_runner, unit, include_dependencies)
         else {
-            let exclusion_reason = trust_excluded_unit_reason(unit, include_dependencies)?;
+            let exclusion_reason =
+                trust_excluded_unit_reason(build_runner, unit, include_dependencies)?;
             excluded_units.push(machine_message::TrustExcludedUnit {
                 index: index.0,
                 mode: trust_compile_mode_name(unit.mode),
@@ -3632,11 +3740,50 @@ fn trust_unit_metadata_args(
     ]
 }
 
+/// Trust (cross-crate composition): the crate names this unit may bundle
+/// foreign bodies from, sorted and deduplicated.
+///
+/// Membership is decided from Cargo's own resolved unit graph, never from a
+/// name a package writes about itself. A dependency qualifies only when this
+/// build compiled it, from a path source in this workspace, as an ordinary
+/// linkable library for the SAME compile kind as the unit that will read it.
+/// Build scripts, proc-macro units, doc units and registry packages are all
+/// outside it: the first three are not in the callee position this lane is
+/// about, and the last is a much larger question than one workspace's own code.
+///
+/// Sorted so the emitted value — which is `[TRACKED]` in the compiler and
+/// therefore enters the crate hash — cannot vary with dependency iteration
+/// order and spuriously rebuild the world.
+fn trust_unit_foreign_bundle_scope(
+    build_runner: &BuildRunner<'_, '_>,
+    unit: &Unit,
+) -> Vec<String> {
+    let mut scope: Vec<String> = build_runner
+        .unit_deps(unit)
+        .iter()
+        .filter(|dep| {
+            dep.unit.is_local()
+                && dep.unit.kind == unit.kind
+                && !dep.unit.mode.is_run_custom_build()
+                && !dep.unit.mode.is_doc()
+                && !dep.unit.target.is_custom_build()
+                && !dep.unit.target.proc_macro()
+                && dep.unit.target.is_lib()
+        })
+        .map(|dep| dep.unit.target.crate_name())
+        .collect();
+    scope.sort();
+    scope.dedup();
+    scope
+}
+
 fn trust_unit_protocol_args(
     is_custom_build: bool,
     is_primary: bool,
     is_test_execution_subject: bool,
     is_certified_monitor_subject: bool,
+    is_build_support_only: bool,
+    is_audited_trust_spec_proc_macro: bool,
     package_name: &str,
     include_dependencies: bool,
 ) -> Vec<String> {
@@ -3649,6 +3796,8 @@ fn trust_unit_protocol_args(
         is_custom_build,
         is_primary,
         is_test_execution_subject,
+        is_build_support_only,
+        is_audited_trust_spec_proc_macro,
         include_dependencies,
     ) {
         args.extend(["-Z".to_string(), "trust-verify=off".to_string()]);
@@ -3659,6 +3808,29 @@ fn trust_unit_protocol_args(
             "trust-certified-test-monitors".to_string(),
         ]);
     }
+    // Trust (cross-crate composition): ship every unit's MIR in its metadata.
+    //
+    // Without this a caller cannot RE-DERIVE a dependency's obligations from the
+    // dependency's own body, because the body is not there to read. Measured on
+    // the real artifact a `targo trust check` produced:
+    // `is_mir_available(trust_ratio::percent)` was FALSE. Nothing in
+    // `should_encode_mir` fires for the shape these crates have — they are
+    // non-generic, non-`#[inline]`, non-`const fn` `pub fn`s — and the last
+    // route, `cross_crate_inlinable`, short-circuits false whenever incremental
+    // is on, which is the dev profile this lane runs under. Raising `opt-level`
+    // is NOT a substitute: the verified lane pipelines with `--emit=metadata`,
+    // where `should_codegen()` is false and the route closes at any opt-level.
+    //
+    // ON EVERY UNIT, NEVER ONE LANE OF TWO SHARING A TARGET DIR. Rustflags are
+    // hashed into Cargo's `unit_id` but NOT into `-Cmetadata`, so a partial
+    // application forks a crate into two artifacts carrying one StableCrateId,
+    // and that surfaces as "found crates (`core` and `core`) with colliding
+    // StableCrateId values" followed by an E0463 that points at nothing related.
+    // The same rule is written down where std's own copy of this flag is applied
+    // in bootstrap. Appending it HERE — the one per-unit function every
+    // compilation of a proof session goes through — is what makes "every unit"
+    // structural rather than a thing to remember.
+    args.extend(["-Z".to_string(), "always-encode-mir".to_string()]);
     args
 }
 
@@ -3670,13 +3842,292 @@ fn trust_proof_primary_unit(
     is_resolved_root_unit || has_certified_monitor
 }
 
+/// Pure policy seam for the per-unit verification decision.
+///
+/// `is_build_support_only` is the Cargo-graph fact that the unit contributes no
+/// code to any artifact the proof is about: every path from a requested root to
+/// it in the unit graph passes through a build-script target. Those units are
+/// scoped out for the same reason `trust_non_proof_mode_exclusion_reason`
+/// already scopes out `CompileMode::RunCustomBuild` — a build script is a Cargo
+/// control job, and its panic-freedom is build integrity, not a property of the
+/// verified artifact. It is deliberately a separate input from `is_custom_build`
+/// (which only names the build-script target itself, never `autocfg` and the
+/// rest of the `[build-dependencies]` closure it links).
+///
+/// Soundness of the exclusion rests on two structural guards, not on the walk
+/// alone: the roots are seeded unconditionally by the caller's walk, and the
+/// `is_primary || is_test_execution_subject` disjunct below re-admits any
+/// primary/test-execution unit regardless of the graph fact. Neither
+/// `is_primary` nor `is_test_execution_subject` can be suppressed by
+/// `is_build_support_only`.
+///
+/// # What becomes TRUSTED rather than proved
+///
+/// Exactly the units a requested root cannot reach without passing through a
+/// build-script target, plus the build-script targets themselves:
+///
+/// 1. the `CompileMode::RunCustomBuild` execution unit — already excluded today
+///    via `TRUST_EXCLUSION_BUILD_SCRIPT_EXECUTION`;
+/// 2. the `build.rs` *compile* unit (`CompileMode::Build`, `TargetKind::CustomBuild`);
+/// 3. every `[build-dependencies]` library and its transitive closure —
+///    `autocfg`, `cc`, `pkg-config`, `version_check`.
+///
+/// Their proof obligations are no longer discharged. Nothing else changes: this
+/// is a scoping decision about which units carry obligations, never a relaxation
+/// of any obligation belonging to a unit that IS linked into the artifact.
+///
+/// # Why this cannot produce a wrong certificate
+///
+/// A build-support unit contributes no code to the artifact the certificate is
+/// about. If `autocfg` panics, Cargo aborts, no rlib and no proof transport are
+/// produced, and there is no certificate to be wrong. A panic here is a
+/// liveness/build-integrity failure, never a soundness failure of an emitted
+/// proof. This is the identical reasoning the toolchain already commits to for
+/// build-script *execution*, documented as "proof is conditional on this exact
+/// execution unit's correctness"; scoping the *compile* of that same code the
+/// same way makes the two halves agree instead of contradict.
+///
+/// # The counter-argument, and why it does not defeat the exclusion
+///
+/// Counter-argument: a buggy build script emits different `cargo::rustc-cfg`
+/// flags, and therefore changes WHICH artifact code is compiled — so the build
+/// script does influence the verified artifact.
+///
+/// That is factually correct and it still does not defeat the exclusion, for
+/// three independent reasons:
+///
+/// * It shows a build script chooses WHAT is proved; it never lets anything go
+///   UNPROVED. Whatever cfg set `autocfg` emits, the resulting units are
+///   compiled under the verifier *with those cfgs* and must discharge every
+///   obligation of that exact post-cfg MIR. A different cfg set yields a
+///   different, still-fully-verified certificate — never an unverified artifact.
+/// * Verifying `autocfg`'s panic-freedom would establish nothing about whether
+///   it emits the *correct* cfgs. Panic-freedom is not functional correctness of
+///   cfg emission, so keeping it in scope buys exactly zero mitigation against
+///   the threat the counter-argument describes.
+/// * The behavioural channel was already trusted before this change, by the
+///   pre-existing `RunCustomBuild` exclusion. Demanding a proof about the code
+///   that produces the cfgs while trusting the cfgs themselves is incoherent:
+///   the strictly weaker link is already conceded.
+///
+/// The honest residual: a build-support unit's *output bytes* can still reach an
+/// artifact via `include_bytes!(concat!(env!("OUT_DIR"), ...))` or an artifact
+/// dependency staged by `build.rs`, and those bytes are trusted-not-proved. This
+/// adds no new authority — anything `build.rs` writes to `OUT_DIR` is already
+/// trusted under the existing execution exclusion. Note that `include!`-ed
+/// generated Rust *source* is unaffected: it compiles as part of the including
+/// unit and stays fully verified.
+///
+/// # `is_audited_trust_spec_proc_macro`: a SEPARATE and WEAKER argument
+///
+/// The second scoping input is the audited Trust spec proc macro
+/// (`trust_unit_audited_trust_spec_proc_macro`). It is kept as its own parameter,
+/// with its own exclusion reason, precisely because it does NOT share the
+/// build-support argument above, and must never be allowed to ride along on it:
+///
+/// * a build-support unit never links into the verified artifact at all;
+/// * a proc macro DOES shape the verified unit's tokens. It runs inside rustc
+///   during the compilation of a unit that IS verified, and its output IS the
+///   code the certificate is about. "It contributes no code to the artifact" is
+///   simply false for it.
+///
+/// So excluding it EXPANDS the trusted base by one crate. The justification is
+/// narrower and it is an audit, not a structural impossibility:
+///
+/// 1. `capture_audited_trust_spec_proc_macro` admits it only if the exact
+///    (package, version) pair is listed in `AUDITED_TRUST_SPEC_SOURCES` AND the
+///    sha256 of both its manifest and its `src/lib.rs` match the pinned digests,
+///    re-hashed at every call, with the file checked for mutation mid-hash. A
+///    crate name is not authority; the content hash is.
+/// 2. That source has been read: each admitted provider is a dependency-free
+///    passthrough whose expansion is the identity function on the annotated item
+///    (`ny-contracts` 0.2.0: `requires`/`ensures`/`invariant`/`cite`, each
+///    discarding its attribute arguments and returning the item unchanged, under
+///    `#![forbid(unsafe_code)]`, with no verifier logic).
+/// 3. Because the expansion is the identity, the tokens the verifier sees are
+///    the tokens the author wrote. The proof obligations of every ANNOTATED unit
+///    are still discharged in full; nothing about them is relaxed here.
+///
+/// What is given up, stated plainly: the toolchain no longer proves anything
+/// about the proc macro crate itself. If a future edit to an allowlisted crate
+/// made its expansion non-identity, the hash check would REFUSE the build (not
+/// silently trust it) — but if someone re-audited badly and re-pinned the new
+/// hash, the verified artifact would contain macro-authored code that carries
+/// its own obligations and is not itself proved panic-free. The allowlist entry
+/// is therefore a trust decision, and this exclusion is what makes the toolchain
+/// say so consistently instead of half-admitting and half-proving the same
+/// crate.
+///
+/// Note that this is not an expansion of the *existing* TCB posture so much as a
+/// removal of an incoherence: the crate was ALREADY admitted past the
+/// no-proc-macro TCB boundary by `reject_in_process_proc_macro_tcb`'s audited
+/// bypass, which is a strictly stronger concession (it lets the crate run inside
+/// the verifying compiler and touch its argv, memory, stderr, and artifact
+/// filesystem). Demanding a panic-freedom proof of a crate already trusted with
+/// the proof transport itself buys nothing.
+///
+/// The concrete failure this fixes: those obligations are not merely hard, they
+/// are not expressible. The four entry points are `proc_macro::TokenStream`
+/// functions whose panic-freedom runs through drop glue for a compiler-internal
+/// bridge type, so under `include-dependencies` the gate stopped on
+/// `ny-contracts` with `4 functions, 0 proved, 4 unknown` and never reached the
+/// crate the run was about.
+///
+/// The exclusion is scoped exactly like the build-support one: it applies only
+/// to the `include_dependencies` disjunct, so a proc macro that is itself a
+/// requested root or a test-execution subject is still verified.
 fn trust_unit_verification_enabled(
     is_custom_build: bool,
     is_primary: bool,
     is_test_execution_subject: bool,
+    is_build_support_only: bool,
+    is_audited_trust_spec_proc_macro: bool,
     include_dependencies: bool,
 ) -> bool {
-    include_dependencies || (!is_custom_build && (is_primary || is_test_execution_subject))
+    // A build-script target is never a proof subject, in any policy mode. Making
+    // this dominate structurally (rather than letting it fall out of the graph
+    // walk) keeps the invariant true even for the degenerate case of a
+    // custom-build unit appearing in `bcx.roots`, which root seeding would
+    // otherwise re-admit under `include_dependencies`.
+    if is_custom_build {
+        return false;
+    }
+    (include_dependencies && !is_build_support_only && !is_audited_trust_spec_proc_macro)
+        || is_primary
+        || is_test_execution_subject
+}
+
+/// Whether this exact unit is the audited, content-hash-pinned Trust spec
+/// proc-macro provider.
+///
+/// This is a re-query of the SAME gate that admits the crate past the
+/// no-proc-macro TCB boundary — `capture_audited_trust_spec_proc_macro` — rather
+/// than a second, looser rule. That is deliberate: two independent notions of
+/// "audited" would be free to drift, and the looser one would win. Every
+/// admission condition therefore still applies here in full — proc-macro target
+/// kind, lib target name `trust`, an exact (package, version) hit in
+/// `AUDITED_TRUST_SPEC_SOURCES`, no dependencies, no build script, the library
+/// source at the canonical `src/lib.rs` path, and a live sha256 match of both
+/// the manifest and the library against the pinned digests.
+///
+/// Fail-closed in both non-admitting directions, because `false` here means
+/// "verify this unit" — the safe answer:
+///
+/// * `Ok(None)` — not a proc macro, not named `trust`, or not on the allowlist:
+///   an ordinary unit, and an unaudited proc macro stays a proof subject AND
+///   stays refused by `reject_in_process_proc_macro_tcb` when a verified unit
+///   depends on it. This exclusion adds no way for it to slip through.
+/// * `Err(_)` — a hash mismatch, an unreadable or racing file, or a shape
+///   violation (dependencies, a build script, a relocated lib source). The error
+///   is deliberately DISCARDED here rather than propagated: this function is a
+///   scoping predicate, and the same call is made on the refusal path in
+///   `prepare_rustc`, which surfaces the identical error and aborts the build.
+///   Swallowing it here cannot hide it there, and answering `false` keeps a
+///   hash-mismatched crate inside the proof frontier in the meantime.
+///
+/// A non-proc-macro target short-circuits before any filesystem work, so the
+/// ordinary library units (`ny-cert`, `num-bigint`, `num-integer`,
+/// `num-rational`, `num-traits`, ...) cannot reach the allowlist lookup at all
+/// and can never be scoped out by this predicate.
+fn trust_unit_audited_trust_spec_proc_macro(unit: &Unit) -> bool {
+    if !unit.target.proc_macro() {
+        return false;
+    }
+    audited_trust_spec_scope_decision(
+        true,
+        capture_audited_trust_spec_proc_macro(&unit.pkg, &unit.target)
+            .map(|capture| capture.is_some()),
+    )
+}
+
+/// Pure policy seam folding the audit gate's three-valued answer into the
+/// scoping bool, so the fail-closed direction is testable without a Cargo
+/// `Unit`.
+///
+/// `true` — the only answer that widens the trusted base — requires BOTH a
+/// proc-macro target and an affirmative admission from the hash-checked gate.
+/// An allowlist miss (`Ok(false)`) and any gate error (`Err`, e.g. a hash
+/// mismatch) both answer `false`, which means "this unit stays in the proof
+/// frontier".
+fn audited_trust_spec_scope_decision(is_proc_macro: bool, audit_gate: Result<bool, String>) -> bool {
+    is_proc_macro && audit_gate.unwrap_or(false)
+}
+
+/// Whether this exact unit exists only to support the build.
+///
+/// A unit is build-support-only when it is not reachable from any requested root
+/// without traversing a build-script target (`TargetKind::CustomBuild`, which
+/// covers both the `CompileMode::Build` compile of `build.rs` and its
+/// `CompileMode::RunCustomBuild` execution). That is the whole
+/// `[build-dependencies]` transitive closure — `autocfg`, `cc`, `pkg-config`,
+/// `version_check` — none of which is ever linked into a verified artifact.
+///
+/// `unit.kind` is NOT usable for this. `CompileKind::Host` is the *only* kind in
+/// a native build (see `CompileKind::from_requested_targets`), so gating on it
+/// would silently scope out the primary crate. Cargo's host-vs-target feature
+/// decoupling also splits a dual-role package into two distinct units that share
+/// `CompileKind::Host` and differ only in resolved features; reachability keeps
+/// the artifact-linked one and drops only the build-side copy. Where Cargo
+/// interns a single shared unit instead, that unit stays reachable from a root
+/// and therefore stays verified — the walk errs toward verifying.
+///
+/// `UnitFor::host` is not consulted: it lives on `UnitDep` and is documented as
+/// not to be used after the unit graph is built, and `Target::for_host()` is a
+/// property of the build-script/proc-macro target itself, not of the ordinary
+/// library targets it pulls in.
+fn trust_unit_build_support_only(build_runner: &BuildRunner<'_, '_>, unit: &Unit) -> bool {
+    let bcx = build_runner.bcx;
+    // Fail closed, twice over. Neither branch can shrink the proof subject:
+    //
+    // * With no requested roots there is no proof subject to scope against, and
+    //   the walk below would classify literally every unit as build-support-only.
+    //   Never widen the trusted base off an empty seed set.
+    // * A unit absent from the unit graph has unknown provenance. A lookup miss
+    //   must mean "verify it", never "trust it".
+    if bcx.roots.is_empty() || !bcx.unit_graph.contains_key(unit) {
+        return false;
+    }
+    !trust_artifact_reachable_units(build_runner).contains(unit)
+}
+
+/// Units reachable from the requested roots without crossing a build script.
+///
+/// Computed once per `BuildRunner` and cached: this is queried several times for
+/// each unit (protocol args, proof-inventory role, exclusion reason, fingerprint),
+/// and recomputing the whole walk per query is O(units x (V+E)).
+fn trust_artifact_reachable_units<'a>(build_runner: &'a BuildRunner<'_, '_>) -> &'a HashSet<Unit> {
+    build_runner.trust_artifact_reachable_units.get_or_init(|| {
+        let bcx = build_runner.bcx;
+        let mut reachable: HashSet<Unit> = HashSet::new();
+        let mut stack: Vec<Unit> = Vec::new();
+        // Requested roots are the proof subject by definition. Seeding them
+        // without consulting the barrier is what makes a scope collapse
+        // structurally impossible: no walk result can remove a root from
+        // verification.
+        for root in &bcx.roots {
+            if reachable.insert(root.clone()) {
+                stack.push(root.clone());
+            }
+        }
+        while let Some(current) = stack.pop() {
+            let Some(deps) = bcx.unit_graph.get(&current) else {
+                continue;
+            };
+            for dep in deps {
+                // A build script is a Cargo control job, not linked code: do not
+                // follow edges through it. `Target::is_custom_build()` is
+                // target-kind based, so this covers both the `CompileMode::Build`
+                // compile of `build.rs` and its `RunCustomBuild` execution.
+                if dep.unit.target.is_custom_build() {
+                    continue;
+                }
+                if reachable.insert(dep.unit.clone()) {
+                    stack.push(dep.unit.clone());
+                }
+            }
+        }
+        reachable
+    })
 }
 
 fn caller_supplied_trust_unit_metadata(rustflags: &[String]) -> Option<&'static str> {
@@ -3707,7 +4158,8 @@ mod trust_verification_role_tests {
         RustcProcessRole, TIPPY_ENCODED_ARGS_ENV,
         TRUST_TARGO_TEST_EXECUTE_FRESH_SESSION, TRUST_TARGO_TEST_MONITOR_SESSION,
         VerifiedTargoCompilerPolicy, apply_build_script_env,
-        audited_trust_spec_requires_fresh_build, audited_trust_spec_source,
+        audited_trust_spec_requires_fresh_build, audited_trust_spec_scope_decision,
+        audited_trust_spec_source,
         caller_supplied_trust_unit_metadata, canonical_trust_string_set,
         canonicalize_trust_proof_inventory, ensure_exact_unit_compile_target_spec_unchanged,
         exact_unit_compile_kind, exact_unit_compile_target_spec_sha256, is_resolved_root_unit,
@@ -3856,6 +4308,22 @@ mod trust_verification_role_tests {
             "a literally-versioned provider must not accept an unaudited version"
         );
 
+        assert!(audited_trust_spec_source("ny-contracts", "0.1.0").is_some());
+        assert!(audited_trust_spec_source("ny-contracts", "0.2.0").is_some());
+        assert!(audited_trust_spec_source("ny-contracts", "0.3.0").is_some());
+
+        // The three ny-contracts entries are the SAME audited artifact under three
+        // version strings (two bare workspace bumps). Pin that: if a future edit
+        // lets these hashes drift apart, one of them is no longer the reviewed
+        // crate and the allowlist has silently widened.
+        let ny = ["0.1.0", "0.2.0", "0.3.0"].map(|v| {
+            audited_trust_spec_source("ny-contracts", v).expect("audited above")
+        });
+        for entry in &ny {
+            assert_eq!(entry.manifest_sha256, ny[0].manifest_sha256);
+            assert_eq!(entry.lib_sha256, ny[0].lib_sha256);
+        }
+
         // `ny-contracts` inherits its version from a workspace root that NEITHER
         // digest covers, so the version is not audit evidence for it and an
         // unrelated `pub bump` must not expire the carve-out. THIS IS THE CASE
@@ -3884,6 +4352,17 @@ mod trust_verification_role_tests {
             ("hostile-shadow", "0.1.1"),
             ("trust", "0.1.1"),
             ("trust-spec", "0.1.0"),
+            // MERGE (b62 <- origin/main): our ("ny-contracts", "0.1.1"/"0.3.1"/"0.4.0")
+            // entries are DROPPED. They asserted those versions are NOT audited, which
+            // was true under the OLD enumerate-the-resolved-versions rule our commits
+            // were patching one bump at a time (6906ae2948 added 0.3.0). Upstream
+            // replaced that rule with a version-agnostic one keyed on the audited
+            // manifest/lib digests, so ny-contracts is audited at ANY version and those
+            // three assertions are now false by construction (the loop above asserts
+            // 99.0.0-rc.1 IS audited). Upstream's rule is at least as strict on the
+            // security property -- the exact digests still decide, so a hostile
+            // ny-contracts of any version is still refused -- and it removes the
+            // silent-refusal-on-bare-bump failure mode. Only the name test remains here.
             ("ny-contracts-shim", "0.1.0"),
             ("ny-trust-spec", "0.1.0"),
         ] {
@@ -3892,6 +4371,50 @@ mod trust_verification_role_tests {
                 "crate/lib naming alone must not authorize {package}@{version}"
             );
         }
+
+        // Scoping an audited spec provider out of the proof frontier must not
+        // become a second, looser notion of "audited". The scope decision is
+        // affirmative ONLY when the hash-checked gate itself admits the crate.
+        assert!(audited_trust_spec_scope_decision(true, Ok(true)));
+        // An allowlist miss — the exact shape of every package/version pair
+        // rejected above — leaves the unit in the proof frontier.
+        assert!(!audited_trust_spec_scope_decision(true, Ok(false)));
+        // So does a gate ERROR: a manifest/lib sha256 mismatch, a source file
+        // mutated mid-hash, or a provider that grew dependencies or a build
+        // script. A hash-mismatched proc macro is never silently scoped out; it
+        // stays a proof subject here and is refused outright on the
+        // `prepare_rustc` path, which propagates this same error.
+        for gate_error in [
+            "Trust spec provider `ny-contracts@0.2.0` does not match its audited source identity",
+            "audited Trust spec provider `ny-contracts@0.2.0` unexpectedly has dependencies",
+            "audited Trust spec provider `ny-contracts@0.2.0` unexpectedly has a build script",
+        ] {
+            assert!(
+                !audited_trust_spec_scope_decision(true, Err(gate_error.to_string())),
+                "a failing audit gate must never scope a proc macro out: {gate_error}"
+            );
+        }
+        // Anti-scope-collapse: a non-proc-macro target can never take this exit,
+        // whatever the gate says. `ny-cert` and the `num-*` libraries reach the
+        // predicate with `is_proc_macro == false`.
+        for gate in [Ok(true), Ok(false), Err("forged admission".to_string())] {
+            assert!(
+                !audited_trust_spec_scope_decision(false, gate),
+                "an ordinary library must never be scoped out as a spec provider"
+            );
+        }
+
+        // And the TCB boundary itself is untouched: an unaudited proc macro that
+        // a verified unit depends on is still REFUSED, not excluded. Scoping is
+        // downstream of admission and never substitutes for it.
+        let error = reject_in_process_proc_macro_tcb(
+            true,
+            "ny-cert@0.1.0::ny_cert",
+            ["hostile-shadow@0.1.1::trust".to_string()],
+        )
+        .expect_err("an unaudited proc macro must still hit the no-proc-macro TCB refusal");
+        assert!(error.contains("no-proc-macro TCB boundary"), "{error}");
+        assert!(error.contains("hostile-shadow@0.1.1::trust"), "{error}");
     }
 
     #[test]
@@ -4252,6 +4775,8 @@ mod trust_verification_role_tests {
             trust_proof_primary_unit(false, true),
             true,
             true,
+            false,
+            false,
             "selected",
             false,
         );
@@ -5259,6 +5784,8 @@ mod trust_verification_role_tests {
             false,
             false,
             false,
+            true,
+            false,
             "selected-package",
             false,
         ));
@@ -5275,6 +5802,11 @@ mod trust_verification_role_tests {
                 "trust-verify-package-name=selected-package",
                 "-Z",
                 "trust-verify=off",
+                // Trust (cross-crate composition): every unit of a proof
+                // session, build scripts included. A partial application forks
+                // a crate into two artifacts sharing one StableCrateId.
+                "-Z",
+                "always-encode-mir",
             ])
         );
 
@@ -5283,6 +5815,8 @@ mod trust_verification_role_tests {
             false,
             false,
             false,
+            false,
+            true,
             false,
             "selected-package",
             false,
@@ -5300,25 +5834,134 @@ mod trust_verification_role_tests {
                 "trust-verify-package-name=selected-package",
                 "-Z",
                 "trust-verify=off",
+                "-Z",
+                "always-encode-mir",
             ])
         );
     }
 
     #[test]
     fn resolved_unit_scope_uses_only_the_explicit_compiler_off_switch() {
-        assert!(trust_unit_verification_enabled(false, true, false, false));
-        assert!(!trust_unit_verification_enabled(false, false, false, false));
-        assert!(!trust_unit_verification_enabled(true, true, false, false));
-        assert!(trust_unit_verification_enabled(false, false, false, true));
-        assert!(trust_unit_verification_enabled(true, false, false, true));
-        assert!(trust_unit_verification_enabled(false, false, true, false));
+        // Default (`include_dependencies == false`) behaviour is byte-identical
+        // to the pre-graph-scoping rule for every combination of the two scoping
+        // inputs: neither is ever read except under the flag.
+        for build_support_only in [false, true] {
+            for audited_spec in [false, true] {
+                assert!(trust_unit_verification_enabled(
+                    false,
+                    true,
+                    false,
+                    build_support_only,
+                    audited_spec,
+                    false
+                ));
+                assert!(!trust_unit_verification_enabled(
+                    false,
+                    false,
+                    false,
+                    build_support_only,
+                    audited_spec,
+                    false
+                ));
+                assert!(!trust_unit_verification_enabled(
+                    true,
+                    true,
+                    false,
+                    build_support_only,
+                    audited_spec,
+                    false
+                ));
+                assert!(trust_unit_verification_enabled(
+                    false,
+                    false,
+                    true,
+                    build_support_only,
+                    audited_spec,
+                    false
+                ));
+            }
+        }
+        // With the flag on, an artifact-reachable dependency verifies ...
+        assert!(trust_unit_verification_enabled(false, false, false, false, false, true));
+        // ... a unit reachable only through a build script does not ...
+        assert!(!trust_unit_verification_enabled(false, false, false, true, false, true));
+        // ... nor does the audited, content-hash-pinned Trust spec proc macro,
+        // which is trusted by audit rather than proved. This is the assertion
+        // that pins the fix: without it the gate stops on `ny-contracts`, whose
+        // four `proc_macro::TokenStream` entry points carry panic-freedom
+        // obligations over compiler-internal drop glue.
+        assert!(!trust_unit_verification_enabled(false, false, false, false, true, true));
+        // ... and a build-script target is never a proof subject in any policy
+        // mode, whatever the graph walk or the audit allowlist says about it.
+        for build_support_only in [false, true] {
+            for audited_spec in [false, true] {
+                for is_primary in [false, true] {
+                    for is_test_execution in [false, true] {
+                        assert!(
+                            !trust_unit_verification_enabled(
+                                true,
+                                is_primary,
+                                is_test_execution,
+                                build_support_only,
+                                audited_spec,
+                                true
+                            ),
+                            "a custom-build target must never be verified"
+                        );
+                    }
+                }
+            }
+        }
+        // Scope-collapse guard: a root or an execution subject stays verified
+        // even if the graph walk were ever to mark it build-support-only, and
+        // even if it were itself an allowlisted spec provider. These are the
+        // assertions that would fail if either discriminator regressed into
+        // scoping out the primary crate.
+        for build_support_only in [false, true] {
+            for audited_spec in [false, true] {
+                assert!(trust_unit_verification_enabled(
+                    false,
+                    true,
+                    false,
+                    build_support_only,
+                    audited_spec,
+                    true
+                ));
+                assert!(trust_unit_verification_enabled(
+                    false,
+                    false,
+                    true,
+                    build_support_only,
+                    audited_spec,
+                    true
+                ));
+            }
+        }
+        // Scope-collapse guard, the other direction: the ONLY dependency shape
+        // the flag scopes out is one of the two named facts. An ordinary
+        // artifact-linked dependency — `ny-cert`, `num-bigint`, `num-integer`,
+        // `num-rational`, `num-traits` — carries neither, and stays verified.
+        // A proc macro that is NOT audited also carries neither
+        // (`trust_unit_audited_trust_spec_proc_macro` answers `false` for an
+        // allowlist miss, a hash mismatch, and an unreadable source alike), so
+        // it remains a proof subject rather than being trusted away.
+        assert!(trust_unit_verification_enabled(false, false, false, false, false, true));
 
-        let primary = trust_unit_protocol_args(false, true, false, false, "selected", false);
+        let primary =
+            trust_unit_protocol_args(false, true, false, false, false, false, "selected", false);
         assert!(!primary.iter().any(|arg| arg == "trust-verify=off"));
 
         for (custom_build, primary) in [(false, false), (true, false), (true, true)] {
-            let excluded =
-                trust_unit_protocol_args(custom_build, primary, false, false, "selected", false);
+            let excluded = trust_unit_protocol_args(
+                custom_build,
+                primary,
+                false,
+                false,
+                false,
+                false,
+                "selected",
+                false,
+            );
             assert!(
                 excluded
                     .windows(2)
@@ -5326,16 +5969,84 @@ mod trust_verification_role_tests {
                 "excluded unit did not receive the explicit off-switch: {excluded:?}"
             );
 
-            let included =
-                trust_unit_protocol_args(custom_build, primary, false, false, "selected", true);
-            assert!(
-                !included.iter().any(|arg| arg == "trust-verify=off"),
-                "include-dependencies unit was incorrectly disabled: {included:?}"
+            let included = trust_unit_protocol_args(
+                custom_build,
+                primary,
+                false,
+                false,
+                false,
+                false,
+                "selected",
+                true,
             );
+            let included_off = included
+                .windows(2)
+                .any(|args| args == ["-Z", "trust-verify=off"]);
+            if custom_build {
+                assert!(
+                    included_off,
+                    "a build-script target must stay off even under include-dependencies: {included:?}"
+                );
+            } else {
+                assert!(
+                    !included_off,
+                    "include-dependencies unit was incorrectly disabled: {included:?}"
+                );
+            }
+
+            let build_support = trust_unit_protocol_args(
+                custom_build,
+                primary,
+                false,
+                false,
+                true,
+                false,
+                "selected",
+                true,
+            );
+            let build_support_off = build_support
+                .windows(2)
+                .any(|args| args == ["-Z", "trust-verify=off"]);
+            if primary && !custom_build {
+                assert!(
+                    !build_support_off,
+                    "a requested root must never be scoped out: {build_support:?}"
+                );
+            } else {
+                assert!(
+                    build_support_off,
+                    "build-support-only unit stayed in scope: {build_support:?}"
+                );
+            }
+
+            let audited_spec = trust_unit_protocol_args(
+                custom_build,
+                primary,
+                false,
+                false,
+                false,
+                true,
+                "selected",
+                true,
+            );
+            let audited_spec_off = audited_spec
+                .windows(2)
+                .any(|args| args == ["-Z", "trust-verify=off"]);
+            if primary && !custom_build {
+                assert!(
+                    !audited_spec_off,
+                    "a requested root must never be scoped out: {audited_spec:?}"
+                );
+            } else {
+                assert!(
+                    audited_spec_off,
+                    "audited trust-spec proc macro stayed in scope: {audited_spec:?}"
+                );
+            }
         }
 
         let execution_subject =
-            trust_unit_protocol_args(false, false, true, true, "selected", false);
+            trust_unit_protocol_args(false, false, true, true, false, false, "selected", false);
         assert!(!execution_subject.iter().any(|arg| arg == "trust-verify=off"));
         assert!(
             execution_subject
@@ -5344,7 +6055,7 @@ mod trust_verification_role_tests {
         );
 
         let harnessless_root =
-            trust_unit_protocol_args(false, true, false, true, "selected", false);
+            trust_unit_protocol_args(false, true, false, true, false, false, "selected", false);
         assert!(!harnessless_root.iter().any(|arg| arg == "trust-verify=off"));
         assert_eq!(
             harnessless_root
@@ -5353,6 +6064,48 @@ mod trust_verification_role_tests {
                 .count(),
             1
         );
+    }
+
+    /// Trust (cross-crate composition): `-Zalways-encode-mir` must reach EVERY
+    /// unit of a proof session, not the verified ones only.
+    ///
+    /// This is pinned rather than left to review because the failure it guards
+    /// is invisible at the seam that causes it: rustflags are hashed into
+    /// Cargo's `unit_id` but NOT into `-Cmetadata`, so a partial application
+    /// forks a crate into two artifacts sharing one StableCrateId and surfaces
+    /// as an E0463 that names nothing related to this file.
+    #[test]
+    fn always_encode_mir_reaches_every_proof_session_unit() {
+        for is_custom_build in [false, true] {
+            for is_primary in [false, true] {
+                for is_execution_subject in [false, true] {
+                    for include_dependencies in [false, true] {
+                        let args = trust_unit_protocol_args(
+                            is_custom_build,
+                            is_primary,
+                            is_execution_subject,
+                            false,
+                            "selected",
+                            include_dependencies,
+                        );
+                        assert!(
+                            args.windows(2).any(|pair| pair == ["-Z", "always-encode-mir"]),
+                            "unit (custom_build={is_custom_build}, primary={is_primary}, \
+                             execution_subject={is_execution_subject}, \
+                             include_dependencies={include_dependencies}) did not receive \
+                             -Zalways-encode-mir: {args:?}"
+                        );
+                        assert_eq!(
+                            args.windows(2)
+                                .filter(|pair| pair == &["-Z", "always-encode-mir"])
+                                .count(),
+                            1,
+                            "-Zalways-encode-mir must be injected exactly once: {args:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

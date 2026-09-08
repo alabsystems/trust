@@ -306,6 +306,15 @@ pub(super) fn generate_vcs_impl(
         return vec![malformed_trust_ir_vc(func, &error)];
     }
 
+    // Trust (verifier-perf, MEASURED 2026-08-31): every VC lane below rebuilds
+    // the SAME two whole-CFG analyses of `func` at every obligation point —
+    // `StmtVersionCtx::build` (two dataflow fixpoints) and the path-guard walk.
+    // On `trust-spec-elab` that was >=99.7% of the compile: `elab_term` (815
+    // basic blocks) never reached a report at all. One memo for the whole
+    // per-function generation; the scope holds a shared borrow of `func`, so the
+    // memo provably cannot observe a mutation. See `FuncAnalysisScope`.
+    let _analysis_scope = super::FuncAnalysisScope::enter(func);
+
     // One semantic projection closes the legacy-consumer surface for MIR
     // `TailCall`: every established call, unsafe/FFI, atomic, dataflow, and
     // per-Return postcondition lane sees the equivalent ordinary call writing
@@ -487,10 +496,10 @@ pub(super) fn generate_vcs_impl(
         // `if len <= N { from_raw_parts(p, len) }` — can be discharged. The defs
         // (`_3 = (_1 <= N)`) are required for the guard (`_3` is true) to connect
         // to the obligation's variables; guards alone are insufficient.
-        let sep_guard_paths = v2_build_path_guard_map(func);
+        let sep_guard_paths = super::guard_map_for(func);
         // Trust (lane-A CSE): build the statement-version oracle ONCE for this
         // function and reuse it across every sep VC's `v2_formula_with_path_guards`.
-        let sep_sv = StmtVersionCtx::build(func);
+        let sep_sv = super::stmt_versions_for(func);
         let sep_path_defs = v2_build_path_definition_map(func);
         // Semantic assert-passed guards capture CheckedBinaryOp results (e.g.
         // `sum == start + len` from `let sum = start + len`) that the regular

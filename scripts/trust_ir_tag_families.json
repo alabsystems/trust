@@ -61,7 +61,11 @@
   "huge body (THIR expr cap)"
  ],
  "not_a_tag": {
+  "FuncId(0)": "crate_module.rs test assertions (wave-CO clean-origin-link error-content checks, e.g. `error.contains(\"FuncId(0)\")` / `missing FuncId(0)` / `bodyless FuncId(0)`) and a lib.rs test comment — a dense function-id rendering inside diagnostic/test strings, not a refusal tag the producer emits",
+  "FuncId(1)": "crate_module.rs test assertion (wave-CO clean-origin-link error-content check `error.contains(\"FuncId(1)\")`) — a dense function-id rendering inside a test string, not a refusal tag the producer emits",
   "Some(agg)": "lib.rs:30954 — a test asserting on generated source text, not an emission site",
+  "FuncId(0)": "crate_module.rs final_validator_rejects_duplicate_function_names — a Debug-rendered id inside an error.contains assertion on the [DuplicateFunctionName] validator message, not an emission site",
+  "FuncId(1)": "crate_module.rs final_validator_rejects_duplicate_function_names — the second Debug-rendered id in the same error.contains assertion",
   "AcqRel": "model.rs `fn name` — an atomic ordering name, not a refusal tag",
   "Acquire": "model.rs `fn name` — an atomic ordering name",
   "Relaxed": "model.rs `fn name` — an atomic ordering name",
@@ -134,8 +138,11 @@
   "Match": "PATTERN",
   "EnumMatch": "PATTERN",
   "TupleMatch": "PATTERN",
+  "SliceMatch": "PATTERN",
+  "FloatMatch": "PATTERN",
   "StrMatch": "PATTERN",
   "IfLet": "PATTERN",
+  "IfLetValue": "PATTERN",
   "Let": "PATTERN",
   "LetTuple": "PATTERN",
   "LetElse": "PATTERN",
@@ -165,6 +172,7 @@
   "ClosureEnv": "CLOSURE",
   "UpvarRef": "CLOSURE",
   "Yield": "CLOSURE",
+  "CoroutineResume": "CLOSURE",
 
   "NamedConst": "CONST",
   "ConstBlock": "CONST",
@@ -178,6 +186,7 @@
   "PendingConst": "CONST",
   "PendingStr": "CONST",
   "PendingStatic": "CONST",
+  "PendingPromoted": "CONST",
 
   "Adt": "AGGREGATE",
   "Tuple": "AGGREGATE",
@@ -198,9 +207,11 @@
   "Coercion": "OPERATOR",
 
   "If": "CONTROL",
+  "Join": "CONTROL",
   "LogicalOp": "CONTROL",
   "Loop": "CONTROL",
   "Break": "CONTROL",
+  "LabeledBlock": "CONTROL",
   "Continue": "CONTROL",
   "Return": "CONTROL",
 
@@ -244,7 +255,10 @@
   "VarRef -> MEMORY. `VarRef(unbound)` and `VarRef(promoted slot missing)` are both slot-model failures; there is no separate 'variable' lane.",
   "Ty spans B1/B2/B8 and is NOT one rankable lane. Rank a B-item off the detail split, never off the TY family total.",
   "The borrow-pointer-VALUE cluster (Deref(non-borrow ptr), Deref(non-scalar pointee), Assign(*r=...), Reborrow) is INSIDE MEMORY under this map — see lane_probes.L10 and the report's DOUBLE-COUNTING section.",
-  "PendingStatic -> CONST, not PRODUCER-INTERNAL and not MEMORY (added 2026-08-29 for wave-SD, 6d4e53fbd6). The head is the deferred-LOCAL-STATIC leg of the SAME finalizer that already owns PendingConst and PendingStr: all three are emitted by `bump_unsupported` inside `resolve_pending_consts` (crate_module.rs:3147-3282), all three are recorded on the SAME `PendingConst` struct (the leg is selected by its `static_global` field, crate_module.rs:3162), and all three are consumed identically — a row on the record's `unsupported` vector, which makes `splice_ok` refuse the body and coverage.json record why. PRODUCER-INTERNAL is the nearest alternative and is rejected for CONSISTENCY, not because the reading is silly: 4 of the 5 details (global not found / shape disagreement / global patch conflict / global not patched) ARE internal-invariant tripwires in the sense PRODUCER-INTERNAL describes, and only `eval failed at finalize` is a coverage decline. But `PendingStr(global patch conflict)`, `PendingStr(global not patched)`, `PendingConst(placeholder not found)` and `PendingConst(sentinel leak)` are the identical shapes and are already CONST, and family assignment is keyed on the HEAD, so splitting PendingStatic by detail would need `tag_overrides` and would leave its two twins unsplit — the map would then partition one finalizer three ways, which is the exact unfalsifiability this file exists to remove. If the finalizer's internal tripwires should be PRODUCER-INTERNAL, move all THREE heads together and say so here. MEMORY is closed by the StaticRef/ThreadLocalRef note above: a static's DATA is CONST work under this map even though a static read is a place. Numeric cost of the choice TODAY: zero — no Pending* tag is live in any corpus artifact (checked sd-static-deferral-0829 and postbuild-v38-simd-2026-08-28, 7256 bodies each, 0 events), so this moves no family total and no rank; it is a forward-looking boundary, not a recount."
+  "PendingStatic -> CONST, not PRODUCER-INTERNAL and not MEMORY (added 2026-08-29 for wave-SD, 6d4e53fbd6). The head is the deferred-LOCAL-STATIC leg of the SAME finalizer that already owns PendingConst and PendingStr: all three are emitted by `bump_unsupported` inside `resolve_pending_consts` (crate_module.rs:3147-3282), all three are recorded on the SAME `PendingConst` struct (the leg is selected by its `static_global` field, crate_module.rs:3162), and all three are consumed identically — a row on the record's `unsupported` vector, which makes `splice_ok` refuse the body and coverage.json record why. PRODUCER-INTERNAL is the nearest alternative and is rejected for CONSISTENCY, not because the reading is silly: 4 of the 5 details (global not found / shape disagreement / global patch conflict / global not patched) ARE internal-invariant tripwires in the sense PRODUCER-INTERNAL describes, and only `eval failed at finalize` is a coverage decline. But `PendingStr(global patch conflict)`, `PendingStr(global not patched)`, `PendingConst(placeholder not found)` and `PendingConst(sentinel leak)` are the identical shapes and are already CONST, and family assignment is keyed on the HEAD, so splitting PendingStatic by detail would need `tag_overrides` and would leave its two twins unsplit — the map would then partition one finalizer three ways, which is the exact unfalsifiability this file exists to remove. If the finalizer's internal tripwires should be PRODUCER-INTERNAL, move all THREE heads together and say so here. MEMORY is closed by the StaticRef/ThreadLocalRef note above: a static's DATA is CONST work under this map even though a static read is a place. Numeric cost of the choice TODAY: zero — no Pending* tag is live in any corpus artifact (checked sd-static-deferral-0829 and postbuild-v38-simd-2026-08-28, 7256 bodies each, 0 events), so this moves no family total and no rank; it is a forward-looking boundary, not a recount.",
+  "PendingPromoted -> CONST (added 2026-09-01 for wave-PC). The head is the deferred PROMOTED-LOCAL-CONST leg of the SAME finalizer that owns PendingConst, PendingStr and PendingStatic — emitted by the same resolve_pending_consts path on the same PendingConst record (leg selected by its promoted_global field), consumed identically as an unsupported row. The PendingStatic note's consistency argument transfers verbatim: family assignment is keyed on the HEAD, its five details (eval failed at finalize / global not found / global not patched / global patch conflict / shape disagreement) are the identical shapes its three twins already carry under CONST, and if the finalizer's internal tripwires should ever move to PRODUCER-INTERNAL, all FOUR heads move together.",
+  "Join -> CONTROL, with If/Loop. The tag is emitted by the control-flow JOIN lowering (the merge of if/match arms into a local), so a slice that moves it is join-machinery work; the wave-CS detail (opaque carrier typed sink) describes the VALUE refused at the join, not a different lane. Reading it as PRODUCER-INTERNAL would hide a user-visible refusal class inside plumbing accounting.",
+  "CoroutineResume -> CLOSURE, not CALL. The tags are pushed at a CALL-resolution site (the coroutine-resume arm), so CALL is the defensible alternative and the per-head table inside CLOSURE prints what moving them would cost. Filed with CLOSURE because the family exists to group residue by the LANE that would retire it, and every one of these is retired by the B5 coroutine frame-protocol work — the same lane that already owns `Yield`. A resume refusal is coroutine work wearing a call's clothes, not call work."
  ],
  "pending_dependencies": {
   "detail-channel (reason_details / at=)": {

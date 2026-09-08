@@ -2,7 +2,7 @@
 [build]
 # Trust: compiler contributors expect a usable linked local toolchain.
 extended = true
-tools = ["targo", "targo-trust", "trustdoc", "tippy", "trustfmt", "trust-analyzer", "trust-miri", "trustc-dev", "src", "trust-llvm-tools"]
+tools = ["targo", "targo-trust", "trustdoc", "tippy", "trustfmt", "trust-analyzer", "trust-miri", "trustc-dev", "src", "trust-llvm-tools", "clean", "ty"]
 # Contributors working on the compiler will probably expect compiler docs to be generated.
 compiler-docs = true
 

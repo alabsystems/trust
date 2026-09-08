@@ -23,9 +23,31 @@
 #   OK        reachable from a remote-tracking branch, or held by an exact
 #             refs/pins/<sha> ref on the canonical remote.
 #
-# Remote-tracking refs are only as fresh as the last fetch; pass --fetch to
-# refresh them first, and --probe to consult the remote --- its refs/pins/*
-# inventory first, then a direct-SHA probe for whatever that does not cover.
+# THE AUDIT NEVER JUDGES FROM REMOTE-TRACKING REFS. This is the defect the mode
+# exists to prevent, and it had it: `rev-list --remotes` reads
+# refs/remotes/origin/*, which are only as fresh as the last fetch, and a
+# remote-tracking ref for a branch the forge has since DELETED or REWOUND
+# survives locally forever. Measured 2026-08-30 in ~/trust: three pins
+# (trust-vc, trust-wp, ty) were reported OK on exactly that evidence, and after
+# a genuine fetch they were on no remote branch and unanchored --- while
+# `--anchor` reported 0 orphans, because it read the same stale refs. An audit
+# that inherits the staleness it exists to detect produces a confident
+# all-clear, which is worse than no audit at all.
+#
+# So durability is decided against the CANONICAL REMOTE's own ref inventory
+# (`git ls-remote`), sampled at audit time, and reachability is walked from
+# THOSE tips. A local ref cannot make a pin durable and a deleted remote branch
+# cannot keep one durable. When a sampled tip's object is absent from this
+# store the audit fetches it into its own `refs/audit-remote-view/*` namespace
+# (never refs/remotes/*, so no other lane's view is perturbed) and re-samples
+# the inventory, failing on a concurrent rewrite rather than mixing two remote
+# states into one verdict. `--offline` opts out and is then REPORTED as
+# UNVERIFIED: that mode can print findings, but it can never print an
+# all-clear. See scripts/tests/audit_first_party_pins_test.py, whose
+# StaleRemoteTrackingRefTests construct the failure.
+#
+# --probe additionally consults the remote for pins that are on no remote ref
+# at all, with a direct-SHA fetch.
 #
 # Before deleting non-main remote heads, use --prepare-head-prune.  That mode
 # deliberately stops counting topic/archive heads as durable: every historical
@@ -121,20 +143,32 @@ def _pins_from_log(out: str) -> set[str]:
     return pins
 
 
-def pins_for_checked(repo: Path, path: str) -> tuple[set[str] | None, str]:
-    """Every historical gitlink value, retaining Git failures for authority."""
+def pins_for_checked(
+    repo: Path, path: str, rev: str = "HEAD"
+) -> tuple[set[str] | None, str]:
+    """Every historical gitlink value, retaining Git failures for authority.
+
+    ``rev`` is the superproject history to walk, and it defaults to this
+    clone's ``HEAD`` --- which is the wrong subject whenever the clone is
+    behind, in the direction that UNDER-reports risk. Measured 2026-08-30 on a
+    clone 41 commits behind ``origin/main``: the HEAD walk missed 10 pins,
+    every one of them freshly published and therefore the least likely to be
+    held by anything but a deletable topic branch. The current ``ay`` pin was
+    among them. Pass ``--superproject-rev origin/main`` to anchor what has
+    actually been published rather than what this checkout happens to hold.
+    """
     done = git_result(
         repo,
-        ["log", "--format=%H", "--raw", "--no-abbrev", "-m", "HEAD", "--", path],
+        ["log", "--format=%H", "--raw", "--no-abbrev", "-m", rev, "--", path],
     )
     if done.returncode != 0:
         return None, f"history walk failed: {_last_line(done.stderr)}"
     return _pins_from_log(done.stdout), ""
 
 
-def pins_for(repo: Path, path: str) -> set[str]:
+def pins_for(repo: Path, path: str, rev: str = "HEAD") -> set[str]:
     """Compatibility wrapper for callers that do not need failure detail."""
-    pins, _ = pins_for_checked(repo, path)
+    pins, _ = pins_for_checked(repo, path, rev)
     return pins or set()
 
 
@@ -228,6 +262,152 @@ def refresh_remote_refs(git_dir: Path) -> str:
         if done.returncode != 0:
             return _git_failure("pin-ref fetch failed", done)
     return ""
+
+
+AUDIT_VIEW_NS = "refs/audit-remote-view"
+AUDIT_VIEW_HEADS = f"+refs/heads/*:{AUDIT_VIEW_NS}/heads/*"
+AUDIT_VIEW_PINS = f"+refs/pins/*:{AUDIT_VIEW_NS}/pins/*"
+
+
+def drop_audit_view(git_dir: Path) -> int:
+    """Leave behind no local ref that could later vouch out of staleness.
+
+    The fetch below is a MEANS, not a record. Left in place,
+    ``refs/audit-remote-view/*`` would become precisely what this module
+    refuses to trust: local refs mirroring one moment's remote branch set,
+    going stale the instant the forge deletes or rewinds a branch.
+
+    And the damage would not stay in this file. ``scripts/submodule_sync.sh``
+    decides ANCHORED with ``git for-each-ref --contains <c>`` over EVERY ref in
+    the submodule --- its comment says refs/heads and refs/tags, the command
+    passes no pattern --- so a lingering audit-view ref would silently become
+    durability evidence for a commit the remote may since have dropped, and
+    ``--restore`` would move a pointer on the strength of it. Measured
+    2026-08-31 before this cleanup existed: 161 such refs across five siblings
+    after a handful of runs.
+
+    The objects stay in the store for the rest of the process, which is all a
+    caller needs; every fleet clone additionally sets ``gc.pruneExpire=never``,
+    so nothing reaps them mid-run either.
+    """
+    listed = git_result(
+        Path("."),
+        ["for-each-ref", "--format=%(refname)", f"{AUDIT_VIEW_NS}/**"],
+        git_dir=git_dir,
+    )
+    if listed.returncode != 0:
+        return 0
+    refs = listed.stdout.split()
+    for ref in refs:
+        git_result(Path("."), ["update-ref", "-d", ref], git_dir=git_dir)
+    return len(refs)
+
+
+class RemoteView(NamedTuple):
+    """What the CANONICAL REMOTE says right now, not what this clone remembers.
+
+    ``heads`` and ``pins`` are commit closures walked from the remote's own
+    branch tips and ``refs/pins/*`` tips. ``anchored`` is the exact
+    self-naming subset (``refs/pins/<sha> -> <sha>``), matching
+    ``remote_pin_is_exact``. ``sampled`` is the raw inventory, kept so a
+    caller can report what it judged against.
+    """
+
+    heads: set[str]
+    pins: set[str]
+    anchored: set[str]
+    sampled: dict[str, str]
+
+
+def remote_authoritative_reachability(
+    git_dir: Path, url: str, *, allow_fetch: bool = True
+) -> tuple[RemoteView | None, str]:
+    """Durability as the canonical remote reports it, never as this clone does.
+
+    The whole point is that no local ref participates in the verdict. The
+    remote's ref inventory is the tip set; objects are pulled into this store
+    only so the walk can run, into this audit's own namespace, and that
+    namespace is deleted on the way out (see ``drop_audit_view``) so the run
+    leaves no ref that a later run could mistake for evidence.
+
+    Cost, measured 2026-08-31 against the nine live siblings: one
+    ``git ls-remote`` per submodule (1.0-1.5 s each) and NO object transfer at
+    all in the steady state, because a clone that has fetched recently already
+    holds every sampled tip. The fetch below fires only for the tips it does
+    not hold.
+    """
+    try:
+        return _remote_authoritative_reachability(git_dir, url, allow_fetch=allow_fetch)
+    finally:
+        drop_audit_view(git_dir)
+
+
+def _remote_authoritative_reachability(
+    git_dir: Path, url: str, *, allow_fetch: bool
+) -> tuple[RemoteView | None, str]:
+    if not url:
+        return None, "canonical submodule URL is missing"
+    patterns = ["refs/heads/*", "refs/pins/*"]
+    before, error = _remote_refs(git_dir, url, patterns)
+    if before is None:
+        return None, error
+    if not before:
+        return None, "canonical remote exposes no branch or pin ref to judge against"
+
+    tips = set(before.values())
+    absent = sorted(sha for sha in tips if not _commit_present(git_dir, sha))
+    sampled = before
+    if absent:
+        if not allow_fetch:
+            return None, (
+                f"{len(absent)} canonical remote tip(s) are absent from this object "
+                f"store (e.g. {absent[0][:12]}) and --offline forbids fetching them; "
+                "no durability claim is possible"
+            )
+        done = git_result(
+            Path("."),
+            ["fetch", "--quiet", "--prune", "--no-tags", url, AUDIT_VIEW_HEADS],
+            git_dir=git_dir,
+        )
+        if done.returncode != 0:
+            return None, _git_failure("remote-head fetch failed", done)
+        if any(ref.startswith("refs/pins/") for ref in before):
+            done = git_result(
+                Path("."),
+                ["fetch", "--quiet", "--no-tags", url, AUDIT_VIEW_PINS],
+                git_dir=git_dir,
+            )
+            if done.returncode != 0:
+                return None, _git_failure("pin-ref fetch failed", done)
+        after, error = _remote_refs(git_dir, url, patterns)
+        if after is None:
+            return None, error
+        if before != after:
+            return None, (
+                "canonical remote refs changed during the audit; "
+                "retry from a stable remote"
+            )
+        sampled = after
+        still_absent = sorted(
+            sha for sha in set(after.values()) if not _commit_present(git_dir, sha)
+        )
+        if still_absent:
+            return None, (
+                f"{len(still_absent)} canonical remote tip(s) remain absent after "
+                f"fetching (e.g. {still_absent[0][:12]}); the local view cannot "
+                "answer for them"
+            )
+
+    head_tips = {sha for ref, sha in sampled.items() if ref.startswith("refs/heads/")}
+    pin_tips = {sha for ref, sha in sampled.items() if ref.startswith("refs/pins/")}
+    heads, error = _reachable_from_tips(git_dir, head_tips)
+    if heads is None:
+        return None, error
+    pins, error = _reachable_from_tips(git_dir, pin_tips)
+    if pins is None:
+        return None, error
+    anchored = {sha for ref, sha in sampled.items() if ref == f"refs/pins/{sha}"}
+    return RemoteView(heads, pins, anchored, sampled), ""
 
 
 def prepare_head_prune_reachability(
@@ -487,7 +667,20 @@ def _commit_present(git_dir: Path, sha: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fetch", action="store_true", help="refresh remote-tracking refs first")
+    parser.add_argument(
+        "--fetch",
+        action="store_true",
+        help="ALSO refresh this clone's refs/remotes/origin/* (the verdict never "
+        "reads them; other tools do). Freshness of the verdict is verified "
+        "against the canonical remote with or without this flag.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="do not contact any remote. The verdict is then LOCAL-ONLY and is "
+        "REPORTED as unverified: this mode can find problems but can never "
+        "issue an all-clear.",
+    )
     parser.add_argument(
         "--probe",
         action="store_true",
@@ -507,12 +700,39 @@ def main() -> int:
         help="with --prepare-head-prune, count remote tags as durable retained refs",
     )
     parser.add_argument("--repo", default=".", help="superproject path")
+    parser.add_argument(
+        "--superproject-rev",
+        default="HEAD",
+        help="superproject history to walk for pins (default: HEAD; use "
+        "origin/main when this clone is behind, or the newest and most fragile "
+        "pins are invisible to the audit)",
+    )
     args = parser.parse_args()
 
     if args.retain_tags and not args.prepare_head_prune:
         parser.error("--retain-tags requires --prepare-head-prune")
+    # Every other mode reaches the remote by construction; saying "offline" and
+    # naming one of them is a contradiction, not a preference to resolve.
+    for conflicting in ("prepare_head_prune", "probe", "anchor", "fetch"):
+        if args.offline and getattr(args, conflicting):
+            parser.error(
+                f"--offline cannot be combined with --{conflicting.replace('_', '-')}"
+            )
 
     repo = Path(args.repo).resolve()
+    resolved_rev = git(repo, ["rev-parse", "--verify", "--quiet", f"{args.superproject_rev}^{{commit}}"]).strip()
+    if not HEX40.fullmatch(resolved_rev):
+        print(
+            f"--superproject-rev {args.superproject_rev!r} does not name a commit "
+            f"in {repo}. Options:\n"
+            f"  * fetch it first:            git fetch origin\n"
+            f"  * name a revision you have:  --superproject-rev origin/main\n"
+            f"  * drop the flag to walk this clone's HEAD",
+            file=sys.stderr,
+        )
+        return 2
+    if args.superproject_rev != "HEAD":
+        print(f"SUBJECT: superproject history of {args.superproject_rev} [{resolved_rev[:12]}]")
     paths = submodule_paths(repo)
     if not paths:
         print("no submodules declared in .gitmodules", file=sys.stderr)
@@ -523,7 +743,16 @@ def main() -> int:
     indeterminate_all: list[tuple[str, str]] = []
     operational_failures: list[tuple[str, str]] = []
     anchor_failures: list[tuple[str, str, str]] = []
+    unverified_freshness: list[str] = []
     anchored_count = 0
+
+    if args.offline:
+        print(
+            "FRESHNESS: UNVERIFIED — --offline judges durability from this "
+            "clone's remote-tracking refs, which a deleted or rewound remote "
+            "branch leaves behind. Findings below are real; an ABSENCE of "
+            "findings is not evidence."
+        )
 
     for path in paths:
         git_dir = submodule_git_dir(repo, path)
@@ -536,7 +765,7 @@ def main() -> int:
                 print(f"{path:<22} {detail}, skipped")
             continue
         url = remote_url(repo, path)
-        pins, error = pins_for_checked(repo, path)
+        pins, error = pins_for_checked(repo, path, resolved_rev)
         if pins is None:
             print(f"{path:<22} ERROR {error}")
             operational_failures.append((path, error))
@@ -662,38 +891,40 @@ def main() -> int:
                 operational_failures.append((path, error))
                 continue
 
-        reachable, error = remote_reachable_set_checked(git_dir)
-        if reachable is None:
-            print(f"{path:<22} ERROR {error}")
-            operational_failures.append((path, error))
-            continue
-
-        # Durability lives on the canonical remote, not in this clone. The
-        # refs/pins/* namespace --- what --anchor publishes --- is never in a
-        # default fetch, so a clone that has not asked for it sees an anchored
-        # pin as absent.
-        anchored_remotely: set[str] = set()
-        if args.probe:
-            if not url:
-                detail = "canonical submodule URL is missing"
-                print(f"{path:<22} ERROR {detail}")
-                operational_failures.append((path, detail))
-                continue
-            pin_refs, error = _remote_refs(git_dir, url, ["refs/pins/*"])
-            if pin_refs is None:
+        # ------------------------------------------------------- the tip set
+        # Durability lives on the canonical remote, not in this clone. Reading
+        # refs/remotes/* here is the defect this audit exists to prevent: a
+        # remote-tracking ref for a deleted or rewound branch keeps conferring
+        # durability forever, and the resulting all-clear is confident and
+        # wrong. The remote's own inventory is the authority; --offline is the
+        # one way to fall back to local evidence, and it says so in the report.
+        freshness = "  (remote-verified)"
+        if args.offline:
+            reachable, error = remote_reachable_set_checked(git_dir)
+            if reachable is None:
                 print(f"{path:<22} ERROR {error}")
                 operational_failures.append((path, error))
                 continue
+            anchored_remotely = set()
+            pin_reachable: set[str] = set()
+            freshness = "  (LOCAL-ONLY, freshness unverified)"
+            unverified_freshness.append(path)
+        else:
+            view, error = remote_authoritative_reachability(git_dir, url)
+            if view is None:
+                print(f"{path:<22} ERROR {error}")
+                operational_failures.append((path, error))
+                continue
+            reachable = view.heads
+            pin_reachable = view.pins
             # Exact self-naming anchors only, matching remote_pin_is_exact.
-            anchored_remotely = {
-                sha for ref, sha in pin_refs.items() if ref == f"refs/pins/{sha}"
-            }
+            anchored_remotely = view.anchored
 
         remote_pinned, absent, orphan = [], [], []
         for sha in sorted(pins):
             if sha in reachable:
                 continue
-            if sha in anchored_remotely:
+            if sha in anchored_remotely or sha in pin_reachable:
                 remote_pinned.append(sha)
             # cat-file -e is silent on success, so check the status, not stdout.
             elif _commit_present(git_dir, sha):
@@ -721,10 +952,11 @@ def main() -> int:
             )
             note, unknown_why = "  (probed)", "probe inconclusive — re-run"
         else:
-            # No remote was asked, so no pin can be declared lost here.
+            # The remote's REF INVENTORY was consulted, but no direct-SHA probe
+            # was, so a pin on no remote ref cannot be declared lost here.
             indeterminate = absent
-            note = "  (local evidence only)"
-            unknown_why = "no remote verdict — re-run with --probe"
+            note = freshness
+            unknown_why = "on no remote ref — re-run with --probe"
 
         ok = (
             len(pins) - len(remote_pinned) - len(missing) - len(orphan)
@@ -773,12 +1005,24 @@ def main() -> int:
                   f"anchor them with a ref in the sibling repo")
     if anchored_count:
         print(f"ANCHORED and exact-remote-verified: {anchored_count}")
+    # A verdict taken on refs nothing refreshed is exactly the state that
+    # produced a false all-clear on 2026-08-30. It is a REPORTED condition and
+    # a hard failure, not a footnote: an audit is allowed to say "I could not
+    # tell", and is never allowed to imply it could.
+    if unverified_freshness:
+        print(
+            f"FRESHNESS UNVERIFIED for {len(unverified_freshness)} submodule(s): "
+            f"{', '.join(unverified_freshness)} — judged from this clone's "
+            "remote-tracking refs, which survive a deleted or rewound remote "
+            "branch. Re-run without --offline for a verdict."
+        )
 
     hard_failure = bool(
         operational_failures
         or anchor_failures
         or unrecoverable
         or indeterminate_all
+        or unverified_freshness
         or (args.prepare_head_prune and fragile)
     )
     if args.prepare_head_prune and not hard_failure:
@@ -788,7 +1032,11 @@ def main() -> int:
         print(f"HEAD-PRUNE READY: every historical pin is reachable from {retained}")
         print("no branches were deleted; delete non-main heads separately with exact SHA leases")
     elif not hard_failure and not fragile:
-        print("every first-party pin is reachable from a remote branch")
+        print(
+            "every first-party pin is reachable from a branch or pin ref on the "
+            "canonical remote (inventory sampled this run, not read from "
+            "remote-tracking refs)"
+        )
     return 1 if hard_failure else 0
 
 

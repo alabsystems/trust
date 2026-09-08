@@ -1,0 +1,103 @@
+; TrustIr text format v1
+module "m1probe"
+target "aarch64-unknown-linux-gnu" 8 little structpass=unclassified
+file 0 "m1probe.rs"
+
+functy.0 = (i32, i32) -> (i32)
+
+functy.1 = (u32, u32) -> (u32)
+
+rustcc fn @arith(functy.0) {
+    ; #producer: trust
+    ; #names: %0="a", %1="b"
+    ; #scope: 0 root
+    ; #scope: 1 parent=0 at 0 2 38
+    ; #scope: 2 parent=1 at 0 2 53
+bb0(%0: i32, %1: i32):
+    %2, %3 = add.overflow i32 %0, %1  ; #loc: 0 2 46  ; #scope: 0
+    %4 = const bool false  ; #loc: 0 2 46  ; #scope: 0
+    %5 = const bool true  ; #loc: 0 2 46  ; #scope: 0
+    %6 = select bool %3, %4, %5  ; #loc: 0 2 46  ; #scope: 0
+    assert %6  ; #proof: no_overflow  ; #loc: 0 2 46  ; #scope: 0
+    %7 = const i32 0  ; #loc: 0 2 61  ; #scope: 1
+    %8 = icmp ne i32 %1, %7  ; #loc: 0 2 61  ; #scope: 1
+    assert %8  ; #proof: div_nonzero  ; #loc: 0 2 61  ; #scope: 1
+    %9 = const i32 -1  ; #loc: 0 2 61  ; #scope: 1
+    %10 = const i32 -2147483648  ; #loc: 0 2 61  ; #scope: 1
+    %11 = icmp ne i32 %1, %9  ; #loc: 0 2 61  ; #scope: 1
+    %12 = icmp ne i32 %0, %10  ; #loc: 0 2 61  ; #scope: 1
+    %13 = const bool true  ; #loc: 0 2 61  ; #scope: 1
+    %14 = select bool %11, %13, %12  ; #loc: 0 2 61  ; #scope: 1
+    assert %14  ; #proof: no_overflow  ; #loc: 0 2 61  ; #scope: 1
+    %15 = sdiv i32 %0, %1  ; #loc: 0 2 61  ; #scope: 1
+    %16, %17 = mul.overflow i32 %2, %15  ; #loc: 0 2 68  ; #scope: 2
+    %18 = const bool false  ; #loc: 0 2 68  ; #scope: 2
+    %19 = const bool true  ; #loc: 0 2 68  ; #scope: 2
+    %20 = select bool %17, %18, %19  ; #loc: 0 2 68  ; #scope: 2
+    assert %20  ; #proof: no_overflow  ; #loc: 0 2 68  ; #scope: 2
+    ret %16  ; #loc: 0 2 75  ; #scope: 0
+}
+
+rustcc fn @remu(functy.1) {
+    ; #producer: trust
+    ; #names: %0="a", %1="b"
+bb0(%0: u32, %1: u32):
+    %2 = const u32 0  ; #loc: 0 3 37
+    %3 = icmp ne u32 %1, %2  ; #loc: 0 3 37
+    assert %3  ; #proof: div_nonzero  ; #loc: 0 3 37
+    %4 = urem u32 %0, %1  ; #loc: 0 3 37
+    ret %4  ; #loc: 0 3 44
+}
+
+rustcc fn @remu_safe(functy.1) {
+    ; #producer: trust
+    ; #names: %0="a", %1="b"
+bb0(%0: u32, %1: u32):
+    %2 = const u32 1  ; #loc: 0 4 51
+    %3 = or u32 %1, %2  ; #loc: 0 4 46
+    %4 = const u32 0  ; #loc: 0 4 42
+    %5 = icmp ne u32 %3, %4  ; #loc: 0 4 42
+    assert %5  ; #proof: div_nonzero  ; #loc: 0 4 42
+    %6 = urem u32 %0, %3  ; #loc: 0 4 42
+    ret %6  ; #loc: 0 4 55
+}
+
+rustcc fn @divu_safe(functy.1) {
+    ; #producer: trust
+    ; #names: %0="a", %1="b"
+bb0(%0: u32, %1: u32):
+    %2 = const u32 1  ; #loc: 0 5 51
+    %3 = or u32 %1, %2  ; #loc: 0 5 46
+    %4 = const u32 0  ; #loc: 0 5 42
+    %5 = icmp ne u32 %3, %4  ; #loc: 0 5 42
+    assert %5  ; #proof: div_nonzero  ; #loc: 0 5 42
+    %6 = udiv u32 %0, %3  ; #loc: 0 5 42
+    ret %6  ; #loc: 0 5 55
+}
+
+rustcc fn @sh(functy.1) {
+    ; #producer: trust
+    ; #names: %0="a", %1="k"
+bb0(%0: u32, %1: u32):
+    %2 = const u32 32  ; #loc: 0 6 35
+    %3 = icmp ult u32 %1, %2  ; #loc: 0 6 35
+    assert %3  ; #proof: shift_in_range  ; #loc: 0 6 35
+    %4 = shl u32 %0, %1  ; #loc: 0 6 35
+    ret %4  ; #loc: 0 6 43
+}
+
+obligation 0 arithmetic_safety pending "direct THIR Assert (overflow) at L2C46 of `m1probe::arith`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "m1probe::arith#L2C46#overflow#o0" range 0 2 46 2 51 site f0/bb0#4
+
+obligation 1 arithmetic_safety pending "direct THIR Assert (div_by_zero) at L2C61 of `m1probe::arith`: divisor is nonzero. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "m1probe::arith#L2C61#div_by_zero#o0" range 0 2 61 2 66 site f0/bb0#7
+
+obligation 2 arithmetic_safety pending "direct THIR Assert (overflow) at L2C61 of `m1probe::arith`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "m1probe::arith#L2C61#overflow#o0" range 0 2 61 2 66 site f0/bb0#14
+
+obligation 3 arithmetic_safety pending "direct THIR Assert (overflow) at L2C68 of `m1probe::arith`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 0 source "trust-thir-lower/direct-assert@1" assertion "m1probe::arith#L2C68#overflow#o0" range 0 2 68 2 73 site f0/bb0#20
+
+obligation 4 arithmetic_safety pending "direct THIR Assert (rem_by_zero) at L3C37 of `m1probe::remu`: remainder divisor is nonzero. RECORDED BY THE LOWERING, NOT PROVED." function 1 source "trust-thir-lower/direct-assert@1" assertion "m1probe::remu#L3C37#rem_by_zero#o0" range 0 3 37 3 42 site f1/bb0#2
+
+obligation 5 arithmetic_safety pending "direct THIR Assert (rem_by_zero) at L4C42 of `m1probe::remu_safe`: remainder divisor is nonzero. RECORDED BY THE LOWERING, NOT PROVED." function 2 source "trust-thir-lower/direct-assert@1" assertion "m1probe::remu_safe#L4C42#rem_by_zero#o0" range 0 4 42 4 53 site f2/bb0#4
+
+obligation 6 arithmetic_safety pending "direct THIR Assert (div_by_zero) at L5C42 of `m1probe::divu_safe`: divisor is nonzero. RECORDED BY THE LOWERING, NOT PROVED." function 3 source "trust-thir-lower/direct-assert@1" assertion "m1probe::divu_safe#L5C42#div_by_zero#o0" range 0 5 42 5 53 site f3/bb0#4
+
+obligation 7 arithmetic_safety pending "direct THIR Assert (overflow) at L6C35 of `m1probe::sh`: arithmetic does not overflow. RECORDED BY THE LOWERING, NOT PROVED." function 4 source "trust-thir-lower/direct-assert@1" assertion "m1probe::sh#L6C35#overflow#o0" range 0 6 35 6 41 site f4/bb0#2

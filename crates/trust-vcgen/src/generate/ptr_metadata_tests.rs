@@ -31,9 +31,7 @@ fn slice_len_upper_bound_gate_excludes_zst() {
     assert!(ty_is_definitely_non_zst(&Ty::Ref { mutable: false, inner: Box::new(Ty::Bool) }));
     // Struct/tuple with a non-ZST field is non-ZST (no regression on &[Struct]).
     assert!(ty_is_definitely_non_zst(&Ty::Tuple(vec![Ty::Unit, Ty::Bool])));
-    assert!(ty_is_definitely_non_zst(&Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    assert!(ty_is_definitely_non_zst(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "S".into(),
         fields: vec![("a".into(), Ty::Unit), ("b".into(), Ty::Int { width: 8, signed: false })],
@@ -45,9 +43,7 @@ fn slice_len_upper_bound_gate_excludes_zst() {
     assert!(!ty_is_definitely_non_zst(&Ty::Unit));
     assert!(!ty_is_definitely_non_zst(&Ty::Tuple(vec![])));
     assert!(!ty_is_definitely_non_zst(&Ty::Tuple(vec![Ty::Unit, Ty::Unit])));
-    assert!(!ty_is_definitely_non_zst(&Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    assert!(!ty_is_definitely_non_zst(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "Z".into(),
         fields: vec![],
@@ -687,9 +683,7 @@ fn try_into_unwrap_fn(start: u128, end: u128, arr_len: u64, result_ty: Ty) -> Ve
     let arr = Ty::Array { elem: Box::new(Ty::Int { width: 8, signed: false }), len: arr_len };
     let slice_ref =
         Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
-    let range_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let range_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "core::ops::Range".into(),
         fields: vec![],
@@ -785,9 +779,7 @@ fn try_into_unwrap_fn(start: u128, end: u128, arr_len: u64, result_ty: Ty) -> Ve
 }
 
 fn result_array(n: u64) -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "core::result::Result".into(),
         fields: vec![
@@ -866,9 +858,7 @@ fn arbitrary_result_unwrap_is_still_flagged() {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt {
-                        adt_kind: None,
-                        layout: None,
+                    ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                         variants: Vec::new(),
                         name: "core::result::Result".into(),
                         fields: vec![("0".into(), Ty::u64()), ("1".into(), Ty::Unit)],
@@ -943,9 +933,7 @@ fn user_index_impl_const_range_try_into_unwrap_is_flagged() {
     // Retype the index RECEIVER local `_1` from `&[u8]` to a user ADT `&MyWrap`.
     func.body.locals[1].ty = Ty::Ref {
         mutable: false,
-        inner: Box::new(Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        inner: Box::new(Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
             variants: Vec::new(),
             name: "mycrate::MyWrap".into(),
             fields: vec![],
@@ -984,9 +972,7 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
     let arr = Ty::Array { elem: Box::new(Ty::u8()), len: arr_len };
     let slice_ref =
         Ty::Ref { mutable: false, inner: Box::new(Ty::Slice { elem: Box::new(Ty::u8()) }) };
-    let rangefrom_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let rangefrom_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "core::ops::RangeFrom".into(),
         fields: vec![],
@@ -995,9 +981,7 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
         enum_layout: None,
     };
     let usize_ty = Ty::Int { width: 64, signed: false };
-    let checked_sub_ty = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let checked_sub_ty = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "(usize, bool)".into(),
         fields: vec![("0".into(), usize_ty.clone()), ("1".into(), Ty::Bool)],
@@ -1117,7 +1101,11 @@ fn rangefrom_suffix_fn(sub_k: u128, arr_len: u64, len_recv: usize) -> Verifiable
                 },
                 BasicBlock { id: BlockId(3), stmts: vec![], terminator: Terminator::Return },
             ],
-            arg_count: 2,
+            // `fn suffix(bytes: &[u8]) -> u64` — ONE parameter. `_2` (`len`) is a body
+            // local (`let len = bytes.len()`), which is what `_2 = PtrMetadata(_1)`
+            // lowers to; declaring it a parameter would make its ENTRY value a second
+            // value of `_2` and withhold every fact keyed on the bare `len`.
+            arg_count: 1,
             return_ty: Ty::u64(),
             datatype_defs: Default::default(),
         },
@@ -1255,9 +1243,7 @@ fn arbitrary_result_unwrap_fn() -> VerifiableFunction {
                 LocalDecl { index: 0, ty: Ty::u64(), name: None },
                 LocalDecl {
                     index: 1,
-                    ty: Ty::Adt {
-                        adt_kind: None,
-                        layout: None,
+                    ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                         variants: Vec::new(),
                         name: "core::result::Result".into(),
                         fields: vec![("0".into(), Ty::u64()), ("1".into(), Ty::Unit)],

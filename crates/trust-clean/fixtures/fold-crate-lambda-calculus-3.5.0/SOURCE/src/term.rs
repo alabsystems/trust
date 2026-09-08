@@ -1,12 +1,11 @@
 //! [Lambda terms](https://en.wikipedia.org/wiki/Lambda_calculus#Lambda_terms)
 
-use std::borrow::Cow;
-use std::error::Error;
-use std::fmt;
-
 pub use self::Notation::*;
 pub use self::Term::*;
 use self::TermError::*;
+use std::borrow::Cow;
+use std::error::Error;
+use std::fmt;
 
 /// The character used to display lambda abstractions (a backslash).
 #[cfg(feature = "backslash_lambda")]
@@ -113,7 +112,11 @@ impl Context {
     /// assert_eq!(ctx.resolve_free_var(4), None);
     /// ```
     pub fn resolve_free_var(&self, idx: usize) -> Option<&str> {
-        if idx == 0 { None } else { self.0.get(idx - 1).map(|s| s.as_str()) }
+        if idx == 0 {
+            None
+        } else {
+            self.0.get(idx - 1).map(|s| s.as_str())
+        }
     }
 }
 
@@ -181,7 +184,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not a `Var`iable.
     pub fn unvar(self) -> Result<usize, TermError> {
-        if let Var(n) = self { Ok(n) } else { Err(NotVar) }
+        if let Var(n) = self {
+            Ok(n)
+        } else {
+            Err(NotVar)
+        }
     }
 
     /// Returns a reference to a variable's De Bruijn index.
@@ -196,7 +203,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not a `Var`iable.
     pub fn unvar_ref(&self) -> Result<&usize, TermError> {
-        if let Var(ref n) = *self { Ok(n) } else { Err(NotVar) }
+        if let Var(ref n) = *self {
+            Ok(n)
+        } else {
+            Err(NotVar)
+        }
     }
 
     /// Returns a mutable reference to a variable's De Bruijn index.
@@ -211,7 +222,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not a `Var`iable.
     pub fn unvar_mut(&mut self) -> Result<&mut usize, TermError> {
-        if let Var(ref mut n) = *self { Ok(n) } else { Err(NotVar) }
+        if let Var(ref mut n) = *self {
+            Ok(n)
+        } else {
+            Err(NotVar)
+        }
     }
 
     /// Returns an abstraction's underlying term, consuming it in the process.
@@ -226,7 +241,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `Abs`traction.
     pub fn unabs(self) -> Result<Term, TermError> {
-        if let Abs(x) = self { Ok(*x) } else { Err(NotAbs) }
+        if let Abs(x) = self {
+            Ok(*x)
+        } else {
+            Err(NotAbs)
+        }
     }
 
     /// Returns a reference to an abstraction's underlying term.
@@ -241,7 +260,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `Abs`traction.
     pub fn unabs_ref(&self) -> Result<&Term, TermError> {
-        if let Abs(ref x) = *self { Ok(x) } else { Err(NotAbs) }
+        if let Abs(ref x) = *self {
+            Ok(x)
+        } else {
+            Err(NotAbs)
+        }
     }
 
     /// Returns a mutable reference to an abstraction's underlying term.
@@ -256,7 +279,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `Abs`traction.
     pub fn unabs_mut(&mut self) -> Result<&mut Term, TermError> {
-        if let Abs(ref mut x) = *self { Ok(x) } else { Err(NotAbs) }
+        if let Abs(ref mut x) = *self {
+            Ok(x)
+        } else {
+            Err(NotAbs)
+        }
     }
 
     /// Returns a pair containing an application's underlying terms, consuming it in the process.
@@ -331,7 +358,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `App`lication.
     pub fn lhs(self) -> Result<Term, TermError> {
-        if let Ok((lhs, _)) = self.unapp() { Ok(lhs) } else { Err(NotApp) }
+        if let Ok((lhs, _)) = self.unapp() {
+            Ok(lhs)
+        } else {
+            Err(NotApp)
+        }
     }
 
     /// Returns a reference to the left-hand side term of an application.
@@ -346,7 +377,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `App`lication.
     pub fn lhs_ref(&self) -> Result<&Term, TermError> {
-        if let Ok((lhs, _)) = self.unapp_ref() { Ok(lhs) } else { Err(NotApp) }
+        if let Ok((lhs, _)) = self.unapp_ref() {
+            Ok(lhs)
+        } else {
+            Err(NotApp)
+        }
     }
 
     /// Returns a mutable reference to the left-hand side term of an application.
@@ -361,7 +396,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `App`lication.
     pub fn lhs_mut(&mut self) -> Result<&mut Term, TermError> {
-        if let Ok((lhs, _)) = self.unapp_mut() { Ok(lhs) } else { Err(NotApp) }
+        if let Ok((lhs, _)) = self.unapp_mut() {
+            Ok(lhs)
+        } else {
+            Err(NotApp)
+        }
     }
 
     /// Returns the right-hand side term of an application. Consumes `self`.
@@ -376,7 +415,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `App`lication.
     pub fn rhs(self) -> Result<Term, TermError> {
-        if let Ok((_, rhs)) = self.unapp() { Ok(rhs) } else { Err(NotApp) }
+        if let Ok((_, rhs)) = self.unapp() {
+            Ok(rhs)
+        } else {
+            Err(NotApp)
+        }
     }
 
     /// Returns a reference to the right-hand side term of an application.
@@ -391,7 +434,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `App`lication.
     pub fn rhs_ref(&self) -> Result<&Term, TermError> {
-        if let Ok((_, rhs)) = self.unapp_ref() { Ok(rhs) } else { Err(NotApp) }
+        if let Ok((_, rhs)) = self.unapp_ref() {
+            Ok(rhs)
+        } else {
+            Err(NotApp)
+        }
     }
 
     /// Returns a mutable reference to the right-hand side term of an application.
@@ -406,7 +453,11 @@ impl Term {
     ///
     /// Returns a `TermError` if `self` is not an `App`lication.
     pub fn rhs_mut(&mut self) -> Result<&mut Term, TermError> {
-        if let Ok((_, rhs)) = self.unapp_mut() { Ok(rhs) } else { Err(NotApp) }
+        if let Ok((_, rhs)) = self.unapp_mut() {
+            Ok(rhs)
+        } else {
+            Err(NotApp)
+        }
     }
 
     /// Returns `true` if `self` is a
@@ -521,7 +572,10 @@ impl Term {
         match self {
             Var(x) => x.saturating_sub(depth),
             Abs(p) => p.max_free_index_helper(depth + 1),
-            App(p) => p.0.max_free_index_helper(depth).max(p.1.max_free_index_helper(depth)),
+            App(p) => {
+                p.0.max_free_index_helper(depth)
+                    .max(p.1.max_free_index_helper(depth))
+            }
         }
     }
 
@@ -573,14 +627,19 @@ impl fmt::Display for Term {
         let max_free_index = self.max_free_index();
         let ctx = auto_generate_context(max_depth, max_free_index);
         let binder_names = generate_binder_names(&ctx, self.max_depth());
-        write!(f, "{}", show_precedence_cla(&ctx, &binder_names, self, 0, 0))
+        write!(
+            f,
+            "{}",
+            show_precedence_cla(&ctx, &binder_names, self, 0, 0)
+        )
     }
 }
 
 /// A helper function to generate a default context for displaying a term.
 fn auto_generate_context(max_depth: u32, max_free_index: usize) -> Context {
-    let free_variables =
-        (0..max_free_index).map(|i| base26_encode(max_depth + i as u32)).collect::<Vec<_>>();
+    let free_variables = (0..max_free_index)
+        .map(|i| base26_encode(max_depth + i as u32))
+        .collect::<Vec<_>>();
     free_variables.into()
 }
 
@@ -593,7 +652,11 @@ struct DisplayWithContext<'a> {
 impl<'a> fmt::Display for DisplayWithContext<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let binder_names = generate_binder_names(self.ctx, self.term.max_depth());
-        write!(f, "{}", show_precedence_cla(self.ctx, &binder_names, self.term, 0, 0))
+        write!(
+            f,
+            "{}",
+            show_precedence_cla(self.ctx, &binder_names, self.term, 0, 0)
+        )
     }
 }
 
@@ -638,7 +701,8 @@ fn show_precedence_cla(
                     .to_owned()
             } else {
                 let idx = (i - depth) as usize;
-                ctx.resolve_free_var(idx).map_or(format!("<unknown{}>", idx), |s| s.to_owned())
+                ctx.resolve_free_var(idx)
+                    .map_or(format!("<unknown{}>", idx), |s| s.to_owned())
             }
         }
         Abs(t) => {
@@ -646,7 +710,9 @@ fn show_precedence_cla(
                 format!(
                     "{}{}.{}",
                     LAMBDA,
-                    binder_names.get(depth as usize).expect("[BUG] binder_names are insufficient"),
+                    binder_names
+                        .get(depth as usize)
+                        .expect("[BUG] binder_names are insufficient"),
                     show_precedence_cla(ctx, binder_names, t, 0, depth + 1)
                 )
             };
@@ -682,14 +748,22 @@ fn show_precedence_dbr(term: &Term, context_precedence: usize) -> String {
         }
         App(boxed) => {
             let (ref t1, ref t2) = **boxed;
-            let ret = format!("{}{}", show_precedence_dbr(t1, 2), show_precedence_dbr(t2, 3));
+            let ret = format!(
+                "{}{}",
+                show_precedence_dbr(t1, 2),
+                show_precedence_dbr(t2, 3)
+            );
             parenthesize_if(&ret, context_precedence == 3).into()
         }
     }
 }
 
 fn parenthesize_if(input: &str, condition: bool) -> Cow<'_, str> {
-    if condition { format!("({})", input).into() } else { input.into() }
+    if condition {
+        format!("({})", input).into()
+    } else {
+        input.into()
+    }
 }
 
 /// A macro for chain application of `Term`s.
@@ -797,13 +871,23 @@ mod tests {
         assert_eq!(&abs!(2, Var(3)).to_string(), "λa.λb.c");
         assert_eq!(&abs!(2, Var(4)).to_string(), "λa.λb.d");
         assert_eq!(
-            app!(Var(3), Var(4), abs(app(Var(4), Var(5))), abs!(2, app(Var(5), Var(6))))
-                .to_string(),
+            app!(
+                Var(3),
+                Var(4),
+                abs(app(Var(4), Var(5))),
+                abs!(2, app(Var(5), Var(6)))
+            )
+            .to_string(),
             "e f (λa.e f) (λa.λb.e f)"
         );
         assert_eq!(
-            app!(abs!(2, app(Var(3), Var(4))), Var(1), Var(2), abs(app(Var(2), Var(3))))
-                .to_string(),
+            app!(
+                abs!(2, app(Var(3), Var(4))),
+                Var(1),
+                Var(2),
+                abs(app(Var(2), Var(3)))
+            )
+            .to_string(),
             "(λa.λb.c d) c d (λa.c d)"
         );
         assert_eq!(
@@ -812,10 +896,17 @@ mod tests {
         );
 
         assert_eq!(
-            abs!(27, app!(Var(28), Var(29), Var(30), Var(50), Var(702), Var(703))).to_string(),
+            abs!(
+                27,
+                app!(Var(28), Var(29), Var(30), Var(50), Var(702), Var(703))
+            )
+            .to_string(),
             "λa.λb.λc.λd.λe.λf.λg.λh.λi.λj.λk.λl.λm.λn.λo.λp.λq.λr.λs.λt.λu.λv.λw.λx.λy.λz.λaa.ab ac ad ax zz aaa"
         );
-        assert_eq!(abs!(3, app!(Var(2), Var(3), Var(4))).to_string(), "λa.λb.λc.b a d");
+        assert_eq!(
+            abs!(3, app!(Var(2), Var(3), Var(4))).to_string(),
+            "λa.λb.λc.b a d"
+        );
         assert_eq!(Var(26).to_string(), "z");
         assert_eq!(Var(27).to_string(), "aa");
     }
@@ -826,12 +917,20 @@ mod tests {
         let succ = abs!(3, app(Var(2), app!(Var(3), Var(2), Var(1))));
         let pred = abs!(
             3,
-            app!(Var(3), abs!(2, app(Var(1), app(Var(2), Var(4)))), abs(Var(2)), abs(Var(1)))
+            app!(
+                Var(3),
+                abs!(2, app(Var(1), app(Var(2), Var(4)))),
+                abs(Var(2)),
+                abs(Var(1))
+            )
         );
 
         assert_eq!(&zero.to_string(), "λa.λb.b");
         assert_eq!(&succ.to_string(), "λa.λb.λc.b (a b c)");
-        assert_eq!(&pred.to_string(), "λa.λb.λc.a (λd.λe.e (d b)) (λd.c) (λd.d)");
+        assert_eq!(
+            &pred.to_string(),
+            "λa.λb.λc.a (λd.λe.e (d b)) (λd.c) (λd.d)"
+        );
 
         assert_eq!(&format!("{:?}", zero), "λλ1");
         assert_eq!(&format!("{:?}", succ), "λλλ2(321)");
@@ -873,15 +972,24 @@ mod tests {
     fn term_display_without_context() {
         let term1 = app(Var(1), Var(2));
         assert_eq!(term1.to_string(), "a b");
-        assert_eq!(term1.with_context(&Context::empty()).to_string(), "<unknown1> <unknown2>");
+        assert_eq!(
+            term1.with_context(&Context::empty()).to_string(),
+            "<unknown1> <unknown2>"
+        );
 
         let term2 = abs(app(Var(1), Var(3)));
         assert_eq!(term2.to_string(), "λa.a c");
-        assert_eq!(term2.with_context(&Context::empty()).to_string(), "λa.a <unknown2>");
+        assert_eq!(
+            term2.with_context(&Context::empty()).to_string(),
+            "λa.a <unknown2>"
+        );
 
         let term3 = abs(Var(2));
         assert_eq!(term3.to_string(), "λa.b");
-        assert_eq!(term3.with_context(&Context::empty()).to_string(), "λa.<unknown1>");
+        assert_eq!(
+            term3.with_context(&Context::empty()).to_string(),
+            "λa.<unknown1>"
+        );
     }
 
     #[test]
@@ -904,7 +1012,10 @@ mod tests {
         assert_eq!(Var(1).max_depth(), 0);
         assert_eq!(abs(Var(1)).max_depth(), 1);
         assert_eq!(abs!(10, Var(5)).max_depth(), 10);
-        assert_eq!(app!(abs!(5, Var(2)), abs!(9, Var(4)), abs!(7, Var(6))).max_depth(), 9);
+        assert_eq!(
+            app!(abs!(5, Var(2)), abs!(9, Var(4)), abs!(7, Var(6))).max_depth(),
+            9
+        );
     }
 
     #[test]

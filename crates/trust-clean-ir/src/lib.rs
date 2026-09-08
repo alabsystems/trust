@@ -45,12 +45,19 @@
 //! across twelve declarations. It is still not `admit_lowering`: enumeration
 //! holds at `u8` only, while a reflector's symbolic result would hold at every
 //! width at once.
-//! It is faithful to the plan, and the plan rests on a kernel verdict, but the
-//! emitted TrustIR body itself has not been reflected back and re-checked. Two
-//! consequences, both binding:
+//! It is faithful to the plan, and the plan rests on a kernel verdict. W2 now
+//! adds one deliberately narrow production exception to the historical
+//! body-ungated state: an independent crate reflects the *actual emitted*
+//! `WrappingBinOp` Function for Add/Sub/Mul at exact UInt8/16/32/64 and the
+//! kernel re-checks that reflected term at the carrier. Two consequences, both
+//! binding:
 //!
-//! * Do not hand a function from here to codegen as if it were gated. The gated
-//!   value-producing lane today is `clean_origin_mir`.
+//! * Do not hand a function from here to codegen merely because this producer
+//!   emitted it. Only a row carrying the private, final-subject-authenticated
+//!   W2 `gate` permission has body authority, and even that same-crate evidence
+//!   is not G5 cross-crate linking or G7 codegen authority. Every other shape
+//!   remains body-ungated. The general gated value-producing lane remains
+//!   `clean_origin_mir`.
 //!
 //!   **This crate IS on a compilation path, in one narrow role** — the older
 //!   note here said nothing in `compiler/` called it, and that has been stale
@@ -59,14 +66,15 @@
 //!   `clean_origin_mir.rs:351` calls [`trust_ir_func_ty`] on the sealed plan,
 //!   making a TrustIR signature that disagrees with the plan's arity a FATAL
 //!   compilation error. That is a real wrong-binary gate: two independent
-//!   readings of one carrier signature must agree. A REFUSAL there is
-//!   deliberately not fatal, since a capability gap in a lane that produces no
-//!   binary must never fail a compilation the MIR lane can complete.
+//!   readings of one carrier signature must agree. A REFUSAL remains nonfatal
+//!   for non-target shapes. For W2 WrappingBinOp, signature lowering and body
+//!   emission refusals are fatal self-disagreements and cannot become skip or
+//!   general-lane rows.
 //!
-//!   What is gated is therefore the SIGNATURE, not the BODY. No emitted TrustIR
-//!   body is put to a gate on a compilation path, so the reflectors below remain
-//!   library-level evidence of emitter faithfulness rather than a shipped
-//!   body-verification gate. Both halves of that sentence matter.
+//!   The signature is gated for every planned shape. Body gating exists only
+//!   for the exact W2 WrappingBinOp slice above; the broader independent
+//!   reflectors below remain library-level evidence rather than shipped
+//!   permissions. Both boundaries matter.
 //!
 //! **INDEPENDENT reflectors now exist** (`tests/independent_reflector_{a,b,c}.rs`),
 //! and this supersedes the co-authorship caveat that stood here. Each was written
@@ -154,20 +162,25 @@
 //!   the cached emitted MIR, RE-RUNS `admit_lowering` fresh (the export lane's
 //!   independence discipline — on a warm cache the demand is not a gate
 //!   execution), and only then calls [`emit_clean_origin_function`]. A
-//!   [`CleanIrRefusal`] is a skip-with-reason row; an environment or gate
-//!   refusal on a registry def is fatal (the environment disagreeing with
-//!   itself).
+//!   [`CleanIrRefusal`] is normally a skip-with-reason row; for the already
+//!   targeted W2 WrappingBinOp population, signature/emission/carrier-gate
+//!   disagreement is fatal and cannot reroute to general. An environment or
+//!   MIR gate refusal on any registry def is fatal (the environment disagreeing
+//!   with itself).
 //! * `trust_thir_lower::clean_origin_join::append_clean_origin` appends the
 //!   records to the assembled per-crate Module: dense ids minted at push,
 //!   `FuncTy` interned by equality, `Producer::Clean` stamped, ZERO claim
 //!   channels (the authority tripwire re-runs after the append), each function
 //!   validated per-function before publication, and a `DesignOnly` disclosure
 //!   SpecModule (`@trust-internal::clean-origin-disclosure-v1`) carrying each
-//!   row's tier IN-BAND — tier `structural`, body `ungated`, the kernel
-//!   verdict bound to the MIR body, never to this spelling.
-//! * Rust→Clean call edges in the Module still point at the fail-closed
-//!   bodyless declarations assemble minted; re-pointing them is increment
-//!   IR-5 of the design ladder, not a quiet side effect here.
+//!   row's tier IN-BAND. Most rows remain tier `structural`/`kernel-tv` with
+//!   body `ungated`; exact W2 WrappingBinOp rows are tier `gate`, with an
+//!   affine token rebound after final id/type/provenance assignment and a
+//!   digest of that exact published Function.
+//! * Same-crate Rust→Clean call edges whose canonical def path and arity match
+//!   are re-pointed to the admitted Clean Function and certified for remap
+//!   shape. That is the landed IR-5 same-crate join witnessed by runmake; it is
+//!   still not G5 digest-bound cross-crate linking.
 //!
 //! The rejected alternative stays recorded because it stays tempting:
 //! `trust-thir-lower`'s flip registry is where Rust-origin bodies reach the
@@ -227,7 +240,7 @@ use trust_ir::inst::{BinOp, ICmpOp, Inst};
 use trust_ir::node::InstrNode;
 use trust_ir::ty::{FuncTy, Ty};
 use trust_ir::value::{BlockId, FuncId, FuncTyId, ValueId};
-use trust_ir::{Block, Constant, Function};
+use trust_ir::{Block, CallingConv, Constant, Function};
 use trust_types::admissible_body::{
     ArithBinOp, ArithExpr, ArithOperand, BeqOperand, RawBinOpKind, RecBodyExpr, SelectCmp,
 };
@@ -805,6 +818,17 @@ pub fn emit_clean_origin_function_with_nat(
     // attrs, provenance carriers), and a literal here would silently pin them
     // the day one is added.
     let mut function = Function::new(id, plan.name(), ty, entry);
+    // Clean-origin declarations are compiler-minted Rust items. The compiler
+    // installs every callable signature with `mk_fn_sig_rust_abi` (the
+    // resolver feed for fixed-width carriers and the deferred provider for
+    // Nat), so the direct TrustIR definition must carry that same convention.
+    // Leaving the `Function::new` C default here is not conservative: it
+    // asserts a foreign ABI and turns every Rust -> Clean call into a
+    // cross-convention edge. A fixed-width scalar happens to hide that lie; a
+    // `Nat` carrier exposes it
+    // because its repr(Rust) struct is then (correctly) refused at an apparent
+    // FFI boundary.
+    function.calling_conv = CallingConv::Rust;
     function.blocks = core::mem::take(&mut blocks);
     function.blocks.insert(0, block);
     Ok(function)
@@ -1201,6 +1225,24 @@ fn fits_unsigned(value: u128, width: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emitted_clean_origin_definition_uses_the_compiler_minted_rust_abi() {
+        let mut session = trust_certify::clean_island::CleanIslandSession::new();
+        let batch = session.check_all(&["def pick (a : UInt64) : UInt64 := a"]);
+        assert!(!batch.is_rejected(), "the Clean declaration must kernel-check: {batch:?}");
+        let env = session.environment().expect("an untainted session has an environment");
+        let plan = trust_clean_origin::plan_clean_origin_body(env, "pick")
+            .expect("the projection must plan");
+        let function = emit_clean_origin_function(&plan, FuncId::new(0), FuncTyId::new(0))
+            .expect("the projection must emit");
+
+        assert_eq!(
+            function.calling_conv,
+            CallingConv::Rust,
+            "the TrustIR definition must agree with the Rust ABI installed for the synthetic item"
+        );
+    }
 
     /// The machine set this producer admits, stated once so a drifting arm has
     /// to change a test that says why the set is what it is.

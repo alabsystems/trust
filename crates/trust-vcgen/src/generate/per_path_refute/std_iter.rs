@@ -413,6 +413,7 @@ mod tests {
             layout: None,
             enum_layout: None,
             adt_kind: Some(AdtKind::Enum),
+            arbitrary_precision: None,
         }
     }
 

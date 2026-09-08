@@ -1752,10 +1752,15 @@ fn calculate_normal(
             unit,
             is_test_execution_subject,
         );
+        let is_build_support_only = super::trust_unit_build_support_only(build_runner, unit);
+        let is_audited_trust_spec_proc_macro =
+            super::trust_unit_audited_trust_spec_proc_macro(unit);
         let verification_enabled = super::trust_unit_verification_enabled(
             is_custom_build,
             is_primary,
             is_test_execution_subject,
+            is_build_support_only,
+            is_audited_trust_spec_proc_macro,
             include_dependencies,
         );
         // Trust: reporting metadata, the derived explicit off-switch, and the
@@ -1772,13 +1777,17 @@ fn calculate_normal(
         // session's authority, and replaying a stored verdict for it would be a
         // proof-authority claim nothing here is entitled to make. That
         // requirement is a property of the units that verify, not of the whole
-        // graph, so it is recorded on exactly those units. Every unit Cargo can
-        // admit to the proof subject has verification enabled (a proof role is
-        // either a resolved root, a test-graph execution subject, or an
-        // explicitly requested dependency — each of which enables verification),
-        // so this pins a superset of the proof subject and can only over-rebuild.
-        // Units compiled with the `-Ztrust-verify=off` off-switch emit no evidence
-        // at all and are ordinary compilations that Cargo may reuse.
+        // graph, so it is recorded on exactly those units. What keeps this
+        // correct is that the tuple hashes `verification_enabled` itself, not any
+        // invariant tying a proof role to verification: under
+        // include-dependencies an explicitly requested dependency that is
+        // build-support-only (reachable from no root except through a build
+        // script), or is the audited Trust spec proc macro, carries a Cargo
+        // graph role and still has verification disabled. Because the decision
+        // is hashed rather than assumed, a unit
+        // that changes scope re-fingerprints and can only over-rebuild. Units
+        // compiled with the `-Ztrust-verify=off` off-switch emit no evidence at
+        // all and are ordinary compilations that Cargo may reuse.
         (
             "targo-trust-unit-scope-v5",
             super::trust_unit_role(is_custom_build, is_primary),

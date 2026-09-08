@@ -421,6 +421,19 @@ impl<'a> Parser<'a> {
                             lane_index,
                         );
                     }
+                    // Trust (E9): a cited attribute clause IS a native
+                    // verifier-language clause; storing it in the native lane
+                    // is what makes the two surfaces one representation.
+                    TrustContractClause::Native(clause) => {
+                        let lane_index = trust_native_requires.len();
+                        trust_native_requires.push(clause);
+                        record_fn_contract_clause(
+                            &mut clause_order,
+                            ast::FnContractClauseKind::Requires,
+                            ast::FnContractClauseLane::Native,
+                            lane_index,
+                        );
+                    }
                 }
             } else if self.token.is_keyword(kw::TrustContractEnsures) {
                 // Trust-origin postcondition clause.
@@ -444,6 +457,21 @@ impl<'a> Parser<'a> {
                             &mut clause_order,
                             ast::FnContractClauseKind::Ensures,
                             ast::FnContractClauseLane::Opaque,
+                            lane_index,
+                        );
+                    }
+                    // Trust (E9): see the requires arm — a cited attribute
+                    // clause joins the native lane, so `#[trust::ensures(P by
+                    // T)]` and `fn f(..) ensures P by T` are the same clause
+                    // from here on (same `result` binding, same native snippet
+                    // syntax, same E9 discharge).
+                    TrustContractClause::Native(clause) => {
+                        let lane_index = trust_native_ensures.len();
+                        trust_native_ensures.push(clause);
+                        record_fn_contract_clause(
+                            &mut clause_order,
+                            ast::FnContractClauseKind::Ensures,
+                            ast::FnContractClauseLane::Native,
                             lane_index,
                         );
                     }
@@ -593,6 +621,16 @@ impl<'a> Parser<'a> {
     /// so the spec text is never name-resolved or type-checked, and the
     /// `trust_contracts` query recovers it from the source map (fail-closed:
     /// an unparseable predicate can only fail to prove, never falsely prove).
+    ///
+    /// Trust (E9, ONE CITATION REPRESENTATION / TWO SURFACES): a payload that
+    /// carries a `by <thm>` citation is not an opaque span — a citation IS the
+    /// declaration that this clause is a verifier-language proof obligation
+    /// discharged by the Clean kernel. Such a payload is therefore handed to
+    /// the SAME [`Self::parse_trust_native_clause`] the first-class signature
+    /// surface uses and joins the SAME native lane, so `#[trust::ensures(P by
+    /// T)]` and `fn f(..) ensures P by T` produce byte-identical AST from that
+    /// point on and share one discharge path. Attribute payloads WITHOUT a
+    /// citation are untouched (typed/opaque exactly as before).
     fn parse_trust_contract_clause(
         &mut self,
         kind: TrustContractClauseKind,
@@ -626,6 +664,32 @@ impl<'a> Parser<'a> {
             (Some(first), Some(last)) => first.span().to(last.span()),
             _ => dspan.entire(),
         };
+
+        // Trust (E9): an authored `by <thm>` citation routes the clause onto
+        // the native verifier-language lane. The pre-filter is deliberately
+        // narrow — a depth-zero `by` token in the payload — so a payload that
+        // cannot carry a citation reaches EXACTLY the pre-existing code below.
+        if trust_attribute_payload_has_depth_zero_by(inner) {
+            let mut citation_parser = Parser::new(self.psess, inner.clone(), None);
+            // Errors here are citation errors (a bare `by`, a malformed dotted
+            // path, an empty predicate before one): they are AUTHORED errors
+            // and must surface, never be cancelled into a silently uncited
+            // opaque clause (a dropped citation would leave a clause looking
+            // checked while nothing checked it).
+            let clause = citation_parser
+                .parse_trust_native_clause(TrustNativeClauseContext::AttributePayload)?;
+            if clause.citation.is_some() {
+                if citation_parser.token != token::Eof {
+                    return Err(self.dcx().struct_span_err(
+                        citation_parser.token.span,
+                        "expected the end of the contract clause after its `by` citation",
+                    ));
+                }
+                return Ok(TrustContractClause::Native(clause));
+            }
+            // The `by` was ordinary predicate vocabulary: fall through to the
+            // unchanged typed/opaque decision below.
+        }
 
         if trust_spec_payload_is_opaque(inner) {
             return Ok(TrustContractClause::Opaque(payload_span));
@@ -720,7 +784,10 @@ impl<'a> Parser<'a> {
                 break;
             }
             if tok.kind.open_delim() == Some(token::Delimiter::Brace) && depth == 0 {
-                if pending_block_kw {
+                // In a self-delimiting attribute payload there is no function
+                // body, so a depth-zero brace group always belongs to the
+                // predicate.
+                if pending_block_kw || context == TrustNativeClauseContext::AttributePayload {
                     pending_block_kw = false;
                     depth += 1;
                 } else {
@@ -943,6 +1010,10 @@ impl<'a> Parser<'a> {
             TrustNativeClauseContext::Loop => {
                 tok.is_non_raw_ident_where(|id| matches!(id.name, sym::invariant | sym::decreases))
             }
+            // One attribute carries exactly one clause; `requires`/`ensures`/
+            // `decreases`/`invariant` inside its payload are ordinary verifier
+            // vocabulary, not a following clause.
+            TrustNativeClauseContext::AttributePayload => false,
         }
     }
 
@@ -951,7 +1022,11 @@ impl<'a> Parser<'a> {
         context: TrustNativeClauseContext,
     ) -> bool {
         matches!(tok.kind, token::TokenKind::Semi | token::TokenKind::Eof)
-            || tok.kind.open_delim() == Some(token::Delimiter::Brace)
+            // An attribute payload has no function body, so a depth-zero `{`
+            // is part of the predicate (`ensures match result { .. } by T`)
+            // rather than the boundary.
+            || (context != TrustNativeClauseContext::AttributePayload
+                && tok.kind.open_delim() == Some(token::Delimiter::Brace))
             || tok.kind.close_delim().is_some()
             || (context == TrustNativeClauseContext::Signature && tok.is_keyword(kw::Where))
             || Self::trust_native_clause_keyword(tok, context)
@@ -1378,6 +1453,12 @@ enum TrustContractClauseKind {
 enum TrustNativeClauseContext {
     Signature,
     Loop,
+    /// Trust (E9): the brace-delimited payload of one `#[trust::requires]` /
+    /// `#[trust::ensures]` attribute. The group is self-delimiting, so the only
+    /// boundary is its end: there is no function body to stop at (a depth-zero
+    /// `{` belongs to the predicate here) and no sibling clause keyword to
+    /// watch for (one attribute carries exactly one clause).
+    AttributePayload,
 }
 
 /// Trust: how one Trust-origin trust-spec contract clause is carried after
@@ -1392,6 +1473,33 @@ enum TrustContractClause {
     /// the predicate text through the source map; the program's types and
     /// runtime behavior are untouched.
     Opaque(Span),
+    /// Trust (E9): the payload carried a `by <thm>` citation, so it is a
+    /// verifier-language clause with a kernel-discharge obligation — exactly
+    /// what the first-class signature surface produces. It joins the NATIVE
+    /// lane so both surfaces share one representation and one discharge path.
+    Native(rustc_ast::TrustNativeClause),
+}
+
+/// Trust (E9): whether a `#[trust::requires]` / `#[trust::ensures]` payload can
+/// possibly carry a `by <thm>` citation.
+///
+/// A citation marker is always a DEPTH-ZERO token of the payload, so only the
+/// stream's own top-level tokens are inspected — a `by` nested inside a call or
+/// a bracket is predicate vocabulary and can never open a citation. This is a
+/// pre-filter, not the decision: a payload that passes it is handed to
+/// [`Parser::parse_trust_native_clause`], which applies the one canonical
+/// citation grammar (shared with the first-class signature surface) and decides
+/// whether this `by` actually starts a citation. A payload that fails it takes
+/// the pre-existing typed/opaque path with no behavior change whatsoever.
+fn trust_attribute_payload_has_depth_zero_by(
+    stream: &rustc_ast::tokenstream::TokenStream,
+) -> bool {
+    use rustc_ast::tokenstream::TokenTree;
+
+    stream.iter().any(|tt| match tt {
+        TokenTree::Token(tok, _) => tok.is_non_raw_ident_where(|id| id.name == sym::by),
+        TokenTree::Delimited(..) => false,
+    })
 }
 
 /// Trust: whether a trust-spec clause payload must stay OPAQUE — i.e. it uses

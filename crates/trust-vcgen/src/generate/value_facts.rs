@@ -24,22 +24,27 @@ use super::*;
 /// function-wide invariant (bare whole-local `_idx` binds the body read via the existing
 /// `normalize_ssa_version_tokens` whole-local collapse — no field-token handling needed).
 pub(super) fn build_checked_sub_result_facts(func: &VerifiableFunction) -> Vec<Formula> {
-    let mut assign_count: FxHashMap<usize, usize> = FxHashMap::default();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, .. } = stmt
-                && place.projections.is_empty()
-            {
-                *assign_count.entry(place.local).or_insert(0) += 1;
-            }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.projections.is_empty()
-        {
-            *assign_count.entry(dest.local).or_insert(0) += 1;
-        }
-    }
-    let stable = |l: usize| assign_count.get(&l).copied().unwrap_or(0) <= 1;
+    // Trust (LIVE false-PROVE, found by the global-fact reassignment census): a
+    // store THROUGH a mutable borrow (`let p = &mut idx; *p = b;` — place.local is
+    // `p`, not `idx`) is a write no def scan can see, and `idx` still scores one
+    // definition. The emitted `idx == lhs - rhs` is then version-renamed onto the
+    // block terminal, i.e. onto the MUTATED `idx`, and pins it to a value it no
+    // longer holds. `borrow_reassigned_index_still_refutes` is the witness:
+    // `if !v.is_empty() { let mut idx = v.len()-1; let p = &mut idx; *p = b;
+    // v[idx] }` verified `2 proved, 0 failed` and indexes out of bounds at
+    // runtime. `local_mut_escapes` is the same kill `is_single_static_assignment`
+    // carries for exactly this channel.
+    //
+    // `value_count <= 1` — NOT a hand-rolled `Assign`-place tally against a
+    // hardcoded 1. A PARAMETER's definition is the implicit ENTRY one, so one
+    // explicit reassignment already gives it two values while a block scan still
+    // reads 1. `param_checked_sub_result_still_refutes` /
+    // `param_checked_add_result_still_refutes` are the witnesses. `<= 1` rather
+    // than `== 1` because an operand that is never whole-defined (a projected
+    // read's base) is stable too.
+    let stable = |l: usize| {
+        crate::local_defs::value_count(func, l).is_at_most(1) && !local_mut_escapes(func, l)
+    };
     let stable_op = |op: &Operand| match op {
         Operand::Constant(_) => true,
         Operand::Copy(p) | Operand::Move(p) => p.projections.is_empty() && stable(p.local),
@@ -133,22 +138,13 @@ pub(super) fn build_checked_sub_result_facts(func: &VerifiableFunction) -> Vec<F
 /// `lhs + rhs > MAX` in the Int theory (negative operands), so the fact is gated
 /// out. Same single-assignment gates as the sub twin.
 pub(super) fn build_checked_add_result_facts(func: &VerifiableFunction) -> Vec<Formula> {
-    let mut assign_count: FxHashMap<usize, usize> = FxHashMap::default();
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            if let Statement::Assign { place, .. } = stmt
-                && place.projections.is_empty()
-            {
-                *assign_count.entry(place.local).or_insert(0) += 1;
-            }
-        }
-        if let Terminator::Call { dest, .. } = &block.terminator
-            && dest.projections.is_empty()
-        {
-            *assign_count.entry(dest.local).or_insert(0) += 1;
-        }
-    }
-    let stable = |l: usize| assign_count.get(&l).copied().unwrap_or(0) <= 1;
+    // The same gate as the sub twin, for the same two reasons: a store through
+    // `&mut` is a write no def scan sees, and a PARAMETER's definition is the
+    // implicit ENTRY one. Both are `local_defs::value_count` + `local_mut_escapes`
+    // there; see that function for the witnesses.
+    let stable = |l: usize| {
+        crate::local_defs::value_count(func, l).is_at_most(1) && !local_mut_escapes(func, l)
+    };
     let stable_op = |op: &Operand| match op {
         Operand::Constant(_) => true,
         Operand::Copy(p) | Operand::Move(p) => p.projections.is_empty() && stable(p.local),
@@ -235,6 +231,7 @@ pub(super) fn build_checked_add_result_facts(func: &VerifiableFunction) -> Vec<F
 /// builder's own doc.
 pub(crate) fn build_global_invariant_facts(func: &VerifiableFunction) -> Vec<Formula> {
     let mut global_facts = build_min_max_facts(func);
+    global_facts.extend(build_len_call_bound_facts(func));
     global_facts.extend(build_checked_sub_result_facts(func));
     global_facts.extend(build_checked_add_result_facts(func));
     global_facts.extend(build_fp_abs_facts(func));
@@ -244,6 +241,7 @@ pub(crate) fn build_global_invariant_facts(func: &VerifiableFunction) -> Vec<For
     global_facts.extend(build_division_exact_facts(func));
     global_facts.extend(build_bitmask_bound_facts(func));
     global_facts.extend(build_intrinsic_bound_facts(func));
+    global_facts.extend(build_nonzero_get_dest_facts(func));
     global_facts.extend(build_flattened_index_facts(func));
     global_facts.extend(build_cast_bound_facts(func));
     global_facts.extend(build_cast_lower_bound_facts(func));
@@ -302,7 +300,7 @@ pub(super) fn build_vec_index_dest_value_tie_facts(func: &VerifiableFunction) ->
         if method_tail(callee) != "index" || args.len() != 2 || !dest.projections.is_empty() {
             continue;
         }
-        if guards::whole_local_def_count(func, dest.local) != 1 {
+        if !crate::local_defs::has_one_explicit_def(func, dest.local) {
             continue;
         }
         let (Operand::Copy(bp) | Operand::Move(bp)) = &args[0] else { continue };
@@ -567,10 +565,10 @@ pub(super) fn build_immutable_index_len_tie_facts(func: &VerifiableFunction) -> 
 /// True iff `root` can NEVER be reseated to a different backing: no whole- or
 /// projected-place write, no call dest, and no `&mut`/`&raw` borrow (through
 /// which the ref itself could be redirected). A param's entry def is its only
-/// def; a non-param must have exactly ONE whole-local def. NOTE: neither
-/// `whole_local_def_count` (no param-entry def) nor `is_single_static_assignment`
-/// (counts a reassigned param as 1 def) gives this on its own — a `mut p` param
-/// reassigned once would slip through either and tie reads across the reseat.
+/// def; a non-param must have exactly ONE whole-local def. STRICTER than
+/// [`crate::local_defs::holds_one_value`], which is why the scan is kept: that
+/// question counts VALUES, and a single CALL DEST or a projected store is a reseat
+/// channel it admits and this rejects outright.
 pub(super) fn root_is_never_reseated(func: &VerifiableFunction, root: usize) -> bool {
     let is_param = (1..=func.body.arg_count).contains(&root);
     let mut defs = 0usize;
@@ -631,9 +629,9 @@ pub(super) fn root_is_never_reseated(func: &VerifiableFunction, root: usize) -> 
 ///    which is itself immutable — never the pointee);
 ///  * the root is NEVER reseated: an immutable-input param or a single-static-
 ///    assignment local (with no `&mut`/`&raw` borrow), ON TOP of the
-///    `base_collection_local_unique` chain check — `whole_local_def_count` does not
-///    count a param's entry def, so a reassigned `mut p` param has count 1 and would
-///    otherwise slip through with the two reads straddling a base reseat;
+///    `base_collection_local_unique` chain check — `root_is_never_reseated` is
+///    stricter than a value count, which admits the single call-dest or projected
+///    write that would leave the two reads straddling a base reseat;
 ///  * facts are only CONJOINED (monotone): a true equality can flip a spurious
 ///    REFUTE to PROVE but cannot hide a real counterexample (which satisfies it too).
 ///
@@ -798,6 +796,80 @@ pub(super) fn build_immutable_read_value_tie_facts(func: &VerifiableFunction) ->
                 });
             }
         }
+    }
+    facts
+}
+
+/// Trust (allocation-size bound for a `.len()` CALL result): a well-formed std `[T]`
+/// slice with a provably NON-ZST element, or a `String`, can never hold more than
+/// `isize::MAX` elements/bytes — every slice/allocation is capped at `isize::MAX`
+/// BYTES and `size_of::<elem>() >= 1` forces `len <= isize::MAX` — so `<c>.len()`
+/// returns a value in `[0, isize::MAX]`. `.len()` lowers to a Call whose dest is a
+/// FRESH `usize` temp, DISTINCT from the `__slice_len` symbols
+/// `conjoin_slice_len_bounds` bounds, so `a.len() + b.len()` reads both results as
+/// free `usize` and FALSE-REFUTES the add-overflow. Emit the bound as a GLOBAL fact on
+/// the single-static-assignment len dest — the same lane and SSA gate as
+/// [`build_min_max_facts`].
+///
+/// SOUNDNESS: `0 <= len <= isize::MAX` is the unconditional allocation-size invariant
+/// of a well-formed slice/String; a conjoined true fact only turns a false-FAIL into a
+/// PROVE, never an overflow into a false-PROVE. Gated to:
+///  * the CRATE-ANCHORED std `len` (`core/std::slice::` receiver-tail `len`, or
+///    `alloc/std::string::String::len`) — an extension-trait `fn len` has a DIFFERENT
+///    callee root and is excluded (a receiver-type check alone would be spoofable);
+///  * a provably NON-ZST element whose type SURVIVES EXTRACTION FAITHFULLY: a `&[T]`
+///    slice carries the real element in `Ty::Slice { elem }`, so a ZST element (`[()]`,
+///    whose len may reach `usize::MAX`) is correctly excluded; `String`'s element is
+///    DEFINITIONALLY `u8` (non-ZST, byte-length capped at `isize::MAX`). A `Vec<T>`
+///    receiver is DELIBERATELY NOT accepted: the extractor ERASES the Vec buffer
+///    element to `NonNull<u8>` (modern `RawVecInner`) AND the Vec `Ty::Adt` name
+///    carries no turbofish, so `Vec<()>` is INDISTINGUISHABLE from `Vec<u8>` — bounding
+///    it would be UNSOUND (a `Vec<()>` len can exceed `isize::MAX`). Recovering the
+///    real Vec element is an extraction-side change, not a vcgen fact.
+///  * a single-static-assignment dest (a reassigned/decremented len carrier would go
+///    stale, exactly the `build_min_max_facts` SSA gate).
+pub(super) fn build_len_call_bound_facts(func: &VerifiableFunction) -> Vec<Formula> {
+    let mut facts = Vec::new();
+    for block in &func.body.blocks {
+        let Terminator::Call { func: callee, args, dest, .. } = &block.terminator else {
+            continue;
+        };
+        let anchored = callee.starts_with("core::slice::")
+            || callee.starts_with("std::slice::")
+            || callee.starts_with("alloc::string::")
+            || callee.starts_with("std::string::");
+        if !dest.projections.is_empty()
+            || args.len() != 1
+            || method_tail(callee) != "len"
+            || !anchored
+            || !is_single_static_assignment(func, dest.local)
+        {
+            continue;
+        }
+        // Receiver element must be provably NON-ZST for `len <= isize::MAX` to hold,
+        // AND its type must survive extraction faithfully. A `&[T]` slice carries the
+        // real `elem`; `String` is definitionally `u8`. A `Vec` receiver is EXCLUDED
+        // (buffer element erased to u8 -> `Vec<()>` unrecognizable) — see doc.
+        let recv_ty = crate::operand_ty_cow(func, &args[0]);
+        let inner = match recv_ty.as_deref() {
+            Some(Ty::Ref { inner, .. }) => inner.as_ref(),
+            Some(other) => other,
+            None => continue,
+        };
+        let elem_non_zst = match inner {
+            Ty::Slice { elem } => ty_is_definitely_non_zst(elem),
+            Ty::Adt { name, .. } => {
+                let base = name.split('<').next().unwrap_or(name);
+                base == "std::string::String" || base == "alloc::string::String"
+            }
+            _ => false,
+        };
+        if !elem_non_zst {
+            continue;
+        }
+        let dest_var = Formula::Var(crate::place_to_var_name(func, dest), Sort::Int);
+        facts.push(Formula::Ge(Box::new(dest_var.clone()), Box::new(Formula::Int(0))));
+        facts.push(Formula::Le(Box::new(dest_var), Box::new(Formula::Int(i64::MAX as i128))));
     }
     facts
 }
@@ -1090,7 +1162,14 @@ pub(super) fn clamp_upper_bound(func: &VerifiableFunction, local: usize) -> Opti
             return None; // a call also writes L
         }
     }
-    if defs.len() != 2 {
+    // `defs.len()` counts what THIS scan saw; `value_count` counts the local's VALUES,
+    // which for a PARAMETER includes the implicit ENTRY definition `body.blocks` never
+    // carries. A merged parameter (`fn f(mut k: usize, ..) { if v > C { k = C } else
+    // { k = v } .. }`) has three, and `min(v, C) <= C` is false of the entry one — the
+    // bound is emitted on the BARE name, so version-renaming would bind it there. For a
+    // non-parameter the two agree: the gather already refuses a projected store and a
+    // call dest, which are the only other things `value_count` counts.
+    if defs.len() != 2 || !crate::local_defs::value_count(func, local).is_exactly(2) {
         return None;
     }
     let (b0, rv0, g0) = defs[0];
@@ -1154,7 +1233,8 @@ pub(super) fn clamp_upper_bound(func: &VerifiableFunction, local: usize) -> Opti
         if !is_single_static_assignment(func, g) {
             continue;
         }
-        let Some(Rvalue::BinaryOp(op, lhs, rhs)) = crate::unique_whole_local_def(func, g) else {
+        let Some(Rvalue::BinaryOp(op, lhs, rhs)) = crate::local_defs::unique_value_def(func, g)
+        else {
             continue;
         };
         // lhs must be the SAME var `v`, rhs the SAME constant `C` as the clamp.
@@ -1256,7 +1336,7 @@ pub(super) fn unsigned_upper_bound(
         if mul { ua.checked_mul(ub) } else { ua.checked_add(ub) }
     };
     if take_field0 {
-        return match crate::unique_whole_local_def(func, p.local) {
+        return match crate::local_defs::unique_value_def(func, p.local) {
             Some(Rvalue::CheckedBinaryOp(BinOp::Add, a, b)) => bin(a, b, false),
             Some(Rvalue::CheckedBinaryOp(BinOp::Mul, a, b)) => bin(a, b, true),
             _ => None,
@@ -1264,7 +1344,7 @@ pub(super) fn unsigned_upper_bound(
     }
     let local_max = crate::place_ty(func, p).as_ref().and_then(ty_max);
     let cap = |v: i128| Some(local_max.map_or(v, |m| v.min(m)));
-    match crate::unique_whole_local_def(func, p.local) {
+    match crate::local_defs::unique_value_def(func, p.local) {
         Some(Rvalue::Cast(inner, to_ty)) => {
             let tmax = ty_max(to_ty)?;
             Some(unsigned_upper_bound(func, inner, fuel - 1).map_or(tmax, |a| a.min(tmax)))
@@ -1306,8 +1386,21 @@ pub(super) fn unsigned_upper_bound(
 /// than `dest`'s type range, so the OUTER operation that consumes `dest` (e.g. the
 /// `_5+_6` in `(a as u32)+(b as u32)+(c as u32)`) sees the real range rather than
 /// the loose `u32` type bound — the vcgen intermediate-bound-loss fix.
+///
+/// TWO EMISSION SITES, ONE THEOREM. The whole-local pass below names a computed
+/// local `_dst`; the field pass names the checked-op RESULT FIELD `_c.0` of
+/// `_c = CheckedBinaryOp(Add|Mul, a, b)` directly. Both ask
+/// [`unsigned_upper_bound`] the same question and both publish the same
+/// inequality — the field pass exists because a chained sum's SECOND and later
+/// adds read `_c.0` as an OPERAND with no intervening whole-local copy, so the
+/// whole-local pass has no place to hang the bound on and the outer add sees only
+/// the loose `0 ≤ _c.0 ≤ TYPE_MAX` type range. Measured on
+/// `(s0!=s1) as u32 + (s1!=s2) as u32 + (s2!=s3) as u32 + (s3!=s0) as u32`: the
+/// first add is kernel-certified and every later one comes back
+/// `overflow:add → runtime_checked`, because the pool holds `_6 ≤ 1`, `_8 ≤ 1`,
+/// `_10 ≤ 1` and `Le(_13.0, 4294967295)` but no tight fact about `_13.0` itself.
 pub(super) fn build_additive_bound_facts(func: &VerifiableFunction) -> Vec<Formula> {
-    use trust_types::{Place, Ty};
+    use trust_types::{Place, Projection, Ty};
     const FUEL: u32 = 16;
     let mut facts = Vec::new();
     for (local_idx, local) in func.body.locals.iter().enumerate() {
@@ -1316,7 +1409,7 @@ pub(super) fn build_additive_bound_facts(func: &VerifiableFunction) -> Vec<Formu
             continue;
         }
         // Only COMPUTED locals (those with a defining rvalue) get a derived bound.
-        if crate::unique_whole_local_def(func, local_idx).is_none() {
+        if crate::local_defs::unique_value_def(func, local_idx).is_none() {
             continue;
         }
         let place = Place { local: local_idx, projections: vec![] };
@@ -1329,6 +1422,66 @@ pub(super) fn build_additive_bound_facts(func: &VerifiableFunction) -> Vec<Formu
         }
         let var = Formula::Var(crate::place_to_var_name(func, &place), Sort::Int);
         facts.push(Formula::Le(Box::new(var), Box::new(Formula::Int(bound))));
+    }
+    // The checked-op RESULT FIELD `_c.0`. Same bound, same guard, named where the
+    // consuming operation actually reads it.
+    //
+    // SOUNDNESS — the emit guard IS the no-wrap proof, not a heuristic. Let `w` be
+    // the width of `_c.0` and `bound = ub(a) + ub(b)` (resp. `ub(a)·ub(b)`), computed
+    // in `i128` with `checked_{add,mul}` so an overflowing product declines outright.
+    // The machine semantics of `CheckedBinaryOp` are `_c.0 = (a ⊕ b) mod 2^w`, so a
+    // bound on the MATHEMATICAL result transfers to `_c.0` only when no wrap occurs.
+    // The fact is emitted ONLY when `bound < 2^w − 1`, hence `bound < 2^w`; with
+    // `a ≤ ub(a)` and `b ≤ ub(b)` that gives `a ⊕ b ≤ bound < 2^w`, so the modulus is
+    // inert and `_c.0 = a ⊕ b ≤ bound`. Exactly at the boundary (`bound = 2^w − 1`,
+    // e.g. `(x/2) + (y/2)` on `u8`) nothing is emitted, and above it the wrap is real
+    // — in both cases the outer operation keeps the loose type range and stays
+    // refutable. Fixture `o05_u8_boundary` is that case.
+    //
+    // NOT A NEW THEOREM. `unsigned_upper_bound`'s `take_field0` arm already returns
+    // this bound, and the whole-local pass above already publishes it whenever MIR
+    // happens to materialise a copy `_dst = move (_c.0)` (`Rvalue::Use` arm). This
+    // pass removes the dependence on that copy existing; the inequality, its
+    // derivation and its guard are unchanged.
+    //
+    // STABILITY GATES on the tuple local, both drop-only: `is_single_static_assignment`
+    // (one whole-local def, no field store, no `SetDiscriminant`/`Deinit`, no
+    // `&mut`/raw borrow, no call-dest write) and `value_local_is_unstable` (adds the
+    // `&mut _c` passed as a Call ARGUMENT channel). `unsigned_upper_bound` itself
+    // re-derives through `local_defs::unique_value_def`, so a second def declines anyway.
+    for block in &func.body.blocks {
+        for stmt in &block.stmts {
+            let Statement::Assign {
+                place: ck,
+                rvalue: Rvalue::CheckedBinaryOp(BinOp::Add | BinOp::Mul, _, _),
+                ..
+            } = stmt
+            else {
+                continue;
+            };
+            if !ck.projections.is_empty()
+                || !is_single_static_assignment(func, ck.local)
+                || crate::guards::value_local_is_unstable(func, ck.local)
+            {
+                continue;
+            }
+            let field0 = Place { local: ck.local, projections: vec![Projection::Field(0)] };
+            let Some(Ty::Int { width, signed: false }) = crate::place_ty(func, &field0) else {
+                continue;
+            };
+            if width >= 127 {
+                continue;
+            }
+            let Some(bound) = unsigned_upper_bound(func, &Operand::Copy(field0.clone()), FUEL)
+            else {
+                continue;
+            };
+            if bound >= (1i128 << width) - 1 {
+                continue;
+            }
+            let var = Formula::Var(crate::place_to_var_name(func, &field0), Sort::Int);
+            facts.push(Formula::Le(Box::new(var), Box::new(Formula::Int(bound))));
+        }
     }
     facts
 }
@@ -1430,7 +1583,7 @@ pub(crate) fn build_discriminant_cse_facts(func: &VerifiableFunction) -> Vec<For
             let owned_agg_field =
                 matches!(src.projections.as_slice(), [trust_types::Projection::Field(_)])
                     && matches!(
-                        crate::unique_whole_local_def(func, src.local),
+                        crate::local_defs::unique_value_def(func, src.local),
                         Some(Rvalue::Aggregate(..))
                     )
                     && crate::place_source_is_stable(func, src.local);
@@ -1470,10 +1623,45 @@ pub(crate) fn build_discriminant_cse_facts(func: &VerifiableFunction) -> Vec<For
 ///
 /// SOUNDNESS: the bound is the enum's OWN TYPE INVARIANT — every inhabitant of the
 /// enum carries a discriminant drawn EXACTLY from its variants' tags, so the
-/// membership disjunction is a TRUE fact about every value the read can produce. It
-/// can only delete IMPOSSIBLE counterexamples (a phantom tag matching no variant),
-/// never a real one (whose witness already carries a valid tag) and never a false
-/// PROVE: the OOB-index / div-by-zero canaries are violated even with EVERY
+/// membership disjunction is a TRUE fact about THE VALUE THE READ PRODUCES.
+///
+/// THAT IS A FACT ABOUT A VALUE, NOT ABOUT A LOCAL, and the two diverge the moment
+/// the local receiving it has a SECOND definition. The fact is emitted against a
+/// local's var name; `generate::safety` conjoins the global set into `vc.formula`
+/// BEFORE `conjoin_preconditions_versioned_recorded` version-renames the whole
+/// formula, so it is renamed in lockstep with the body and binds that block's
+/// TERMINAL version of the local EXACTLY — a version the discriminant read never
+/// produced. A branch merge then makes the membership FALSE of the value actually
+/// held, the path condition goes UNSAT, and everything on it is vacuously proved and
+/// kernel-certified.
+///
+/// LIVE FALSE PROVE at 70a7534fd1, on the CAST destination:
+///   `let d = if c { e as usize } else { b }; arr[d]`
+/// lowers to `bb1: _6 = Discriminant(_1); _5 = move _6 as u64` / `bb2: _5 = copy _3`,
+/// so the cast destination `_5` IS the merged local, `d ∈ {0,1}` bound it globally,
+/// and the always-out-of-bounds `arr[d]` at `d = 4` verified `1 proved, 0 failed`
+/// rc=0 while panicking on 58 of 132 swept inputs. Both destinations — the
+/// `Discriminant` dest and the `as`-cast dest — therefore carry
+/// `is_single_static_assignment`; `merged_enum_cast_index_still_refutes` is the row.
+///
+/// The SOURCE-keyed canonical name (`discriminant_formula_var_name`) needs no such
+/// gate and gets none: it denotes `src`'s discriminant, and every value `src` can
+/// ever hold is an inhabitant of the same enum, so the membership survives any
+/// reassignment of `src`.
+///
+/// GATING THE CAST DESTINATION IS NOT ENOUGH ON ITS OWN. The cast fact
+/// `(_5 as ToTy) ∈ {tags}` is a claim about the value `_5` holds, and `_5`'s value
+/// is the cast of `_6` — so it is true only if `_6` STILL holds the discriminant
+/// where the cast runs. A merged/reseated `_6` (bb1 `_6 = Discriminant(e)`, bb2
+/// `_6 = copy b`, bb3 `_5 = move _6 as u64`) makes `_5` arbitrary while `_5` itself
+/// is perfectly single-assignment, and the fact false-PROVES the `arr[_5]` bounds
+/// row. So the cast arm gates BOTH the cast dest AND the `Discriminant` dest it
+/// reads; `merged_disc_dest_cast_index_still_refutes` is the row.
+///
+/// With every destination on that chain gated the fact deletes only IMPOSSIBLE
+/// counterexamples (a phantom tag matching no variant), never a real one
+/// (whose witness already carries
+/// a valid tag): the OOB-index / div-by-zero canaries are violated even with EVERY
 /// discriminant in range, so this fact leaves them refuted. The tag set is the
 /// ACTUAL per-variant `VariantDef.discriminant` (or the positional `0..n` for a
 /// `Ty::Datatype`), NOT a `0..n-1` interval — a `#[repr]` enum with non-contiguous
@@ -1527,11 +1715,17 @@ pub(super) fn build_discriminant_variant_range_facts(func: &VerifiableFunction) 
             // Build `d ∈ {tags}` over the dest var name (default lane) AND the
             // canonical generated discriminant name (native CHC path). Either
             // name may be the one a VC references; the other is inert.
-            let dest_name = crate::place_to_var_name(func, dest);
+            //
+            // The DEST name is gated on single assignment (see the header): on a
+            // reassigned dest the fact binds a value the read never produced. The
+            // SOURCE-keyed canonical name is not — it names `src`'s discriminant,
+            // which is an inhabitant of this enum however often `src` is reseated.
             let discr_name =
                 crate::discriminant_formula_var_name(&crate::place_to_var_name(func, src));
-            let mut tag_var_sets: Vec<(String, Vec<i128>)> =
-                vec![(dest_name, tags.clone()), (discr_name, tags.clone())];
+            let mut tag_var_sets: Vec<(String, Vec<i128>)> = vec![(discr_name, tags.clone())];
+            if super::callee_summaries::is_single_static_assignment(func, dest.local) {
+                tag_var_sets.push((crate::place_to_var_name(func, dest), tags.clone()));
+            }
             // Trust (P0 enum-disc cast false REFUTATION, -full): the discriminant is
             // almost always CAST before use as an index — `arr[e as usize]` lowers to
             //   `_4 = Discriminant(e); _3 = move _4 as usize (IntToInt); arr[_3]`.
@@ -1558,7 +1752,50 @@ pub(super) fn build_discriminant_variant_range_facts(func: &VerifiableFunction) 
             // the SOURCE value equal to its declared tag under the repr (a negative
             // `repr(iN)` tag, whose `as usize` reinterprets the sign bit, is left to
             // the loose path — no fact, so no false refutation either way).
-            if tags.iter().all(|&t| t >= 0) {
+            //
+            // Trust (P0 raw-vs-NORMALIZED discriminant FALSE PROOF — the SECOND
+            // consumer of the `guards.rs::normalize_raw_discriminant` lesson, and the
+            // WORSE one: this fact is GLOBAL, conjoined by `build_global_invariant_facts`
+            // onto EVERY VC of the function). While `VariantDef::discriminant` still
+            // STORED the extractor's RAW BIT PATTERN — always non-negative in its `i128`
+            // carrier, `-1` under `#[repr(i8)]` arriving as `255` — the old
+            // `tags.iter().all(|&t| t >= 0)` gate was VACUOUS for every signed repr and
+            // the "negative tags take the loose path" promise two paragraphs above was
+            // never actually enforced. Live witness:
+            //
+            //     #[repr(i8)] enum E { A = 0, B = -1 }        // patterns {0, 255}
+            //     fn f(e: E, arr: &[u8; 256]) -> u8 { arr[e as usize] }
+            //
+            // the raw gate passed, the cast-destination fact `_3 ∈ {0, 255}` was emitted,
+            // and the bounds VC `_3 < 256` PROVED — while `E::B as usize` really is
+            // `0xFFFF_FFFF_FFFF_FFFF` and the index panics.
+            // `normalized_nonneg_tag_set` reinterprets each pattern as its TRUE SIGNED
+            // VALUE first (mirroring `guards.rs::normalize_raw_discriminant` and the
+            // native bridge's `normalize_disc`), so that enum's tag set is `{0, -1}`, the
+            // gate declines, and NO cast-destination fact is emitted — exactly the loose
+            // path this site already documents as its intent.
+            //
+            // PREMISE CORRECTED 2026-08-31 (this paragraph asserted the opposite as a
+            // LIVE convention, which is now false and is exactly the convention that
+            // would make the `guards.rs` signed->unsigned cast lane unsound). Since
+            // `b4fd4c0e43a` repair #1, extraction DECODES the tag at the single boundary
+            // (`trust_mir_extract::ty_convert`'s `decode_discr_tag_or_raw`), so
+            // `VariantDef::discriminant` — and therefore `enum_variant_tag_set`, and
+            // therefore the `dest`/`discr` facts above — carries the TRUE SIGNED tag,
+            // not the raw pattern. That is the correct fact and nothing here needs to
+            // change: `normalize_raw_discriminant` is IDEMPOTENT on an already-decoded
+            // value (`normalize(-1, 8, true) == -1`), so `normalized_nonneg_tag_set`
+            // gives the same verdict on either spelling. The RULE the old paragraph was
+            // reaching for still stands and is what must be preserved: NORMALIZE before
+            // any ORDER comparison on a declared discriminant, and never normalize an
+            // equality against a tag variable that carries whatever the tag facts carry
+            // (same split as `guards.rs`). DO NOT re-raw the tags to match this comment's
+            // former claim — `guards.rs`'s `Ite(Ge(c,0), c, c + 2^64)` cast relation
+            // would then take its POSITIVE arm on `_4 == 255` and false-PROVE
+            // `_d < 256`.
+            if let Some(normalized_tags) =
+                normalized_nonneg_tag_set(func, dest, src_ty.as_ref(), &tags)
+            {
                 for cast_block in &func.body.blocks {
                     for cast_stmt in &cast_block.stmts {
                         let Statement::Assign {
@@ -1576,14 +1813,29 @@ pub(super) fn build_discriminant_variant_range_facts(func: &VerifiableFunction) 
                             Operand::Copy(p) | Operand::Move(p)
                                 if p.local == dest.local && p.projections.is_empty()
                         );
+                        // The cast destination is gated on single assignment for
+                        // the same reason as the `Discriminant` dest, and it is the
+                        // destination the LIVE false PROVE went through (see the
+                        // header: `let d = if c { e as usize } else { b }`). The
+                        // `Discriminant` dest `dest.local` this cast READS is gated
+                        // too: a reseated `_6` makes `_5 = _6 as u64` arbitrary
+                        // however stable `_5` is (see the header).
                         if reads_disc
                             && cast_dest.projections.is_empty()
+                            && super::callee_summaries::is_single_static_assignment(
+                                func,
+                                cast_dest.local,
+                            )
+                            && super::callee_summaries::is_single_static_assignment(
+                                func, dest.local,
+                            )
                             && let Ty::Int { width: to_w, signed: to_s } = to_ty
                         {
-                            // Fold each tag through the destination type (mod 2^w +
-                            // sign reinterpretation); dedup — a narrowing cast can
-                            // collapse distinct tags onto one residue.
-                            let mut cast_tags: Vec<i128> = tags
+                            // Fold each NORMALIZED tag (the value the cast actually
+                            // reads) through the destination type (mod 2^w + sign
+                            // reinterpretation); dedup — a narrowing cast can collapse
+                            // distinct tags onto one residue.
+                            let mut cast_tags: Vec<i128> = normalized_tags
                                 .iter()
                                 .map(|&t| truncate_nonneg_tag_as_int(t, *to_w, *to_s))
                                 .collect();
@@ -1767,6 +2019,22 @@ fn selector_write_channel_is_unaccountable(func: &VerifiableFunction, local: usi
                 return true;
             }
         }
+        // A `Call` DESTINATION naming the selector. THIS ARM IS INERT TODAY AND NO TEST
+        // CAN KILL IT: `coroutine_resume_state_contract` tallies `Terminator::Call
+        // { dest }` itself and requires `writes == 1` while also requiring the entry
+        // `Discriminant` read, so a `Call` writing the selector is always a SECOND write
+        // and the contract declines before this belt runs. It is named anyway because
+        // the doc above scopes this predicate to "any write channel the counter provably
+        // cannot see", and a reader checking that scope against the code found `Call`
+        // missing and had to go read the recognizer to learn it was covered elsewhere.
+        // Naming it makes the belt readable on its own and stops the recognizer's tally
+        // from being the single point of failure for this channel. Monotone: it can only
+        // withdraw the fact, i.e. turn PROVE into FAIL, never the reverse.
+        if let Terminator::Call { dest, .. } = &block.terminator
+            && dest.local == local
+        {
+            return true;
+        }
         if let Terminator::Drop { place, .. } = &block.terminator
             && place.local == local
         {
@@ -1869,6 +2137,105 @@ pub(super) fn enum_variant_tag_set(ty: &Ty) -> Option<Vec<i128>> {
         }
         _ => None,
     }
+}
+
+/// The shared raw-discriminant normalizer, re-exported from `crate::guards` so the
+/// convention lives in ONE place. The two lanes previously carried byte-identical copies
+/// under a "MUST stay byte-identical" comment — a divergence hazard for exactly the
+/// soundness rule they encode: NORMALIZE before any ORDER comparison on a declared
+/// discriminant, and never normalize an equality against a tag variable that itself
+/// carries the raw pattern. The native bridge keeps its own `normalize_disc` /
+/// `sign_extend_raw_value` (`trust-ir-bridge` `lower.rs`) because it is a separate crate;
+/// keep those in sync with this one.
+use crate::guards::normalize_raw_discriminant;
+
+/// The `(width, signed)` carrier a `#[repr(iN)]`/`#[repr(uN)]` hint names.
+fn enum_repr_hint_width_signed(hint: trust_types::EnumReprHint) -> (u32, bool) {
+    use trust_types::EnumReprHint as H;
+    match hint {
+        H::U8 => (8, false),
+        H::U16 => (16, false),
+        H::U32 => (32, false),
+        H::U64 => (64, false),
+        H::I8 => (8, true),
+        H::I16 => (16, true),
+        H::I32 => (32, true),
+        H::I64 => (64, true),
+    }
+}
+
+/// Trust (P0 raw-vs-NORMALIZED discriminant FALSE PROOF): the enum's declared tag set as
+/// TRUE SIGNED VALUES, or `None` when the set may not be treated as non-negative.
+///
+/// `raw_tags` are the extractor's RAW BIT PATTERNS (`VariantDef::discriminant`), always
+/// non-negative in their `i128` carrier, so testing them for `>= 0` directly is VACUOUS.
+/// Each pattern is reinterpreted per the discriminant's own repr `(width, signed)` before
+/// the gate.
+///
+/// The repr is read from EVERY signal the model carries, and a tag is admitted only when
+/// ALL of them agree on ONE non-negative value:
+///   * the MIR discriminant temp's DECLARED type (`disc_dest`, the local the cast reads)
+///     — REQUIRED; a non-integer / unresolvable type declines outright. This is the
+///     signal `guards.rs` uses.
+///   * the enum's `#[repr]` hint, when the extractor captured one;
+///   * the layout tag / niche scalar's width+signedness, when a layout is present.
+/// Requiring AGREEMENT (not just "the first signal says non-negative") is what closes the
+/// widened-carrier variant of the same hole: an `isize` discriminant temp over a
+/// `repr(i8)` enum would sign-extend `255` at 64 bits and still look non-negative, but the
+/// `I8` repr signal reports `-1`, so the set is declined. Any disagreement, any negative,
+/// any missing/undecodable signal ⇒ `None` ⇒ NO cast-destination fact (fail-closed: a
+/// missed proof, never a false one).
+fn normalized_nonneg_tag_set(
+    func: &VerifiableFunction,
+    disc_dest: &Place,
+    enum_ty: &Ty,
+    raw_tags: &[i128],
+) -> Option<Vec<i128>> {
+    let mut candidates: Vec<(u32, bool)> = Vec::new();
+    // The value that is actually cast: the MIR discriminant temp.
+    let disc_ty = crate::place_ty_cow(func, disc_dest)?;
+    candidates.push((disc_ty.int_width()?, disc_ty.is_signed()));
+    if let Ty::Adt { faithful_enum_repr, enum_layout, .. } = enum_ty {
+        if let Some(Some(hint)) = faithful_enum_repr {
+            candidates.push(enum_repr_hint_width_signed(*hint));
+        }
+        if let Some(layout) = enum_layout {
+            // MERGE (b62 <- origin/main): `Untagged` is a variant this branch added to
+            // `EnumTagEncodingInfo`; upstream's match predates it. An untagged image
+            // carries NO tag lane at all, so there is no tag width/signedness to offer
+            // as a normalization candidate. FAIL CLOSED by contributing nothing: the
+            // candidate list keeps only the MIR discriminant temp's own width (and any
+            // faithful repr hint), and if that cannot normalize every raw tag to one
+            // agreed non-negative value the caller already returns `None`. Pushing a
+            // fabricated width here would be exactly the P0 enum-discriminant
+            // narrowing-cast false proof this function exists to prevent.
+            let hint = match &layout.encoding {
+                trust_types::EnumTagEncodingInfo::Direct { tag_ty, .. } => Some(*tag_ty),
+                trust_types::EnumTagEncodingInfo::Niche { niche_ty, .. } => Some(*niche_ty),
+                trust_types::EnumTagEncodingInfo::Untagged => None,
+            };
+            if let Some(hint) = hint {
+                candidates.push(enum_repr_hint_width_signed(hint));
+            }
+        }
+    }
+    let mut normalized = Vec::with_capacity(raw_tags.len());
+    for &raw in raw_tags {
+        let mut agreed: Option<i128> = None;
+        for &(width, signed) in &candidates {
+            let value = normalize_raw_discriminant(raw, width, signed);
+            if value < 0 {
+                return None;
+            }
+            match agreed {
+                None => agreed = Some(value),
+                Some(seen) if seen == value => {}
+                Some(_) => return None,
+            }
+        }
+        normalized.push(agreed?);
+    }
+    Some(normalized)
 }
 
 /// Trust (UNINHABITED MATCH ARM, false REFUTATION): [`enum_variant_tag_set`]
@@ -2166,7 +2533,7 @@ pub(super) fn checked_self_decrement_const(
     t: usize,
 ) -> Option<i128> {
     let Some(Rvalue::CheckedBinaryOp(trust_types::BinOp::Sub, lhs, rhs)) =
-        crate::unique_whole_local_def(func, t)
+        crate::local_defs::unique_value_def(func, t)
     else {
         return None;
     };

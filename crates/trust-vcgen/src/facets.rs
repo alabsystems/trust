@@ -117,7 +117,13 @@ pub fn scan_structural_facets_with_callees(
     // whitelisted ops below can be trusted to cover — v1 maps any escape to
     // ALL facets rather than pretending a finer taxonomy exists yet.
     for local in &func.body.locals {
-        if !ty_in_scalar_fragment(&local.ty) {
+        // A local the CONTRACT lowering injected is not a step of the body:
+        // see `facet_inference::is_contract_injected_ty`. Without this,
+        // writing a closure-form `ensures` removed the function's own
+        // admissibility.
+        if !local_ty_in_fragment(&local.ty, local.index, func.body.arg_count)
+            && !trust_types::facet_inference::is_contract_injected_ty(&local.ty, &func.def_path)
+        {
             let who = local
                 .name
                 .as_deref()
@@ -184,6 +190,29 @@ pub fn scan_structural_facets_with_callees(
     }
 }
 
+/// The per-local type gate: [`ty_in_scalar_fragment`] for every local, plus —
+/// at a source PARAMETER position only — an all-scalar struct.
+///
+/// The struct predicate is IMPORTED from `trust_types::facet_inference`, the
+/// authority-grade validator this scan is intersected with, rather than
+/// restated here. Two copies of the same rule is how the diagnostic lane and
+/// the authority lane drift apart: this scan would then report `NotEstablished`
+/// for a body the compiler admits, which reads as a coverage gap that does not
+/// exist. One definition, one meaning.
+fn local_ty_in_fragment(ty: &Ty, index: usize, arg_count: usize) -> bool {
+    ty_in_scalar_fragment(ty)
+        || ((1..=arg_count).contains(&index)
+            && trust_types::facet_inference::ty_is_scalar_struct(ty))
+        // Checked-arithmetic widening: the RETURN SLOT may be the pinned std
+        // `Option<iN>` shape (the predicate is imported from the authority
+        // validator — one definition, one meaning; see the struct rule above).
+        || (index == 0 && trust_types::facet_inference::ty_is_std_option_of_signed(ty).is_some())
+        // …and it may be an ALL-SCALAR STRUCT, which is what a per-term rule
+        // step returns (`Term { coeff, lit }`). Same imported predicate as the
+        // parameter rule above, so the two positions cannot drift apart.
+        || (index == 0 && trust_types::facet_inference::ty_is_scalar_struct(ty))
+}
+
 fn ty_in_scalar_fragment(ty: &Ty) -> bool {
     match ty {
         Ty::Bool | Ty::Int { .. } | Ty::PtrSizedInt { .. } | Ty::Char | Ty::Unit => true,
@@ -243,6 +272,28 @@ fn statement_violation(stmt: &Statement) -> Option<Violation> {
                         Some(Violation::all("operand outside the v1 fragment".to_string()))
                     }
                 }
+                // Constructing a std `Option` value (checked-arithmetic
+                // widening): value-total and effect-free — the aggregate
+                // writes only its destination. The diagnostic lane checks the
+                // coarse shape (the std Option ADT, no active field, at most
+                // one fragment operand); the audited firewall
+                // (`facet_inference`) supplies the exact destination-typed
+                // variant/payload validation this scan cannot see here.
+                // Constructing an ADT value: value-total and effect-free -- the
+                // aggregate writes only its destination. Covers the std
+                // `Option` of the checked-arithmetic widening AND a plain
+                // struct such as `Term { coeff, lit }`, which is the shape
+                // every mapping rule's per-term step builds. This diagnostic
+                // lane checks the coarse shape only (an ADT, no active field --
+                // a union field-write aliases its siblings -- and every operand
+                // inside the fragment); the audited firewall
+                // (`facet_inference::rvalue_matches_ty`) supplies the exact
+                // destination-typed variant/field validation this scan cannot
+                // see here, and refuses enums outright.
+                Rvalue::Aggregate(
+                    trust_types::AggregateKind::Adt { active_field: None, .. },
+                    ops,
+                ) if ops.iter().all(operand_in_fragment) => None,
                 other => {
                     Some(Violation::all(format!("rvalue outside the v1 whitelist: {other:?}")))
                 }
@@ -297,6 +348,10 @@ fn terminator_violation(
             if certified_callees.contains(callee.as_str())
                 || callee.starts_with(trust_types::TRUST_RUSTC_INTRINSIC_PATH_PREFIX)
                 || trust_types::RustcTotalPrimitiveMethod::classify(callee).is_some()
+                // A compiler-marked overflow-CHECKED signed primitive method
+                // (Shape A of the checked-arithmetic lane) — pure, total,
+                // deterministic, panic-free as a function into `Option`.
+                || trust_types::RustcCheckedPrimitiveMethod::classify(callee).is_some()
             {
                 None
             } else {
@@ -715,6 +770,152 @@ mod tests {
         f.body.locals[1].ty = Ty::Ref { mutable: true, inner: Box::new(Ty::u64()) };
         let scan = scan_structural_facets(&f);
         assert!(!scan.pure.is_established(), "&mut param can never scan Pure");
+    }
+
+    /// Checked-arithmetic widening: on the measured `-O` Shape-B diamond
+    /// (with a MARKED cold_path hint) the compiler scan establishes
+    /// Pure/Deterministic/NoPanic; its `detect_loops` HEURISTIC (block-id
+    /// order) mis-reads the extraction's arm→join edges (ids 3/4 → 1) as a
+    /// back-edge and leaves Total un-established — a DIAGNOSTIC-lane
+    /// under-claim only, because admission reads the COMPOSED table, whose
+    /// authority half (`facet_inference`, a real DFS) certifies Total and
+    /// promotes the record. This test pins that exact split so a future
+    /// "fix" cannot silently flip either lane. The bare cold_path spelling
+    /// stays declined in both lanes.
+    #[test]
+    fn checked_diamond_scan_matches_the_audit() {
+        let int = || Ty::Int { width: 64, signed: true };
+        let option = trust_types::Ty::adt_enum_with_disc_safety(
+            "core::option::Option",
+            vec![
+                trust_types::VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                trust_types::VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), int())],
+                },
+            ],
+            true,
+        );
+        let agg = |variant: usize| trust_types::AggregateKind::Adt {
+            name: "core::option::Option".into(),
+            variant,
+            active_field: None,
+            args: Some("core::option::Option<i64>".into()),
+        };
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let diamond = |cold_callee: &str| {
+            func_with(
+                vec![
+                    LocalDecl { index: 0, ty: option.clone(), name: None },
+                    LocalDecl { index: 1, ty: int(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: int(), name: Some("b".into()) },
+                    LocalDecl { index: 3, ty: int(), name: None },
+                    LocalDecl { index: 4, ty: Ty::Bool, name: None },
+                    LocalDecl { index: 5, ty: Ty::Tuple(vec![int(), Ty::Bool]), name: None },
+                    LocalDecl { index: 6, ty: Ty::Unit, name: None },
+                ],
+                vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![
+                            assign(
+                                Place::local(5),
+                                Rvalue::CheckedBinaryOp(
+                                    BinOp::Add,
+                                    Operand::Copy(Place::local(1)),
+                                    Operand::Copy(Place::local(2)),
+                                ),
+                            ),
+                            assign(
+                                Place::local(3),
+                                Rvalue::Use(Operand::Copy(Place::field(5, 0))),
+                            ),
+                            assign(
+                                Place::local(4),
+                                Rvalue::Use(Operand::Copy(Place::field(5, 1))),
+                            ),
+                        ],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Copy(Place::local(4)),
+                            targets: vec![(0, BlockId(4))],
+                            otherwise: BlockId(2),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            func: cold_callee.to_string(),
+                            callee_identity: None,
+                            args: vec![],
+                            dest: Place::local(6),
+                            target: Some(BlockId(3)),
+                            span: SourceSpan::default(),
+                            atomic: None,
+                            is_foreign: false,
+                            is_unsafe_sig: false,
+                            unwind: trust_types::UnwindEdge::Unreachable,
+                        },
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![assign(Place::local(0), Rvalue::Aggregate(agg(0), vec![]))],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                    BasicBlock {
+                        id: BlockId(4),
+                        stmts: vec![assign(
+                            Place::local(0),
+                            Rvalue::Aggregate(agg(1), vec![Operand::Copy(Place::local(3))]),
+                        )],
+                        terminator: Terminator::Goto(BlockId(1)),
+                    },
+                ],
+                2,
+                option.clone(),
+            )
+        };
+        let marked = diamond("@trust-rustc-intrinsic::core::intrinsics::cold_path");
+        let scan = scan_structural_facets(&marked);
+        assert!(scan.pure.is_established(), "{:?}", scan.pure);
+        assert!(scan.deterministic.is_established(), "{:?}", scan.deterministic);
+        assert!(scan.no_panic.is_established(), "{:?}", scan.no_panic);
+        // The id-order loop heuristic's known under-claim on this numbering.
+        match &scan.total {
+            FacetFinding::NotEstablished { reason } => {
+                assert!(reason.contains("back-edge"), "{reason}")
+            }
+            other => panic!(
+                "if the scan now establishes Total here, detect_loops learned real \
+                 back-edge detection — update this pin deliberately: {other:?}"
+            ),
+        }
+        // The AUTHORITY half certifies all four — that is what the composed
+        // table promotes from, so the body is admissible end to end.
+        let audited = audited_facets(&marked);
+        assert!(
+            audited.pure && audited.total && audited.deterministic && audited.no_panic,
+            "the audited analysis must certify the marked checked diamond: {audited:?}"
+        );
+        assert_scan_is_audited_subset(&marked, "checked diamond (marked)");
+
+        // The bare, source-spellable cold_path has no authenticated identity:
+        // both lanes must decline.
+        let bare = diamond("core::intrinsics::cold_path");
+        let scan = scan_structural_facets(&bare);
+        assert!(
+            !scan.pure.is_established() && !scan.total.is_established(),
+            "an unmarked cold_path callee must decline"
+        );
+        assert_scan_is_audited_subset(&bare, "checked diamond (bare)");
     }
 
     #[test]

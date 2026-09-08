@@ -109,6 +109,7 @@ fn term_ty() -> Ty {
         disc_index_safe: false,
         faithful_enum_repr: None,
         enum_layout: None,
+        arbitrary_precision: None,
     }
 }
 

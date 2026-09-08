@@ -66,7 +66,14 @@ impl IntoParigotNum for usize {
         let mut ret = abs!(2, Var(1));
 
         for _ in 0..self {
-            ret = abs!(2, app!(Var(2), ret.clone(), ret.unabs().and_then(|r| r.unabs()).unwrap()));
+            ret = abs!(
+                2,
+                app!(
+                    Var(2),
+                    ret.clone(),
+                    ret.unabs().and_then(|r| r.unabs()).unwrap()
+                )
+            );
         }
 
         ret
@@ -117,7 +124,11 @@ impl IntoSignedNum for i32 {
             Binary => panic!("signed binary numbers are not supported"),
         };
 
-        if self > 0 { tuple!(numeral, abs!(2, Var(1))) } else { tuple!(abs!(2, Var(1)), numeral) }
+        if self > 0 {
+            tuple!(numeral, abs!(2, Var(1)))
+        } else {
+            tuple!(abs!(2, Var(1)), numeral)
+        }
     }
 }
 
@@ -129,7 +140,11 @@ macro_rules! impl_pair {
             U: $trait_name,
         {
             fn $function_name(self) -> Term {
-                abs(app!(Var(1), (self.0).$function_name(), (self.1).$function_name()))
+                abs(app!(
+                    Var(1),
+                    (self.0).$function_name(),
+                    (self.1).$function_name()
+                ))
             }
         }
     };

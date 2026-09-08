@@ -449,8 +449,12 @@ pub fn extract_enum_step_machine(
                 }
             }
         }
-        if def_count != 1 {
-            return false; // not a single-assignment temp — conservatively decline
+        // Not a single-VALUED temp — conservatively decline. The second conjunct is
+        // the ENTRY definition a PARAMETER carries, which this scan cannot see: `mut
+        // x` written once here would otherwise resolve to the written operand on the
+        // edge that still holds the incoming argument. `local_defs` owns that count.
+        if def_count != 1 || !crate::local_defs::body_has_one_explicit_def(body, place.local) {
+            return false;
         }
         match def {
             Some(Operand::Copy(p) | Operand::Move(p)) => {

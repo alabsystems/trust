@@ -1369,16 +1369,61 @@ fn an_inclusive_range_is_counted_end_minus_start_plus_one() {
 #[test]
 fn a_symbolic_inclusive_range_adds_one_to_the_span() {
     // `(0..=n).collect()` with `n` an argument, so `end` is a symbol.
-    let symbolic = |adt_name: &str, ops: Vec<Operand>| {
-        let mut f = range_collect_bundle(adt_name, ops);
-        f.body.locals.push(LocalDecl { index: 2, ty: Ty::u32(), name: Some("n".into()) });
-        f.body.arg_count = 1;
-        f
+    //
+    // The PARAMETER is `_1` and the range is the BODY TEMP `_2`. MIR numbers the
+    // parameters `1..=arg_count`, so the earlier spelling — `range_collect_bundle`
+    // (range at `_1`) with `arg_count = 1` bolted on — made the RANGE the argument
+    // and `n` a non-parameter local: the opposite of what the test says, and a shape
+    // `alloc_vcs::local_def` now declines outright (a parameter's aggregate `Assign`
+    // is its SECOND value, and the count it derives becomes the obligation's count).
+    let symbolic = |adt_name: &str, ops: Vec<Operand>| VerifiableFunction {
+        name: "count".to_string(),
+        def_path: "user::count".to_string(),
+        span: SourceSpan::default(),
+        body: VerifiableBody {
+            locals: vec![
+                LocalDecl { index: 0, ty: adt("alloc::vec::Vec<u8>"), name: None },
+                LocalDecl { index: 1, ty: Ty::u32(), name: Some("n".into()) },
+                LocalDecl { index: 2, ty: adt(adt_name), name: Some("r".into()) },
+            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                stmts: vec![Statement::Assign {
+                    place: Place::local(2),
+                    rvalue: Rvalue::Aggregate(
+                        AggregateKind::Adt {
+                            name: adt_name.to_string(),
+                            variant: 0,
+                            active_field: None,
+                            args: None,
+                        },
+                        ops,
+                    ),
+                    span: SourceSpan::default(),
+                }],
+                terminator: call(
+                    &format!(
+                        "<{adt_name} as core::iter::traits::iterator::Iterator>\
+                         ::collect::<alloc::vec::Vec<u8>>::<__trust_elem_bytes@1>"
+                    ),
+                    vec![Operand::Move(Place::local(2))],
+                    0,
+                    None,
+                ),
+            }],
+            arg_count: 1,
+            return_ty: adt("alloc::vec::Vec<u8>"),
+            datatype_defs: Default::default(),
+        },
+        contracts: vec![],
+        preconditions: vec![],
+        postconditions: vec![],
+        spec: Default::default(),
     };
-    let end = Operand::Copy(Place::local(2));
+    let end = Operand::Copy(Place::local(1));
 
     let exclusive = symbolic("core::ops::range::Range<i32>", vec![int(0), end.clone()]);
-    let excl_count = iter_collect_count(&exclusive, &Operand::Move(Place::local(1)));
+    let excl_count = iter_collect_count(&exclusive, &Operand::Move(Place::local(2)));
     assert!(
         matches!(excl_count, Some(Formula::Sub(..))),
         "planted violation is gone: the exclusive arm no longer emits the bare span, so the \
@@ -1386,7 +1431,7 @@ fn a_symbolic_inclusive_range_adds_one_to_the_span() {
     );
 
     let inclusive = symbolic(RANGE_INCLUSIVE_ADT, vec![int(0), end, int(0)]);
-    let incl_count = iter_collect_count(&inclusive, &Operand::Move(Place::local(1)));
+    let incl_count = iter_collect_count(&inclusive, &Operand::Move(Place::local(2)));
     match incl_count {
         Some(Formula::Add(span, one)) => {
             assert!(matches!(*span, Formula::Sub(..)), "the inclusive count is span + 1");

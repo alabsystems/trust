@@ -21,10 +21,13 @@
 //   * environment failure or a fresh `admit_lowering` refusal on a REGISTRY def
 //     is FATAL at the registry span — the "environment disagrees with itself"
 //     class; silence there would fail open;
-//   * a `trust-clean-ir` capability refusal (`CleanIrRefusal`) is a
+//   * a `trust-clean-ir` capability refusal (`CleanIrRefusal`) is normally a
 //     SKIP-WITH-REASON row — a lane that produces no binary must never fail a
-//     compilation the MIR lane completes. The refusal `Display` carries its
-//     fix options (v7/D3).
+//     compilation the MIR lane completes. W2's already-targeted WrappingBinOp
+//     population is the bounded exception: signature lowering, Function
+//     emission, or carrier-gate refusal is a compiler self-disagreement and is
+//     fatal, never rerouted through the general lane. The refusal `Display`
+//     carries its fix options (v7/D3) for every non-target shape.
 //
 // The caller (`rustc_interface::passes`) invokes this ONLY when verification is
 // enabled: on verification-off artifact lanes there is deliberately no demand
@@ -38,7 +41,9 @@ use trust_thir_lower::clean_origin_join::{
     GeneralRow,
 };
 
-use crate::clean_origin_mir::{clean_crate_environment, clean_origin_defs, clean_origin_registry_entry};
+use crate::clean_origin_mir::{
+    clean_crate_environment, clean_origin_defs, clean_origin_registry_entry,
+};
 
 /// Collect the trust-ir spelling of every Clean-origin def in this crate,
 /// re-earning the kernel faithfulness verdict per def.
@@ -120,9 +125,8 @@ pub fn collect_clean_origin_ir(tcx: TyCtxt<'_>) -> Vec<CleanOriginIrOutcome> {
         // callee def_paths (`with_no_trimmed_paths`), or IR-5's edge matching
         // silently finds nothing (fail-closed, but the lane looks landed while
         // linking nothing).
-        let def_path = rustc_middle::ty::print::with_no_trimmed_paths!(
-            tcx.def_path_str(def.to_def_id())
-        );
+        let def_path =
+            rustc_middle::ty::print::with_no_trimmed_paths!(tcx.def_path_str(def.to_def_id()));
 
         // Side A, re-planned from the kernel environment (fresh, independent
         // of the provider run's plan).
@@ -178,6 +182,43 @@ pub fn collect_clean_origin_ir(tcx: TyCtxt<'_>) -> Vec<CleanOriginIrOutcome> {
                     FuncTyId::new(0),
                 ) {
                     Ok(function) => {
+                        // W2 carrier gate: this exact bounded shape may no longer
+                        // escape on the historical kernel-TV/ungated rung. The
+                        // independent production reflector reads `function`
+                        // itself (not the sealed shape's operands), rebuilds a
+                        // Clean term, and asks the kernel for whole-term defeq.
+                        // A targeted refusal is an internal wrong-code signal:
+                        // fatal here, never converted to a skip or weaker tier.
+                        let gate = if matches!(
+                            plan.shape(),
+                            trust_clean_origin::CleanOriginShape::WrappingBinOp { .. }
+                        ) {
+                            Some(
+                                trust_clean_ir_gate::admit_wrapping_binop(
+                                    env,
+                                    &plan,
+                                    def_index,
+                                    &def_path,
+                                    &signature,
+                                    &function,
+                                )
+                                .unwrap_or_else(|refusal| {
+                                    tcx.dcx().span_fatal(
+                                        span,
+                                        format!(
+                                            "internal: the independently reflected TrustIR body \
+                                             for targeted Clean wrapping-binop `{name}` was refused \
+                                             at the carrier gate ({}). This body is never demoted to \
+                                             kernel-tv or structural evidence; report the compiler \
+                                             disagreement.",
+                                            refusal.note()
+                                        ),
+                                    )
+                                }),
+                            )
+                        } else {
+                            None
+                        };
                         let (tv, tv_note) =
                             mint_kernel_tv(env, &name, shape, &signature, &function);
                         out.push(CleanOriginIrOutcome::Emitted(CleanOriginIrRecord {
@@ -187,26 +228,47 @@ pub fn collect_clean_origin_ir(tcx: TyCtxt<'_>) -> Vec<CleanOriginIrOutcome> {
                             shape,
                             signature,
                             function,
+                            gate,
                             tv,
                             tv_note,
                         }))
                     }
-                    Err(refusal) => out.push(CleanOriginIrOutcome::Skipped(CleanOriginIrSkip {
-                        def_index,
-                        def_path,
-                        clean_name: name,
-                        shape,
-                        reason: refusal.to_string(),
-                    })),
+                    Err(refusal) => {
+                        let reason = trust_ir_precursor_refusal(
+                            tcx,
+                            span,
+                            &plan,
+                            &name,
+                            "function-emission",
+                            refusal.to_string(),
+                        );
+                        out.push(CleanOriginIrOutcome::Skipped(CleanOriginIrSkip {
+                            def_index,
+                            def_path,
+                            clean_name: name,
+                            shape,
+                            reason,
+                        }))
+                    }
                 }
             }
-            Err(refusal) => out.push(CleanOriginIrOutcome::Skipped(CleanOriginIrSkip {
-                def_index,
-                def_path,
-                clean_name: name,
-                shape,
-                reason: refusal.to_string(),
-            })),
+            Err(refusal) => {
+                let reason = trust_ir_precursor_refusal(
+                    tcx,
+                    span,
+                    &plan,
+                    &name,
+                    "signature-lowering",
+                    refusal.to_string(),
+                );
+                out.push(CleanOriginIrOutcome::Skipped(CleanOriginIrSkip {
+                    def_index,
+                    def_path,
+                    clean_name: name,
+                    shape,
+                    reason,
+                }))
+            }
         }
     }
     // The general lane covers what the planner did NOT emit. An EMITTED name
@@ -225,6 +287,32 @@ pub fn collect_clean_origin_ir(tcx: TyCtxt<'_>) -> Vec<CleanOriginIrOutcome> {
         out.push(CleanOriginIrOutcome::General(general));
     }
     out
+}
+
+/// Preserve the historical skip-with-reason behavior outside W2, but make
+/// every precursor refusal fatal once the sealed plan identifies the bounded
+/// WrappingBinOp population. Calling this helper from BOTH lowering Err arms is
+/// a source-pinned part of the gate: a target may never fall through into the
+/// general recorder after signature or Function emission disagrees.
+fn trust_ir_precursor_refusal(
+    tcx: TyCtxt<'_>,
+    span: rustc_span::Span,
+    plan: &trust_clean_origin::CleanOriginPlan,
+    clean_name: &str,
+    stage: &'static str,
+    detail: String,
+) -> String {
+    if matches!(plan.shape(), trust_clean_origin::CleanOriginShape::WrappingBinOp { .. }) {
+        tcx.dcx().span_fatal(
+            span,
+            format!(
+                "internal: targeted Clean wrapping-binop `{clean_name}` refused during TrustIR \
+                 {stage} ({detail}). This targeted disagreement is fatal and is never recorded \
+                 as a skip, rerouted to the general lane, or demoted; report the compiler bug."
+            ),
+        );
+    }
+    detail
 }
 
 /// A stable, short tag for the plan's shape, for coverage rows. Deliberately a
@@ -291,57 +379,71 @@ fn mint_kernel_tv(
     match shape {
         "projection" | "constant-uint" | "wrapping-binop" | "composed" => {}
         "raw-binop" => {
-            return (None, Some(
-                "kernel-tv not attempted: the denotation fragment has no Nat rule for \
+            return (
+                None,
+                Some(
+                    "kernel-tv not attempted: the denotation fragment has no Nat rule for \
                  BinOp::And/Or — Fragment-2 covers Add/Sub/Mul only (clean-reflect \
                  denote_binop, fail-closed) and trust-ir-build's clean_backend_tv mirror \
                  matches it. Options: (1) extend BOTH denotation copies in one increment \
                  with a bitwise Nat vocabulary plus probes-first kernel-agreement evidence; \
                  (2) rely on the MIR lane's admit_lowering, which already gates this shape \
                  at the carrier; (3) leave the row structural."
-                    .to_string(),
-            ));
+                        .to_string(),
+                ),
+            );
         }
-        "select" | "select-literal" | "select-operands" | "select-beq"
-        | "select-beq-general" => {
-            return (None, Some(
-                "kernel-tv not attempted: this shape is emitted as a value-producing \
+        "select" | "select-literal" | "select-operands" | "select-beq" | "select-beq-general" => {
+            return (
+                None,
+                Some(
+                    "kernel-tv not attempted: this shape is emitted as a value-producing \
                  Inst::Select in one block, and the denotation fragment's only conditional \
                  form is the Fragment-3a CondBr diamond — Inst::Select has no denotation \
                  rule and is refused fail-closed. Options: (1) add a select rule denoting \
                  to the existing Bool.rec piecewise vocabulary to BOTH denotation copies in \
                  one increment; (2) re-spell the emission as the CondBr diamond the \
                  fragment already denotes; (3) leave the row structural."
-                    .to_string(),
-            ));
+                        .to_string(),
+                ),
+            );
         }
         "inductive-projection" => {
-            return (None, Some(
-                "kernel-tv not attempted: the SOURCE side is a recursive definition whose \
+            return (
+                None,
+                Some(
+                    "kernel-tv not attempted: the SOURCE side is a recursive definition whose \
                  projection-equality rests on an induction proof, and Eq.refl definitional \
                  equality cannot decide extensional equality — a source-side exclusion, \
                  not a walker gap. Options: keep faithfulness at the MIR lane's \
                  induction-backed gate; leave the row structural."
-                    .to_string(),
-            ));
+                        .to_string(),
+                ),
+            );
         }
         "structural-nat-rec" | "well-founded-nat-rec" => {
-            return (None, Some(
-                "kernel-tv unreachable: the shape is a recording-path skip already (the \
+            return (
+                None,
+                Some(
+                    "kernel-tv unreachable: the shape is a recording-path skip already (the \
                  recursion computes at unbounded Nat and needs a NatRuntime), and the \
                  Nat-mod-2^w vocabulary cannot state an unbounded computation. Options: \
                  land the design's §6.4 Nat-runtime modelling first; keep faithfulness at \
                  the MIR lane's kernel recursion gates."
-                    .to_string(),
-            ));
+                        .to_string(),
+                ),
+            );
         }
         other => {
-            return (None, Some(format!(
-                "kernel-tv not attempted: shape `{other}` has no TV disposition recorded \
+            return (
+                None,
+                Some(format!(
+                    "kernel-tv not attempted: shape `{other}` has no TV disposition recorded \
                  — a new shape must decide its denotation story explicitly. Options: add \
                  the shape to the mint pre-filter with its fragment argument, or leave \
                  the row structural."
-            )));
+                )),
+            );
         }
     }
 
@@ -359,45 +461,56 @@ fn mint_kernel_tv(
     let lhs = match clean_reflect::denote_function(&mini, function_ref) {
         Ok(denotation) => denotation,
         Err(refusal) => {
-            return (None, Some(format!(
-                "kernel-tv not attempted: the emitted function is outside the denotation \
+            return (
+                None,
+                Some(format!(
+                    "kernel-tv not attempted: the emitted function is outside the denotation \
                  fragment ({refusal:?}). Options: widen BOTH denotation copies in one \
                  increment, or leave the row structural (mixed-width signatures are the \
                  common cause — the TV walker requires one uniform width, which the MIR \
                  gate does not)."
-            )));
+                )),
+            );
         }
     };
     if !lhs.callees.is_empty() {
-        return (None, Some(
-            "kernel-tv not attempted: the emitted function carries call edges, and this \
+        return (
+            None,
+            Some(
+                "kernel-tv not attempted: the emitted function carries call edges, and this \
              mint covers the call-free fragment only. Options: extend the mint to \
              Fragment-3b callee grounding, or leave the row structural."
-                .to_string(),
-        ));
+                    .to_string(),
+            ),
+        );
     }
 
     // The source side: the declaration's ORIGINAL kernel definition — the same
     // provenance-gated value the plan pipeline reads.
     let kernel_name = clean_kernel::Name::from_string(clean_name);
-    let Some(defn) = env.get_const(&kernel_name).and_then(|constant| constant.value.clone())
-    else {
-        return (None, Some(
-            "kernel-tv not attempted: the kernel environment holds no definition value \
+    let Some(defn) = env.get_const(&kernel_name).and_then(|constant| constant.value.clone()) else {
+        return (
+            None,
+            Some(
+                "kernel-tv not attempted: the kernel environment holds no definition value \
              for this declaration at the mint seam — a state the plan pipeline gates \
              against, so report this if seen. The row stays structural."
-                .to_string(),
-        ));
+                    .to_string(),
+            ),
+        );
     };
     let records = clean_reflect::RecordVocab::from_module(&mini);
     let rhs = match clean_reflect::denote_source(&defn, lhs.width, &lhs.callees, &records) {
         Ok(denotation) => denotation,
         Err(refusal) => {
-            return (None, Some(format!(
-                "kernel-tv not attempted: the kernel definition is outside the source \
+            return (
+                None,
+                Some(format!(
+                    "kernel-tv not attempted: the kernel definition is outside the source \
                  denotation fragment ({refusal:?}). Options: widen BOTH denotation \
                  copies' source recognition in one increment, or leave the row structural."
-            )));
+                )),
+            );
         }
     };
 
@@ -420,11 +533,14 @@ fn mint_kernel_tv(
     ) {
         (Ok(term), Ok(context)) => (term, context),
         (Err(reason), _) | (_, Err(reason)) => {
-            return (None, Some(format!(
-                "kernel-tv not attempted: certificate payload failed to serialize \
+            return (
+                None,
+                Some(format!(
+                    "kernel-tv not attempted: certificate payload failed to serialize \
                  ({reason}). Report this — the payload codec refusing a fragment term \
                  is a codec bound, not a program property."
-            )));
+                )),
+            );
         }
     };
 
@@ -456,10 +572,7 @@ fn mint_kernel_tv(
             }),
         },
     };
-    (
-        Some(trust_thir_lower::clean_origin_join::CleanTvMint { obligation, certificate }),
-        None,
-    )
+    (Some(trust_thir_lower::clean_origin_join::CleanTvMint { obligation, certificate }), None)
 }
 
 // ── the GENERAL Clean lane (totality campaign) ──────────────────────────────
@@ -550,10 +663,8 @@ fn collect_general_clean_ir(
                 batch.push(decl);
                 batch_names.push(name);
             }
-            Ok(None) => rows.push(GeneralRow {
-                clean_name: name,
-                outcome: GeneralOutcome::NotComputational,
-            }),
+            Ok(None) => rows
+                .push(GeneralRow { clean_name: name, outcome: GeneralOutcome::NotComputational }),
             Err(error) => rows.push(GeneralRow {
                 clean_name: name,
                 outcome: GeneralOutcome::Skipped {
@@ -576,10 +687,7 @@ fn collect_general_clean_ir(
     // declarations (RuntimeLowering::ExternCalls), disclosed by presence.
     let target = &tcx.sess.target;
     let emit_config = clean_compiler::emit_trust_ir::TrustIrConfig {
-        module_name: format!(
-            "clean-general::{}",
-            tcx.crate_name(rustc_span::def_id::LOCAL_CRATE)
-        ),
+        module_name: format!("clean-general::{}", tcx.crate_name(rustc_span::def_id::LOCAL_CRATE)),
         use_clean_dialect: false,
         runtime_lowering: clean_compiler::emit_trust_ir::RuntimeLowering::ExternCalls,
         // Mirrors `crate_module::stamp_target_info_if_vacuous` exactly — the

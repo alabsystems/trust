@@ -32,7 +32,11 @@
 set -uo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 FIX="$REPO_ROOT/tests/self-proof/strict-pass-frontier"
-TARGO="${TARGO:-$REPO_ROOT/build/aarch64-apple-darwin/stage1/bin/targo}"
+# Trust: `build/host` symlinks to `build/<host-triple>`, so this resolves on every
+# platform. Naming `aarch64-apple-darwin` literally made this line dead on any
+# non-Apple host (measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
+# directory does not exist). The env/arg override above is unchanged.
+TARGO="${TARGO:-$REPO_ROOT/build/host/stage1/bin/targo}"
 
 if [ ! -x "$TARGO" ]; then
   echo "REFUSE: no targo at $TARGO (set TARGO=...)"; exit 2

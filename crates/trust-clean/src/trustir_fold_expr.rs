@@ -5417,7 +5417,30 @@ fn has_exposed_interior_mutability_fueled(defs: &DatatypeDefs, ty: &Ty, fuel: u3
                     | "expr::types::FVarId"
                     | "expr::types::Literal"
             ) {
-                return false;
+                // Trust: EFHT-D [R1] (2026-08-30) — the exemption above is keyed on the
+                // PRINTED path, which a LOCAL crate named `expr`/`level`/`name` can
+                // collide with. Before trusting the name, scan the ADT's OWN fields
+                // (and variant fields) ONE level: a suspicious-name ADT/Datatype, a
+                // `&mut`, or a raw-pointer field means this is NOT the pinned
+                // clean-kernel value family — fail closed. The genuine clean-kernel
+                // types hold no such field directly (pinned both ways in
+                // `efht_d_walker_name_exemption_scans_fields`), so their verdict is
+                // unchanged; a forged `expr::Expr { tag: u8, c: Cell<u8> }` now reads
+                // exposed instead of hiding behind the name.
+                let field_is_hot = |field: &Ty| match field {
+                    Ty::Ref { mutable: true, .. } | Ty::RawPtr { .. } => true,
+                    Ty::Adt { name, .. } | Ty::Datatype { name, .. } => suspicious_name(name),
+                    _ => false,
+                };
+                return fields
+                    .iter()
+                    .map(|(_, field)| field)
+                    .chain(
+                        variants
+                            .iter()
+                            .flat_map(|variant| variant.fields.iter().map(|(_, field)| field)),
+                    )
+                    .any(field_is_hot);
             }
             if name == "std::sync::Arc" {
                 // Ignore Arc's private refcounts, but never its logical

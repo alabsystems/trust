@@ -558,10 +558,10 @@ pub fn generate_callsite_l0_replay_candidates(
     // the inputs the caller can actually be entered with.
     let arithmetic_safe_func = without_unmodeled_contract_arithmetic(func);
     let func_view = arithmetic_safe_func.as_ref();
-    let guard_paths_map = v2_build_path_guard_map(func_view);
+    let guard_paths_map = super::guard_map_for(func_view);
     let semantic_guards = build_semantic_guard_map(func_view);
     let path_definition_map = v2_build_path_definition_map(func_view);
-    let sv = StmtVersionCtx::build(func_view);
+    let sv = super::stmt_versions_for(func_view);
     let global_facts = build_global_invariant_facts(func_view);
     let own_preconditions = stable_caller_preconditions(func_view);
 

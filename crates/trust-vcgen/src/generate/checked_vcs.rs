@@ -948,6 +948,10 @@ fn v2_eq_def_binds_projected_operand(
 /// terminator, so a later rewrite of the compared value would decouple the
 /// assert from the operation it nominally guards). Admits a CONSTANT or a
 /// PROJECTION-FREE place — the shipped rule. Fail-closed on every other shape.
+    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+    // the other line's caller; kept for the lane that owns it. `expect` is
+    // self-expiring — this warns the moment a caller lands.
+#[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 fn v2_eq_def_binds_operand_to_const(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
@@ -1262,7 +1266,7 @@ pub(super) fn v2_build_assert_negation_vc(
     let raw = v2_assert_failure_formula(func, cond, expected);
     let (formula, body, kept) =
         v2_formula_with_block_defs_at_point_recorded(func, block, block.stmts.len(), raw);
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let subject = version_rename_at(
         &operand_to_formula(func, operand),
         &sv,
@@ -1723,7 +1727,7 @@ fn v2_shift_overflow_seed_record(
     }
     let shift_range = conjuncts[0].clone();
     let atomic_core = conjuncts[1].clone();
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let subject = version_rename_at(&operand_to_formula(func, rhs), &sv, func, block.id, end);
     let mut wrappers = vec![ObligationWrapper::ConjoinFactsLast { facts: vec![shift_range] }];
     if !kept.is_empty() {
@@ -1806,6 +1810,18 @@ pub(super) fn v2_build_cast_vc(
     // gate (`collect_cast_relation_unsupported`); without it this one cast poisoned
     // the whole function's obligations (its address-exposure stayed UnsupportedMir).
     if from_ty.is_pointer_like() && to_ty.is_integer() {
+        return None;
+    }
+
+    // Trust (verified-sysroot §5 step 3, slice 1): the same address-exposure,
+    // spelled through a thin single-pointer NEWTYPE source (`NonNull<T> ->
+    // usize`, the extractor's `nonnull_to_usize` transmute leg), which
+    // `is_pointer_like` (Ref/RawPtr only) does not cover. Equally infallible —
+    // no overflow/panic obligation — and the value lane is handled by
+    // `is_modeled_identity_cast` (identity over the collapsed allocation
+    // model's address value). Guards inside the predicate keep fat/narrowing/
+    // signed/recover shapes on the fail-closed path below.
+    if crate::is_thin_pointer_address_expose_cast(&from_ty, to_ty) {
         return None;
     }
 
@@ -2000,7 +2016,7 @@ pub(super) fn v2_build_negation_raw_vc(
     // byte-identical to the formula. Kept block-defs form a ConjoinFactsLast wrapper.
     let (formula, body, kept) =
         v2_formula_with_block_defs_at_point_recorded(func, block, stmt_index, raw);
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let subject = version_rename_at(&value, &sv, func, block.id, stmt_index);
 
     // Trust (slice ARM 2, Int raw-Neg path — ATOMIC-CORE recording, 2026-07-31).

@@ -68,6 +68,14 @@ pub(super) fn unique_whole_local_conversion_call<'a>(
     func: &'a VerifiableFunction,
     local: usize,
 ) -> Option<(&'a Vec<Operand>, &'a Place)> {
+    // A PARAMETER carries an implicit ENTRY definition that `body.blocks` never shows,
+    // so "exactly one conversion Call defines it" would not mean the unwrap reads the
+    // conversion's `Ok` — the entry value is a second one, and the conclusion here
+    // SUPPRESSES a panic obligation. Declining is monotone: it drops a hypothesis, so
+    // a proof can only become harder.
+    if local >= 1 && local <= func.body.arg_count {
+        return None;
+    }
     let mut found: Option<(&'a Vec<Operand>, &'a Place)> = None;
     for block in &func.body.blocks {
         // A statement-level whole-local re-def makes `_r` ambiguous: bail.
@@ -250,7 +258,7 @@ pub(super) fn slice_arg_static_len(
         });
     }
     // Transparent whole-local copies: `_s = Use(_t)` / `_s = &_t` / deref-copy.
-    match crate::unique_whole_local_def(func, local)? {
+    match crate::local_defs::unique_value_def(func, local)? {
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) | Rvalue::CopyForDeref(p) => {
             slice_arg_static_len(func, p, fuel - 1)
         }
@@ -306,7 +314,7 @@ pub(super) fn range_aggregate_const_len(func: &VerifiableFunction, op: &Operand)
         return None;
     }
     let Rvalue::Aggregate(AggregateKind::Adt { name, variant: 0, .. }, operands) =
-        crate::unique_whole_local_def(func, p.local)?
+        crate::local_defs::unique_value_def(func, p.local)?
     else {
         return None;
     };
@@ -368,7 +376,7 @@ pub(super) fn range_from_const_len(
         return None;
     }
     let Rvalue::Aggregate(AggregateKind::Adt { name, variant: 0, .. }, operands) =
-        crate::unique_whole_local_def(func, p.local)?
+        crate::local_defs::unique_value_def(func, p.local)?
     else {
         return None;
     };
@@ -404,7 +412,7 @@ pub(super) fn local_is_len_of(
     let (Operand::Copy(recv_place) | Operand::Move(recv_place)) = receiver else {
         return false;
     };
-    let inner_place = match crate::unique_whole_local_def(func, len_local) {
+    let inner_place = match crate::local_defs::unique_value_def(func, len_local) {
         Some(Rvalue::UnaryOp(trust_types::UnOp::PtrMetadata, inner)) => {
             if !matches!(crate::ptr_metadata_model(func, inner), crate::PtrMetadataModel::Length(_))
             {
@@ -467,7 +475,7 @@ pub(super) fn range_bound_affine(
         return None;
     }
     // Bare local: a fn param/arg has no in-body def -> it IS the base (offset 0).
-    let Some(def) = crate::unique_whole_local_def(func, p.local) else {
+    let Some(def) = crate::local_defs::unique_value_def(func, p.local) else {
         return Some((Some(p.local), 0));
     };
     match def {
@@ -490,7 +498,7 @@ pub(super) fn range_bound_from_binop_def(
     t: usize,
     fuel: u32,
 ) -> Option<(Option<usize>, i128)> {
-    match crate::unique_whole_local_def(func, t)? {
+    match crate::local_defs::unique_value_def(func, t)? {
         Rvalue::CheckedBinaryOp(op @ (BinOp::Add | BinOp::Sub), a, b)
         | Rvalue::BinaryOp(op @ (BinOp::Add | BinOp::Sub), a, b) => {
             range_bound_combine(func, *op, a, b, fuel)
@@ -811,6 +819,13 @@ pub(super) fn collect_cast_relation_unsupported(
         // poisoning the whole function's obligations (e.g. its arithmetic-overflow
         // safety VCs) into Unsupported.
         || (source_ty.is_pointer_like() && target_ty.is_integer())
+        // Trust (verified-sysroot §5 step 3, slice 1): thin-pointer address
+        // EXPOSE through a single-pointer NEWTYPE source (`NonNull<T> ->
+        // usize`), which the Ref/RawPtr-only arm above misses. Modeled as
+        // identity over the collapsed allocation model's address value
+        // (`is_modeled_identity_cast`); fat/narrowing/signed/recover shapes
+        // fail the predicate's guards and stay on the fail-closed arm below.
+        || crate::is_thin_pointer_address_expose_cast(&source_ty, target_ty)
     {
         return;
     }

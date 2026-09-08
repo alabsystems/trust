@@ -296,7 +296,7 @@ pub fn lift_from_lir(lir: &LirFunction) -> Result<VerifiableFunction, BridgeErro
                         span: trust_types::SourceSpan::default(),
                     };
                 }
-                Opcode::Call { name } => {
+                Opcode::Call { name, .. } => {
                     // Lift a Call into a Terminator::Call.
                     let _arg_locals: Vec<Operand> = instr
                         .args

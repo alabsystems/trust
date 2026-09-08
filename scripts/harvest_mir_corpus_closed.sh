@@ -38,7 +38,11 @@ set -uo pipefail
 ROOT=$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)
 OUT=${1:-$HOME/trust-corpora/mir-closed-mono}
 PROJ=${2:-$OUT.project}
-BIN=${TRUST_BIN_DIR:-$ROOT/build/aarch64-apple-darwin/stage1/bin}
+# Trust: `build/host` symlinks to `build/<host-triple>`, so this resolves on every
+# platform. Naming `aarch64-apple-darwin` literally made this line dead on any
+# non-Apple host (measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
+# directory does not exist). The env/arg override above is unchanged.
+BIN=${TRUST_BIN_DIR:-$ROOT/build/host/stage1/bin}
 
 for tool in trustc cargo; do
   [ -x "$BIN/$tool" ] || { echo "missing $BIN/$tool — build stage1 first" >&2; exit 2; }

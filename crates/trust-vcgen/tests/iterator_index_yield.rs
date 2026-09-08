@@ -59,6 +59,13 @@ fn chunks_exact_yields_exact_length_chunks() {
     // `for c in s.chunks_exact(4) { c[k] }` — each yielded chunk has length EXACTLY
     // 4, so the chunk's modeled `__slice_len` must be constrained `== 4`, letting
     // c[0]..c[3] discharge. The bounds VC must carry that `len == 4` fact.
+    //
+    // The chunk-length trace resolves the `ChunksExact` local through
+    // `local_defs::unique_value_def`, and the `Iterator::next` desugar `&mut`-borrows
+    // that local — so this fact exists only because that resolver still admits the
+    // ESCAPE channel, which is the seam's open defect (see `body_unique_value_def`'s
+    // `Escape` arm). Closing the defect empties this row; the repair has to move the
+    // iterator tracers onto an origin question rather than loosen the seam.
     let func: VerifiableFunction =
         serde_json::from_str(include_str!("fixtures/chunks_exact_index_mir.json"))
             .expect("fixture MIR must deserialize");

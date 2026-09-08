@@ -76,7 +76,7 @@ pub(super) fn trace_iter_to_into_iter_arg(
     if fuel == 0 {
         return None;
     }
-    if let Some(rvalue) = crate::unique_whole_local_def(func, local) {
+    if let Some(rvalue) = crate::local_defs::unique_value_def(func, local) {
         return match rvalue {
             Rvalue::Ref { place, .. } if place.projections.is_empty() => {
                 trace_iter_to_into_iter_arg(func, place.local, fuel - 1)
@@ -169,7 +169,7 @@ pub(super) fn for_each_array_source(
 ) -> Option<(Ty, u64, Operand)> {
     const FUEL: u32 = 16;
     // x = *deref_src
-    let deref_src = match crate::unique_whole_local_def(func, x_local)? {
+    let deref_src = match crate::local_defs::unique_value_def(func, x_local)? {
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
             if matches!(p.projections.as_slice(), [trust_types::Projection::Deref]) =>
         {
@@ -178,7 +178,7 @@ pub(super) fn for_each_array_source(
         _ => return None,
     };
     // deref_src = some_local.Downcast(_).Field(0)  (the Option Some payload `&ELEM`)
-    let some_local = match crate::unique_whole_local_def(func, deref_src)? {
+    let some_local = match crate::local_defs::unique_value_def(func, deref_src)? {
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
             if matches!(
                 p.projections.as_slice(),
@@ -236,7 +236,7 @@ pub(super) fn index_range_reduction_bound(
 ) -> Option<(i128, i128)> {
     const FUEL: u32 = 16;
     // x = a[i] : a load of an Index place (possibly behind a Deref for `&[ELEM; N]`).
-    let idx_local = match crate::unique_whole_local_def(func, x_local)? {
+    let idx_local = match crate::local_defs::unique_value_def(func, x_local)? {
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p)) => index_local_of_place(p)?,
         _ => return None,
     };
@@ -249,7 +249,7 @@ pub(super) fn index_range_reduction_bound(
     }
     let elem_max = (1i128 << width) - 1;
     // i = (next() as Some).0 — the value yielded by the loop's exclusive Range.
-    let opt_local = match crate::unique_whole_local_def(func, idx_local)? {
+    let opt_local = match crate::local_defs::unique_value_def(func, idx_local)? {
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
             if is_some_payload_projection(&p.projections) =>
         {
@@ -493,14 +493,14 @@ pub(super) fn reduction_mul_operands(
     func: &VerifiableFunction,
     addend_local: usize,
 ) -> Option<(Operand, Operand)> {
-    match crate::unique_whole_local_def(func, addend_local)? {
+    match crate::local_defs::unique_value_def(func, addend_local)? {
         Rvalue::CheckedBinaryOp(BinOp::Mul, l, r) | Rvalue::BinaryOp(BinOp::Mul, l, r) => {
             Some((l.clone(), r.clone()))
         }
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
             if matches!(p.projections.as_slice(), [trust_types::Projection::Field(0)]) =>
         {
-            match crate::unique_whole_local_def(func, p.local)? {
+            match crate::local_defs::unique_value_def(func, p.local)? {
                 Rvalue::CheckedBinaryOp(BinOp::Mul, l, r) => Some((l.clone(), r.clone())),
                 _ => None,
             }
@@ -516,14 +516,14 @@ pub(super) fn reduction_shl_operands(
     func: &VerifiableFunction,
     addend_local: usize,
 ) -> Option<(Operand, Operand)> {
-    match crate::unique_whole_local_def(func, addend_local)? {
+    match crate::local_defs::unique_value_def(func, addend_local)? {
         Rvalue::CheckedBinaryOp(BinOp::Shl, l, r) | Rvalue::BinaryOp(BinOp::Shl, l, r) => {
             Some((l.clone(), r.clone()))
         }
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
             if matches!(p.projections.as_slice(), [trust_types::Projection::Field(0)]) =>
         {
-            match crate::unique_whole_local_def(func, p.local)? {
+            match crate::local_defs::unique_value_def(func, p.local)? {
                 Rvalue::CheckedBinaryOp(BinOp::Shl, l, r) => Some((l.clone(), r.clone())),
                 _ => None,
             }
@@ -543,7 +543,7 @@ pub(super) fn factor_max(func: &VerifiableFunction, op: &Operand) -> Option<i128
         Operand::Constant(ConstValue::Int(c)) if *c >= 0 => Some(*c),
         Operand::Constant(ConstValue::Uint(c, _)) if *c <= i128::MAX as u128 => Some(*c as i128),
         Operand::Copy(p) | Operand::Move(p) if p.projections.is_empty() => {
-            let Rvalue::Cast(src, _) = crate::unique_whole_local_def(func, p.local)? else {
+            let Rvalue::Cast(src, _) = crate::local_defs::unique_value_def(func, p.local)? else {
                 return None;
             };
             let ty = crate::operand_ty_cow(func, src)?;
@@ -565,7 +565,7 @@ pub(super) fn factor_elem_local(func: &VerifiableFunction, op: &Operand) -> Opti
         return None;
     }
     let Rvalue::Cast(Operand::Copy(xp) | Operand::Move(xp), _) =
-        crate::unique_whole_local_def(func, p.local)?
+        crate::local_defs::unique_value_def(func, p.local)?
     else {
         return None;
     };
@@ -593,7 +593,7 @@ pub(super) fn addend_per_iteration_bound(
 ) -> Option<(i128, i128)> {
     // (a) bare widened element: `t += x as ACC`.
     if let Some(Rvalue::Cast(Operand::Copy(xp) | Operand::Move(xp), _)) =
-        crate::unique_whole_local_def(func, addend_local)
+        crate::local_defs::unique_value_def(func, addend_local)
         && xp.projections.is_empty()
         && let Some(kb) = for_each_element_fixed_array_bound(func, xp.local)
             .or_else(|| index_range_reduction_bound(func, xp.local))
@@ -652,7 +652,7 @@ pub(super) fn signed_addend_per_iteration_range(
     addend_local: usize,
 ) -> Option<(i128, i128)> {
     let Rvalue::Cast(Operand::Copy(xp) | Operand::Move(xp), _) =
-        crate::unique_whole_local_def(func, addend_local)?
+        crate::local_defs::unique_value_def(func, addend_local)?
     else {
         return None;
     };
@@ -681,7 +681,7 @@ pub(super) fn loop_var_const_range(
     local: usize,
 ) -> Option<(i128, i128)> {
     const FUEL: u32 = 16;
-    let opt_local = match crate::unique_whole_local_def(func, local)? {
+    let opt_local = match crate::local_defs::unique_value_def(func, local)? {
         Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
             if is_some_payload_projection(&p.projections) =>
         {
@@ -694,11 +694,18 @@ pub(super) fn loop_var_const_range(
 }
 
 /// The local of a `dst = Use(Copy(tuple.0))` extraction of `tuple_local`'s field 0 — the index
-/// `_20` in `_20 = _23.0` for a checked-op result `_23`. None if no such single extraction.
+/// `_20` in `_20 = _23.0` for a checked-op result `_23`.
+///
+/// `None` unless there is EXACTLY ONE such extraction. It previously returned the
+/// first match with no uniqueness gate, so with two consumers the caller learned
+/// about one of them and silently ignored the other — a caller that reads this as
+/// "the consumer" would be wrong. `checked_result_field0_consumer_is_unique` is the
+/// row that fails when the second-distinct-consumer bail is deleted.
 pub(super) fn checked_result_field0_consumer(
     func: &VerifiableFunction,
     tuple_local: usize,
 ) -> Option<usize> {
+    let mut found: Option<usize> = None;
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             if let Statement::Assign {
@@ -710,11 +717,14 @@ pub(super) fn checked_result_field0_consumer(
                 && p.local == tuple_local
                 && p.projections.as_slice() == [trust_types::Projection::Field(0)]
             {
-                return Some(place.local);
+                if found.is_some_and(|f| f != place.local) {
+                    return None;
+                }
+                found = Some(place.local);
             }
         }
     }
-    None
+    found
 }
 
 /// The field-0 consumer of a checked result, but only when its bare symbol has
@@ -789,7 +799,7 @@ pub(super) fn build_flattened_index_facts(func: &VerifiableFunction) -> Vec<Form
             }
             // mul_p = Use(Copy(mul_tuple.0)); mul_tuple = CheckedMul(y, W_const).
             let Some(Rvalue::Use(Operand::Copy(mt) | Operand::Move(mt))) =
-                crate::unique_whole_local_def(func, mul_p.local)
+                crate::local_defs::unique_value_def(func, mul_p.local)
             else {
                 continue;
             };
@@ -797,7 +807,7 @@ pub(super) fn build_flattened_index_facts(func: &VerifiableFunction) -> Vec<Form
                 continue;
             }
             let Some(Rvalue::CheckedBinaryOp(BinOp::Mul, y_op, w_op)) =
-                crate::unique_whole_local_def(func, mt.local)
+                crate::local_defs::unique_value_def(func, mt.local)
             else {
                 continue;
             };
@@ -1010,7 +1020,7 @@ pub(super) fn operand_root_local(
     if !p.projections.is_empty() {
         return None;
     }
-    if let Some(Rvalue::Use(inner)) = crate::unique_whole_local_def(func, p.local) {
+    if let Some(Rvalue::Use(inner)) = crate::local_defs::unique_value_def(func, p.local) {
         if let Some(root) = operand_root_local(func, inner, fuel - 1) {
             return Some(root);
         }
@@ -1100,7 +1110,7 @@ pub(super) fn build_converging_pointer_facts(
         // The guard discriminant must be `_g = Lt(lo, hi)`.
         let Some(g_local) = operand_root_local(func, discr, FUEL) else { continue };
         let Some(Rvalue::BinaryOp(trust_types::BinOp::Lt, a, b)) =
-            crate::unique_whole_local_def(func, g_local)
+            crate::local_defs::unique_value_def(func, g_local)
         else {
             continue;
         };

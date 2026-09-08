@@ -1,0 +1,48 @@
+# STEP-4 COVERAGE FLOOR — verified core::num L0 coverage (the ratchet's banked state).
+#
+# Plan of record: docs/design/2026-08-19-verified-sysroot-scoping.md §5 step 4 —
+#   "a coverage ratchet so the number can only go up."
+# The deliverable it gates: "N functions in `library/core` carry a discharged L0
+#   obligation set, verified by `trustc`, gate-checked".
+#
+# WHAT THIS FILE IS. The hand-reviewed, banked pair of numbers for the Mode::Std
+# verification lane's core::num slice. The checking test
+# (`trust_ir_bridge::std_core_num_coverage_ratchet`) compares this floor against
+# the committed measurement snapshot beside it
+# (`core_num_l0_coverage.snapshot.json`) and goes red on ANY disagreement:
+#   * snapshot BELOW floor  -> REGRESSION: verified coverage was retired.
+#   * snapshot ABOVE floor  -> UNBANKED GAIN: raise the floor in the SAME commit
+#     that regenerated the snapshot, or the gain is held by no gate and the next
+#     regression down to the old floor reads green.
+# Exact agreement is deliberate. A floor with slack cannot see a regression
+# inside the slack — the same measured lesson that replaced
+# `SPINE_DECLINED_CEILING` with the exact `SPINE_DECLINED_PIN` census in
+# crates/trust-ir-bridge/src/flip.rs (Trust #63).
+#
+# WHY TWO FILES AT ALL, if they must agree: the snapshot is MACHINE-WRITTEN
+# (regenerated wholesale by a measurement; carries per-function rows), while
+# this floor is HAND-EDITED and reviewed. Their forced agreement means a
+# regenerated snapshot that silently drops coverage cannot pass by
+# regeneration alone — the floor edit is a second, human-visible act in the
+# same diff, exactly the pin-file discipline of
+# scripts/hooks-pin/pin-waivers.txt.
+#
+# UPDATE PROCEDURE — the only two legitimate edits:
+#   1. BANK A MEASURED INCREASE. Regenerate the snapshot from a real Mode::Std
+#      verification-lane build (the main session's reserved std-build step;
+#      never from a hand-computed guess and never via x.py in a measurement
+#      lane), then copy the snapshot's two totals into the two lines below, in
+#      the same commit.
+#   2. RETIRE COVERAGE (a downward edit). Allowed only with an attribution
+#      added to this header naming which functions stopped verifying and why —
+#      the same discipline flip.rs applies to a re-pin.
+#
+# FLOOR INITIALIZED AT 0 (2026-08-30): no Mode::Std lane build has been
+# measured yet. The main session's first measured build sets the real number;
+# nothing in this file may be invented ahead of that measurement.
+#
+# Parsed FAIL-CLOSED by the ratchet test: exactly the two keys below, once
+# each. An unknown key, a duplicate key, a missing key, or a non-integer value
+# is a test failure, not a warning.
+verified_function_count_floor = 0
+discharged_l0_obligation_count_floor = 0

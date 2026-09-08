@@ -1,0 +1,40 @@
+error: the initializer of `L` can wait on `L` itself: a `std::sync::LazyLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/lazy_lock_self_deref.rs:14:44
+   |
+LL | static L: LazyLock<u32> = LazyLock::new(|| *L + 1);
+   |                           -----------------^^-----
+   |                           |                |
+   |                           |                the initializer of `L` reaches this call, which waits on `L` again
+   |                           this call starts the initializer of `L`
+   |
+   = note: call path: `L::{closure#0}` -> `*L`
+   = help: compute the value inside the initializer without waiting on `L` in it — read the input it needs directly instead of asking `L` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then a `OnceLock` set from that value before any reader
+   = help: or, if the initializer can legitimately observe an uninitialized `L`, read `LazyLock::get(&L)` there — it never waits
+note: `L` is declared here
+  --> $DIR/lazy_lock_self_deref.rs:14:1
+   |
+LL | static L: LazyLock<u32> = LazyLock::new(|| *L + 1);
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: the initializer of `M` can wait on `M` itself: a `std::sync::LazyLock` initializer that re-enters its own cell deadlocks — the initializing thread parks forever
+  --> $DIR/lazy_lock_self_deref.rs:20:6
+   |
+LL | static M: LazyLock<u32> = LazyLock::new(init_m);
+   |                           --------------------- this call starts the initializer of `M`
+...
+LL |     *LazyLock::force(&M) + 1
+   |      ^^^^^^^^^^^^^^^^^^^ the initializer of `M` reaches this call, which waits on `M` again
+   |
+   = note: call path: `init_m` -> `LazyLock::force(&M)`
+   = help: compute the value inside the initializer without waiting on `M` in it — read the input it needs directly instead of asking `M` for it
+   = help: or hoist the computation out of the initializer: `let v = ...;` then a `OnceLock` set from that value before any reader
+   = help: or, if the initializer can legitimately observe an uninitialized `M`, read `LazyLock::get(&M)` there — it never waits
+note: `M` is declared here
+  --> $DIR/lazy_lock_self_deref.rs:17:1
+   |
+LL | static M: LazyLock<u32> = LazyLock::new(init_m);
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+

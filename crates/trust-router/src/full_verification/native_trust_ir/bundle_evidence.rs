@@ -985,6 +985,8 @@ fn trust_mc_native_trust_ir_bundle_evidence(
             bundle,
             obligations,
             native_bundle,
+            // No live source-generation authority on this arm (fail-closed).
+            None,
             deadline,
         ),
     };

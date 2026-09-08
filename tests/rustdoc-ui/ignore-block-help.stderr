@@ -12,7 +12,7 @@ help: `ignore` code blocks require valid Rust code for syntax highlighting; mark
    |
 LL | /// ```ignore (to-prevent-tidy-error)
    |     ^^^
-   = note: error from rustc: character literal may only contain one codepoint
+   = note: error from trustc: character literal may only contain one codepoint
    = note: `#[warn(rustdoc::invalid_rust_codeblocks)]` on by default
 
 warning: 1 warning emitted

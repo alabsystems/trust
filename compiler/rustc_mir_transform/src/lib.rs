@@ -74,6 +74,9 @@ mod trust_contract_query;
 // `optimized_mir` seam cannot flip. See trust_instance_flip.rs.
 mod trust_instance_flip;
 mod trust_ir_flip;
+// Trust: the once-initializer re-entrancy check — a hard error, gated by nothing but
+// front-end cleanliness (NOT by `-Ztrust-verify`). Driver entry point exported below.
+mod trust_once_reentrancy;
 mod trust_proof_query;
 mod trust_r1_oracle;
 // Trust (v6/D1): the `targo trust spec --emit clean` session-artifact writer.
@@ -258,6 +261,7 @@ declare_passes! {
 // Trust (lane CTFE): the trivial-const flip probe. MEASUREMENT ONLY — gated on
 // `-Ztrust-ctfe-trivial-probe`, installs no body, changes no emitted code.
 pub use trust_ir_flip::probe_trivial_const_flips as trust_probe_trivial_const_flips;
+pub use trust_once_reentrancy::trust_check_once_initializer_reentrancy;
 pub use trust_verify::{
     initialize_ay_solver_identity as trust_initialize_ay_solver_identity,
     trust_emit_transport_crate_summary, trust_ensure_whole_crate_verification,
@@ -287,6 +291,7 @@ pub fn provide(providers: &mut Providers) {
         trust_mir_direct_local_callees: trust_verify::trust_mir_direct_local_callees,
         trust_mir_mutually_recursive_functions:
             trust_verify::trust_mir_mutually_recursive_functions,
+        trust_mir_once_body_facts: trust_once_reentrancy::trust_mir_once_body_facts,
         mir_for_ctfe,
         mir_coroutine_witnesses: coroutine::mir_coroutine_witnesses,
         optimized_mir,
@@ -609,7 +614,21 @@ fn mir_for_ctfe(tcx: TyCtxt<'_>, def_id: LocalDefId) -> &Body<'_> {
 fn mir_for_trust_verification(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<&Body<'_>> {
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id);
     if body.is_stolen() {
-        return None;
+        // The elaborated-MIR `Steal` was consumed by `optimized_mir`. If that query
+        // (or an ancestor it transitively reaches) is still IN PROGRESS, re-entering
+        // it here would cycle — honor the fail-soft `None` contract (callers degrade
+        // via the absent-callee may-panic marker). Otherwise `optimized_mir` has
+        // necessarily already COMPLETED and is CACHED (per-monomorphization callee
+        // bundling can read `optimized_mir`/`instance_mir` for ONE instance of a
+        // generic fn — stealing the SHARED elaborated body — and then need this
+        // snapshot for the generic def or another instance), so fall back to its
+        // further-optimized real-codegen body — a sound source for structural/
+        // interprocedural verification. Prevents the `body.borrow()` ICE without
+        // giving up coverage in the completed-and-cached case.
+        if trust_verify::optimized_mir_query_would_cycle(tcx, def_id.to_def_id()) {
+            return None;
+        }
+        return Some(tcx.optimized_mir(def_id));
     }
     Some(tcx.arena.alloc(body.borrow().clone()))
 }

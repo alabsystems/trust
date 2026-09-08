@@ -19,9 +19,18 @@ fn min2(x: u8, y: u8) -> u8 {
     if x < y { x } else { y }
 }
 
+// RECLASSIFIED 2026-08-23 by the ill-typed-goal gate. The refusal is the same
+// refusal; the compiler now names the boundary one step earlier and one step
+// more honestly. This clause has no variables, so the atom elaborator gives its
+// literals the Nat domain, and the goal applies the `u8` kernel import to `Nat`
+// arguments — an equality that does not typecheck. Both discharge routes now
+// infer the goal's type BEFORE judging any proof against it, so the verdict is
+// `ClauseOutsideFragment` rather than a failed statement/certification audit.
+// What this fixture pins is unchanged: four positive structural facet findings
+// do not discharge a citation.
 fn cite_fully_certified() -> u8
     ensures min2(1, 2) == 1 by placeholder
-    //~^ ERROR citation `placeholder` failed the strict Clean statement/certification audit
+    //~^ ERROR citation `placeholder` cannot be validated because this clause is outside the exact statement fragment: the elaborated goal does not typecheck
 {
     1
 }

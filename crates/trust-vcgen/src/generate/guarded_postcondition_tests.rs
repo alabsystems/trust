@@ -129,7 +129,7 @@ fn a_preconditioned_verified_summary_is_injected_as_an_implication() {
          a call-site antecedent"
     );
     assert!(
-        callee_postcondition_is_injectable(&func, dest, &summary, args.len()),
+        callee_postcondition_is_injectable(&func, dest, &summary, args),
         "slice 2: a preconditioned callee is injectable once its clause rides \
          under its own guard"
     );
@@ -199,7 +199,7 @@ fn a_precondition_naming_the_result_symbol_injects_nothing() {
         !summary_postconditions_ride_with_their_guard(&summary),
         "`_0` is not a formal, so this guard is not call-site expressible"
     );
-    assert!(!callee_postcondition_is_injectable(&func, dest, &summary, args.len()));
+    assert!(!callee_postcondition_is_injectable(&func, dest, &summary, args));
     assert!(
         rebind_callee_postconditions(&func, args, dest, &summary).is_empty(),
         "EMIT must refuse on exactly the condition ADMIT refuses on — an \
@@ -228,7 +228,7 @@ fn an_unexpressible_guard_conjunct_kills_the_whole_injection() {
         .with_verified_callee_postcondition(result_positive());
 
     assert!(!summary_postconditions_ride_with_their_guard(&summary));
-    assert!(!callee_postcondition_is_injectable(&func, dest, &summary, args.len()));
+    assert!(!callee_postcondition_is_injectable(&func, dest, &summary, args));
     assert!(rebind_callee_postconditions(&func, args, dest, &summary).is_empty());
 }
 

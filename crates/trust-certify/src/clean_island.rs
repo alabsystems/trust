@@ -236,6 +236,26 @@ pub fn kernel_discharge_ensures_citation(
 /// [`island_definition_value`]: non-definitions answer `None`.
 #[must_use]
 pub fn island_definition_arity(env: &KernelEnvironment, name: &str) -> Option<usize> {
+    island_definition_signature(env, name).map(|(arity, _)| arity)
+}
+
+/// [`island_definition_arity`] plus the definition's RESULT domain, when the
+/// Clean codomain determines one unambiguously.
+///
+/// Only a literal `Bool` codomain is reported. The Clean-type → `Domain` map is
+/// NOT injective — `BitVec 64` is the carrier of both `Signed(I64)` and
+/// `USize(W64)`, and `Nat` is a carrier the clause fragment reaches from several
+/// places — so reading a domain back off a numeric carrier would type a clause
+/// atom at a carrier the island author never wrote. `Bool` has exactly one
+/// preimage, which is why it is the one case recorded; everything else answers
+/// `None` and every consumer of [`trust_spec_elab::Admission::ret_domain`] fails
+/// closed on `None`. This keeps behaviour for every non-`Bool` island definition
+/// byte-identical to before the field existed.
+#[must_use]
+pub fn island_definition_signature(
+    env: &KernelEnvironment,
+    name: &str,
+) -> Option<(usize, Option<trust_spec_elab::Domain>)> {
     island_definition_value(env, name)?;
     let info = env.get_const(&clean_kernel::Name::from_string(name))?;
     let mut arity = 0usize;
@@ -244,7 +264,171 @@ pub fn island_definition_arity(env: &KernelEnvironment, name: &str) -> Option<us
         arity += 1;
         ty = codomain;
     }
-    Some(arity)
+    let ret_domain = match ty.kind() {
+        clean_kernel::ExprKind::Const(n, _) if n.to_string() == "Bool" => {
+            Some(trust_spec_elab::Domain::Bool)
+        }
+        // `Option (BitVec N)` (checked-arithmetic lane): TODAY this codomain
+        // has exactly ONE preimage — `Domain::OptionSigned(N)` is the sole
+        // Option-carrier domain — so the map stays injective and reading it
+        // back cannot retype an author's carrier. The consumers it feeds are
+        // safe even in spirit: the recorded domain drives only the RELATION
+        // carrier (`Eq (Option (BitVec N))`, signedness-neutral) and the
+        // constructor formers' INNER typing, whose wrapping arithmetic is
+        // bit-identical for signed and unsigned two's-complement. THE DAY an
+        // unsigned-Option domain is added, this arm must go back to `None`
+        // exactly as the numeric carriers do — the injectivity note above is
+        // the contract.
+        _ => option_signed_width_of_codomain(ty).map(trust_spec_elab::Domain::OptionSigned),
+    };
+    Some((arity, ret_domain))
+}
+
+/// The `MachineSIntWidth` of a Clean codomain `Option (BitVec N)` — accepting
+/// both the elaborator's bare `Nat` width literal and the island elaborator's
+/// `OfNat.ofNat Nat N (instOfNatNat N)` wrapping (the two defeq spellings the
+/// vendored elaborators actually produce) — else `None`.
+fn option_signed_width_of_codomain(ty: &clean_kernel::Expr) -> Option<trust_spec_elab::MachineSIntWidth> {
+    use clean_kernel::ExprKind;
+    let ExprKind::App(option_head, payload) = ty.kind() else {
+        return None;
+    };
+    let ExprKind::Const(option_name, _) = option_head.kind() else {
+        return None;
+    };
+    if option_name.to_string() != "Option" {
+        return None;
+    }
+    let ExprKind::App(bitvec_head, width_expr) = payload.kind() else {
+        return None;
+    };
+    let ExprKind::Const(bitvec_name, _) = bitvec_head.kind() else {
+        return None;
+    };
+    if bitvec_name.to_string() != "BitVec" {
+        return None;
+    }
+    let width = nat_literal_of(width_expr)?;
+    use trust_spec_elab::MachineSIntWidth::{I8, I16, I32, I64, I128};
+    Some(match width {
+        8 => I8,
+        16 => I16,
+        32 => I32,
+        64 => I64,
+        128 => I128,
+        _ => return None,
+    })
+}
+
+/// The small `Nat` a literal-or-`OfNat`-wrapped width expression denotes.
+fn nat_literal_of(e: &clean_kernel::Expr) -> Option<u64> {
+    use clean_kernel::{ExprKind, Literal};
+    match e.kind() {
+        ExprKind::Lit(Literal::Nat(n)) => n.to_u64(),
+        // OfNat.ofNat Nat <lit> (instOfNatNat <lit>) — take the explicit
+        // literal argument (the instance repeats it).
+        ExprKind::App(f, _inst) => {
+            let ExprKind::App(f2, lit) = f.kind() else {
+                return None;
+            };
+            let ExprKind::App(head, _nat_ty) = f2.kind() else {
+                return None;
+            };
+            let ExprKind::Const(name, _) = head.kind() else {
+                return None;
+            };
+            if name.to_string() != "OfNat.ofNat" {
+                return None;
+            }
+            let ExprKind::Lit(Literal::Nat(n)) = lit.kind() else {
+                return None;
+            };
+            n.to_u64()
+        }
+        _ => None,
+    }
+}
+
+/// The DECLARED Clean carrier types of an island definition's value parameters
+/// and result, read straight off the kernel's recorded declaration — the
+/// authoritative answer to "what does this constant actually take, and at what
+/// widths?" (E6/E9 widening increment 8).
+///
+/// WHY A [`trust_spec_elab::Carrier`] AND NOT A `Domain`. This walks the same
+/// Pi telescope as [`island_definition_signature`] and is bound by the same
+/// injectivity caveat documented there: `BitVec 64` is the carrier of `i64`,
+/// `usize` and `isize` alike, so a `Domain` read back off it would be a GUESS.
+/// A `Carrier` is the Clean type itself, normalized — the codomain of the
+/// `Domain -> Carrier` map, never its inverse. The clause elaborator uses it
+/// only to CHECK a domain some other authority already fixed (the Rust
+/// signature behind the clause binding), so nothing here can retype a term.
+///
+/// Fail-closed by construction: a carrier this reader does not RECOGNIZE — an
+/// `Int`, a structure, a dependent `BitVec n` whose width is a bound variable,
+/// a universe-polymorphic head — answers `None` for the WHOLE signature, and
+/// [`trust_spec_elab::Admission::carriers`] being `None` puts the elaborator
+/// back on its pre-increment behaviour (one ambient domain across the atom).
+/// A definition whose telescope is dependent therefore cannot be read as
+/// non-dependent by accident: the dependency shows up as an unreadable width
+/// and the whole record is refused.
+#[must_use]
+pub fn island_definition_carriers(
+    env: &KernelEnvironment,
+    name: &str,
+) -> Option<trust_spec_elab::DeclaredCarriers> {
+    island_definition_value(env, name)?;
+    let info = env.get_const(&clean_kernel::Name::from_string(name))?;
+    // A universe-polymorphic declaration is already refused by the admission
+    // path; refuse it here too so this reader is safe to call on its own.
+    if !info.level_params.is_empty() {
+        return None;
+    }
+    let mut params = Vec::new();
+    let mut ty: &clean_kernel::Expr = &info.type_;
+    while let clean_kernel::ExprKind::Pi(_, domain, codomain) = ty.kind() {
+        params.push(carrier_of_clean_type(domain)?);
+        ty = codomain;
+    }
+    let ret = carrier_of_clean_type(ty)?;
+    Some(trust_spec_elab::DeclaredCarriers { params, ret })
+}
+
+/// One Clean type read as a [`trust_spec_elab::Carrier`], or `None` when the
+/// shape is not one of the closed set the clause fragment has carriers for.
+///
+/// The `BitVec`/`Option` arms accept BOTH width spellings the vendored
+/// elaborators produce (a bare `Nat` literal and the
+/// `OfNat.ofNat Nat N (instOfNatNat N)` wrapping) via [`nat_literal_of`], for
+/// the same reason [`option_signed_width_of_codomain`] does: the two are defeq
+/// and an island author never chooses between them.
+fn carrier_of_clean_type(ty: &clean_kernel::Expr) -> Option<trust_spec_elab::Carrier> {
+    use clean_kernel::ExprKind;
+    use trust_spec_elab::{Carrier, MachineUIntWidth};
+    match ty.kind() {
+        ExprKind::Const(name, _) => match name.to_string().as_str() {
+            "Nat" => Some(Carrier::Nat),
+            "Bool" => Some(Carrier::Bool),
+            "UInt8" => Some(Carrier::UInt(MachineUIntWidth::U8)),
+            "UInt16" => Some(Carrier::UInt(MachineUIntWidth::U16)),
+            "UInt32" => Some(Carrier::UInt(MachineUIntWidth::U32)),
+            "UInt64" => Some(Carrier::UInt(MachineUIntWidth::U64)),
+            _ => None,
+        },
+        ExprKind::App(head, arg) => {
+            let ExprKind::Const(head_name, _) = head.kind() else {
+                return None;
+            };
+            match head_name.to_string().as_str() {
+                "BitVec" => {
+                    let bits = nat_literal_of(arg)?;
+                    Some(Carrier::BitVec(u32::try_from(bits).ok()?))
+                }
+                "Option" => Some(Carrier::Option(Box::new(carrier_of_clean_type(arg)?))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The compiler's reserved namespace for E6 kernel-imported program functions
@@ -405,7 +589,7 @@ pub fn admit_certified_island_definition(
         }
     }
 
-    let arity = island_definition_arity(env, name)
+    let (arity, ret_domain) = island_definition_signature(env, name)
         .ok_or_else(|| format!("island definition `{name}` has no supported arity"))?;
     let certified = || trust_spec_elab::FacetStatus::Certified {
         evidence: "clean-island-kernel-definition".to_string(),
@@ -419,6 +603,19 @@ pub fn admit_certified_island_definition(
             no_panic: certified(),
         },
     );
+    // The DECLARED carriers, straight from the kernel's recorded type for this
+    // constant — the only authority on what the island author actually wrote.
+    // `None` (an unrecognized carrier anywhere in the telescope) leaves the
+    // clause elaborator on its pre-increment single-ambient-domain behaviour,
+    // which is fail-closed, not permissive.
+    //
+    // The arity CROSS-CHECK is not decoration: `arity` above and `params` here
+    // are two independent walks of the same Pi telescope, and the elaborator
+    // indexes arguments by one while checking against the other. A disagreement
+    // means one of the two reads the declaration wrongly, so drop the carrier
+    // record rather than index into a list that does not describe this
+    // constant.
+    let carriers = island_definition_carriers(env, name).filter(|c| c.params.len() == arity);
     // ------------------------------------------------------------------
     // I2 — mint the status through the sealed seam.
     // ------------------------------------------------------------------
@@ -466,7 +663,8 @@ pub fn admit_certified_island_definition(
     let status = trust_symbols::CicKernelRecheck::held_by_kernel_recheck()
         .kernel_checked(digest, trust_symbols::AxiomClosure::audited([]));
     debug_assert!(status.is_certified(), "a Certified grade must project to a Certified status");
-    let admission = trust_spec_elab::Admission::kernel_checked(name, arity, status);
+    let admission = trust_spec_elab::Admission::kernel_checked(name, arity, status)
+        .with_declared_signature(ret_domain, carriers);
     // Record the island definition's RETURN domain — the Pi-telescope codomain
     // of the type the kernel just re-checked — so a variable-free clause atom
     // citing it (`answer() == c42(0)`) is typed at the definition's own
@@ -608,6 +806,13 @@ pub fn kernel_prove_ensures_by_defeq(
     if std::env::var_os("TRUST_E9_DEBUG").is_some() {
         eprintln!("TRUST_E9_DEBUG GOAL clause={clause_src:?} goal={goal}");
     }
+    // The same ill-typed-goal gate as the citation route: `check_type` below
+    // judges the PROOF term and treats the goal expression as given, so it
+    // must not be handed a goal the kernel cannot type (see
+    // [`reject_untyped_goal`]).
+    if let Some(verdict) = reject_untyped_goal(env, &goal) {
+        return verdict;
+    }
     // Strip the Pi telescope, remembering binders for the mirroring lambda.
     let mut binders: Vec<(clean_kernel::BinderData, clean_kernel::Expr)> = Vec::new();
     let mut body: &clean_kernel::Expr = &goal;
@@ -633,7 +838,41 @@ pub fn kernel_prove_ensures_by_defeq(
     }
 }
 
-/// Shared, soundness-critical tail: look up the cited theorem, reject a
+/// An elaborated clause goal must itself TYPECHECK before any discharge is
+/// attempted against it. The kernel's definitional-equality judgment computes
+/// on the goal AS A TERM and does not re-derive its typing, so a clause that
+/// applies an island definition at a different carrier than its declared
+/// domain (`def ident_i (x : Int) : Int := x` called from an `i64`- or
+/// `u64`-typed clause) elaborates to an ILL-TYPED equality whose two sides can
+/// still CONVERGE computationally — and `Eq.refl` or a cited proof term is
+/// then accepted against a proposition that does not type. Measured
+/// 2026-08-23 on fragment probe f13 and its u64 twin: the acceptance predates
+/// the signed widening (the widening only made it reachable from `iN`
+/// clauses). Fail closed instead, and carry the fix.
+fn reject_untyped_goal(
+    env: &Environment,
+    goal: &clean_kernel::Expr,
+) -> Option<CitationVerdict> {
+    // `infer_sort` is the kernel's FULL-CHECKING validation entry (the one
+    // `add_decl` itself uses; `infer_only=false`, so application arguments
+    // are actually checked — plain `infer_type` deliberately skips that and
+    // accepts the ill-typed application this gate exists to catch).
+    match clean_kernel::TypeChecker::new(env).infer_sort(goal) {
+        Ok(_) => None,
+        Err(error) => Some(CitationVerdict::ClauseOutsideFragment {
+            reason: format!(
+                "the elaborated goal does not typecheck ({error:?}); a call in the clause most \
+                 likely applies an island definition at a different carrier than its declared \
+                 domain — restate the island definition over the clause's carrier, or change \
+                 the clause to compare values of one carrier (TRUST_E9_DEBUG prints the exact \
+                 goal)"
+            ),
+        }),
+    }
+}
+
+/// Shared, soundness-critical tail: reject a goal the kernel cannot TYPE
+/// (see [`reject_untyped_goal`]), look up the cited theorem, reject a
 /// non-theorem / unsafe / partial / proofless declaration, then grade its proof
 /// term against `goal` via `cert_meter::grade` (the transitive
 /// sorry/axiom-closure + proof-checks-goal audit). `Certified` is the ONLY
@@ -658,6 +897,9 @@ fn grade_cited_theorem_against_goal(
     theorem: &str,
     goal: &clean_kernel::Expr,
 ) -> CitationVerdict {
+    if let Some(verdict) = reject_untyped_goal(env, goal) {
+        return verdict;
+    }
     let theorem_name = clean_kernel::Name::from_string(theorem);
     let Some(info) = env.get_const(&theorem_name) else {
         return CitationVerdict::TheoremNotFound;
@@ -835,6 +1077,188 @@ pub fn check_generated_carrier_faithfulness(
 }
 
 #[must_use]
+/// Mint ONE kernel definition PER FIELD of a struct-returning body, and return
+/// them keyed for the discharge lane.
+///
+/// A clause on an aggregate return names `result.<field>`, never `result`, so
+/// what the lane needs is field `i`'s defining expression -- not a Clean
+/// structure for the client's ADT, which would mean mapping every client type
+/// into the kernel. Each field is minted with the SAME helper its shape would
+/// use as a whole body (`admit_projection_function`, `admit_select_function`),
+/// under a per-field constant, over the FLATTENED parameter list that
+/// `admit_field_projection_function` already established as the calling
+/// convention for a signature carrying an aggregate.
+///
+/// PER FIELD, FAIL-CLOSED. A field whose shape has no mint, or whose operands
+/// are not single flattened scalars, is SKIPPED rather than refusing the
+/// others -- `sat_term`'s `lit` field is a `Lit`, which flattens to two rows
+/// and is not a scalar operand, while its `coeff` field is the cap and mints
+/// cleanly. A skipped field simply has no kernel denotation, so a clause naming
+/// it fails closed exactly as an unadmitted call does.
+///
+/// The minted `param_names` are recorded so `elaborate_ensures` can enforce
+/// ORDER AGREEMENT against the compiler's own flattening, which is the one
+/// failure the kernel cannot catch: the goal would still type, and a theorem
+/// about `coeff` would discharge a clause about `degree`.
+pub fn admit_function_fields_into(
+    env: &mut Environment,
+    func: &trust_types::VerifiableFunction,
+    facet_table: &trust_spec_elab::FacetTable,
+) -> Vec<(String, trust_spec_elab::Admission)> {
+    use trust_types::admissible_body::{AdmissibleBody, recognize_admissible_body};
+    if !facet_table.get(&func.def_path).is_some_and(trust_spec_elab::FnFacets::admissible) {
+        return Vec::new();
+    }
+    let Some(AdmissibleBody::AggregateFields { fields }) = recognize_admissible_body(func) else {
+        return Vec::new();
+    };
+    let debug = std::env::var_os("TRUST_E6_DEBUG").is_some();
+    let Some(rows) = param_flat_rows(func) else {
+        if debug {
+            eprintln!(
+                "TRUST_E6_DEBUG field-mint fn={} REFUSED: parameters do not flatten to scalars",
+                func.def_path
+            );
+        }
+        return Vec::new();
+    };
+    // A source parameter is usable as a scalar operand only when its OWN
+    // declared type is a scalar domain.
+    //
+    // Not "flattens to one row": a single-field struct also flattens to one
+    // row, and minting its flat position for a `Projection` of the WHOLE
+    // parameter would give `result.lit` the term of `lit.var` -- a `Lit`
+    // denoted by a `u32`, so a clause comparing the field would compare the
+    // wrong thing at the wrong carrier. Caught by
+    // `a_struct_returning_body_mints_one_constant_per_field`, which expects a
+    // non-scalar field SKIPPED and saw it minted.
+    let scalar_flat = |p: usize| -> Option<usize> {
+        let local = func.body.locals.iter().find(|l| l.index == p + 1)?;
+        ty_to_domain(&local.ty)?;
+        Some(rows.iter().take(p).map(Vec::len).sum::<usize>())
+    };
+    // The flat row of parameter `p`'s FIELD `f` -- what a `FieldProjection`
+    // shape names. `-O` copies `self.var` into a temp before building the
+    // aggregate, so a constructor that forwards a field of a STRUCT parameter
+    // arrives in this shape rather than as a whole-parameter `Projection`.
+    // `scalar_flat` cannot serve it: it asks whether the parameter's OWN type
+    // is scalar, and here it is deliberately a struct.
+    //
+    // Admitted ONLY when the parameter is a plain struct whose every field
+    // occupies exactly one flat row, which is what makes the field's index
+    // equal its offset. A field that itself flattens to several rows (a nested
+    // struct) would put the offset somewhere else entirely, so the counts must
+    // agree before the index may be used as a position -- the same
+    // wrong-carrier hazard `scalar_flat` guards against, one level down.
+    let field_flat = |p: usize, f: usize| -> Option<usize> {
+        let local = func.body.locals.iter().find(|l| l.index == p + 1)?;
+        let trust_types::Ty::Adt { fields: pfields, variants, .. } = &local.ty else {
+            return None;
+        };
+        if !variants.is_empty() || pfields.len() != rows.get(p)?.len() || f >= pfields.len() {
+            return None;
+        }
+        Some(rows.iter().take(p).map(Vec::len).sum::<usize>() + f)
+    };
+    let (domains, names): (Vec<_>, Vec<_>) =
+        rows.iter().flatten().cloned().unzip::<_, _, Vec<_>, Vec<_>>();
+    let trust_types::Ty::Adt { fields: declared, variants, .. } = &func.body.return_ty else {
+        if debug {
+            eprintln!(
+                "TRUST_E6_DEBUG field-mint fn={} REFUSED: return type is not an Adt ({:?})",
+                func.def_path,
+                func.body.return_ty
+            );
+        }
+        return Vec::new();
+    };
+    // An enum's field is variant-relative, and a positional mismatch would key
+    // a field's term under another field's name.
+    if !variants.is_empty() || declared.len() != fields.len() {
+        if debug {
+            eprintln!(
+                "TRUST_E6_DEBUG field-mint fn={} REFUSED: return type has {} declared field(s) \
+                 against {} recognized, or is an enum",
+                func.def_path,
+                declared.len(),
+                fields.len()
+            );
+        }
+        return Vec::new();
+    }
+    let base = mangle_kernel_const(&func.def_path);
+    let mut out = Vec::new();
+    for (index, (shape, (field_name, _))) in fields.iter().zip(declared.iter()).enumerate() {
+        let kernel_const = format!("{base}__f{index}");
+        // A field with NO shape is skipped: nothing is claimed for it, so a
+        // clause naming it fails closed as an unadmitted call.
+        let Some(shape) = shape else { continue };
+        let minted = match shape {
+            AdmissibleBody::Projection { param } => {
+                let Some(flat) = scalar_flat(*param) else { continue };
+                trust_spec_elab::admit_projection_function(env, &kernel_const, &domains, flat)
+            }
+            AdmissibleBody::Select { cmp, cmp_left, cmp_right, then_param, else_param } => {
+                use trust_types::admissible_body::SelectCmp as RecCmp;
+                let (Some(l), Some(r), Some(t), Some(e)) = (
+                    scalar_flat(*cmp_left),
+                    scalar_flat(*cmp_right),
+                    scalar_flat(*then_param),
+                    scalar_flat(*else_param),
+                ) else {
+                    continue;
+                };
+                let cmp = match cmp {
+                    RecCmp::Lt => trust_spec_elab::SelectCmp::Lt,
+                    RecCmp::Le => trust_spec_elab::SelectCmp::Le,
+                    RecCmp::Eq => trust_spec_elab::SelectCmp::Eq,
+                };
+                trust_spec_elab::admit_select_function(
+                    env,
+                    &kernel_const,
+                    &domains,
+                    cmp,
+                    l,
+                    r,
+                    t,
+                    e,
+                )
+            }
+            AdmissibleBody::FieldProjection { param, field } => {
+                let Some(flat) = field_flat(*param, *field) else { continue };
+                trust_spec_elab::admit_projection_function(env, &kernel_const, &domains, flat)
+            }
+            // Every other shape is skipped rather than guessed at.
+            _ => continue,
+        };
+        match minted {
+            Ok(mut admission) => {
+                admission.param_names = Some(names.clone());
+                let key = format!("{}__field_{field_name}", func.def_path);
+                if debug {
+                    eprintln!(
+                        "TRUST_E6_DEBUG field-mint fn={} field={field_name} MINTED as {key}",
+                        func.def_path
+                    );
+                }
+                out.push((key, admission));
+            }
+            Err(reason) => {
+                // A field that does not mint leaves a clause naming it failing
+                // closed with "no per-field import", which says nothing about
+                // WHY. Say it here instead of making the next reader guess.
+                if std::env::var_os("TRUST_E6_DEBUG").is_some() {
+                    eprintln!(
+                        "TRUST_E6_DEBUG field-mint fn={} field={field_name} REFUSED: {reason}",
+                        func.def_path
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn admit_function_into(
     env: &mut Environment,
     func: &trust_types::VerifiableFunction,
@@ -853,14 +1277,68 @@ pub fn admit_function_into(
                 _ => None,
             })
             .collect();
+        // The DEFICITS are what a reader actually needs when `admissible` is
+        // false: without them the line says a body was refused but not by
+        // which facet or why, which cost real time chasing `sat_term`.
+        let deficits = facet_table
+            .get(&func.def_path)
+            .map(|f| f.deficits().join("; "))
+            .unwrap_or_else(|| "<no facet record>".to_string());
+        // A COMPACT BODY SUMMARY. Three separate recognizer bugs were chased by
+        // guessing what `-O` had done to a body -- if-conversion, parameter-slot
+        // reuse, block ordering -- because nothing printed the shape. One line
+        // per block, naming each statement's destination and rvalue kind and
+        // the terminator, ends that.
+        let shape: Vec<String> = func
+            .body
+            .blocks
+            .iter()
+            .map(|b| {
+                let stmts: Vec<String> = b
+                    .stmts
+                    .iter()
+                    .filter_map(|st| match st {
+                        trust_types::Statement::Assign { place, rvalue, .. } => Some(format!(
+                            "_{}{}={}",
+                            place.local,
+                            if place.projections.is_empty() { String::new() } else { ".*".into() },
+                            match rvalue {
+                                trust_types::Rvalue::Use(_) => "use",
+                                trust_types::Rvalue::BinaryOp(..) => "binop",
+                                trust_types::Rvalue::CheckedBinaryOp(..) => "checked",
+                                trust_types::Rvalue::Aggregate(..) => "aggregate",
+                                trust_types::Rvalue::Cast(..) => "cast",
+                                trust_types::Rvalue::UnaryOp(..) => "unop",
+                                _ => "other",
+                            }
+                        )),
+                        _ => None,
+                    })
+                    .collect();
+                let term = match &b.terminator {
+                    trust_types::Terminator::Return => "ret".to_string(),
+                    trust_types::Terminator::Goto(t) => format!("goto{}", t.0),
+                    trust_types::Terminator::SwitchInt { targets, otherwise, .. } => format!(
+                        "switch[{}]else{}",
+                        targets.iter().map(|(v, t)| format!("{v}->{}", t.0)).collect::<Vec<_>>().join(","),
+                        otherwise.0
+                    ),
+                    trust_types::Terminator::Call { .. } => "call".to_string(),
+                    other => format!("{other:?}").chars().take(12).collect(),
+                };
+                format!("bb{}[{}|{}]", b.id.0, stmts.join(","), term)
+            })
+            .collect();
         eprintln!(
-            "TRUST_E6_DEBUG fn={} admissible={} blocks={} arg_count={} calls={:?} recognize={:?}",
+            "TRUST_E6_DEBUG fn={} admissible={} blocks={} arg_count={} calls={:?} recognize={:?} shape={} deficits=[{}]",
             func.def_path,
             admissible,
             func.body.blocks.len(),
             func.body.arg_count,
             call_terms,
             recognize_admissible_body(func),
+            shape.join(" "),
+            deficits,
         );
     }
     if !facet_table.get(&func.def_path).is_some_and(trust_spec_elab::FnFacets::admissible) {
@@ -922,6 +1400,44 @@ pub fn admit_function_into(
                 )
             }
         }
+        AdmissibleBody::ConstantInt { value, width_bits } => {
+            // The signed sibling. The recognizer already pinned the declared
+            // return type to a signed carrier of exactly `width_bits`, pinned
+            // the return place `_0` to agree, and range-checked the literal
+            // against it. Here: the width must be a supported
+            // `MachineSIntWidth`, and — belt and braces over the recognizer —
+            // the return type must resolve to exactly that signed domain, so a
+            // width the domain table spells differently can never mint.
+            let width = signed_machine_width(width_bits)?;
+            if ty_to_domain(&func.body.return_ty) != Some(trust_spec_elab::Domain::Signed(width)) {
+                return None;
+            }
+            trust_spec_elab::admit_signed_constant_function(env, &kernel_const, value, width)
+        }
+        AdmissibleBody::AggregateFields { .. } => {
+            // Recognized, but NOT minted -- and this arm is fail-closed on
+            // purpose rather than unimplemented by oversight.
+            //
+            // Every other arm mints ONE Clean definition for the whole
+            // function, because every other shape returns a scalar. An
+            // aggregate return has no such term: minting it would require
+            // mapping the client's ADT onto a Clean structure, which is a far
+            // larger commitment than the clause actually needs. What a clause
+            // on such a function names is `result.<i>`, so what the discharge
+            // lane needs is FIELD i's defining term, not the record's.
+            //
+            // Recognizing the shape is still worth doing on its own: it is what
+            // lets the facet lane admit these bodies, which is what makes
+            // `gate_admissible_coverage` demand a contract on them. The clause
+            // then discharges through the NATIVE verifier (`sat_term` proves
+            // `result.coeff <= degree` that way today) rather than by citation.
+            //
+            // The next increment is a per-field mint plus an E9 binding for
+            // `result.<i>`; until it lands, returning None here means such a
+            // function simply carries no kernel import, which is exactly the
+            // state the citation lane already fails closed on.
+            return None;
+        }
         AdmissibleBody::Projection { param } => {
             // Derive every parameter's domain from its declared type; fail
             // closed if any parameter is not a supported machine/bool
@@ -929,6 +1445,32 @@ pub fn admit_function_into(
             // parameter's type, which admit_projection_function reads).
             let param_domains = param_domains_of(func)?;
             trust_spec_elab::admit_projection_function(env, &kernel_const, &param_domains, param)
+        }
+        AdmissibleBody::FieldProjection { param, field } => {
+            // The kernel never sees the aggregate: the import is minted over
+            // the FLATTENED scalar parameter list, so `fn degree_of(c: Cst)`
+            // becomes `fun degree coeff => degree`. The recognizer already
+            // pinned the body to `_0 = _p.f` on a by-value struct parameter
+            // whose field type IS the return type; this arm maps `(p, f)` onto
+            // its position in that flat list and re-checks the carrier.
+            let rows = param_flat_rows(func)?;
+            if field >= rows.get(param)?.len() {
+                return None;
+            }
+            let flat_index = rows.iter().take(param).map(Vec::len).sum::<usize>() + field;
+            let (domains, names): (Vec<_>, Vec<_>) = rows.into_iter().flatten().unzip();
+            // Belt and braces over the recognizer's own return-type check: the
+            // projected carrier must be the one the function returns.
+            if ty_to_domain(&func.body.return_ty).as_ref() != domains.get(flat_index) {
+                return None;
+            }
+            trust_spec_elab::admit_field_projection_function(
+                env,
+                &kernel_const,
+                &domains,
+                &names,
+                flat_index,
+            )
         }
         AdmissibleBody::Select { cmp, cmp_left, cmp_right, then_param, else_param } => {
             let param_domains = param_domains_of(func)?;
@@ -949,29 +1491,94 @@ pub fn admit_function_into(
                 else_param,
             )
         }
-        // R2/C9: the param-vs-const compare, routed through the NEW admit
-        // route (`admit_select_literal_function` — the phase-1 probes
-        // measured that no pre-existing producer could mint this side B).
-        // Same boundary translation as the parameter select above; the
-        // producer does its own single-domain/Machine-only guards and
-        // range-checks the literal fail-closed.
-        AdmissibleBody::SelectLiteral { cmp, cmp_param, literal, then_param, else_param } => {
+            // R2/C9: the param-vs-const compare, routed through the NEW admit
+            // route (`admit_select_literal_function` — the phase-1 probes
+            // measured that no pre-existing producer could mint this side B).
+            // Same boundary translation as the parameter select above; the
+            // producer does its own single-domain/Machine-only guards and
+            // range-checks the literal fail-closed.
+            AdmissibleBody::SelectLiteral { cmp, cmp_param, literal, then_param, else_param } => {
+                let param_domains = param_domains_of(func)?;
+                use trust_types::admissible_body::SelectCmp as RecCmp;
+                let cmp = match cmp {
+                    RecCmp::Lt => trust_spec_elab::SelectCmp::Lt,
+                    RecCmp::Le => trust_spec_elab::SelectCmp::Le,
+                    RecCmp::Eq => trust_spec_elab::SelectCmp::Eq,
+                };
+                trust_spec_elab::admit_select_literal_function(
+                    env,
+                    &kernel_const,
+                    &param_domains,
+                    cmp,
+                    cmp_param,
+                    literal,
+                    then_param,
+                    else_param,
+                )
+            }
+        AdmissibleBody::ComparisonBool { cmp, left, right } => {
+            // The recognizer already pinned the declared return type to
+            // `bool` and normalized `>`/`>=` by operand swap; the mint enforces
+            // the single machine/signed parameter domain (the decision's
+            // carrier) and range-checks any literal operand against it.
             let param_domains = param_domains_of(func)?;
-            use trust_types::admissible_body::SelectCmp as RecCmp;
+            use trust_types::admissible_body::{CmpOperand as RecOp, SelectCmp as RecCmp};
             let cmp = match cmp {
                 RecCmp::Lt => trust_spec_elab::SelectCmp::Lt,
                 RecCmp::Le => trust_spec_elab::SelectCmp::Le,
                 RecCmp::Eq => trust_spec_elab::SelectCmp::Eq,
             };
-            trust_spec_elab::admit_select_literal_function(
+            let opnd = |o: RecOp| match o {
+                RecOp::Param(i) => trust_spec_elab::CmpOperand::Param(i),
+                RecOp::Const(v) => trust_spec_elab::CmpOperand::Const(v),
+                RecOp::NegConst(m) => trust_spec_elab::CmpOperand::NegConst(m),
+            };
+            trust_spec_elab::admit_comparison_function(
                 env,
                 &kernel_const,
                 &param_domains,
                 cmp,
-                cmp_param,
-                literal,
-                then_param,
-                else_param,
+                opnd(left),
+                opnd(right),
+            )
+        }
+        AdmissibleBody::BoolBinary { op, left, right } => {
+            // Each leaf is an already-admissible comparison; the mint composes
+            // the two leaf decisions with `Bool.and`/`Bool.or`, matching the
+            // clause lane's `A && B` / `A || B` elaboration exactly. The
+            // single-domain / literal-range checks live in the mint, shared
+            // with the single-comparison arm above.
+            let param_domains = param_domains_of(func)?;
+            use trust_types::admissible_body::{
+                BoolBinOp as RecBoolOp, CmpOperand as RecOp, ComparisonLeaf, SelectCmp as RecCmp,
+            };
+            let cmp = |c: RecCmp| match c {
+                RecCmp::Lt => trust_spec_elab::SelectCmp::Lt,
+                RecCmp::Le => trust_spec_elab::SelectCmp::Le,
+                RecCmp::Eq => trust_spec_elab::SelectCmp::Eq,
+            };
+            let opnd = |o: RecOp| match o {
+                RecOp::Param(i) => trust_spec_elab::CmpOperand::Param(i),
+                RecOp::Const(v) => trust_spec_elab::CmpOperand::Const(v),
+                RecOp::NegConst(m) => trust_spec_elab::CmpOperand::NegConst(m),
+            };
+            let op = match op {
+                RecBoolOp::And => trust_spec_elab::BoolBinOp::And,
+                RecBoolOp::Or => trust_spec_elab::BoolBinOp::Or,
+            };
+            let ComparisonLeaf { cmp: lc, left: ll, right: lr } = left;
+            let ComparisonLeaf { cmp: rc, left: rl, right: rr } = right;
+            trust_spec_elab::admit_bool_binary_function(
+                env,
+                &kernel_const,
+                &param_domains,
+                op,
+                cmp(lc),
+                opnd(ll),
+                opnd(lr),
+                cmp(rc),
+                opnd(rl),
+                opnd(rr),
             )
         }
         AdmissibleBody::Arithmetic { op, left, right } => {
@@ -1004,6 +1611,87 @@ pub fn admit_function_into(
             let names: Vec<String> = (0..func.body.arg_count).map(|i| format!("p{i}")).collect();
             let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
             trust_spec_elab::admit_expr_function(env, &kernel_const, &body, &name_refs, &domain)
+        }
+        AdmissibleBody::CheckedArithmetic { op, width_bits, left, right } => {
+            // The recognizer already pinned: the pinned std `Option<iN>`
+            // return shape (Direct tag), the exact CheckedBinaryOp dataflow /
+            // marked-callee identity, no `Assert`, and in-range operands.
+            // Here: every parameter must live at the SIGNED operand carrier
+            // of the SAME width (the mint re-checks this), and the width must
+            // be a supported `MachineSIntWidth` — anything else fails the
+            // import closed.
+            let width = signed_machine_width(width_bits)?;
+            let param_domains = param_domains_of(func)?;
+            use trust_types::admissible_body::{ArithOperand, CheckedArithOp as RecOp};
+            let opnd = |o: ArithOperand| match o {
+                ArithOperand::Param(i) => trust_spec_elab::CmpOperand::Param(i),
+                ArithOperand::Const(v) => trust_spec_elab::CmpOperand::Const(v),
+            };
+            let op = match op {
+                RecOp::Add => trust_spec_elab::CheckedArithOp::Add,
+                RecOp::Sub => trust_spec_elab::CheckedArithOp::Sub,
+                RecOp::Mul => trust_spec_elab::CheckedArithOp::Mul,
+            };
+            trust_spec_elab::admit_checked_arithmetic_function(
+                env,
+                &kernel_const,
+                &param_domains,
+                op,
+                width,
+                opnd(left),
+                opnd(right),
+            )
+        }
+        AdmissibleBody::GuardedNarrow { from_bits, to_bits, param } => {
+            // The recognizer already pinned: the pinned std `Option<iN>`
+            // return shape (Direct tag), the exact `i64::MIN`/`i64::MAX`
+            // conjunction guard over exactly this parameter, the `Some`-of-its
+            // -truncation / `None` arm split with BOTH guard-false edges on
+            // the SAME `None` block, no `Assert` and no call. Here: the source
+            // and target widths must be supported `MachineSIntWidth`s and
+            // every parameter must have a supported domain — anything else
+            // fails the import closed. The mint re-checks that the narrowed
+            // parameter lives at the source carrier and that the (from, to)
+            // pair is the one this increment admits.
+            let from = signed_machine_width(from_bits)?;
+            let to = signed_machine_width(to_bits)?;
+            let param_domains = param_domains_of(func)?;
+            trust_spec_elab::admit_guarded_narrow_function(
+                env,
+                &kernel_const,
+                &param_domains,
+                from,
+                to,
+                param,
+            )
+        }
+        AdmissibleBody::WidenedEq { from_bits, to_bits, narrow_param, wide_param, cast_on_left } => {
+            // The recognizer already pinned: one block, exactly the measured
+            // cast-then-`Eq` pair, a SIGNED source and a SIGNED strictly-wider
+            // target (so the cast is sign extension, never zero extension and
+            // never truncation), both operands bare parameters at their own
+            // carriers, and a `bool` return. Here: both widths must be
+            // supported `MachineSIntWidth`s, every parameter must have a
+            // supported domain, and the return type must resolve to `bool` —
+            // anything else fails the import closed. The mint re-checks that
+            // each parameter lives at the carrier its role requires and that
+            // the (from, to) pair is the one this increment admits.
+            let from = signed_machine_width(from_bits)?;
+            let to = signed_machine_width(to_bits)?;
+            if ty_to_domain(&func.body.return_ty) != Some(trust_spec_elab::Domain::Bool) {
+                return None;
+            }
+            let param_domains = param_domains_of(func)?;
+            trust_spec_elab::admit_widened_eq_function(
+                env,
+                &kernel_const,
+                &param_domains,
+                from,
+                to,
+                narrow_param,
+                wide_param,
+                cast_on_left,
+            )
         }
         trust_types::admissible_body::AdmissibleBody::Composed { expr } => {
             let param_domains = param_domains_of(func)?;
@@ -1114,6 +1802,21 @@ impl CleanIslandSession {
     /// The session is tainted if any island was rejected or any cycle found,
     /// so positive citation evidence is withheld exactly as it is for
     /// [`Self::check`].
+    /// Record that `module`'s declarations are supplied by a source THIS run
+    /// elaborates (W2/lean-sibling-imports): the `.lean` front door marks each
+    /// operand's module name before [`Self::check_all`], so an `import` of a
+    /// SIBLING OPERAND resolves — under whole-batch header-first elaboration
+    /// it is semantically a no-op, and clean-elab's `ImportPolicy` doc has
+    /// always counted this resolution class as resolved (the clean-native path
+    /// simply never received the record). Only name-resolution bookkeeping:
+    /// every marked module's declarations are still elaborated from source and
+    /// kernel-checked in this same session, external `.olean` search stays
+    /// permanently disabled, and an unmarked module keeps the verbatim
+    /// fail-closed refusal. The island lane marks nothing.
+    pub fn mark_import_satisfied_from_source(&mut self, module: &str) {
+        self.file_ctx.mark_import_satisfied_from_source(module);
+    }
+
     pub fn check_all(&mut self, sources: &[&str]) -> crate::clean_island_batch::CleanIslandBatch {
         let batch = crate::clean_island_batch::check_islands_batched(
             &mut self.env,
@@ -1145,10 +1848,16 @@ impl CleanIslandSession {
         functions: &[trust_types::VerifiableFunction],
         facet_table: &trust_spec_elab::FacetTable,
     ) -> Vec<(String, trust_spec_elab::Admission)> {
-        functions
-            .iter()
-            .filter_map(|func| admit_function_into(&mut self.env, func, facet_table))
-            .collect()
+        // A struct-returning body contributes ONE admission PER FIELD; every
+        // other shape contributes at most one for the whole function.
+        let mut out = Vec::new();
+        for func in functions {
+            out.extend(admit_function_fields_into(&mut self.env, func, facet_table));
+            if let Some(one) = admit_function_into(&mut self.env, func, facet_table) {
+                out.push(one);
+            }
+        }
+        out
     }
 
     /// Invalidate positive evidence after a caller-side island ingestion
@@ -1289,14 +1998,51 @@ fn machine_width(bits: u32) -> Option<trust_spec_elab::MachineUIntWidth> {
     })
 }
 
+/// The signed sibling of [`machine_width`]: `i8`–`i128`.
+///
+/// `i128` joined the table on 2026-08-24 (E6 widening increment 6). Nothing
+/// below the table blocked it: `MachineSIntWidth::I128` and the `BitVec 128`
+/// carrier have been in the clause elaborator all along, `Domain::bitvec_bits`
+/// already answers `Some(128)`, `Domain::numeral`/`negative_numeral` already
+/// range-check at `2^127`, and the sign-flip order key is the same
+/// `Nat.xor (BitVec.toNat v) 2^(w-1)` shape at the wider `w`. The width table
+/// was the only gate, and the cost of it being closed was that every
+/// `i128`-typed function stayed unadmitted, so `result` in its postcondition
+/// stayed universally quantified and the citation failed with a raw
+/// `TermRejected` term dump instead of a discharge.
+fn signed_machine_width(bits: u32) -> Option<trust_spec_elab::MachineSIntWidth> {
+    use trust_spec_elab::MachineSIntWidth::{I8, I16, I32, I64, I128};
+    Some(match bits {
+        8 => I8,
+        16 => I16,
+        32 => I32,
+        64 => I64,
+        128 => I128,
+        _ => return None,
+    })
+}
+
 /// The E6 elaboration [`trust_spec_elab::Domain`] a Rust type carries, or `None`
-/// for a type outside the supported fragment (signed integers, floats,
-/// references, aggregates, …) — which fails the import closed.
+/// for a type outside the supported fragment (floats, references, aggregates, …)
+/// — which fails the import closed. Signed `i8`–`i64` map to
+/// [`trust_spec_elab::Domain::Signed`] (E6 widening increment 4): the exact
+/// two's-complement `BitVec` carrier whose comparisons the clause elaborator
+/// already states over the sign-flip order keys.
+///
+/// `i128`/`u128` map to `Signed(I128)`/`U128` (E6 widening increment 6). Note
+/// `u128` is NOT a `Machine` width: `MachineUIntWidth` tops out at 64 and its
+/// carrier is `UInt64`, whereas `u128`'s carrier is the exact `BitVec 128`
+/// [`trust_spec_elab::Domain::U128`] already provides. Routing it through
+/// `machine_width` would have been the silent wrong answer.
 fn ty_to_domain(ty: &trust_types::Ty) -> Option<trust_spec_elab::Domain> {
     use trust_spec_elab::{Domain, MachineUIntWidth};
     match ty {
         trust_types::Ty::Bool => Some(Domain::Bool),
+        trust_types::Ty::Int { width: 128, signed: false } => Some(Domain::U128),
         trust_types::Ty::Int { width, signed: false } => machine_width(*width).map(Domain::Machine),
+        trust_types::Ty::Int { width, signed: true } => {
+            signed_machine_width(*width).map(Domain::Signed)
+        }
         trust_types::Ty::PtrSizedInt { signed: false } => {
             Some(Domain::Machine(MachineUIntWidth::U64))
         }
@@ -1312,6 +2058,59 @@ fn param_domains_of(
 ) -> Option<Vec<trust_spec_elab::Domain>> {
     (1..=func.body.arg_count)
         .map(|i| func.body.locals.iter().find(|l| l.index == i).and_then(|l| ty_to_domain(&l.ty)))
+        .collect()
+}
+
+/// The FLATTENED clause-side parameter rows of `func`, GROUPED BY SOURCE
+/// PARAMETER: for each value parameter in declaration order, the
+/// `(domain, clause-side name)` rows it contributes — one row for itself when
+/// it is a supported scalar, or ONE ROW PER DECLARED FIELD when it is a struct
+/// (E6/E9 widening increment 7). `None` if any parameter contributes nothing
+/// this lane can name.
+///
+/// This must produce the SAME list, in the SAME order, as the compiler's
+/// `trust_fn_param_type_names` — which computes it independently from HIR
+/// types. Two properties keep them from drifting:
+///
+///   * **All-or-nothing per parameter.** A struct contributes rows only when
+///     EVERY declared field maps to a supported domain; one unsupported field
+///     refuses the whole parameter (and, since a projection mint needs every
+///     row, the whole function). There is therefore NO per-field filter for the
+///     two sides to disagree about — and they would disagree, because the two
+///     type vocabularies are not identical (`isize` has a `Domain` on one side
+///     and not the other). A disagreement now lands on ARITY, which makes the
+///     goal ill-typed and `reject_untyped_goal` refuses it.
+///   * **The names are recorded.** `Admission::param_names` carries this list
+///     into `elaborate_ensures`, which refuses a clause whose own parameter
+///     list differs. That is what catches a same-length REORDERING, the one
+///     drift the kernel cannot see.
+///
+/// A parameter with no recorded local name yields `None`: without it there is
+/// no clause-side spelling to record, and an unnamed row could not be checked.
+fn param_flat_rows(
+    func: &trust_types::VerifiableFunction,
+) -> Option<Vec<Vec<(trust_spec_elab::Domain, String)>>> {
+    (1..=func.body.arg_count)
+        .map(|i| {
+            let local = func.body.locals.iter().find(|l| l.index == i)?;
+            let name = local.name.as_deref()?;
+            if let Some(domain) = ty_to_domain(&local.ty) {
+                return Some(vec![(domain, name.to_string())]);
+            }
+            // An ENUM is refused: its `fields` list is the union view across
+            // variants, so field `i` is variant-relative and does not name one
+            // value of the parameter.
+            let trust_types::Ty::Adt { fields, variants, .. } = &local.ty else {
+                return None;
+            };
+            if !variants.is_empty() {
+                return None;
+            }
+            fields
+                .iter()
+                .map(|(field, ty)| Some((ty_to_domain(ty)?, format!("{name}.{field}"))))
+                .collect::<Option<Vec<_>>>()
+        })
         .collect()
 }
 
@@ -1715,43 +2514,489 @@ pub fn clause_monitor_status(
 mod tests {
     use super::*;
 
-    /// Trust (#63, R3) — THE RED CASE, written before the green one per the
-    /// plan's own acceptance: a generated carrier whose body does NOT match its
-    /// Clean definition must be REJECTED, with the kernel as the only judge.
-    ///
-    /// The carrier here is an E6-recognizable IDENTITY body, so admission
-    /// succeeds and the refusal comes from the DEFEQ GATE itself — the test
-    /// exercises the gate, not the admission filter in front of it.
+    /// The NORMATIVE AUTHORED client spellings (veripb_kernel.lean §checked
+    /// arithmetic — the byte-level term structure the checked-arith spec makes
+    /// the plan of record: sign-case-match `toIntN`, the exact literals, the
+    /// `fitsI64` guard shape, `fitsI128` as authored), elaborated by the SAME
+    /// island elaborator a client island goes through — plus the two §5.7
+    /// FORGERY twins (`checkedAddSwapped64` with the `some`/`none` arms
+    /// reversed; `checkedSub64` for the add↔sub swap).
+    const CHECKED_MODEL_ISLAND: &str = r#"
+def key64 (v : BitVec 64) : Nat :=
+    Nat.xor (BitVec.toNat v) 9223372036854775808
+
+def toInt64 (v : BitVec 64) : Int :=
+    match Nat.ble 9223372036854775808 (key64 v) with
+    | true  => Int.ofNat (Nat.sub (key64 v) 9223372036854775808)
+    | false => Int.negSucc (Nat.sub 9223372036854775807 (key64 v))
+
+def i64Max : Int := 9223372036854775807
+def i64Min : Int := Int.neg 9223372036854775808
+
+def fitsI64 (x : Int) : Bool :=
+  match Int.ble i64Min x with
+  | true  => Int.ble x i64Max
+  | false => false
+
+def ofInt64 (x : Int) : BitVec 64 :=
+    match Int.ble (Int.ofNat 0) x with
+    | true  => BitVec.ofNat 64 (Int.toNat x)
+    | false => BitVec.ofNat 64 (Int.toNat (Int.add x (Int.ofNat 18446744073709551616)))
+
+def checkedAdd64 (a : BitVec 64) (b : BitVec 64) : Option (BitVec 64) :=
+    match fitsI64 (Int.add (toInt64 a) (toInt64 b)) with
+    | true  => some (ofInt64 (Int.add (toInt64 a) (toInt64 b)))
+    | false => none
+
+def checkedSub64 (a : BitVec 64) (b : BitVec 64) : Option (BitVec 64) :=
+    match fitsI64 (Int.sub (toInt64 a) (toInt64 b)) with
+    | true  => some (ofInt64 (Int.sub (toInt64 a) (toInt64 b)))
+    | false => none
+
+def checkedMul64 (a : BitVec 64) (b : BitVec 64) : Option (BitVec 64) :=
+    match fitsI64 (Int.mul (toInt64 a) (toInt64 b)) with
+    | true  => some (ofInt64 (Int.mul (toInt64 a) (toInt64 b)))
+    | false => none
+
+def checkedAddSwapped64 (a : BitVec 64) (b : BitVec 64) : Option (BitVec 64) :=
+    match fitsI64 (Int.add (toInt64 a) (toInt64 b)) with
+    | true  => none
+    | false => some (ofInt64 (Int.add (toInt64 a) (toInt64 b)))
+
+def key128 (v : BitVec 128) : Nat :=
+    Nat.xor (BitVec.toNat v) 170141183460469231731687303715884105728
+
+def toInt128 (v : BitVec 128) : Int :=
+    match Nat.ble 170141183460469231731687303715884105728 (key128 v) with
+    | true  => Int.ofNat (Nat.sub (key128 v) 170141183460469231731687303715884105728)
+    | false => Int.negSucc (Nat.sub 170141183460469231731687303715884105727 (key128 v))
+
+def i128Max : Int := 170141183460469231731687303715884105727
+def i128Min : Int := Int.neg 170141183460469231731687303715884105728
+
+def fitsI128 (x : Int) : Bool :=
+    match Int.ble i128Min x with
+    | true  => Int.ble x i128Max
+    | false => false
+
+def ofInt128 (x : Int) : BitVec 128 :=
+    match Int.ble (Int.ofNat 0) x with
+    | true  => BitVec.ofNat 128 (Int.toNat x)
+    | false => BitVec.ofNat 128 (Int.toNat (Int.add x (Int.ofNat 340282366920938463463374607431768211456)))
+
+def checkedMul128 (a : BitVec 128) (b : BitVec 128) : Option (BitVec 128) :=
+    match fitsI128 (Int.mul (toInt128 a) (toInt128 b)) with
+    | true  => some (ofInt128 (Int.mul (toInt128 a) (toInt128 b)))
+    | false => none
+
+def trunc64 (v : BitVec 128) : BitVec 64 :=
+    BitVec.ofNat 64 (BitVec.toNat v)
+
+def narrowWide (x : BitVec 128) : Option (BitVec 64) :=
+    match fitsI64 (toInt128 x) with
+    | true  => some (trunc64 x)
+    | false => none
+
+def narrowWideSwapped (x : BitVec 128) : Option (BitVec 64) :=
+    match fitsI64 (toInt128 x) with
+    | true  => none
+    | false => some (trunc64 x)
+
+def trunc64Narrower (v : BitVec 128) : BitVec 64 :=
+    BitVec.ofNat 64 (BitVec.toNat (BitVec.ofNat 32 (BitVec.toNat v)))
+
+def narrowWideTrunc32 (x : BitVec 128) : Option (BitVec 64) :=
+    match fitsI64 (toInt128 x) with
+    | true  => some (trunc64Narrower x)
+    | false => none
+
+def narrowWideFitsWide (x : BitVec 128) : Option (BitVec 64) :=
+    match fitsI128 (toInt128 x) with
+    | true  => some (trunc64 x)
+    | false => none
+
+def sextWide (v : BitVec 64) : BitVec 128 :=
+    ofInt128 (toInt64 v)
+
+def eqOkW (m : BitVec 64) (t : BitVec 128) : Bool :=
+    Decidable.decide (Eq (BitVec.toNat (sextWide m)) (BitVec.toNat t))
+                     (Nat.decEq (BitVec.toNat (sextWide m)) (BitVec.toNat t))
+
+def zextWide (v : BitVec 64) : BitVec 128 :=
+    BitVec.ofNat 128 (BitVec.toNat v)
+
+def eqOkZeroExt (m : BitVec 64) (t : BitVec 128) : Bool :=
+    Decidable.decide (Eq (BitVec.toNat (zextWide m)) (BitVec.toNat t))
+                     (Nat.decEq (BitVec.toNat (zextWide m)) (BitVec.toNat t))
+
+def eqOkTrunc (m : BitVec 64) (t : BitVec 128) : Bool :=
+    Decidable.decide (Eq (BitVec.toNat m) (BitVec.toNat (trunc64 t)))
+                     (Nat.decEq (BitVec.toNat m) (BitVec.toNat (trunc64 t)))
+
+def zeroI64 : BitVec 64 := BitVec.ofNat 64 Nat.zero
+def oneI64 : BitVec 64 := BitVec.ofNat 64 1
+def twoI64 : BitVec 64 := BitVec.ofNat 64 2
+def negOneI64 : BitVec 64 := BitVec.ofNat 64 18446744073709551615
+def minI64Bits : BitVec 64 := BitVec.ofNat 64 9223372036854775808
+def maxI64Bits : BitVec 64 := BitVec.ofNat 64 9223372036854775807
+def oneI32 : BitVec 32 := BitVec.ofNat 32 1
+def zeroI128 : BitVec 128 := BitVec.ofNat 128 Nat.zero
+def oneI128 : BitVec 128 := BitVec.ofNat 128 1
+def minI128Bits : BitVec 128 := BitVec.ofNat 128 170141183460469231731687303715884105728
+def maxI128Bits : BitVec 128 := BitVec.ofNat 128 170141183460469231731687303715884105727
+"#;
+
+    /// The §5.7 discipline, end to end: the CHECKED-ARITHMETIC MINT's seeded
+    /// model is DELTA-DEFEQ to the client island's AUTHORED model — through
+    /// the real island elaborator, with the vendored (literal-only-`toNat`)
+    /// kernel, so the equality closes by lazy-delta unfolding on STUCK
+    /// scrutinees with no closed-pipeline evaluation — and every forged
+    /// variant (swapped `some`/`none` arms; `add`↔`sub`) is CAUGHT, not
+    /// silently green.
     #[test]
-    fn r3_diverging_generated_carrier_is_rejected() {
-        use trust_types::{
-            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-            Terminator, Ty, VerifiableBody, VerifiableFunction,
+    fn checked_mint_is_defeq_to_the_island_authored_model_and_swaps_are_caught() {
+        use trust_spec_elab::{CheckedArithOp, CmpOperand, Domain, MachineSIntWidth};
+        let mut env = Environment::with_prelude();
+        let mut file_ctx = FileContext::new();
+        file_ctx.disable_external_import_search();
+        let outcome = check_clean_island_with_context(CHECKED_MODEL_ISLAND, &mut env, &mut file_ctx);
+        assert!(!outcome.is_rejected(), "the authored island must register: {outcome:?}");
+
+        let i64d = Domain::Signed(MachineSIntWidth::I64);
+        let i128d = Domain::Signed(MachineSIntWidth::I128);
+        for (mint_name, op, dom, width) in [
+            ("cadd64_mint", CheckedArithOp::Add, &i64d, MachineSIntWidth::I64),
+            ("csub64_mint", CheckedArithOp::Sub, &i64d, MachineSIntWidth::I64),
+            ("cmul64_mint", CheckedArithOp::Mul, &i64d, MachineSIntWidth::I64),
+            ("cmul128_mint", CheckedArithOp::Mul, &i128d, MachineSIntWidth::I128),
+        ] {
+            trust_spec_elab::admit_checked_arithmetic_function(
+                &mut env,
+                mint_name,
+                &[dom.clone(), dom.clone()],
+                op,
+                width,
+                CmpOperand::Param(0),
+                CmpOperand::Param(1),
+            )
+            .unwrap_or_else(|e| panic!("{mint_name} must admit into the island env: {e}"));
+        }
+
+        // The island definition's `Option (BitVec 64)` codomain records the
+        // (currently unique-preimage) Option result domain, which is what lets
+        // a probe clause spell `result == cadd_isl(a, b)`.
+        assert_eq!(
+            island_definition_signature(&env, "checkedAdd64"),
+            Some((2, Some(Domain::OptionSigned(MachineSIntWidth::I64)))),
+            "an Option (BitVec 64) island codomain must record OptionSigned(I64)"
+        );
+        assert_eq!(
+            island_definition_signature(&env, "checkedMul128"),
+            Some((2, Some(Domain::OptionSigned(MachineSIntWidth::I128)))),
+            "an Option (BitVec 128) island codomain must record OptionSigned(I128)"
+        );
+
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let bv_lit = |bits: u64, v: u64| {
+            clean_kernel::Expr::apps(
+                clean_kernel::Expr::const_(clean_kernel::Name::from_string("BitVec.ofNat"), vec![]),
+                [clean_kernel::Expr::nat_lit(bits), clean_kernel::Expr::nat_lit(v)],
+            )
         };
-        let identity_carrier = |def_path: &str| VerifiableFunction {
-            name: "gen".into(),
-            def_path: def_path.into(),
+        let app2 = |f: &str, a: clean_kernel::Expr, b: clean_kernel::Expr| {
+            clean_kernel::Expr::apps(
+                clean_kernel::Expr::const_(clean_kernel::Name::from_string(f), vec![]),
+                [a, b],
+            )
+        };
+        let (a64, b64) = (bv_lit(64, 1), bv_lit(64, 2));
+        let (a128, b128) = (bv_lit(128, 1), bv_lit(128, 2));
+
+        // POSITIVE: mint ≡ island authored model, per op, both widths.
+        for (mint_name, island_name, a, b) in [
+            ("cadd64_mint", "checkedAdd64", &a64, &b64),
+            ("csub64_mint", "checkedSub64", &a64, &b64),
+            ("cmul64_mint", "checkedMul64", &a64, &b64),
+            ("cmul128_mint", "checkedMul128", &a128, &b128),
+        ] {
+            assert!(
+                tc.is_def_eq(
+                    &app2(mint_name, a.clone(), b.clone()),
+                    &app2(island_name, a.clone(), b.clone())
+                ),
+                "{mint_name} must be delta-defeq to the island's authored {island_name}"
+            );
+        }
+
+        // §5.7 NEG probe 1: the swapped-`some`/`none` island twin is NOT
+        // def-eq to the mint (a consistently-reversed model must be CAUGHT).
+        assert!(
+            !tc.is_def_eq(
+                &app2("cadd64_mint", a64.clone(), b64.clone()),
+                &app2("checkedAddSwapped64", a64.clone(), b64.clone())
+            ),
+            "a swapped some/none model must NOT close against the mint"
+        );
+
+        // §5.7 NEG probe 2: the add↔sub swap is CAUGHT in both directions.
+        assert!(
+            !tc.is_def_eq(
+                &app2("cadd64_mint", a64.clone(), b64.clone()),
+                &app2("checkedSub64", a64.clone(), b64.clone())
+            ),
+            "an add mint must NOT close against the island's checkedSub64"
+        );
+        assert!(
+            !tc.is_def_eq(
+                &app2("csub64_mint", a64.clone(), b64.clone()),
+                &app2("checkedAdd64", a64.clone(), b64.clone())
+            ),
+            "a sub mint must NOT close against the island's checkedAdd64"
+        );
+    }
+
+    /// The §5.7 discipline for the GUARDED-NARROW lane: the mint's seeded
+    /// model is DELTA-DEFEQ to the client island's AUTHORED `narrowWide` —
+    /// through the real island elaborator — and each of the three forgeries is
+    /// CAUGHT, not silently green.
+    ///
+    /// The forgeries are compared on an OPAQUE argument, never a literal: at a
+    /// closed literal the guard scrutinee evaluates away, and the `fitsI128`
+    /// forgery would agree with the mint on every value that happens to fit
+    /// `i64` — the exact false-`Some` bug it must detect would go unseen. On an
+    /// opaque argument both guards are stuck and structurally different, which
+    /// is the comparison the citation lane actually performs.
+    #[test]
+    fn guarded_narrow_mint_is_defeq_to_the_island_model_and_forgeries_are_caught() {
+        use trust_spec_elab::{Domain, MachineSIntWidth};
+        let mut env = Environment::with_prelude();
+        let mut file_ctx = FileContext::new();
+        file_ctx.disable_external_import_search();
+        let outcome = check_clean_island_with_context(CHECKED_MODEL_ISLAND, &mut env, &mut file_ctx);
+        assert!(!outcome.is_rejected(), "the authored island must register: {outcome:?}");
+
+        let i128d = Domain::Signed(MachineSIntWidth::I128);
+        trust_spec_elab::admit_guarded_narrow_function(
+            &mut env,
+            "narrow_mint",
+            std::slice::from_ref(&i128d),
+            MachineSIntWidth::I128,
+            MachineSIntWidth::I64,
+            0,
+        )
+        .expect("the guarded-narrow mint must admit into the island env");
+
+        // The island definition's `Option (BitVec 64)` codomain over a
+        // `BitVec 128` parameter is what lets a probe clause spell
+        // `result == narrow_isl(x)` at MIXED widths.
+        assert_eq!(
+            island_definition_signature(&env, "narrowWide"),
+            Some((1, Some(Domain::OptionSigned(MachineSIntWidth::I64)))),
+            "an Option (BitVec 64) island codomain must record OptionSigned(I64)"
+        );
+
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let app1 = |f: &str, a: clean_kernel::Expr| {
+            clean_kernel::Expr::app(
+                clean_kernel::Expr::const_(clean_kernel::Name::from_string(f), vec![]),
+                a,
+            )
+        };
+        // An OPAQUE wide argument: no closed-pipeline evaluation, so the
+        // comparison is the delta-unfolding one the citation lane performs.
+        let opaque = clean_kernel::Expr::fvar(clean_kernel::FVarId::new(0));
+        let literal = clean_kernel::Expr::apps(
+            clean_kernel::Expr::const_(clean_kernel::Name::from_string("BitVec.ofNat"), vec![]),
+            [clean_kernel::Expr::nat_lit(128), clean_kernel::Expr::nat_lit(7)],
+        );
+
+        // POSITIVE: mint ≡ the island's authored model, opaque and closed.
+        for (what, arg) in [("an opaque argument", &opaque), ("a closed literal", &literal)] {
+            assert!(
+                tc.is_def_eq(&app1("narrow_mint", arg.clone()), &app1("narrowWide", arg.clone())),
+                "the guarded-narrow mint must be delta-defeq to the island's \
+                 authored narrowWide at {what}"
+            );
+        }
+
+        // NEG (a): arms swapped — `None` where the guard holds. This is the
+        // wrong-verdict shape the recognizer already forbids structurally;
+        // the oracle double-covers it, because a positive fixture alone
+        // closes under a CONSISTENTLY wrong mint.
+        // NEG (b): a narrower truncation — the payload loses its high bits.
+        // NEG (c): the guard widened to `fitsI128`, which is TRUE for every
+        //          `i128`, so every wide value would be admitted wrapped —
+        //          exactly the VeriPB bug-C false-`Some` class.
+        for (forgery, why) in [
+            ("narrowWideSwapped", "a swapped some/none model"),
+            ("narrowWideTrunc32", "a wrong-width truncation"),
+            ("narrowWideFitsWide", "a guard widened to fitsI128"),
+        ] {
+            assert!(
+                !tc.is_def_eq(
+                    &app1("narrow_mint", opaque.clone()),
+                    &app1(forgery, opaque.clone())
+                ),
+                "{why} must NOT close against the guarded-narrow mint"
+            );
+        }
+
+        drop(tc);
+
+        // A wrong-width or wrong-direction request fails the MINT closed
+        // rather than producing a differently-typed admission.
+        for (from, to) in [
+            (MachineSIntWidth::I128, MachineSIntWidth::I32),
+            (MachineSIntWidth::I64, MachineSIntWidth::I64),
+            (MachineSIntWidth::I64, MachineSIntWidth::I128),
+        ] {
+            assert!(
+                trust_spec_elab::admit_guarded_narrow_function(
+                    &mut env,
+                    "narrow_parked",
+                    std::slice::from_ref(&i128d),
+                    from,
+                    to,
+                    0,
+                )
+                .is_err(),
+                "({from:?} -> Option<{to:?}>) must park"
+            );
+        }
+        // A parameter that is not at the source carrier, and an out-of-range
+        // parameter index, both fail closed.
+        assert!(
+            trust_spec_elab::admit_guarded_narrow_function(
+                &mut env,
+                "narrow_parked",
+                &[Domain::Signed(MachineSIntWidth::I64)],
+                MachineSIntWidth::I128,
+                MachineSIntWidth::I64,
+                0,
+            )
+            .is_err(),
+            "a narrowed parameter off the source carrier must fail closed"
+        );
+        assert!(
+            trust_spec_elab::admit_guarded_narrow_function(
+                &mut env,
+                "narrow_parked",
+                std::slice::from_ref(&i128d),
+                MachineSIntWidth::I128,
+                MachineSIntWidth::I64,
+                1,
+            )
+            .is_err(),
+            "an out-of-range parameter index must fail closed"
+        );
+    }
+
+    /// The wiring arm for the GUARDED-NARROW lane: the measured `c2` body with
+    /// certified facets mints through [`admit_function_into`] with the
+    /// `Option<i64>` return domain recorded; uncertified facets mint nothing,
+    /// and the UNGUARDED body (`c11`) mints nothing even with every facet
+    /// certified.
+    #[test]
+    fn admit_function_into_mints_guarded_narrow() {
+        use trust_types::{
+            AggregateKind, BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue,
+            SourceSpan, Statement, Terminator, Ty, VariantDef, VerifiableBody, VerifiableFunction,
+        };
+        let i64_ty = Ty::Int { width: 64, signed: true };
+        let i128_ty = Ty::Int { width: 128, signed: true };
+        let option = Ty::adt_enum_with_disc_safety(
+            "core::option::Option",
+            vec![
+                VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), i64_ty.clone())],
+                },
+            ],
+            true,
+        );
+        let agg = |variant: usize| AggregateKind::Adt {
+            name: "core::option::Option".into(),
+            variant,
+            active_field: None,
+            args: Some("core::option::Option<i64>".into()),
+        };
+        let stmt = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let switch = |flag: usize, zero: usize, other: usize| Terminator::SwitchInt {
+            discr: Operand::Move(Place::local(flag)),
+            targets: vec![(0, BlockId(zero))],
+            otherwise: BlockId(other),
+            exhaustive_enum_unreachable: false,
+            span: SourceSpan::default(),
+        };
+        let narrow = VerifiableFunction {
+            name: "narrow".into(),
+            def_path: "crate::narrow".into(),
             span: SourceSpan::default(),
             body: VerifiableBody {
                 locals: vec![
-                    LocalDecl { index: 0, ty: Ty::Int { width: 64, signed: false }, name: None },
-                    LocalDecl {
-                        index: 1,
-                        ty: Ty::Int { width: 64, signed: false },
-                        name: Some("x0".into()),
-                    },
+                    LocalDecl { index: 0, ty: option.clone(), name: None },
+                    LocalDecl { index: 1, ty: i128_ty, name: Some("x".into()) },
+                    LocalDecl { index: 2, ty: Ty::Bool, name: None },
+                    LocalDecl { index: 3, ty: Ty::Bool, name: None },
+                    LocalDecl { index: 4, ty: i64_ty.clone(), name: None },
                 ],
-                blocks: vec![BasicBlock {
-                    id: BlockId(0),
-                    stmts: vec![Statement::Assign {
-                        place: Place::local(0),
-                        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
-                        span: SourceSpan::default(),
-                    }],
-                    terminator: Terminator::Return,
-                }],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![stmt(
+                            Place::local(2),
+                            Rvalue::BinaryOp(
+                                trust_types::BinOp::Ge,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Int(-9_223_372_036_854_775_808)),
+                            ),
+                        )],
+                        terminator: switch(2, 3, 1),
+                    },
+                    BasicBlock {
+                        id: BlockId(1),
+                        stmts: vec![stmt(
+                            Place::local(3),
+                            Rvalue::BinaryOp(
+                                trust_types::BinOp::Le,
+                                Operand::Copy(Place::local(1)),
+                                Operand::Constant(ConstValue::Int(9_223_372_036_854_775_807)),
+                            ),
+                        )],
+                        terminator: switch(3, 3, 2),
+                    },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![
+                            stmt(
+                                Place::local(4),
+                                Rvalue::Cast(Operand::Copy(Place::local(1)), i64_ty),
+                            ),
+                            stmt(
+                                Place::local(0),
+                                Rvalue::Aggregate(
+                                    agg(1),
+                                    vec![Operand::Move(Place::local(4))],
+                                ),
+                            ),
+                        ],
+                        terminator: Terminator::Goto(BlockId(4)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![stmt(Place::local(0), Rvalue::Aggregate(agg(0), vec![]))],
+                        terminator: Terminator::Goto(BlockId(4)),
+                    },
+                    BasicBlock { id: BlockId(4), stmts: vec![], terminator: Terminator::Return },
+                ],
                 arg_count: 1,
-                return_ty: Ty::Int { width: 64, signed: false },
+                return_ty: option,
                 datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
@@ -1760,102 +3005,112 @@ mod tests {
             spec: Default::default(),
         };
 
-        let mut env = Environment::with_prelude();
-        let outcome = check_clean_island_into(
-            "def r3_same (x : UInt64) : UInt64 := x
-
-\
-             def r3_diff (x : UInt64) : UInt64 := UInt64.add x 1",
-            &mut env,
-        );
-        assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
-
-        let mut facets = trust_spec_elab::FacetTable::from_structural_facets([
-            ("gen::same_carrier", true, true, true, true),
-            ("gen::diff_carrier", true, true, true, true),
-        ]);
-
-        // RED: the identity carrier does NOT compute `x + 1`. The kernel must
-        // refuse, and the refusal must be the defeq gate (not admission).
-        let carrier = identity_carrier("gen::diff_carrier");
-        let verdict =
-            check_generated_carrier_faithfulness(&mut env, "r3_diff", &carrier, &mut facets);
-        match &verdict {
-            Err(CarrierFaithfulnessRejection::NotDefinitionallyEqual { detail, .. }) => {
-                // The refusal must come from the KERNEL's defeq judgment, not
-                // from a failed elaboration in front of it — the gate's first
-                // draft passed this test for the wrong reason (an unrecorded
-                // admission failed elaboration, which also maps to this
-                // variant), and the GREEN control below is what exposed it.
-                assert!(
-                    detail.contains("kernel refused definitional equality"),
-                    "the RED case must be the kernel's judgment, not a gate in \
-                     front of it: {detail}"
-                );
-            }
-            other => panic!(
-                "a diverging generated carrier MUST be rejected by the kernel's \
-                 defeq judgment — a green here is a miscompiler: {other:?}"
-            ),
-        }
-
-        // GREEN CONTROL: the SAME carrier against the definition it faithfully
-        // implements passes — so the red above is discrimination, not a gate
-        // that refuses everything.
-        let carrier = identity_carrier("gen::same_carrier");
-        let verdict =
-            check_generated_carrier_faithfulness(&mut env, "r3_same", &carrier, &mut facets);
-        assert!(verdict.is_ok(), "the faithful carrier must pass: {verdict:?}");
-    }
-
-    /// Trust (#63, R3) — fail-closed controls on the gates IN FRONT of the
-    /// kernel: a carrier outside the E6 fragment is REFUSED (R2 may only emit
-    /// what this gate can check), and an arity mismatch never reaches defeq.
-    #[test]
-    fn r3_gate_refuses_what_it_cannot_check() {
-        use trust_types::{
-            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
-            Terminator, Ty, VerifiableBody, VerifiableFunction,
-        };
-        let mut env = Environment::with_prelude();
-        let outcome = check_clean_island_into("def r3_tgt (x : UInt64) : UInt64 := x", &mut env);
-        assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
-        let mut facets = trust_spec_elab::FacetTable::from_structural_facets([(
-            "gen::opaque",
+        let certified = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::narrow",
             true,
             true,
             true,
             true,
         )]);
-        // A body the E6 recognizer cannot elaborate (raw pointer cast shape):
-        // the gate must refuse rather than skip the check.
-        let opaque = VerifiableFunction {
-            name: "gen".into(),
-            def_path: "gen::opaque".into(),
+        let mut env = Environment::with_prelude();
+        let (path, admission) = admit_function_into(&mut env, &narrow, &certified)
+            .expect("certified + recognized must mint");
+        assert_eq!(path, "crate::narrow");
+        assert_eq!(admission.arity, 1);
+        assert_eq!(
+            admission.return_domain().cloned(),
+            Some(trust_spec_elab::Domain::OptionSigned(
+                trust_spec_elab::MachineSIntWidth::I64
+            ))
+        );
+        assert_eq!(admission.param_names, None);
+
+        // Uncertified facets: nothing mints even for the recognized body.
+        let uncertified = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::narrow",
+            true,
+            true,
+            false,
+            true,
+        )]);
+        let mut env2 = Environment::with_prelude();
+        assert!(
+            admit_function_into(&mut env2, &narrow, &uncertified).is_none(),
+            "uncertified facets must not mint"
+        );
+
+        // The UNGUARDED body — `Some(x as i64)` with no width check — mints
+        // NOTHING even with every facet certified. If this ever mints, an
+        // unguarded truncation has been admitted as if it were guarded.
+        let mut unguarded = narrow;
+        unguarded.body.blocks = vec![BasicBlock {
+            id: BlockId(0),
+            stmts: unguarded.body.blocks[2].stmts.clone(),
+            terminator: Terminator::Return,
+        }];
+        let mut env3 = Environment::with_prelude();
+        assert!(
+            admit_function_into(&mut env3, &unguarded, &certified).is_none(),
+            "an unguarded narrowing cast must never mint"
+        );
+    }
+
+    /// The wiring arm: a recognized checked body with certified facets mints
+    /// through [`admit_function_into`]; uncertified facets or an unmarked
+    /// callee mint nothing.
+    #[test]
+    fn admit_function_into_mints_checked_arithmetic() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, SourceSpan, Terminator, Ty,
+            VariantDef, VerifiableBody, VerifiableFunction,
+        };
+        let int = Ty::Int { width: 64, signed: true };
+        let option = Ty::adt_enum_with_disc_safety(
+            "core::option::Option",
+            vec![
+                VariantDef { name: "None".into(), discriminant: 0, fields: vec![] },
+                VariantDef {
+                    name: "Some".into(),
+                    discriminant: 1,
+                    fields: vec![("0".into(), int.clone())],
+                },
+            ],
+            true,
+        );
+        let cadd = |callee: &str| VerifiableFunction {
+            name: "cadd".into(),
+            def_path: "crate::cadd".into(),
             span: SourceSpan::default(),
             body: VerifiableBody {
                 locals: vec![
-                    LocalDecl { index: 0, ty: Ty::Int { width: 64, signed: false }, name: None },
-                    LocalDecl {
-                        index: 1,
-                        ty: Ty::Int { width: 64, signed: false },
-                        name: Some("x0".into()),
-                    },
+                    LocalDecl { index: 0, ty: option.clone(), name: None },
+                    LocalDecl { index: 1, ty: int.clone(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: int.clone(), name: Some("b".into()) },
                 ],
-                blocks: vec![BasicBlock {
-                    id: BlockId(0),
-                    stmts: vec![Statement::Assign {
-                        place: Place::local(0),
-                        rvalue: Rvalue::Cast(
-                            Operand::Copy(Place::local(1)),
-                            Ty::Int { width: 32, signed: false },
-                        ),
-                        span: SourceSpan::default(),
-                    }],
-                    terminator: Terminator::Return,
-                }],
-                arg_count: 1,
-                return_ty: Ty::Int { width: 64, signed: false },
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![],
+                        terminator: Terminator::Call {
+                            func: callee.into(),
+                            callee_identity: None,
+                            args: vec![
+                                Operand::Copy(Place::local(1)),
+                                Operand::Copy(Place::local(2)),
+                            ],
+                            dest: Place::local(0),
+                            target: Some(BlockId(1)),
+                            span: SourceSpan::default(),
+                            atomic: None,
+                            is_foreign: false,
+                            is_unsafe_sig: false,
+                            unwind: trust_types::UnwindEdge::Unreachable,
+                        },
+                    },
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Return },
+                ],
+                arg_count: 2,
+                return_ty: option.clone(),
                 datatype_defs: Default::default(),
             },
             contracts: Vec::new(),
@@ -1863,16 +3118,186 @@ mod tests {
             postconditions: Vec::new(),
             spec: Default::default(),
         };
-        let verdict =
-            check_generated_carrier_faithfulness(&mut env, "r3_tgt", &opaque, &mut facets);
-        assert!(
-            matches!(
-                verdict,
-                Err(CarrierFaithfulnessRejection::CarrierOutsideCheckedFragment { .. })
-                    | Err(CarrierFaithfulnessRejection::NotDefinitionallyEqual { .. })
-            ),
-            "an uncheckable carrier must be refused, never skipped: {verdict:?}"
+        let marked = "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_add";
+
+        // Certified facets + the marked callee: the admission mints, with the
+        // Option return domain recorded.
+        let certified = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::cadd",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut env = Environment::with_prelude();
+        let minted = admit_function_into(&mut env, &cadd(marked), &certified);
+        let (path, admission) = minted.expect("certified + recognized must mint");
+        assert_eq!(path, "crate::cadd");
+        assert_eq!(admission.arity, 2);
+        assert_eq!(
+            admission.return_domain().cloned(),
+            Some(trust_spec_elab::Domain::OptionSigned(
+                trust_spec_elab::MachineSIntWidth::I64
+            ))
         );
+        assert_eq!(admission.param_names, None);
+
+        // Uncertified facets: nothing mints even for the recognized body.
+        let uncertified = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::cadd",
+            true,
+            false,
+            true,
+            true,
+        )]);
+        let mut env2 = Environment::with_prelude();
+        assert!(
+            admit_function_into(&mut env2, &cadd(marked), &uncertified).is_none(),
+            "uncertified facets must not mint"
+        );
+
+        // An UNMARKED callee: the recognizer refuses, nothing mints.
+        let mut env3 = Environment::with_prelude();
+        assert!(
+            admit_function_into(
+                &mut env3,
+                &cadd("core::num::<impl i64>::checked_add"),
+                &certified
+            )
+            .is_none(),
+            "an unmarked callee must not mint"
+        );
+    }
+
+    /// A struct-returning per-term rule step mints ONE CONSTANT PER FIELD, and
+    /// the coefficient field's constant really is the cap.
+    ///
+    /// This is the shape `TRUST_E6_DEBUG` reports for
+    /// `veripb_core_proved::sat_term` at `-O`: an asymmetric select diamond
+    /// whose empty arm keeps `coeff`, feeding an aggregate built in the return
+    /// block, with the contract closure constructed in the entry block.
+    #[test]
+    fn a_struct_returning_body_mints_one_constant_per_field() {
+        use trust_types::{
+            AggregateKind, BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let i64t = || Ty::Int { width: 64, signed: true };
+        let lit = Ty::adt("crate::Lit", vec![("var".into(), Ty::Int { width: 32, signed: false })]);
+        let term = Ty::adt("crate::Term", vec![("coeff".into(), i64t()), ("lit".into(), lit.clone())]);
+        let assign = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        let func = VerifiableFunction {
+            name: "sat".into(),
+            def_path: "crate::sat".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: term.clone(), name: None },
+                    LocalDecl { index: 1, ty: i64t(), name: Some("degree".into()) },
+                    LocalDecl { index: 2, ty: i64t(), name: Some("coeff".into()) },
+                    LocalDecl { index: 3, ty: lit, name: Some("lit".into()) },
+                    LocalDecl { index: 4, ty: Ty::Bool, name: None },
+                ],
+                blocks: vec![
+                    BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![assign(
+                            Place::local(4),
+                            Rvalue::BinaryOp(
+                                trust_types::BinOp::Le,
+                                Operand::Copy(Place::local(2)),
+                                Operand::Copy(Place::local(1)),
+                            ),
+                        )],
+                        terminator: Terminator::SwitchInt {
+                            discr: Operand::Move(Place::local(4)),
+                            targets: vec![(0, BlockId(2))],
+                            otherwise: BlockId(1),
+                            exhaustive_enum_unreachable: false,
+                            span: SourceSpan::default(),
+                        },
+                    },
+                    // EMPTY arm: `_2` already holds `coeff`.
+                    BasicBlock { id: BlockId(1), stmts: vec![], terminator: Terminator::Goto(BlockId(3)) },
+                    BasicBlock {
+                        id: BlockId(2),
+                        stmts: vec![assign(Place::local(2), Rvalue::Use(Operand::Copy(Place::local(1))))],
+                        terminator: Terminator::Goto(BlockId(3)),
+                    },
+                    BasicBlock {
+                        id: BlockId(3),
+                        stmts: vec![assign(
+                            Place::local(0),
+                            Rvalue::Aggregate(
+                                AggregateKind::Adt {
+                                    name: "crate::Term".into(),
+                                    variant: 0,
+                                    active_field: None,
+                                    args: None,
+                                },
+                                vec![Operand::Copy(Place::local(2)), Operand::Copy(Place::local(3))],
+                            ),
+                        )],
+                        terminator: Terminator::Return,
+                    },
+                ],
+                arg_count: 3,
+                return_ty: term,
+                datatype_defs: Default::default(),
+            },
+            contracts: vec![],
+            preconditions: vec![],
+            postconditions: vec![],
+            spec: Default::default(),
+        };
+
+        let facets = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::sat",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[func], &facets);
+
+        // `coeff` mints; `lit` is skipped, because a `Lit` parameter flattens to
+        // more than one row and is not a scalar operand.
+        let coeff = minted
+            .iter()
+            .find(|(key, _)| key == "crate::sat__field_coeff")
+            .unwrap_or_else(|| panic!("no coeff field admission in {:?}", minted.iter().map(|(k, _)| k).collect::<Vec<_>>()));
+        assert!(
+            minted.iter().all(|(key, _)| key != "crate::sat__field_lit"),
+            "a field with no scalar mint must be SKIPPED, not guessed"
+        );
+
+        // …and it IS the cap, by definitional reduction over the flattened
+        // parameter list (degree, coeff, lit.var).
+        let env = session.environment().expect("session env");
+        let tc = clean_kernel::TypeChecker::new(env);
+        let bv = |bits: u64, v: u64| {
+            clean_kernel::Expr::apps(
+                clean_kernel::Expr::const_(clean_kernel::Name::from_string("BitVec.ofNat"), vec![]),
+                [clean_kernel::Expr::nat_lit(bits), clean_kernel::Expr::nat_lit(v)],
+            )
+        };
+        let n = |v: u64| bv(64, v);
+        let app = |deg: u64, cf: u64| {
+            clean_kernel::Expr::apps(
+                clean_kernel::Expr::const_(
+                    clean_kernel::Name::from_string(&coeff.1.kernel_const),
+                    vec![],
+                ),
+                [n(deg), n(cf), bv(32, 0)],
+            )
+        };
+        assert!(tc.is_def_eq(&app(3, 5), &n(3)), "cap(degree=3, coeff=5) = 3");
+        assert!(tc.is_def_eq(&app(5, 3), &n(3)), "cap(degree=5, coeff=3) = 3");
     }
 
     #[test]
@@ -1969,6 +3394,148 @@ mod tests {
         // arity 2 (two parameters); the mint succeeded so the kernel accepted
         // `fun x y => x : u64 -> u64 -> u64`.
         assert_eq!(minted[0].1.arity, 2);
+    }
+
+    /// `fn degree_of(c: Cst) -> u64 { c.degree }` with `Cst { degree, coeff }`
+    /// — the E6/E9 increment-7 shape, as the extractor produces it.
+    fn field_projection_fixture(
+        field_index: usize,
+        fields: Vec<(String, trust_types::Ty)>,
+    ) -> trust_types::VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Projection, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        VerifiableFunction {
+            name: "degree_of".into(),
+            def_path: "crate::degree_of".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::u64(), name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::adt("crate::Cst", fields),
+                        name: Some("c".into()),
+                    },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place {
+                            local: 1,
+                            projections: vec![Projection::Field(field_index)],
+                        })),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::u64(),
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        }
+    }
+
+    fn scalar_cst_fields() -> Vec<(String, trust_types::Ty)> {
+        vec![("degree".to_string(), trust_types::Ty::u64()), ("coeff".to_string(), trust_types::Ty::u64())]
+    }
+
+    /// Certified facets under BOTH the def-path and the bare name — the
+    /// dual keying `discharge_ensures_citations_in_walk` performs, since a
+    /// clause names the function the way source does.
+    fn all_facets(path: &str) -> trust_spec_elab::FacetTable {
+        let bare = path.rsplit("::").next().unwrap_or(path);
+        trust_spec_elab::FacetTable::from_structural_facets([
+            (path, true, true, true, true),
+            (bare, true, true, true, true),
+        ])
+    }
+
+    /// The whole increment-7 lane in one assertion: an aggregate-parameter
+    /// function is minted over its FLATTENED scalar list, and an `ensures`
+    /// clause spelling a dotted path closes against it.
+    #[test]
+    fn admit_program_functions_mints_a_field_projection_and_a_dotted_clause_discharges() {
+        let func = field_projection_fixture(0, scalar_cst_fields());
+        let facets = all_facets("crate::degree_of");
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[func], &facets);
+        assert_eq!(minted.len(), 1, "the field projection is minted: {minted:?}");
+        let admission = &minted[0].1;
+        // ONE BINDER PER SCALAR FIELD — the aggregate itself never reaches the
+        // kernel, so the arity is 2 (`degree`, `coeff`), not 1.
+        assert_eq!(admission.arity, 2);
+        assert_eq!(
+            admission.param_names.as_deref(),
+            Some(["c.degree".to_string(), "c.coeff".to_string()].as_slice()),
+            "the mint records the flattened clause-side names it bound"
+        );
+
+        // The clause `result == c.degree` now elaborates and closes by
+        // reflexivity against the minted body `fun degree coeff => degree`.
+        let mut table = facets.clone();
+        table.admit("degree_of", admission.clone());
+        let params = [("c.degree", "u64"), ("c.coeff", "u64")];
+        let goal = trust_spec_elab::elaborate_ensures(
+            "result == c.degree",
+            &params,
+            "degree_of",
+            &table,
+        )
+        .expect("a dotted-path ensures clause elaborates");
+        let env = session.environment().expect("an untainted session");
+        assert!(
+            clean_kernel::TypeChecker::new(env).infer_sort(&goal).is_ok(),
+            "the elaborated goal must itself typecheck (the `reject_untyped_goal` gate): {goal}"
+        );
+    }
+
+    /// The cross-check that makes the two independent flattenings safe: a
+    /// clause whose parameter list is a REORDERING of the minted one is
+    /// refused, even though it has the right length and the right domains and
+    /// the resulting goal would typecheck perfectly well.
+    #[test]
+    fn a_reordered_parameter_list_is_refused_against_the_minted_import() {
+        let func = field_projection_fixture(0, scalar_cst_fields());
+        let facets = all_facets("crate::degree_of");
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[func], &facets);
+        let mut table = facets.clone();
+        table.admit("degree_of", minted[0].1.clone());
+        let swapped = [("c.coeff", "u64"), ("c.degree", "u64")];
+        let err = trust_spec_elab::elaborate_ensures(
+            "result == c.degree",
+            &swapped,
+            "degree_of",
+            &table,
+        )
+        .expect_err("a reordered flattening must NOT discharge");
+        assert!(
+            err.contains("disagrees with the parameter list"),
+            "the refusal must name the real cause: {err}"
+        );
+    }
+
+    /// ALL-OR-NOTHING: one field outside the supported scalar vocabulary
+    /// refuses the whole parameter, and therefore the whole mint. Filtering it
+    /// out instead would make this side's list disagree with the compiler's.
+    #[test]
+    fn a_struct_with_a_non_scalar_field_mints_nothing() {
+        let fields = vec![
+            ("degree".to_string(), trust_types::Ty::u64()),
+            ("terms".to_string(), trust_types::Ty::Slice { elem: Box::new(trust_types::Ty::u64()) }),
+        ];
+        let func = field_projection_fixture(0, fields);
+        let facets = all_facets("crate::degree_of");
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[func], &facets);
+        assert!(minted.is_empty(), "an unsupported field refuses the whole mint: {minted:?}");
     }
 
     #[test]
@@ -2773,6 +4340,548 @@ mod tests {
         );
     }
 
+
+    /// `fn min2_i64(a: i64, b: i64) -> i64 { if a < b { a } else { b } }` —
+    /// byte-for-byte the MIR of [`min2_verifiable_function`] at the SIGNED
+    /// 64-bit carrier (the recognizer is shape-only; only the local types and
+    /// the def path differ).
+    fn min2_i64_verifiable_function() -> trust_types::VerifiableFunction {
+        let mut func = min2_verifiable_function();
+        func.name = "min2_i64".into();
+        func.def_path = "crate::min2_i64".into();
+        for local in &mut func.body.locals {
+            if local.ty == trust_types::Ty::u64() {
+                local.ty = trust_types::Ty::i64();
+            }
+        }
+        func.body.return_ty = trust_types::Ty::i64();
+        func
+    }
+
+    /// The i64 sign-flip order key, as island source: `Nat.xor (BitVec.toNat v)
+    /// 2^63`. The SAME key spelling the E9 goal builder prints
+    /// (`TRUST_E9_DEBUG`), so this constant doubles as the documentation of
+    /// what an island author copies.
+    fn i64_key(v: &str) -> String {
+        format!("(Nat.xor (BitVec.toNat {v}) 9223372036854775808)")
+    }
+
+    /// E6 WIDENING INCREMENT 4 (signed select), citation lane end-to-end: a
+    /// SIGNED i64 min2 mints through `ty_to_domain`/`admit_select_function`,
+    /// and an island theorem over the kernel import DISCHARGES
+    /// `ensures result <= a`. This is the acceptance shape for carrying
+    /// compiler-checked contracts on i64 kernel functions (veripb Coeff=i64).
+    #[test]
+    fn signed_select_citation_discharges_over_the_kernel_import() {
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::min2_i64",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let minted =
+            session.admit_program_functions(&[min2_i64_verifiable_function()], &facet_seed);
+        assert_eq!(minted.len(), 1, "signed min2 must mint: {minted:?}");
+        assert_eq!(minted[0].1.kernel_const, "trust_import_crate__min2_i64");
+
+        // The island theorem, stated over the kernel import at the SIGNED
+        // encoding: comparisons go through the sign-flip order keys, exactly
+        // as the elaborated goal spells them. The proof is a REAL case split
+        // on the minted `Nat.decLt` decision — not rfl-trivial.
+        let (ka, kb) = (i64_key("a"), i64_key("b"));
+        let theorem = format!(
+            "theorem smin2_le_a : forall (a : BitVec 64) (b : BitVec 64), \
+                 Nat.le (Nat.xor (BitVec.toNat (trust_import_crate__min2_i64 a b)) \
+                     9223372036854775808) {ka} := \
+                 fun a b => Decidable.casesOn \
+                     (motive := fun (d : Decidable (Nat.lt {ka} {kb})) => \
+                         Nat.le (Nat.xor (BitVec.toNat (Decidable.casesOn \
+                             (motive := fun _ => BitVec 64) d (fun _ => b) (fun _ => a))) \
+                             9223372036854775808) {ka}) \
+                     (Nat.decLt {ka} {kb}) \
+                     (fun h => Iff.mp (Nat.not_lt {ka} {kb}) h) \
+                     (fun h => Nat.le.refl {ka})",
+        );
+        let outcome = session.check(&theorem);
+        assert!(
+            !outcome.is_rejected(),
+            "the signed island theorem must check; got {:?}",
+            outcome.errors
+        );
+
+        let mut table = facet_seed.clone();
+        for (path, admission) in &minted {
+            table.admit(path.clone(), admission.clone());
+        }
+        let env = session.environment().expect("session env");
+        let params: &[(&str, &str)] = &[("a", "i64"), ("b", "i64")];
+        let verdict = kernel_discharge_ensures_citation(
+            env,
+            "smin2_le_a",
+            "result <= a",
+            params,
+            "crate::min2_i64",
+            &table,
+        );
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "the signed citation must DISCHARGE `ensures result <= a`; got {verdict:?}"
+        );
+
+        // FALSIFICATION — the same theorem must NOT discharge the converse
+        // clause (`result >= a` is false for min2 in general).
+        let converse = kernel_discharge_ensures_citation(
+            env,
+            "smin2_le_a",
+            "result >= a",
+            params,
+            "crate::min2_i64",
+            &table,
+        );
+        assert!(
+            !matches!(converse, CitationVerdict::KernelStatementMatchCertified),
+            "a `<=` proof must NOT discharge `result >= a`; got {converse:?}"
+        );
+    }
+
+    /// The ill-typed-goal gate (2026-08-23), pinned on the exact shape that
+    /// found it: an island definition over `Int` cited from an `i64` clause.
+    /// Both sides of the elaborated equality beta-reduce to the same term, so
+    /// WITHOUT the gate the kernel accepted `Eq.refl` against a proposition
+    /// that does not type (`ident_int x` applies `Int -> Int` to a
+    /// `BitVec 64`). The gate infers the goal's type first and fails closed
+    /// with the fix in the message. The same acceptance reproduced at u64 —
+    /// the hole predated the signed widening — so the u64 twin is pinned too.
+    #[test]
+    fn cross_carrier_island_call_fails_closed_not_ill_typed_discharge() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, VerifiableBody, VerifiableFunction,
+        };
+        for (fn_ty, dom) in [(trust_types::Ty::i64(), "i64"), (trust_types::Ty::u64(), "u64")] {
+            // `fn idi(x) -> x` at fn_ty — the identity projection, so BOTH
+            // sides of the clause's equality beta-reduce to `x` and the ONLY
+            // thing standing between the ill-typed goal and a discharge is
+            // the gate under test.
+            let func = VerifiableFunction {
+                name: "idi".into(),
+                def_path: "crate::idi".into(),
+                span: SourceSpan::default(),
+                body: VerifiableBody {
+                    locals: vec![
+                        LocalDecl { index: 0, ty: fn_ty.clone(), name: None },
+                        LocalDecl { index: 1, ty: fn_ty.clone(), name: Some("x".into()) },
+                    ],
+                    blocks: vec![BasicBlock {
+                        id: BlockId(0),
+                        stmts: vec![Statement::Assign {
+                            place: Place::local(0),
+                            rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                            span: SourceSpan::default(),
+                        }],
+                        terminator: Terminator::Return,
+                    }],
+                    arg_count: 1,
+                    return_ty: fn_ty.clone(),
+                    datatype_defs: Default::default(),
+                },
+                contracts: Vec::new(),
+                preconditions: Vec::new(),
+                postconditions: Vec::new(),
+                spec: Default::default(),
+            };
+            let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+                "crate::idi",
+                true,
+                true,
+                true,
+                true,
+            )]);
+            let mut session = CleanIslandSession::new();
+            let minted = session.admit_program_functions(&[func], &facet_seed);
+            assert_eq!(minted.len(), 1, "identity must mint at {dom}");
+
+            let outcome = session.check("def ident_int (x : Int) : Int := x");
+            assert!(!outcome.is_rejected(), "Int island must check: {:?}", outcome.errors);
+
+            let mut table = facet_seed.clone();
+            for (path, admission) in &minted {
+                table.admit(path.clone(), admission.clone());
+            }
+            let env = session.environment().expect("session env").clone();
+            admit_certified_island_definition(&env, "ident_int", &mut table)
+                .expect("island definition must be admissible");
+            let params: &[(&str, &str)] = &[("x", dom)];
+            let defeq = kernel_prove_ensures_by_defeq(
+                &env,
+                "result == ident_int(x)",
+                params,
+                "crate::idi",
+                &table,
+            );
+            assert!(
+                matches!(defeq, CitationVerdict::ClauseOutsideFragment { .. }),
+                "a cross-carrier island call must fail closed at {dom}; got {defeq:?}"
+            );
+        }
+    }
+
+    /// The UI-fixture shape for the signed lane, pinned at the library level:
+    /// islands check FIRST (so the theorem cannot name the `trust_import_*`
+    /// constant) and are stated over the UNFOLDED encoding instead, exactly
+    /// like `tests/ui/trust/e9_min2_case_split_discharge.rs` does for u64.
+    /// For i64 the readable island spelling is a named key helper —
+    /// `def key64 (v : BitVec 64) : Nat := Nat.xor (BitVec.toNat v) 2^63` —
+    /// with the theorem written through it; `key64` is an unfoldable island
+    /// Definition, so kernel delta-reduction bridges it to the mint's inlined
+    /// keys during grading. (The FULLY-inline spelling, with the ite and keys
+    /// written raw inside the statement, trips a Clean elaborator unification
+    /// corner — measured 2026-08-23 — so the helper form is the documented
+    /// authoring shape.)
+    #[test]
+    fn signed_island_first_unfolded_theorem_discharges() {
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::min2_i64",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let keydef = "def key64 (v : BitVec 64) : Nat := \
+             Nat.xor (BitVec.toNat v) 9223372036854775808";
+        let outcome_key = session.check(keydef);
+        assert!(!outcome_key.is_rejected(), "key helper must check: {:?}", outcome_key.errors);
+        let theorem = "theorem min2_i64_le_left : forall (a : BitVec 64) (b : BitVec 64), \
+                 Nat.le (key64 (if Nat.lt (key64 a) (key64 b) then a else b)) (key64 a) := \
+                 fun a b => Decidable.casesOn \
+                     (motive := fun (d : Decidable (Nat.lt (key64 a) (key64 b))) => \
+                         Nat.le (key64 (Decidable.casesOn \
+                             (motive := fun _ => BitVec 64) d (fun _ => b) \
+                             (fun _ => a))) (key64 a)) \
+                     (Nat.decLt (key64 a) (key64 b)) \
+                     (fun h => Iff.mp (Nat.not_lt (key64 a) (key64 b)) h) \
+                     (fun h => Nat.le.refl (key64 a))";
+        let outcome = session.check(theorem);
+        assert!(!outcome.is_rejected(), "island theorem must check: {:?}", outcome.errors);
+
+        // The mint happens AFTER the islands, as in the compiler.
+        let minted =
+            session.admit_program_functions(&[min2_i64_verifiable_function()], &facet_seed);
+        assert_eq!(minted.len(), 1, "signed min2 must mint: {minted:?}");
+        let mut table = facet_seed.clone();
+        for (path, admission) in &minted {
+            table.admit(path.clone(), admission.clone());
+        }
+        let env = session.environment().expect("session env");
+        let verdict = kernel_discharge_ensures_citation(
+            env,
+            "min2_i64_le_left",
+            "result <= a",
+            &[("a", "i64"), ("b", "i64")],
+            "crate::min2_i64",
+            &table,
+        );
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "the island-first unfolded-encoding theorem must discharge; got {verdict:?}"
+        );
+    }
+
+    /// THE SHARED-BARE-NAME DEFECT (fixed 2026-08-26), end to end through the
+    /// citation lane.
+    ///
+    /// `record_fn_facets` keys an item's facet record under its canonical
+    /// def-path AND every spellable suffix, and evicts (forever) any key two
+    /// def-paths claim. That eviction is correct and is KEPT: an ambiguous
+    /// spelling an author writes in a clause must fail closed. But the
+    /// contracted function's OWN identity is not something an author wrote —
+    /// the compiler knows the item — and the ensures lane used to derive it from
+    /// the BARE name, re-entering the ambiguity keyspace through the one door it
+    /// did not need. A contract on `veripb_core_proved::cap_coeff` (bare name
+    /// shared with `CoeffDomain::cap_coeff` and four impls) could therefore
+    /// NEVER bind `result`.
+    ///
+    /// Here: two items claim the bare `min2_i64`, so that key is evicted; the
+    /// canonical def-path survives and the SAME theorem, clause, and mint
+    /// discharge through it — while the old bare identity still fails closed.
+    #[test]
+    fn ensures_discharge_keys_on_the_def_path_when_the_bare_name_is_evicted() {
+        let self_path = "crate::min2_i64";
+        let twin_path = "crate::other::min2_i64";
+        // The collision `record_fn_facets` detects: both items' spellable suffix
+        // sets contain the bare name.
+        let bare = "min2_i64".to_string();
+        assert!(trust_spec_elab::spec_spellings(self_path).contains(&bare));
+        assert!(trust_spec_elab::spec_spellings(twin_path).contains(&bare));
+        // …so the table it leaves behind holds every key EXCEPT that one.
+        // `other::min2_i64` (the twin's unambiguous suffix) survives too; the
+        // contracted function has no surviving suffix at all, only its def-path.
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([
+            (self_path, true, true, true, true),
+            (twin_path, true, true, true, true),
+            ("other::min2_i64", true, true, true, true),
+        ]);
+        assert!(facet_seed.get(&bare).is_none(), "the ambiguous bare key must stay evicted");
+
+        let mut session = CleanIslandSession::new();
+        let keydef = "def key64 (v : BitVec 64) : Nat := \
+             Nat.xor (BitVec.toNat v) 9223372036854775808";
+        assert!(!session.check(keydef).is_rejected(), "key helper must check");
+        let theorem = "theorem min2_i64_le_left : forall (a : BitVec 64) (b : BitVec 64), \
+                 Nat.le (key64 (if Nat.lt (key64 a) (key64 b) then a else b)) (key64 a) := \
+                 fun a b => Decidable.casesOn \
+                     (motive := fun (d : Decidable (Nat.lt (key64 a) (key64 b))) => \
+                         Nat.le (key64 (Decidable.casesOn \
+                             (motive := fun _ => BitVec 64) d (fun _ => b) \
+                             (fun _ => a))) (key64 a)) \
+                     (Nat.decLt (key64 a) (key64 b)) \
+                     (fun h => Iff.mp (Nat.not_lt (key64 a) (key64 b)) h) \
+                     (fun h => Nat.le.refl (key64 a))";
+        let outcome = session.check(theorem);
+        assert!(!outcome.is_rejected(), "island theorem must check: {:?}", outcome.errors);
+
+        let minted =
+            session.admit_program_functions(&[min2_i64_verifiable_function()], &facet_seed);
+        assert_eq!(minted.len(), 1, "the contracted function must still mint: {minted:?}");
+        // Admission keying mirrors `trust_mint_program_admissions`: def-path plus
+        // every spelling. The evicted bare key gets an admission entry but NO
+        // facet record, so `FacetTable::admitted` still refuses it — that is the
+        // fail-closed invariant this test also pins.
+        let mut table = facet_seed.clone();
+        for (path, admission) in &minted {
+            for spelling in trust_spec_elab::spec_spellings(path) {
+                if spelling != *path {
+                    table.admit(spelling, admission.clone());
+                }
+            }
+            table.admit(path.clone(), admission.clone());
+        }
+        assert!(table.admitted(&bare).is_none(), "an evicted spelling is never admitted");
+
+        let env = session.environment().expect("session env");
+        let params: &[(&str, &str)] = &[("a", "i64"), ("b", "i64")];
+
+        // FIXED: the canonical def-path identity reaches the surviving record
+        // and the postcondition discharges.
+        let by_def_path = kernel_discharge_ensures_citation(
+            env,
+            "min2_i64_le_left",
+            "result <= a",
+            params,
+            self_path,
+            &table,
+        );
+        assert!(
+            matches!(by_def_path, CitationVerdict::KernelStatementMatchCertified),
+            "the canonical def-path must discharge; got {by_def_path:?}"
+        );
+
+        // UNCHANGED (eviction untouched): the ambiguous bare spelling still
+        // fails closed — it can never bind `result` to one of several candidate
+        // items.
+        let by_bare = kernel_discharge_ensures_citation(
+            env,
+            "min2_i64_le_left",
+            "result <= a",
+            params,
+            &bare,
+            &table,
+        );
+        match by_bare {
+            CitationVerdict::ClauseOutsideFragment { ref reason } => {
+                assert!(reason.contains("E6-admitted"), "{reason}");
+            }
+            other => panic!("an evicted bare identity must fail closed; got {other:?}"),
+        }
+    }
+
+    /// Signed select, defeq lane + the two NEG probes the mint's comment
+    /// demands: (1) an island def over the sign-flip keys discharges
+    /// `result == isl(a, b)` by pure kernel defeq; (2) the UNSIGNED-order
+    /// confusion (plain `toNat` keys, no sign flip) must NOT discharge — that
+    /// island denotes a function that differs at mixed-sign inputs; (3) the
+    /// swapped-branch (max-where-min) island must NOT discharge — the
+    /// `ite` argument-order trap is only caught by a NEG probe.
+    #[test]
+    fn signed_island_defeq_discharges_and_confusions_fail_closed() {
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::min2_i64",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let minted =
+            session.admit_program_functions(&[min2_i64_verifiable_function()], &facet_seed);
+        assert_eq!(minted.len(), 1, "signed min2 must mint: {minted:?}");
+
+        let (ka, kb) = (i64_key("a"), i64_key("b"));
+        // (1) The signed island spelling: keys compared through Nat's `<`.
+        let smin = format!(
+            "def smin_isl (a : BitVec 64) (b : BitVec 64) : BitVec 64 := \
+                 if Nat.lt {ka} {kb} then a else b"
+        );
+        // (2) The unsigned-order CONFUSION: raw toNat keys. A DIFFERENT
+        // function at mixed signs (it calls i64::MIN the larger value).
+        let umin = "def umin_isl (a : BitVec 64) (b : BitVec 64) : BitVec 64 := \
+                 if Nat.lt (BitVec.toNat a) (BitVec.toNat b) then a else b"
+            .to_string();
+        // (3) The argument-order trap: branches swapped mints max, not min.
+        let smax = format!(
+            "def smax_isl (a : BitVec 64) (b : BitVec 64) : BitVec 64 := \
+                 if Nat.lt {ka} {kb} then b else a"
+        );
+        for src in [&smin, &umin, &smax] {
+            let outcome = session.check(src);
+            assert!(!outcome.is_rejected(), "island must check: {src}: {:?}", outcome.errors);
+        }
+
+        let mut table = facet_seed.clone();
+        for (path, admission) in &minted {
+            table.admit(path.clone(), admission.clone());
+        }
+        let env = session.environment().expect("session env").clone();
+        for isl in ["smin_isl", "umin_isl", "smax_isl"] {
+            admit_certified_island_definition(&env, isl, &mut table)
+                .expect("island definition must be admissible");
+        }
+        let params: &[(&str, &str)] = &[("a", "i64"), ("b", "i64")];
+        let discharge = |clause: &str| {
+            kernel_prove_ensures_by_defeq(&env, clause, params, "crate::min2_i64", &table)
+        };
+
+        let verdict = discharge("result == smin_isl(a, b)");
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "the signed island spelling must defeq-discharge; got {verdict:?}"
+        );
+        let confusion = discharge("result == umin_isl(a, b)");
+        assert!(
+            !matches!(confusion, CitationVerdict::KernelStatementMatchCertified),
+            "the UNSIGNED-order island must NOT discharge a signed select; got {confusion:?}"
+        );
+        let swapped = discharge("result == smax_isl(a, b)");
+        assert!(
+            !matches!(swapped, CitationVerdict::KernelStatementMatchCertified),
+            "the swapped-branch island must NOT discharge; got {swapped:?}"
+        );
+    }
+
+    /// `fn le_i64(a: i64, b: i64) -> bool { a <= b }` — the comparison-to-bool
+    /// shape (E6 widening increment 5) as MIR lowers it: one block, one
+    /// `BinaryOp(Le, _1, _2)` assigned to the return place.
+    fn le_i64_verifiable_function() -> trust_types::VerifiableFunction {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        VerifiableFunction {
+            name: "le_i64".into(),
+            def_path: "crate::le_i64".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                    LocalDecl { index: 1, ty: Ty::i64(), name: Some("a".into()) },
+                    LocalDecl { index: 2, ty: Ty::i64(), name: Some("b".into()) },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::BinaryOp(
+                            BinOp::Le,
+                            Operand::Copy(Place::local(1)),
+                            Operand::Copy(Place::local(2)),
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 2,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        }
+    }
+
+    /// E6 widening increment 5, end-to-end at the admission level: the
+    /// guard-shape comparison function (`fn le_i64(a: i64, b: i64) -> bool`)
+    /// mints through `ty_to_domain` + `admit_comparison_function`, and the
+    /// IMPORTED constant is semantically validated by definitional reduction
+    /// at the kernel — including the mixed-sign row an unsigned-order mint
+    /// gets wrong.
+    ///
+    /// MEASURED BOUNDARY (2026-08-23, this increment): the E9 defeq/citation
+    /// lanes cannot yet carry a clause over a BOOL-RETURNING program
+    /// function, for a reason OUTSIDE this shape: `atom_domain` infers a
+    /// comparison atom's carrier from its argument VARIABLES, so
+    /// `result == le_isl(a, b)` over i64 params mints `Eq (BitVec 64) …`
+    /// around two Bool-valued calls — a wrong-typed goal that fails closed
+    /// (never wrongly discharges). Widening the clause elaborator to type
+    /// call atoms by their admitted callee's RETURN domain is the follow-on
+    /// increment; the admission below is what it will consume.
+    #[test]
+    fn comparison_bool_shape_mints_and_is_semantically_faithful() {
+        let facet_seed = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::le_i64",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let mut session = CleanIslandSession::new();
+        let minted = session.admit_program_functions(&[le_i64_verifiable_function()], &facet_seed);
+        assert_eq!(minted.len(), 1, "le_i64 must mint: {minted:?}");
+        assert_eq!(minted[0].1.kernel_const, "trust_import_crate__le_i64");
+        assert_eq!(minted[0].1.arity, 2);
+
+        // Semantic validation of the IMPORT by definitional reduction, on the
+        // kernel-canonical raw-literal BitVec values (see the spec-elab signed
+        // select test for why raw literals).
+        let env = session.environment().expect("session env");
+        let tc = clean_kernel::TypeChecker::new(env);
+        let btrue =
+            clean_kernel::Expr::const_(clean_kernel::Name::from_string("Bool.true"), vec![]);
+        let bfalse =
+            clean_kernel::Expr::const_(clean_kernel::Name::from_string("Bool.false"), vec![]);
+        let lit = |v: u128| clean_kernel::Expr::nat_lit(u64::try_from(v).unwrap());
+        let app2 = |a: clean_kernel::Expr, b: clean_kernel::Expr| {
+            clean_kernel::Expr::apps(
+                clean_kernel::Expr::const_(
+                    clean_kernel::Name::from_string("trust_import_crate__le_i64"),
+                    vec![],
+                ),
+                [a, b],
+            )
+        };
+        let neg1 = (1u128 << 64) - 1; // -1 as a two's-complement bit pattern
+        assert!(tc.is_def_eq(&app2(lit(3), lit(5)), &btrue), "le_i64(3, 5)");
+        assert!(tc.is_def_eq(&app2(lit(5), lit(3)), &bfalse), "!le_i64(5, 3)");
+        // Le-vs-Lt discriminator: a mint that read `<=` as `<` fails here.
+        assert!(tc.is_def_eq(&app2(lit(3), lit(3)), &btrue), "le_i64(3, 3)");
+        // The mixed-sign row: signed order says -1 <= 1; raw bit order says
+        // the opposite. A mint that dropped the sign-flip keys fails here.
+        assert!(tc.is_def_eq(&app2(lit(neg1), lit(1)), &btrue), "le_i64(-1, 1)");
+        assert!(tc.is_def_eq(&app2(lit(1), lit(neg1)), &bfalse), "!le_i64(1, -1)");
+
+        // NEG: without the facet certification nothing mints.
+        let mut bare_session = CleanIslandSession::new();
+        let none = bare_session.admit_program_functions(
+            &[le_i64_verifiable_function()],
+            &trust_spec_elab::FacetTable::new(),
+        );
+        assert!(none.is_empty(), "an uncertified comparison body must not mint");
+    }
+
     #[test]
     fn admit_program_functions_mints_wrapping_arithmetic() {
         use trust_types::{
@@ -2795,6 +4904,7 @@ mod tests {
                         stmts: Vec::new(),
                         terminator: Terminator::Call {
                             func: "@trust-rustc-total-primitive-method::core::num::<impl u64>::wrapping_add".into(),
+                            callee_identity: None,
                             args: vec![
                                 Operand::Copy(Place::local(1)),
                                 Operand::Constant(ConstValue::Uint(1, 64)),
@@ -2806,7 +4916,6 @@ mod tests {
                             unwind: trust_types::UnwindEdge::Unreachable,
                             is_foreign: false,
                             is_unsafe_sig: false,
-                            callee_identity: None,
                         },
                     },
                     BasicBlock {
@@ -3007,6 +5116,190 @@ mod tests {
                 CitationVerdict::KernelStatementMatchCertified
             ),
             "a conjunction with ONE diverging conjunct must not discharge"
+        );
+    }
+
+    /// The E6/E9 widening increment 8 pin, end to end and at BOTH shapes the
+    /// increment unblocks — with the clause elaborator, the real island
+    /// elaborator, and the kernel all in the loop.
+    ///
+    /// (1) A MIXED-WIDTH island CALL. `eqOkW (m : BitVec 64) (t : BitVec 128)`
+    ///     applied to an `i64` and an `i128` parameter. Before the increment
+    ///     the elaborator typed an atom's operands by ONE ambient domain taken
+    ///     from its variables, so this reported "mixed domains in one
+    ///     comparison (Signed(I64) and Signed(I128))" and the clause never
+    ///     reached the kernel — even though the two widths were never in one
+    ///     comparison, only in one argument list.
+    ///
+    /// (2) A VARIABLE-LESS atom. `result == zeroI64()` on a nullary signed
+    ///     constant. Before the increment an atom with no variables defaulted
+    ///     to `Nat`, putting a `BitVec 64` island constant under an `Eq Nat`,
+    ///     which the ill-typed-goal gate refused — the documented f04-f09 wall.
+    ///
+    /// (3) The NEGATIVE that must NOT move: a bare `machine == truth` across
+    ///     two widths, with NO typed callee to justify it. The elaborator has
+    ///     no cast there and refuses it exactly as before. This is the pin that
+    ///     keeps the widening from becoming a silent coercion.
+    #[test]
+    fn typed_call_arguments_take_the_callees_declared_carriers() {
+        use trust_spec_elab::{Domain, FacetStatus, FacetTable, FnFacets, MachineSIntWidth};
+        let mut env = Environment::with_prelude();
+        let mut file_ctx = FileContext::new();
+        file_ctx.disable_external_import_search();
+        let outcome = check_clean_island_with_context(CHECKED_MODEL_ISLAND, &mut env, &mut file_ctx);
+        assert!(!outcome.is_rejected(), "the authored island must register: {outcome:?}");
+
+        let i64d = Domain::Signed(MachineSIntWidth::I64);
+        let i128d = Domain::Signed(MachineSIntWidth::I128);
+        // The SELF mints: `fn eq_ok(machine: i64, truth: i128) -> bool` and
+        // `fn zero_i64() -> i64 { 0 }`, exactly as the compiler mints them.
+        let eq_ok = trust_spec_elab::admit_widened_eq_function(
+            &mut env,
+            "eq_ok_def",
+            &[i64d.clone(), i128d.clone()],
+            MachineSIntWidth::I64,
+            MachineSIntWidth::I128,
+            0,
+            1,
+            true,
+        )
+        .expect("the widened-equality mint must admit");
+        let zero_i64 = trust_spec_elab::admit_signed_constant_function(
+            &mut env,
+            "zero_i64_def",
+            0,
+            MachineSIntWidth::I64,
+        )
+        .expect("the signed-constant mint must admit");
+
+        let cert = || FacetStatus::Certified { evidence: "increment-8-pin".to_string() };
+        let admissible =
+            || FnFacets { pure: cert(), total: cert(), deterministic: cert(), no_panic: cert() };
+        let mut facets = FacetTable::new();
+        facets.insert("eq_ok", admissible());
+        facets.admit("eq_ok", eq_ok);
+        facets.insert("zero_i64", admissible());
+        facets.admit("zero_i64", zero_i64);
+        for island in ["eqOkW", "zeroI64", "eqOkZeroExt"] {
+            admit_certified_island_definition(&env, island, &mut facets)
+                .unwrap_or_else(|e| panic!("island `{island}` must be admitted: {e}"));
+        }
+
+        // (1) The mixed-width call now elaborates AND closes: both sides unfold
+        // to the same stuck `toInt64`/`ofInt128` chain.
+        let mixed_params: &[(&str, &str)] = &[("machine", "i64"), ("truth", "i128")];
+        let verdict = kernel_prove_ensures_by_defeq(
+            &env,
+            "result == eqOkW(machine, truth)",
+            mixed_params,
+            "eq_ok",
+            &facets,
+        );
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "a call whose DECLARED parameters differ in width must discharge: {verdict:?}"
+        );
+
+        // ...and the widening buys no proving power: the ZERO-extending twin,
+        // which agrees with the mint on every non-negative `machine` and
+        // differs on every negative one, is still refused by the kernel.
+        assert!(
+            !matches!(
+                kernel_prove_ensures_by_defeq(
+                    &env,
+                    "result == eqOkZeroExt(machine, truth)",
+                    mixed_params,
+                    "eq_ok",
+                    &facets
+                ),
+                CitationVerdict::KernelStatementMatchCertified
+            ),
+            "a zero-extending forgery must NOT discharge against the sign-extending mint"
+        );
+
+        // (2) The variable-less atom takes the mint's RECORDED return domain,
+        // and the island's declared `BitVec 64` result carrier agrees with it.
+        let verdict = kernel_prove_ensures_by_defeq(&env, "result == zeroI64()", &[], "zero_i64", &facets);
+        assert!(
+            matches!(verdict, CitationVerdict::KernelStatementMatchCertified),
+            "a nullary signed constant against an island constant must discharge: {verdict:?}"
+        );
+
+        // (3) THE NEGATIVE. Two operands of different widths in ONE comparison,
+        // reached through no callee at all: the elaborator has no cast to
+        // justify it and must still refuse, with the same message as before.
+        let verdict = kernel_prove_ensures_by_defeq(
+            &env,
+            "result == eqOkW(machine, truth) && machine == truth",
+            mixed_params,
+            "eq_ok",
+            &facets,
+        );
+        match verdict {
+            CitationVerdict::ClauseOutsideFragment { reason } => assert!(
+                reason.contains("mixed domains in one comparison"),
+                "the bare cross-width comparison must keep its own refusal: {reason}"
+            ),
+            other => panic!("a bare cross-width comparison must fail closed, got {other:?}"),
+        }
+
+        // (4) A call at the WRONG carrier is refused BY NAME rather than
+        // elaborated and left for the ill-typed-goal gate: `eqOkW` declares its
+        // first parameter at `BitVec 64`, and an `i128` argument is not that.
+        let verdict = kernel_prove_ensures_by_defeq(
+            &env,
+            "result == eqOkW(truth, truth)",
+            mixed_params,
+            "eq_ok",
+            &facets,
+        );
+        match verdict {
+            CitationVerdict::ClauseOutsideFragment { reason } => assert!(
+                reason.contains("declares parameter 0 at carrier `BitVec 64`"),
+                "an argument off the declared carrier must be named: {reason}"
+            ),
+            other => panic!("an argument off the declared carrier must fail closed, got {other:?}"),
+        }
+    }
+
+    /// The carrier reader is the AUTHORITY the increment-8 check rests on, so
+    /// it is pinned directly: it reports the island's declared telescope, and
+    /// it answers `None` — leaving the elaborator on its pre-increment
+    /// behaviour — for anything it does not recognize.
+    #[test]
+    fn island_definition_carriers_reports_the_declared_telescope() {
+        use trust_spec_elab::{Carrier, MachineUIntWidth};
+        let mut env = Environment::with_prelude();
+        let mut file_ctx = FileContext::new();
+        file_ctx.disable_external_import_search();
+        let outcome = check_clean_island_with_context(CHECKED_MODEL_ISLAND, &mut env, &mut file_ctx);
+        assert!(!outcome.is_rejected(), "the authored island must register: {outcome:?}");
+
+        let eq_ok_w = island_definition_carriers(&env, "eqOkW").expect("eqOkW has readable carriers");
+        assert_eq!(eq_ok_w.params, vec![Carrier::BitVec(64), Carrier::BitVec(128)]);
+        assert_eq!(eq_ok_w.ret, Carrier::Bool);
+
+        let zero = island_definition_carriers(&env, "zeroI64").expect("zeroI64 has readable carriers");
+        assert_eq!(zero.params, Vec::new());
+        assert_eq!(zero.ret, Carrier::BitVec(64));
+
+        let checked =
+            island_definition_carriers(&env, "checkedAdd64").expect("checkedAdd64 is readable");
+        assert_eq!(checked.params, vec![Carrier::BitVec(64), Carrier::BitVec(64)]);
+        assert_eq!(checked.ret, Carrier::Option(Box::new(Carrier::BitVec(64))));
+
+        // `Int` is not a clause carrier, so a definition over it reports
+        // NOTHING rather than an approximation.
+        assert!(island_definition_carriers(&env, "toInt64").is_none(), "an `Int` codomain is unreadable");
+        assert!(island_definition_carriers(&env, "no_such_def").is_none());
+
+        // `BitVec N` has THREE domain preimages and must never be inverted;
+        // the carriers with exactly one may be.
+        assert!(Carrier::BitVec(64).unique_domain().is_none(), "BitVec must not invert");
+        assert_eq!(Carrier::Bool.unique_domain(), Some(trust_spec_elab::Domain::Bool));
+        assert_eq!(
+            Carrier::UInt(MachineUIntWidth::U64).unique_domain(),
+            Some(trust_spec_elab::Domain::Machine(MachineUIntWidth::U64))
         );
     }
 
@@ -3290,6 +5583,7 @@ mod tests {
         let prim =
             |callee: &str, args: Vec<Operand>, dest: Place, target: BlockId| Terminator::Call {
                 func: callee.into(),
+                callee_identity: None,
                 args,
                 dest,
                 target: Some(target),
@@ -3298,7 +5592,6 @@ mod tests {
                 unwind: trust_types::UnwindEdge::Unreachable,
                 is_foreign: false,
                 is_unsafe_sig: false,
-                callee_identity: None,
             };
         let chain = VerifiableFunction {
             name: "chain".into(),
@@ -3822,6 +6115,628 @@ mod tests {
         assert!(
             !matches!(typed, CitationVerdict::ClauseOutsideFragment { .. }),
             "typed clause must elaborate (not out-of-fragment): {typed:?}"
+        );
+    }
+
+    /// The §5.7 discipline for the SIGNED-CONSTANT lane: each minted literal
+    /// is DELTA-DEFEQ to the island's authored `BitVec` spelling of that same
+    /// value — through the real island elaborator — and the wrong-VALUE and
+    /// wrong-WIDTH forgeries are CAUGHT, not silently green.
+    ///
+    /// The boundary rows are the ones with content. `0` must take
+    /// `Domain::zero`'s `Nat.zero` spelling; a negative must take the
+    /// TWO'S-COMPLEMENT pattern, so `-1` is `2^64 - 1` and NOT `1`; and
+    /// `iN::MIN` is the extreme where a magnitude carried as `-value` would
+    /// have overflowed.
+    #[test]
+    fn signed_constant_mint_is_defeq_to_the_island_model_and_forgeries_are_caught() {
+        use trust_spec_elab::{Domain, MachineSIntWidth};
+        let mut env = Environment::with_prelude();
+        let mut file_ctx = FileContext::new();
+        file_ctx.disable_external_import_search();
+        let outcome = check_clean_island_with_context(CHECKED_MODEL_ISLAND, &mut env, &mut file_ctx);
+        assert!(!outcome.is_rejected(), "the authored island must register: {outcome:?}");
+
+        // POSITIVE: mint ≡ the island's authored literal, per value and width.
+        let rows: [(&str, i128, MachineSIntWidth, &str); 9] = [
+            ("zero64_mint", 0, MachineSIntWidth::I64, "zeroI64"),
+            ("one64_mint", 1, MachineSIntWidth::I64, "oneI64"),
+            ("negone64_mint", -1, MachineSIntWidth::I64, "negOneI64"),
+            ("min64_mint", i128::from(i64::MIN), MachineSIntWidth::I64, "minI64Bits"),
+            ("max64_mint", i128::from(i64::MAX), MachineSIntWidth::I64, "maxI64Bits"),
+            ("zero128_mint", 0, MachineSIntWidth::I128, "zeroI128"),
+            ("one128_mint", 1, MachineSIntWidth::I128, "oneI128"),
+            ("min128_mint", i128::MIN, MachineSIntWidth::I128, "minI128Bits"),
+            ("max128_mint", i128::MAX, MachineSIntWidth::I128, "maxI128Bits"),
+        ];
+        for (mint_name, value, width, _) in rows {
+            let adm =
+                trust_spec_elab::admit_signed_constant_function(&mut env, mint_name, value, width)
+                    .unwrap_or_else(|e| panic!("{mint_name} must admit into the island env: {e}"));
+            assert_eq!(adm.arity, 0);
+            assert_eq!(adm.return_domain().cloned(), Some(Domain::Signed(width)));
+            assert_eq!(adm.param_names, None);
+        }
+
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let konst =
+            |n: &str| clean_kernel::Expr::const_(clean_kernel::Name::from_string(n), vec![]);
+        for (mint_name, value, _, island_name) in rows {
+            assert!(
+                tc.is_def_eq(&konst(mint_name), &konst(island_name)),
+                "the mint of {value} must be delta-defeq to the island's {island_name}"
+            );
+        }
+
+        // NEG (a): a wrong VALUE is caught — including the one that matters,
+        // `-1` read as its MAGNITUDE rather than its two's-complement pattern.
+        for (mint_name, forgery, why) in [
+            ("one64_mint", "twoI64", "an off-by-one value"),
+            ("negone64_mint", "oneI64", "a negative read as its magnitude"),
+            ("min64_mint", "maxI64Bits", "MIN read as MAX"),
+            ("zero64_mint", "oneI64", "zero read as one"),
+        ] {
+            assert!(
+                !tc.is_def_eq(&konst(mint_name), &konst(forgery)),
+                "{why} must NOT close against the signed-constant mint"
+            );
+        }
+        // NEG (b): a wrong WIDTH is caught by TYPING — which is where a
+        // `BitVec` constant's carrier actually lives.
+        //
+        // MEASURED 2026-08-26, and worth recording because it is not what a
+        // reader would guess: `is_def_eq` ALONE is width-BLIND on closed
+        // `BitVec.ofNat` literals. The kernel's `reduce_bitvec_of_nat` turns
+        // `BitVec.ofNat W n` into the payload literal, so `BitVec.ofNat 32 1`
+        // and `BitVec.ofNat 64 1` share a normal form and the equality
+        // judgment answers `true` for both. That is NOT a hole in this lane:
+        // `add_decl` FULL-TYPE-CHECKS every mint against its declared carrier
+        // before the `Admission` exists, and the citation lane type-checks the
+        // `Eq.refl` it constructs, so a width the mint did not declare can
+        // never be reached. But it does mean the width pin must be asserted
+        // with the TYPE CHECKER rather than the equality judgment — asserting
+        // it with `is_def_eq` would have been a test that passes for the wrong
+        // reason, or (as here) fails for the right one.
+        let bv_ty = |bits: u64| {
+            clean_kernel::Expr::app(
+                clean_kernel::Expr::const_(clean_kernel::Name::from_string("BitVec"), vec![]),
+                clean_kernel::Expr::nat_lit(bits),
+            )
+        };
+        for (mint_name, good, bad) in
+            [("one64_mint", 64u64, 32u64), ("one128_mint", 128, 64), ("min64_mint", 64, 128)]
+        {
+            tc.check_type(&konst(mint_name), &bv_ty(good))
+                .unwrap_or_else(|e| panic!("{mint_name} must inhabit BitVec {good}: {e:?}"));
+            assert!(
+                tc.check_type(&konst(mint_name), &bv_ty(bad)).is_err(),
+                "{mint_name} must NOT inhabit BitVec {bad} — the carrier is part of \
+                 the constant's identity"
+            );
+        }
+        // …and symmetrically, the wrong-width island twin does not inhabit the
+        // mint's carrier.
+        assert!(
+            tc.check_type(&konst("oneI32"), &bv_ty(64)).is_err(),
+            "a `BitVec 32` island twin must not inhabit the mint's `BitVec 64`"
+        );
+
+        drop(tc);
+
+        // A literal that does not fit the requested carrier fails the MINT
+        // closed, BEFORE the kernel — mirroring rustc's own out-of-range
+        // rejection, so `ofNat`'s wrap-around can never be picked up silently.
+        for (value, width) in [
+            (128i128, MachineSIntWidth::I8),
+            (-129, MachineSIntWidth::I8),
+            (i128::from(i32::MAX) + 1, MachineSIntWidth::I32),
+            (i128::from(i32::MIN) - 1, MachineSIntWidth::I32),
+            (i128::from(i64::MAX) + 1, MachineSIntWidth::I64),
+            (i128::from(i64::MIN) - 1, MachineSIntWidth::I64),
+        ] {
+            assert!(
+                trust_spec_elab::admit_signed_constant_function(
+                    &mut env, "parked", value, width
+                )
+                .is_err(),
+                "{value} must fail closed at {width:?}"
+            );
+        }
+    }
+
+    /// The §5.7 discipline for the WIDENING-CAST comparison lane: the mint's
+    /// seeded sign-extension model is DELTA-DEFEQ to the client island's
+    /// authored `eqOkW` — through the real island elaborator — and each
+    /// forgery is CAUGHT.
+    ///
+    /// The forgeries are compared on OPAQUE arguments, never literals: at a
+    /// closed literal both models evaluate away and a ZERO-extending twin
+    /// would agree with the mint on every NON-NEGATIVE value, so the exact
+    /// wrong-accept bug it must detect would go unseen. On opaque arguments
+    /// both sides are stuck and structurally different, which is the
+    /// comparison the citation lane actually performs.
+    #[test]
+    fn widened_eq_mint_is_defeq_to_the_island_model_and_forgeries_are_caught() {
+        use trust_spec_elab::{Domain, MachineSIntWidth};
+        let mut env = Environment::with_prelude();
+        let mut file_ctx = FileContext::new();
+        file_ctx.disable_external_import_search();
+        let outcome = check_clean_island_with_context(CHECKED_MODEL_ISLAND, &mut env, &mut file_ctx);
+        assert!(!outcome.is_rejected(), "the authored island must register: {outcome:?}");
+
+        let i64d = Domain::Signed(MachineSIntWidth::I64);
+        let i128d = Domain::Signed(MachineSIntWidth::I128);
+        let adm = trust_spec_elab::admit_widened_eq_function(
+            &mut env,
+            "eq_ok_mint",
+            &[i64d.clone(), i128d.clone()],
+            MachineSIntWidth::I64,
+            MachineSIntWidth::I128,
+            0,
+            1,
+            true,
+        )
+        .expect("the widened-equality mint must admit into the island env");
+        assert_eq!(adm.arity, 2);
+        assert_eq!(adm.return_domain().cloned(), Some(Domain::Bool), "the decision's codomain is `Bool`");
+
+        let tc = clean_kernel::TypeChecker::new(&env);
+        let app2 = |f: &str, a: clean_kernel::Expr, b: clean_kernel::Expr| {
+            clean_kernel::Expr::apps(
+                clean_kernel::Expr::const_(clean_kernel::Name::from_string(f), vec![]),
+                [a, b],
+            )
+        };
+        // OPAQUE arguments: no closed-pipeline evaluation, so the comparison
+        // is the delta-unfolding one the citation lane performs.
+        let m = clean_kernel::Expr::fvar(clean_kernel::FVarId::new(0));
+        let t = clean_kernel::Expr::fvar(clean_kernel::FVarId::new(1));
+
+        // POSITIVE: mint ≡ the island's authored sign-extending model.
+        assert!(
+            tc.is_def_eq(&app2("eq_ok_mint", m.clone(), t.clone()), &app2("eqOkW", m.clone(), t.clone())),
+            "the widened-equality mint must be delta-defeq to the island's authored eqOkW"
+        );
+
+        // NEG (a): ZERO extension — `BitVec.ofNat 128 (BitVec.toNat v)`. This
+        // is THE faithfulness hazard of this lane: it agrees with the mint on
+        // every non-negative `machine` and disagrees on every negative one, so
+        // a wrong model here would let the contract claim a false equality for
+        // exactly the wrapped values the guard exists to reject.
+        // NEG (b): the comparison pulled down to the NARROW width, i.e. the
+        // wide side truncated instead of the narrow side widened — the
+        // opposite direction, and information-losing.
+        for (forgery, why) in [
+            ("eqOkZeroExt", "a ZERO-extending model"),
+            ("eqOkTrunc", "a truncating (narrow-width) comparison"),
+        ] {
+            assert!(
+                !tc.is_def_eq(
+                    &app2("eq_ok_mint", m.clone(), t.clone()),
+                    &app2(forgery, m.clone(), t.clone())
+                ),
+                "{why} must NOT close against the widened-equality mint"
+            );
+        }
+
+        drop(tc);
+
+        // A wrong-width or wrong-DIRECTION request fails the MINT closed.
+        for (from, to) in [
+            (MachineSIntWidth::I128, MachineSIntWidth::I64),
+            (MachineSIntWidth::I32, MachineSIntWidth::I64),
+            (MachineSIntWidth::I64, MachineSIntWidth::I64),
+        ] {
+            assert!(
+                trust_spec_elab::admit_widened_eq_function(
+                    &mut env, "parked", &[i64d.clone(), i128d.clone()], from, to, 0, 1, true,
+                )
+                .is_err(),
+                "({from:?} -> {to:?}) must park"
+            );
+        }
+        // Parameters off their required carriers, the same index on both
+        // sides, and an out-of-range index all fail closed.
+        for (domains, narrow, wide, why) in [
+            (vec![i128d.clone(), i128d.clone()], 0usize, 1usize, "a narrow parameter at the wide carrier"),
+            (vec![i64d.clone(), i64d.clone()], 0, 1, "a wide parameter at the narrow carrier"),
+            (vec![i64d.clone(), i128d.clone()], 0, 0, "the same parameter on both sides"),
+            (vec![i64d.clone(), i128d.clone()], 0, 2, "an out-of-range index"),
+            (vec![Domain::Bool, i128d.clone()], 0, 1, "a `bool` narrow parameter"),
+        ] {
+            assert!(
+                trust_spec_elab::admit_widened_eq_function(
+                    &mut env,
+                    "parked",
+                    &domains,
+                    MachineSIntWidth::I64,
+                    MachineSIntWidth::I128,
+                    narrow,
+                    wide,
+                    true,
+                )
+                .is_err(),
+                "{why} must fail closed"
+            );
+        }
+    }
+
+
+    /// The wiring arm for the SIGNED-CONSTANT lane: each of the four real
+    /// client bodies this increment unblocks
+    /// (`<i64 as CoeffDomain>::zero`/`::one`, `<i128 as Exact>::zero`/`::one`)
+    /// mints through [`admit_function_into`] with the signed return domain
+    /// recorded; uncertified facets mint nothing, and an UNSIGNED return at
+    /// the identical body shape mints nothing.
+    #[test]
+    fn admit_function_into_mints_signed_constants() {
+        use trust_types::{
+            BasicBlock, BlockId, ConstValue, LocalDecl, Operand, Place, Rvalue, SourceSpan,
+            Statement, Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let constant_fn = |path: &str, value: i128, ty: Ty| VerifiableFunction {
+            name: "k".into(),
+            def_path: path.into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![LocalDecl { index: 0, ty: ty.clone(), name: None }],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Constant(ConstValue::Int(value))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 0,
+                return_ty: ty,
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+        let i64_ty = Ty::Int { width: 64, signed: true };
+        let i128_ty = Ty::Int { width: 128, signed: true };
+
+        // `Environment::with_prelude()` is expensive, so the whole matrix runs
+        // in THREE environments rather than one per row: all the positives
+        // mint into one env (each `def_path` mangles to its own kernel
+        // constant, so they cannot collide), and the two negative classes
+        // share one each.
+        let mut env = Environment::with_prelude();
+        let mut env_uncertified = Environment::with_prelude();
+        let mut env_refused = Environment::with_prelude();
+
+        // The four blocked client functions, by the shape their bodies have.
+        for (path, value, ty, width) in [
+            ("veripb_core_proved::<i64 as CoeffDomain>::zero", 0i128, &i64_ty,
+             trust_spec_elab::MachineSIntWidth::I64),
+            ("veripb_core_proved::<i64 as CoeffDomain>::one", 1, &i64_ty,
+             trust_spec_elab::MachineSIntWidth::I64),
+            ("veripb_core_proved::<i128 as Exact>::zero", 0, &i128_ty,
+             trust_spec_elab::MachineSIntWidth::I128),
+            ("veripb_core_proved::<i128 as Exact>::one", 1, &i128_ty,
+             trust_spec_elab::MachineSIntWidth::I128),
+        ] {
+            let func = constant_fn(path, value, ty.clone());
+            let certified =
+                trust_spec_elab::FacetTable::from_structural_facets([(path, true, true, true, true)]);
+            let (got_path, admission) = admit_function_into(&mut env, &func, &certified)
+                .unwrap_or_else(|| panic!("{path} must mint once recognized"));
+            assert_eq!(got_path, path);
+            assert_eq!(admission.arity, 0);
+            assert_eq!(
+                admission.return_domain().cloned(),
+                Some(trust_spec_elab::Domain::Signed(width)),
+                "{path} must record its signed carrier"
+            );
+
+            // Uncertified facets: nothing mints even for the recognized body.
+            let uncertified = trust_spec_elab::FacetTable::from_structural_facets([(
+                path, true, true, false, true,
+            )]);
+            assert!(
+                admit_function_into(&mut env_uncertified, &func, &uncertified).is_none(),
+                "uncertified facets must not mint {path}"
+            );
+        }
+
+        // A NEGATIVE literal mints too — the case whose kernel spelling is the
+        // two's-complement pattern rather than the magnitude.
+        let neg = constant_fn("crate::neg", -1, i64_ty.clone());
+        let certified =
+            trust_spec_elab::FacetTable::from_structural_facets([("crate::neg", true, true, true, true)]);
+        assert!(admit_function_into(&mut env, &neg, &certified).is_some(), "a negative literal mints");
+
+        // An UNSIGNED return at the identical body shape mints NOTHING: a
+        // `ConstValue::Int` at a `uN` carrier has no signed reading, and
+        // taking one would give `-1` the value `u64::MAX`.
+        let unsigned = constant_fn("crate::u", -1, Ty::Int { width: 64, signed: false });
+        let certified_u =
+            trust_spec_elab::FacetTable::from_structural_facets([("crate::u", true, true, true, true)]);
+        assert!(
+            admit_function_into(&mut env_refused, &unsigned, &certified_u).is_none(),
+            "a signed literal at an unsigned return must never mint"
+        );
+    }
+
+    /// The wiring arm for the WIDENING-CAST comparison lane: the measured
+    /// `eq_ok` body with certified facets mints through [`admit_function_into`]
+    /// with the `Bool` return domain recorded; uncertified facets mint
+    /// nothing, and the two faithfulness hazards — a TRUNCATING cast and an
+    /// UNSIGNED (zero-extending) source — mint nothing even with every facet
+    /// certified.
+    #[test]
+    fn admit_function_into_mints_widened_eq() {
+        use trust_types::{
+            BasicBlock, BinOp, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let i64_ty = Ty::Int { width: 64, signed: true };
+        let i128_ty = Ty::Int { width: 128, signed: true };
+        let stmt = |place: Place, rvalue: Rvalue| Statement::Assign {
+            place,
+            rvalue,
+            span: SourceSpan::default(),
+        };
+        // The measured `-O` body of `veripb_core_proved::guard::eq_ok`.
+        let eq_ok = |narrow: Ty, wide: Ty, cast_to: Ty| VerifiableFunction {
+            name: "eq_ok".into(),
+            def_path: "crate::eq_ok".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Bool, name: None },
+                    LocalDecl { index: 1, ty: narrow, name: Some("machine".into()) },
+                    LocalDecl { index: 2, ty: wide, name: Some("truth".into()) },
+                    LocalDecl { index: 3, ty: cast_to.clone(), name: None },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![
+                        Statement::StorageLive(3),
+                        stmt(Place::local(3), Rvalue::Cast(Operand::Copy(Place::local(1)), cast_to)),
+                        stmt(
+                            Place::local(0),
+                            Rvalue::BinaryOp(
+                                BinOp::Eq,
+                                Operand::Move(Place::local(3)),
+                                Operand::Copy(Place::local(2)),
+                            ),
+                        ),
+                        Statement::StorageDead(3),
+                    ],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 2,
+                return_ty: Ty::Bool,
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+
+        let certified = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::eq_ok",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        let good = eq_ok(i64_ty.clone(), i128_ty.clone(), i128_ty.clone());
+        let mut env = Environment::with_prelude();
+        let (path, admission) = admit_function_into(&mut env, &good, &certified)
+            .expect("certified + recognized must mint");
+        assert_eq!(path, "crate::eq_ok");
+        assert_eq!(admission.arity, 2);
+        assert_eq!(
+            admission.return_domain().cloned(),
+            Some(trust_spec_elab::Domain::Bool),
+            "a decision function records the `Bool` codomain"
+        );
+        assert_eq!(admission.param_names, None);
+
+        let uncertified = trust_spec_elab::FacetTable::from_structural_facets([(
+            "crate::eq_ok",
+            true,
+            false,
+            true,
+            true,
+        )]);
+        let mut env2 = Environment::with_prelude();
+        assert!(
+            admit_function_into(&mut env2, &good, &uncertified).is_none(),
+            "uncertified facets must not mint"
+        );
+
+        // The two faithfulness hazards, each at the SAME MIR spelling as the
+        // admitted body. If either ever mints, a cast has been modeled as
+        // something it is not.
+        let mut env3 = Environment::with_prelude();
+        for (narrow, wide, cast_to, why) in [
+            (i128_ty.clone(), i64_ty.clone(), i64_ty.clone(), "a TRUNCATING cast"),
+            (
+                Ty::Int { width: 64, signed: false },
+                i128_ty.clone(),
+                i128_ty.clone(),
+                "a ZERO-extending unsigned source",
+            ),
+            (
+                i64_ty.clone(),
+                Ty::Int { width: 128, signed: false },
+                Ty::Int { width: 128, signed: false },
+                "an unsigned target carrier",
+            ),
+        ] {
+            assert!(
+                admit_function_into(&mut env3, &eq_ok(narrow, wide, cast_to), &certified).is_none(),
+                "{why} must never mint through the sign-extension lane"
+            );
+        }
+    }
+
+    /// Trust (#63, R3) — THE RED CASE, written before the green one per the
+    /// plan's own acceptance: a generated carrier whose body does NOT match its
+    /// Clean definition must be REJECTED, with the kernel as the only judge.
+    ///
+    /// The carrier here is an E6-recognizable IDENTITY body, so admission
+    /// succeeds and the refusal comes from the DEFEQ GATE itself — the test
+    /// exercises the gate, not the admission filter in front of it.
+    #[test]
+    fn r3_diverging_generated_carrier_is_rejected() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let identity_carrier = |def_path: &str| VerifiableFunction {
+            name: "gen".into(),
+            def_path: def_path.into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Int { width: 64, signed: false }, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Int { width: 64, signed: false },
+                        name: Some("x0".into()),
+                    },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Use(Operand::Copy(Place::local(1))),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Int { width: 64, signed: false },
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+
+        let mut env = Environment::with_prelude();
+        let outcome = check_clean_island_into(
+            "def r3_same (x : UInt64) : UInt64 := x
+
+\
+             def r3_diff (x : UInt64) : UInt64 := UInt64.add x 1",
+            &mut env,
+        );
+        assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
+
+        let mut facets = trust_spec_elab::FacetTable::from_structural_facets([
+            ("gen::same_carrier", true, true, true, true),
+            ("gen::diff_carrier", true, true, true, true),
+        ]);
+
+        // RED: the identity carrier does NOT compute `x + 1`. The kernel must
+        // refuse, and the refusal must be the defeq gate (not admission).
+        let carrier = identity_carrier("gen::diff_carrier");
+        let verdict =
+            check_generated_carrier_faithfulness(&mut env, "r3_diff", &carrier, &mut facets);
+        match &verdict {
+            Err(CarrierFaithfulnessRejection::NotDefinitionallyEqual { detail, .. }) => {
+                // The refusal must come from the KERNEL's defeq judgment, not
+                // from a failed elaboration in front of it — the gate's first
+                // draft passed this test for the wrong reason (an unrecorded
+                // admission failed elaboration, which also maps to this
+                // variant), and the GREEN control below is what exposed it.
+                assert!(
+                    detail.contains("kernel refused definitional equality"),
+                    "the RED case must be the kernel's judgment, not a gate in \
+                     front of it: {detail}"
+                );
+            }
+            other => panic!(
+                "a diverging generated carrier MUST be rejected by the kernel's \
+                 defeq judgment — a green here is a miscompiler: {other:?}"
+            ),
+        }
+
+        // GREEN CONTROL: the SAME carrier against the definition it faithfully
+        // implements passes — so the red above is discrimination, not a gate
+        // that refuses everything.
+        let carrier = identity_carrier("gen::same_carrier");
+        let verdict =
+            check_generated_carrier_faithfulness(&mut env, "r3_same", &carrier, &mut facets);
+        assert!(verdict.is_ok(), "the faithful carrier must pass: {verdict:?}");
+    }
+
+    /// Trust (#63, R3) — fail-closed controls on the gates IN FRONT of the
+    /// kernel: a carrier outside the E6 fragment is REFUSED (R2 may only emit
+    /// what this gate can check), and an arity mismatch never reaches defeq.
+    #[test]
+    fn r3_gate_refuses_what_it_cannot_check() {
+        use trust_types::{
+            BasicBlock, BlockId, LocalDecl, Operand, Place, Rvalue, SourceSpan, Statement,
+            Terminator, Ty, VerifiableBody, VerifiableFunction,
+        };
+        let mut env = Environment::with_prelude();
+        let outcome = check_clean_island_into("def r3_tgt (x : UInt64) : UInt64 := x", &mut env);
+        assert!(!outcome.is_rejected(), "island: {:?}", outcome.errors);
+        let mut facets = trust_spec_elab::FacetTable::from_structural_facets([(
+            "gen::opaque",
+            true,
+            true,
+            true,
+            true,
+        )]);
+        // A body the E6 recognizer cannot elaborate (raw pointer cast shape):
+        // the gate must refuse rather than skip the check.
+        let opaque = VerifiableFunction {
+            name: "gen".into(),
+            def_path: "gen::opaque".into(),
+            span: SourceSpan::default(),
+            body: VerifiableBody {
+                locals: vec![
+                    LocalDecl { index: 0, ty: Ty::Int { width: 64, signed: false }, name: None },
+                    LocalDecl {
+                        index: 1,
+                        ty: Ty::Int { width: 64, signed: false },
+                        name: Some("x0".into()),
+                    },
+                ],
+                blocks: vec![BasicBlock {
+                    id: BlockId(0),
+                    stmts: vec![Statement::Assign {
+                        place: Place::local(0),
+                        rvalue: Rvalue::Cast(
+                            Operand::Copy(Place::local(1)),
+                            Ty::Int { width: 32, signed: false },
+                        ),
+                        span: SourceSpan::default(),
+                    }],
+                    terminator: Terminator::Return,
+                }],
+                arg_count: 1,
+                return_ty: Ty::Int { width: 64, signed: false },
+                datatype_defs: Default::default(),
+            },
+            contracts: Vec::new(),
+            preconditions: Vec::new(),
+            postconditions: Vec::new(),
+            spec: Default::default(),
+        };
+        let verdict =
+            check_generated_carrier_faithfulness(&mut env, "r3_tgt", &opaque, &mut facets);
+        assert!(
+            matches!(
+                verdict,
+                Err(CarrierFaithfulnessRejection::CarrierOutsideCheckedFragment { .. })
+                    | Err(CarrierFaithfulnessRejection::NotDefinitionallyEqual { .. })
+            ),
+            "an uncheckable carrier must be refused, never skipped: {verdict:?}"
         );
     }
 }

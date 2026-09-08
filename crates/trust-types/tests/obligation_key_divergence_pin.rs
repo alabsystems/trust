@@ -351,14 +351,26 @@ fn direct_lane_births_exactly_the_four_known_asserts_and_no_contracts() {
         "no slice bounds obligation is born in the direct lane today"
     );
 
-    // The lane's own self-declaration, read live from the producer source.
+    // The lane's own self-declaration, read live from the producer source —
+    // and read as the const's ASSIGNED variant, not as a substring. The old
+    // substring probe (`contains("structural-parity-only-v1")`) stayed
+    // textually green across the Step 2/3 capability flip because the variant
+    // string survives in source; what this pin needs is the RECORDED tier.
     let crate_module =
         std::fs::read_to_string(repo_root().join("crates/trust-thir-lower/src/crate_module.rs"))
             .expect("crate_module.rs readable");
+    let assignment = crate_module
+        .split("pub const DIRECT_OBLIGATION_CAPABILITY: DirectObligationCapability =")
+        .nth(1)
+        .expect("the capability const is declared")
+        .split(';')
+        .next()
+        .expect("the capability const assignment terminates");
     assert!(
-        crate_module.contains("structural-parity-only-v1"),
-        "trust-thir-lower no longer declares structural-parity-only-v1: the direct lane's \
-         obligation capability changed — re-take the artifacts and re-derive this pin"
+        assignment.contains("ObligationBearingPending"),
+        "the direct lane's recorded obligation capability changed from \
+         obligation-bearing-pending-v2: re-take both lane fixture artifacts and \
+         re-derive this pin (assigned variant read live: {assignment:?})"
     );
 }
 

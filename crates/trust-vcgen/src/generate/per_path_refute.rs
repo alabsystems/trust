@@ -1987,6 +1987,7 @@ mod tests {
             layout: None,
             enum_layout: None,
             adt_kind: Some(trust_types::AdtKind::Enum),
+            arbitrary_precision: None,
         };
         retype_local(&mut func, 5, option_ref_u16);
         assert!(

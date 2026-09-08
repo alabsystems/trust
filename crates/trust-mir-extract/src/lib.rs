@@ -128,10 +128,15 @@ pub mod ctfe_reentrancy {
     }
 }
 mod convert;
+pub use convert::function_is_borrow_provenance_clean;
+pub use convert::std_adapter_total_panic_free;
+pub use ty_convert::is_authenticated_bignum_crate;
+pub use ty_convert::is_authenticated_serde_json_crate;
 pub use convert::{
     CertifiedPairedCondvarWaitCallSite, collect_certified_paired_condvar_wait_calls,
-    func_operand_name, is_derived_total_method, is_total_derived_trait_call,
-    tcx_is_authenticated_core_integer_wrapping_method, trust_try_total_marker,
+    func_operand_name, is_derived_total_method, is_diverging_panic_or_abort_terminal,
+    is_total_derived_trait_call, tcx_is_authenticated_core_integer_wrapping_method,
+    trust_try_total_marker,
 };
 // Research-only backward slicing for VC minimization. No production caller
 // consumes the sliced body yet, so compiling this sizeable analysis into
@@ -297,8 +302,73 @@ pub fn safe_def_path_str(tcx: TyCtxt<'_>, def_id: DefId) -> String {
     let rendered = with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
         with_no_trimmed_paths!(tcx.def_path_str(def_id))
     )));
-    apply_cross_namespace_tag(tcx, def_id, rendered)
+    apply_cross_namespace_tag(tcx, def_id, canonicalize_rendered_lifetimes(rendered))
 }
+
+/// Trust (R150): collapse every rendered LIFETIME token to a single canonical
+/// `'_`, so the two primary path producers agree on one spelling for one item.
+///
+/// THE BUG THIS CLOSES, measured on ny-cert (R149). The bundle names a body with
+/// [`safe_def_path_str`] -> `tcx.def_path_str`, which renders the DEFINITION's
+/// generic params, so `impl<'a> Parser<'a> { fn peek }` becomes
+/// `ny_cert::json::Parser::<'a>::peek`. A CALL SITE names the same body with
+/// [`safe_def_path_str_with_args`] -> `tcx.def_path_str_with_args`, which
+/// substitutes the call's CONCRETE args, where the region is anonymous — so the
+/// same item becomes `ny_cert::json::Parser::<'_>::peek`. The bridge matches
+/// callees BY RENDERED NAME, so the two never met: `TRUST_BUNDLE_MEMBERS` shows
+/// `Parser::<'a>::peek` KEPT as a bundle member 14 times while the caller is told
+/// `body not in the lowered bundle` for `Parser::<'_>::peek`. Six ny-cert methods
+/// (`peek`, `error`, `bump`, `parse_hex4`, `skip_whitespace`, `new`) lose 15
+/// obligations to this, every one of them bundled, present and lowered.
+///
+/// SOUNDNESS. Rust has NO lifetime-based specialization and regions are erased
+/// before monomorphization, so there is exactly one body per (DefId, type-args)
+/// pair and two paths differing ONLY in a rendered region denote the SAME item.
+/// Canonicalizing therefore cannot merge two distinct items — it can only let two
+/// spellings of ONE item agree, which is precisely the defect. Type and const
+/// arguments are untouched, so the `f::<bool>` vs `f::<i32>` discrimination that
+/// [`safe_def_path_str_with_args`] exists to provide is preserved byte-for-byte.
+///
+/// NOT A NEW FORGERY SURFACE (false proof #14 discipline): this narrows the region
+/// slot only, and anyone who could forge `<'a>` could already forge `<'_>` today.
+/// The set of distinguishable non-region spellings is unchanged.
+///
+/// FAIL-CLOSED DIRECTION: the defect currently reports a PRESENT, PROVED body as
+/// absent, which costs completeness and never soundness. Fixing it can only move
+/// obligations from `unknown` toward a real verdict — and the callee body still
+/// has to prove itself on its own merits once matched.
+fn canonicalize_rendered_lifetimes(rendered: String) -> String {
+    if !rendered.contains('\'') {
+        return rendered;
+    }
+    let mut out = String::with_capacity(rendered.len());
+    let mut chars = rendered.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+            continue;
+        }
+        // A lifetime token is `'` followed by either a braced sentinel the
+        // renderer emits (`'{erased}`) or an identifier (`a`, `_`, `static`, `1`).
+        // Consume it whole and emit the canonical form. A def path cannot contain
+        // a char literal, so every `'` here is a lifetime.
+        out.push('\'');
+        out.push('_');
+        if chars.peek() == Some(&'{') {
+            for inner in chars.by_ref() {
+                if inner == '}' {
+                    break;
+                }
+            }
+        } else {
+            while chars.peek().is_some_and(|c| c.is_alphanumeric() || *c == '_') {
+                chars.next();
+            }
+        }
+    }
+    out
+}
+
 
 /// The DEFINITION-side [`trust_types::CalleeIdentity`] of `def_id` — the
 /// identity a CALL to this item carries when the call is the item itself rather
@@ -385,7 +455,9 @@ pub fn safe_def_path_str_with_args<'tcx>(
     let rendered = with_def_path_disambiguators!(with_resolve_crate_name!(with_no_visible_paths!(
         with_no_trimmed_paths!(tcx.def_path_str_with_args(def_id, args))
     )));
-    apply_cross_namespace_tag(tcx, def_id, rendered)
+    // R150: the SAME canonicalization the definition-side producer applies, so one
+    // item has one spelling on both sides. See `canonicalize_rendered_lifetimes`.
+    apply_cross_namespace_tag(tcx, def_id, canonicalize_rendered_lifetimes(rendered))
 }
 
 /// Trust (§RESIDUAL 7 — the cross-NAMESPACE collision): append the namespace tag,
@@ -2224,7 +2296,180 @@ pub fn faithful_vtable_key_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> trus
 /// A rustc type is a finite tree, so the walk terminates without this — the bound exists
 /// so a pathologically nested type produces a REFUSAL (fail-closed, its own tag) instead
 /// of a multi-kilobyte identity string in every consumer that carries it.
+///
+/// It bounds this function's OWN `child` recursion and nothing else. It cannot bound the
+/// re-entrant chain through [`faithful_vtable_key_ty`], which starts a fresh conversion
+/// at `depth = 0` every trip — see [`KeySkeletonFrame`].
 const MAX_KEY_NESTING_DEPTH: u32 = 16;
+
+// ─── THE RE-ENTRANCY CYCLE, and why every bound in the type lowering missed it ───
+//
+// THE DEFECT (reproduced 2026-09-01 as a SIGBUS — a native stack overflow — in
+// `trustc`, on a 13-line crate and on `clean-runtime`).
+//
+// `faithful_key_skeleton` classifies each node by running the FULL type lowering
+// (`faithful_vtable_key_ty` -> `ty_convert::convert_ty_in_env`) and asking whether the
+// closed grammar admits the result. `convert_ty_in_env` constructs a FRESH
+// `TyLoweringCtx`. Every bound the lowering owns — `MAX_TYPE_LOWERING_DEPTH`,
+// `MAX_TYPE_LOWERING_NODES`, `MAX_TYPE_LOWERING_PRODUCED_NODES`, the `adt_stack`
+// back-edge guard, the memo cache, the canonical cut set — lives in that context and is
+// therefore RESET at the boundary. So the guards were never missing; they were
+// DISCARDED, once per trip around a cycle that crosses the boundary:
+//
+//     convert_ty_inner(dyn Fn(&[V]) -> _)      <- TyKind::Dynamic arm
+//       -> faithful_principal_key              <- renders the principal's arguments
+//         -> faithful_key_component
+//           -> faithful_key_skeleton((&[V],))  <- depth RESET to 0
+//             -> faithful_vtable_key_ty
+//               -> convert_ty_in_env((&[V],))  <- guard state RESET
+//                 -> ... -> V's `dyn Fn(&[V]) -> _` field -> back to the top
+//
+// A trait object whose principal ARGUMENT is a nominal type that transitively HOLDS that
+// same trait object closes the loop. It is an ordinary shape, not a pathological one:
+// `clean-runtime` is the shipped instance, and the whole `dyn Fn`/`FnMut`/`FnOnce` family
+// over a self-holding value domain has it. Nothing bounded the recursion, so `trustc`
+// died of the exact failure class it exists to catch.
+//
+// WHICH SHAPES ACTUALLY CRASH — measured, because two plausible readings of the trace
+// were wrong and each would have mis-sized this fix. (a) The `Fn`-sugar TUPLE around the
+// arguments is NOT the escape hatch: `dyn Take<Cycle2>` puts the recursive type in
+// argument position bare and still SIGBUSes, so it is the POSITION, not the tuple.
+// (b) The associated-type BINDING term reaches this same renderer and is the same edge in
+// principle, but no binding-term instance reproduces today. The reason is a property of
+// the CUT SET, not of the binding position: `canonical_cut_set` computes cut points over
+// the NOMINAL FIELD graph (`nominal_frontier` peels `Ref`/`RawPtr`/`Adt` and does not
+// follow a `dyn`'s predicate arguments), so a type whose ONLY cycle runs through a key is
+// not a cut point and the fresh walk EXPANDS it — while every binding-term shape found so
+// far also carries an ordinary recursive field, which makes it a cut point and reduces
+// the fresh walk to a one-node marker. The `Cycle2`/`Guarded` pair in
+// `tests/ui/trust/trust_vtable_key_reentrancy_cycle.rs` differ in exactly that one field
+// and in exactly whether they crash. Do not read "binding terms are safe" out of that —
+// read "the cut set is currently covering them".
+//
+// AND DO NOT READ "an ordinary recursive field makes a type safe" out of it either,
+// which is the reason this guard is not narrowed to the uncut case. There is a SECOND
+// way the fresh walk expands a type instead of cutting it, and `ty_convert.rs` documents
+// it against `MAX_CANONICAL_CUT_NODES` itself: when cut-point discovery exceeds that
+// bound "the cut set is EMPTY and lowering is byte-identical to today's" (see also its
+// note R1). An empty cut set cuts nothing, whatever the field graph says, and what is
+// left holding the line is precisely the per-context `adt_stack` fail-safe that this
+// boundary discards. `clean-runtime` reaches the trait object through
+// `IoTaskHandle`/`Arc`/`Mutex`/`Condvar`, a large enough graph for that to be live; the
+// re-entered roots measured there are `(io_runtime::IoValue,)` and `io_runtime::IoValue`,
+// and which of the two routes applies was NOT isolated.
+//
+// THE FIX is a guard whose state SURVIVES the boundary — a thread-local stack of the
+// types whose skeleton is being rendered right now, on the same shape as
+// `ty_convert::record_cut_definition`'s `in_progress` set. Two independent bounds,
+// because they catch different things and neither is sufficient alone:
+//
+//   1. EXACT CYCLE DETECTION (`RefusalShape::SelfReferential`). Re-entering a type
+//      already on this thread's stack is refused by name. This is not a truncation and
+//      it costs no precision on any terminating input: a path from `X` back to `X` must
+//      cross `faithful_principal_key`, because `child` only descends to PROPER subterms
+//      of a finite rustc type and a type is not a proper subterm of itself — and every
+//      crossing resets `depth`, so the chain is a genuine non-terminating fixpoint. The
+//      guard therefore fires ONLY on inputs that would otherwise crash the compiler.
+//
+//   2. A WELL-FOUNDED FRAME BOUND (`RefusalShape::ReentryBoundExceeded`). Detection
+//      alone does not prove termination, because a GENERIC family can re-enter with a
+//      NEW type on every trip and never repeat one:
+//      `struct S<T>(Box<dyn Fn(&S<Box<T>>)>)` walks `S<u8>`, `S<Box<u8>>`,
+//      `S<Box<Box<u8>>>`, … all distinct. `MAX_KEY_SKELETON_FRAMES` is the ranking
+//      function that makes the descent well-founded regardless of what the type graph
+//      does. It is a STOP, not a refusal, so it carries its OWN tag: a bound that is
+//      hit must never be reported as a clean "this type has no key".
+//
+// SOUNDNESS: both outcomes are the pre-existing fail-closed value. The refusal
+// propagates as `Err` out of `faithful_principal_key`, which the extractor's
+// `TyKind::Dynamic` arm turns into `principal_key: None` and the THIR producer's
+// `trait_object_id` turns into an unsupported body. `principal_key: None` takes the THIN
+// spelling in `trust-ir-bridge` (`TrustIrTy::Ptr`), so no identity is minted and no two
+// trait objects can be merged. It can only lose a proof, never manufacture one.
+
+/// The bound on SIMULTANEOUSLY ACTIVE [`faithful_key_skeleton`] frames on one thread.
+///
+/// Sized against the other bound in this file: one skeleton call's own `child` chain is
+/// capped at [`MAX_KEY_NESTING_DEPTH`] (16), so 64 frames admit four FULLY nested
+/// re-entrant renderings before the stop applies. Nothing in the corpus approaches it —
+/// the cycle above is caught by the exact detector on its FIRST repeat, one trip in —
+/// so this is the backstop for the non-repeating generic family, and hitting it is a
+/// reportable event rather than an expected degradation.
+///
+/// WHERE A HIT IS OBSERVABLE, exactly, because this is the one bound here that can
+/// TRUNCATE rather than refuse and a truncation that reports nothing is the defect this
+/// whole change is about. It rides the ordinary refusal-tag channel:
+/// `RefusalShape::ReentryBoundExceeded` -> `Ty(dyn {principal arg,assoc binding}: key
+/// re-entrancy bound exceeded)` -> the `Err` of `faithful_principal_key`, which the THIR
+/// producer propagates as the body's unsupported reason and which lands in the
+/// reason-tag histogram under its own name, never pooled with a grammar refusal.
+///
+/// It is NOT separately observable on the EXTRACTOR side: `ty_convert.rs`'s
+/// `TyKind::Dynamic` arm ends in `.ok()`, so every refusal — this one and the eight that
+/// predate it — collapses to `principal_key: None` with no reason recorded. That is the
+/// pre-existing shape of that call site and this bound does not make it worse, but do
+/// not read the tag above as covering the extractor. Giving that side a reason needs a
+/// carrier `Ty::Dynamic` does not have; until it does, a bound hit during extraction is
+/// countable only as one more `None`.
+const MAX_KEY_SKELETON_FRAMES: usize = 64;
+
+thread_local! {
+    /// The types whose key skeleton is being rendered on this thread, innermost last.
+    ///
+    /// Thread-local, like `ty_convert::FAITHFUL_SCALARS` and `DATATYPE_DEFS`, because
+    /// rustc runs `mir_built` in parallel and each worker owns its own extraction — and
+    /// because the cycle crosses a function boundary (`convert_ty_in_env`) that cannot
+    /// carry the state as a parameter without threading a context through the whole
+    /// type-lowering API.
+    static KEY_SKELETON_FRAMES: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A lifetime-free identity for an interned rustc type.
+///
+/// rustc INTERNS `Ty<'tcx>`: one allocation per distinct type, so the address `kind()`
+/// hands back is injective over types (equal types share it, distinct types cannot).
+/// The `usize` is what lets the in-progress stack live in a `thread_local!` at all — a
+/// `Ty<'tcx>` cannot, and the borrow it would need does not exist across the re-entry.
+fn interned_ty_identity(ty: ty::Ty<'_>) -> usize {
+    std::ptr::from_ref(ty.kind()) as usize
+}
+
+/// RAII membership in the in-progress set — see the block comment above.
+struct KeySkeletonFrame(usize);
+
+impl KeySkeletonFrame {
+    /// Claim `ty`, or say WHY it cannot be claimed. Both refusals are named, distinct,
+    /// and reported through the ordinary refusal-tag channel.
+    fn enter(ty: ty::Ty<'_>) -> Result<Self, trust_types::RefusalShape> {
+        let id = interned_ty_identity(ty);
+        KEY_SKELETON_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            if frames.contains(&id) {
+                return Err(trust_types::RefusalShape::SelfReferential);
+            }
+            if frames.len() >= MAX_KEY_SKELETON_FRAMES {
+                return Err(trust_types::RefusalShape::ReentryBoundExceeded);
+            }
+            frames.push(id);
+            Ok(KeySkeletonFrame(id))
+        })
+    }
+}
+
+impl Drop for KeySkeletonFrame {
+    fn drop(&mut self) {
+        // Strictly LIFO: the only constructor is `enter`, the value is never moved out
+        // of its frame, and `Drop` runs on unwind as well as on return — so the entry
+        // popped here is always this frame's own. Asserted rather than assumed, because
+        // a mismatched pop would leave a stale id that refuses a legitimate type
+        // forever.
+        KEY_SKELETON_FRAMES.with(|frames| {
+            let popped = frames.borrow_mut().pop();
+            debug_assert_eq!(popped, Some(self.0), "key-skeleton frame stack is not LIFO");
+        });
+    }
+}
 
 /// Trust (vtable slice 18): the `tcx`-level walk that turns ONE rustc type into the
 /// renderable skeleton `trust_types::VtableKeyTy`.
@@ -2269,6 +2514,12 @@ fn faithful_key_skeleton<'tcx>(
     depth: u32,
 ) -> Result<trust_types::VtableKeyTy, trust_types::RefusalShape> {
     use trust_types::{RefusalShape, VtableKeyTy as K};
+
+    // BEFORE the conversion below, which is the re-entrant call: `faithful_vtable_key_ty`
+    // starts a FRESH `TyLoweringCtx`, so every bound the lowering owns is reset at that
+    // boundary and a `dyn` reachable from `ty` walks straight back here. This frame is
+    // the only state that survives it. See the block comment on `MAX_KEY_SKELETON_FRAMES`.
+    let _frame = KeySkeletonFrame::enter(ty)?;
 
     let closed = faithful_vtable_key_ty(tcx, ty);
     if closed.vtable_source_type_key_in_body(owner).is_some() {
@@ -2426,13 +2677,38 @@ pub fn faithful_principal_key<'tcx>(
     // adopting it here additionally closes a pre-existing asymmetry: the producer's
     // `trait_object_id` hashed the UNSTAMPED `safe_def_path_str` while the oracle hashed
     // the stamped one. Identity in this corpus, divergent under impersonation.
-    let principal = preds.principal().ok_or("Ty(dyn no principal)")?;
-    let tr = principal.skip_binder();
-    let base = dollar_free(sysroot_authenticated_def_path_str(tcx, tr.def_id))?;
+    // Trust (wave-DNP): a PRINCIPAL-LESS trait object (`dyn Send`, `dyn Send + Sync`) is
+    // identified ENTIRELY by its auto-trait set, so it gets an EMPTY base and the existing
+    // `+auto` tail does the rest. Two properties make that key injective rather than merely
+    // convenient, and both are already pinned by the code below:
+    //   * DISJOINT FIRST CHARACTER — a principal-ful key always begins with a def-path
+    //     character, and a principal-less one always begins with `+` (the auto tail is
+    //     non-empty by the refusal below), so the two families cannot collide;
+    //   * the auto set is SORTED and def-path-stamped, so `dyn Send + Sync` and
+    //     `dyn Sync + Send` are one key and an impersonating `Send` is not the real one.
+    // The `None` branch fails closed on anything that is not purely auto traits: a
+    // projection bound without a principal is not constructible (refuse rather than assume),
+    // and a `dyn` with neither principal nor autos is not a type.
+    let principal = preds.principal();
+    let (base, tr) = match principal {
+        Some(p) => {
+            let tr = p.skip_binder();
+            (dollar_free(sysroot_authenticated_def_path_str(tcx, tr.def_id))?, Some(tr))
+        }
+        None => {
+            if preds.projection_bounds().next().is_some() {
+                return Err("Ty(dyn no principal: unrenderable auto set)".into());
+            }
+            if preds.auto_traits().next().is_none() {
+                return Err("Ty(dyn no principal: unrenderable auto set)".into());
+            }
+            (String::new(), None)
+        }
+    };
 
     // Principal arguments — NON-LIFETIME only.
     let mut args = Vec::new();
-    for arg in tr.args.iter() {
+    for arg in tr.iter().flat_map(|t| t.args.iter()) {
         if arg.as_region().is_some() {
             continue;
         }
@@ -2481,7 +2757,9 @@ pub fn faithful_principal_key<'tcx>(
     }
     autos.sort();
 
-    if args.is_empty() && bindings.is_empty() && autos.is_empty() {
+    // Trust (wave-DNP): guarded on `principal.is_some()` so the empty-base case can never
+    // take the verbatim return (it would yield the empty string).
+    if principal.is_some() && args.is_empty() && bindings.is_empty() && autos.is_empty() {
         // The overwhelmingly common `dyn Trait` — returned VERBATIM, so no existing
         // identity can churn.
         return Ok(base);
@@ -2520,7 +2798,42 @@ pub fn extract_function_for_codegen<'tcx>(
     body: &mir::Body<'tcx>,
 ) -> Result<VerifiableFunction, CodegenExtractionError> {
     let mut function = extract_function_with_purpose(tcx, body, None, ExtractionPurpose::Codegen);
-    validate_codegen_fidelity(tcx, body, &mut function)?;
+    validate_codegen_fidelity(tcx, body, &mut function, CodegenTyPolicy::Strict)?;
+    Ok(function)
+}
+
+/// How [`validate_codegen_fidelity`] judges ADT-typed signatures and locals.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CodegenTyPolicy {
+    /// Every ADT is layout-erased for this consumer — the MIR->LIR codegen
+    /// lane, whose lowering has no ADT story at all. The historical default.
+    Strict,
+    /// ADMIT an ADT that carries its FAITHFUL layout facts — an enum marked
+    /// `faithful_enum_repr: Some(_)` (extracted under the FaithfulScalarsGuard
+    /// with register_enum-eligible structure) or a struct with a concrete
+    /// `layout: Some(_)`. The trust-ir upstream lane's policy: the bridge
+    /// registers such defs producer-equal (the differential's oracle does so
+    /// on every local body), and the converter's pair-enum / recorded-layout
+    /// lanes consume them; anything the chain cannot map still refuses
+    /// DOWNSTREAM by name — never a miscompile, never a silent admit here.
+    AdmitFaithfulAdts,
+}
+
+/// [`extract_function_for_codegen`] for the trust-ir UPSTREAM lane: the
+/// extraction runs under the [`ty_convert::FaithfulScalarsGuard`] (so
+/// isize/usize/char keep their identity and eligible enums carry
+/// `faithful_enum_repr` — the exact spellings `lower_mir_compat_to_trust_ir`
+/// maps, proven daily by the THIR/MIR differential's oracle side), and the
+/// fidelity gate judges ADTs under [`CodegenTyPolicy::AdmitFaithfulAdts`].
+/// Every STRUCTURAL fidelity check (block order, statement shapes,
+/// terminators) is unchanged.
+pub fn extract_function_for_trust_ir_upstream<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+) -> Result<VerifiableFunction, CodegenExtractionError> {
+    let _guard = crate::ty_convert::FaithfulScalarsGuard::enable();
+    let mut function = extract_function_with_purpose(tcx, body, None, ExtractionPurpose::Codegen);
+    validate_codegen_fidelity(tcx, body, &mut function, CodegenTyPolicy::AdmitFaithfulAdts)?;
     Ok(function)
 }
 
@@ -2830,13 +3143,23 @@ fn enum_discriminant_range_preconditions<'tcx>(
 ///
 /// SOUNDNESS mirrors the discriminant pass: the fact is a universal type
 /// invariant (monotone — it deletes only infeasible models; any real
-/// violation's witness also satisfies it, so no false-PROVE), and it is
-/// emitted only for non-argument locals with EXACTLY ONE textual definition
-/// (every value the local ever holds comes from that one char-producing
-/// statement), binding the bare entry name exactly as the discriminant facts
-/// do. Arguments are skipped like the discriminant pass skips them (a
-/// parameter-named precondition would become a call-site PROVE obligation —
-/// a separate mechanism).
+/// violation's witness also satisfies it, so no false-PROVE).
+///
+/// TWO CLASSES OF LOCAL, two gates:
+///   * a PARAMETER (`1..=arg_count`) is bound unconditionally — its rustc type
+///     IS `char`, so every value it holds is a Unicode scalar value at entry and
+///     after any in-body reassignment (which preserves the type). This is the
+///     same argument [`integer_param_range_preconditions`] makes for the integer
+///     parameter bound, and it is named by that function's rule so the two facts
+///     land on the same SMT var. Parameters were previously skipped on the
+///     grounds that a parameter-named precondition would become a call-site
+///     PROVE obligation; that is not so on this list — call-site `Precondition`
+///     VCs are built from the callee's CONTRACT formulas
+///     (`extract_contract_formulas_memo` in `trust_verify`), never from
+///     `VerifiableFunction::preconditions` — and the integer parameter bound has
+///     shipped on this same list since audit #6.
+///   * a NON-parameter local is bound only with EXACTLY ONE textual definition,
+///     so every value it holds comes from that one char-producing statement.
 fn char_range_preconditions<'tcx>(body: &mir::Body<'tcx>, vbody: &VerifiableBody) -> Vec<Formula> {
     // Textual write counts (same single-assignment gate as the discriminant
     // pass — one MIR assignment statement, even inside a loop, means every
@@ -2866,11 +3189,14 @@ fn char_range_preconditions<'tcx>(body: &mir::Body<'tcx>, vbody: &VerifiableBody
             continue;
         }
         let l = idx.as_usize();
-        // Non-return, non-argument locals only (see the doc comment).
-        if l == 0 || l <= vbody.arg_count {
+        // The return slot carries no entry name to bind.
+        if l == 0 {
             continue;
         }
-        if write_counts.get(&l).copied() != Some(1) {
+        // A parameter needs no single-definition gate; a body local does (see
+        // the doc comment's two classes).
+        let is_param = l <= vbody.arg_count;
+        if !is_param && write_counts.get(&l).copied() != Some(1) {
             continue;
         }
         // Defensive: the lowered local must be the u32 char lowers to, so the
@@ -2881,6 +3207,19 @@ fn char_range_preconditions<'tcx>(body: &mir::Body<'tcx>, vbody: &VerifiableBody
         }
         let name =
             vbody.locals.get(l).and_then(|d| d.name.clone()).unwrap_or_else(|| format!("_{l}"));
+        // A PARAMETER's fact is named by `integer_param_range_preconditions`'
+        // rule — the source name only when UNIQUE across all locals, else the
+        // collision-safe `_<index>` — so this bound and that one land on the
+        // same var, and a shadowed name can never carry this fact onto a
+        // different local (which would be an unsound bound, not merely a
+        // disconnected one). Body locals keep their existing spelling.
+        let name = if is_param
+            && vbody.locals.iter().filter(|d| d.name.as_deref() == Some(name.as_str())).count() != 1
+        {
+            format!("_{l}")
+        } else {
+            name
+        };
         let var = || Formula::var(&name, Sort::Int);
         out.push(Formula::And(vec![
             Formula::Ge(Box::new(var()), Box::new(Formula::Int(0))),
@@ -4416,7 +4755,7 @@ fn extract_body<'tcx>(
     // `ty_convert::normalize_alias`.
     let typing_env = body.typing_env(tcx);
 
-    let locals = body
+    let mut locals: Vec<LocalDecl> = body
         .local_decls
         .iter_enumerated()
         .map(|(local, decl)| {
@@ -4428,6 +4767,19 @@ fn extract_body<'tcx>(
             }
         })
         .collect();
+
+    // Trust (F6 monomorphization gap): a by-reference
+    // `<num_rational::Ratio<num_bigint::BigInt> as …>::method(&self)` call is fully
+    // monomorphized (the callee's `generic_args` carry the concrete `BigInt`), yet
+    // the receiver LOCAL's lowered type can carry the identity-substituted
+    // `Ratio<T>` (element = un-substituted `TyKind::Param`) — which
+    // `authenticate_arbitrary_precision` correctly refuses (fail-closed), leaving
+    // the F6 bridge gate stampless and every by-ref num-rational read/predicate
+    // UNKNOWN. Recover the stamp the CONCRETE call already proves by
+    // re-authenticating each direct, non-generic call's concrete receiver with the
+    // SOLE `StableCrateId`-gated writer and rewriting the receiver local's stamp.
+    // See `convert::refine_bignum_receiver_stamps` (soundness argument there).
+    convert::refine_bignum_receiver_stamps(tcx, body, &mut locals);
 
     let blocks = body
         .basic_blocks
@@ -4459,6 +4811,9 @@ fn extract_body<'tcx>(
         // so the codegen-purpose path must retain the original MIR shape.
         convert::rewrite_range_contains_calls(tcx, body, &mut vbody);
         convert::discharge_provably_safe_pointer_asserts(tcx, body, &mut vbody);
+        // Sound per-call-site total-sentinel rewrite of transparent-thiserror
+        // `<dyn Error>::source` (proof-only normalization; gated on TRUST_ERRSOURCE_DEVIRT).
+        convert::stamp_errsource_devirt_total_calls(tcx, body, &mut vbody);
         // Spawn calls deliberately retain their authenticated def-path unchanged.
         // A callee-name suffix is not proof authority, so extraction never stamps one.
     }
@@ -4615,6 +4970,7 @@ fn validate_codegen_fidelity<'tcx>(
     tcx: TyCtxt<'tcx>,
     mir_body: &mir::Body<'tcx>,
     function: &mut VerifiableFunction,
+    ty_policy: CodegenTyPolicy,
 ) -> Result<(), CodegenExtractionError> {
     let def_path = function.def_path.clone();
     let fail = |location: String, detail: String| CodegenExtractionError::UnsupportedMir {
@@ -4644,7 +5000,8 @@ fn validate_codegen_fidelity<'tcx>(
         });
     }
 
-    if let Some(detail) = codegen_ty_issue(&function.body.return_ty, "return type") {
+    if let Some(detail) = codegen_ty_issue_with_policy(&function.body.return_ty, "return type", ty_policy)
+    {
         return Err(fail("return type".to_string(), detail));
     }
     for (expected, local) in function.body.locals.iter().enumerate() {
@@ -4657,7 +5014,9 @@ fn validate_codegen_fidelity<'tcx>(
                 ),
             });
         }
-        if let Some(detail) = codegen_ty_issue(&local.ty, &format!("local _{}", local.index)) {
+        if let Some(detail) =
+            codegen_ty_issue_with_policy(&local.ty, &format!("local _{}", local.index), ty_policy)
+        {
             return Err(fail(format!("local _{}", local.index), detail));
         }
     }
@@ -4698,7 +5057,9 @@ fn validate_codegen_fidelity<'tcx>(
                     ),
                 });
             }
-            if let Some(detail) = codegen_statement_issue(statement) {
+            if let Some(detail) =
+                codegen_statement_issue_with_policy(statement, &function.body.locals, ty_policy)
+            {
                 return Err(fail(location, detail));
             }
         }
@@ -4716,6 +5077,40 @@ fn validate_codegen_fidelity<'tcx>(
     Ok(())
 }
 
+/// [`codegen_ty_issue`] with the ADT policy applied at EVERY nesting level:
+/// under `AdmitFaithfulAdts`, an ADT carrying its faithful layout facts is
+/// admitted (and its FIELD types are not descended into — the downstream
+/// bridge/converter own their own fail-closed mapping of the def); everything
+/// else defers to the strict judgment.
+fn codegen_ty_issue_with_policy(ty: &Ty, context: &str, policy: CodegenTyPolicy) -> Option<String> {
+    if policy == CodegenTyPolicy::AdmitFaithfulAdts {
+        match ty {
+            Ty::Adt { faithful_enum_repr: Some(_), .. } => return None,
+            Ty::Adt { layout: Some(_), variants, .. } if variants.is_empty() => return None,
+            // The FAITHFUL scalar spellings the guard mints (isize/usize/char
+            // identity, `&str`): the bridge maps them onto trust-ir
+            // Usize/Isize/Char/FatPtr(Str) and the converter's scalar and
+            // str-formal lanes consume them. The strict lane never sees these
+            // spellings (no guard), so its vocabulary is untouched.
+            Ty::PtrSizedInt { .. } | Ty::Char | Ty::Str => return None,
+            Ty::Ref { inner, .. } | Ty::RawPtr { pointee: inner, .. } => {
+                return codegen_ty_issue_with_policy(inner, &format!("{context} pointee"), policy);
+            }
+            Ty::Tuple(fields) => {
+                return fields.iter().enumerate().find_map(|(index, field)| {
+                    codegen_ty_issue_with_policy(
+                        field,
+                        &format!("{context}.{index}"),
+                        policy,
+                    )
+                });
+            }
+            _ => {}
+        }
+    }
+    codegen_ty_issue(ty, context)
+}
+
 fn codegen_ty_issue(ty: &Ty, context: &str) -> Option<String> {
     let nested = |child: &Ty, suffix: &str| codegen_ty_issue(child, &format!("{context}{suffix}"));
     match ty {
@@ -4730,7 +5125,13 @@ fn codegen_ty_issue(ty: &Ty, context: &str) -> Option<String> {
         }
         // These verification models omit rustc's concrete field offsets,
         // discriminant encoding, vtable, or state-machine layout.
-        Ty::Adt { name, .. } => Some(format!("{context} uses layout-erased ADT `{name}`")),
+        Ty::Adt { name, faithful_enum_repr, layout, variants, .. } => Some(format!(
+            "{context} uses layout-erased ADT `{name}` (faithful_enum_repr {}, layout {}, {} \
+             variant(s))",
+            if faithful_enum_repr.is_some() { "Some" } else { "None" },
+            if layout.is_some() { "Some" } else { "None" },
+            variants.len(),
+        )),
         Ty::Datatype { name, .. } => Some(format!("{context} uses proof-only datatype `{name}`")),
         Ty::Closure { name, .. } => Some(format!("{context} uses layout-erased closure `{name}`")),
         Ty::Dynamic { trait_name, .. } => Some(format!(
@@ -4821,6 +5222,11 @@ fn codegen_const_issue(value: &ConstValue) -> Option<String> {
         }
         ConstValue::UnitVariantRef { .. } => Some(
             "unit-variant reference omits the referenced allocation and layout".to_string(),
+        ),
+        // Trust: EFHT-P — same opaque-reference carrier class as the arm above.
+        ConstValue::StructScalarFieldsRef { .. } => Some(
+            "struct-scalar-fields reference omits the referenced allocation and layout"
+                .to_string(),
         ),
         ConstValue::CallableItem { .. } => {
             Some("callable-item constant is an identity-only placeholder".to_string())
@@ -4915,6 +5321,51 @@ fn codegen_statement_name(statement: &Statement) -> &'static str {
         Statement::Nop => "Nop",
         _ => "<unclassified>",
     }
+}
+
+/// [`codegen_statement_issue`] with the ADT policy applied to AGGREGATE
+/// builds: under `AdmitFaithfulAdts`, an `Rvalue::Aggregate` of an ADT kind is
+/// judged by the DESTINATION LOCAL's extracted type — if that type is
+/// faithful-admitted (an enum with `faithful_enum_repr`, a struct with a
+/// recorded layout), the build is expressible downstream (the trust-ir bridge
+/// lowers exactly these constructs for the differential's oracle on every
+/// local body) and only the OPERANDS are checked. `SetDiscriminant` follows
+/// the same rule through its place. Everything else defers to the strict
+/// judgment, and the strict lane never takes this path.
+fn codegen_statement_issue_with_policy(
+    statement: &Statement,
+    locals: &[LocalDecl],
+    policy: CodegenTyPolicy,
+) -> Option<String> {
+    if policy == CodegenTyPolicy::AdmitFaithfulAdts {
+        let faithful_place = |place: &Place| {
+            locals.get(place.local).is_some_and(|decl| {
+                codegen_ty_issue_with_policy(&decl.ty, "aggregate destination", policy).is_none()
+            })
+        };
+        match statement {
+            Statement::Assign { place, rvalue: Rvalue::Aggregate(kind, values), .. }
+                if matches!(kind, AggregateKind::Adt { .. }) && faithful_place(place) =>
+            {
+                return values.iter().find_map(codegen_operand_issue);
+            }
+            Statement::SetDiscriminant { place, .. } if faithful_place(place) => {
+                return None;
+            }
+            // UNCHECKED arithmetic (`unchecked_add` in core's checked_add
+            // fast path): machine-wise the plain wrapping op — the trust-ir
+            // bridge lowers it under the R87 discipline (integer destination
+            // required, UB modeled as the wrapping concretization the machine
+            // executes). Judge operands and destination like a BinaryOp.
+            Statement::Assign { place, rvalue: Rvalue::UncheckedBinaryOp(_, lhs, rhs), .. } => {
+                return codegen_place_issue(place)
+                    .or_else(|| codegen_operand_issue(lhs))
+                    .or_else(|| codegen_operand_issue(rhs));
+            }
+            _ => {}
+        }
+    }
+    codegen_statement_issue(statement)
 }
 
 fn codegen_statement_issue(statement: &Statement) -> Option<String> {

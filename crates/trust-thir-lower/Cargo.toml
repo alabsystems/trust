@@ -36,6 +36,7 @@ trust-ir-bridge = { path = "../trust-ir-bridge" }
 # module-validation block in crate_module.rs. `tracing` carries the per-class counts to the
 # scorecard, the same channel the mir_built hook's coverage events already use.
 trust-ir-build = { path = "../../first-party/trust-ir/crates/trust-ir-build" }
+trust-clean-ir-gate = { path = "../trust-clean-ir-gate" }
 tracing = { workspace = true }
 # Trust: P1.2 slice 1 — the derived-vs-built MIR comparator canonicalizes the
 # trust-mir-extract VerifiableBody (trust-types) of BOTH bodies.
@@ -53,3 +54,8 @@ rustc_middle = { path = "../../compiler/rustc_middle" }
 # session-level flip gates.
 rustc_session = { path = "../../compiler/rustc_session" }
 rustc_span = { path = "../../compiler/rustc_span" }
+
+[dev-dependencies]
+trust-certify = { path = "../trust-certify" }
+trust-clean-ir = { path = "../trust-clean-ir" }
+trust-clean-origin = { path = "../trust-clean-origin" }

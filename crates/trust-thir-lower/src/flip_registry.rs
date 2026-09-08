@@ -356,6 +356,25 @@ fn fnptr_adapter_allows_flip(fnptr_adapter: bool) -> bool {
 /// which is precisely why it had to be a decision and not an inherited accident. `TyCtxt`-free for
 /// the same reason [`union_lane_allows_flip`] and [`fnptr_adapter_allows_flip`] are: the whole
 /// decision is then executable by a unit test.
+/// Trust (wave-MR): the `&mut` twin of [`thin_reborrows_allow_flip`], and DELIBERATELY STRICTER —
+/// it refuses the whole class rather than re-using the shared side's confinement certificate.
+///
+/// `call_result_reborrow_is_confined` was written for a value that is only READ: it establishes
+/// that a forwarded `&T` cannot outlive or alias its way past what the module shows. A `&mut`
+/// forwarded out of a body is a value someone may WRITE THROUGH, and the argument for that is not
+/// the same argument — confinement of a read does not bound the effects of a write. Reusing the
+/// certificate here would be borrowing the *shape* of a proof whose content does not transfer.
+///
+/// So: refuse for absence of evidence, which is exactly the pre-certificate wave-TR posture and is
+/// honest as stated. The ROWS are still recorded (`Lowered::mut_reborrows`) so a later wave can
+/// certify the class against the module rather than re-derive it from scratch — the same reason
+/// the shared side kept its rows before it had a certificate.
+///
+/// `TyCtxt`-free, so the decision is executable by a unit test.
+fn mut_reborrows_allow_flip(mut_reborrows: &[ThinReborrow]) -> bool {
+    mut_reborrows.is_empty()
+}
+
 fn thin_reborrows_allow_flip(
     module: &Module,
     callees: &[CalleeRef],
@@ -400,9 +419,10 @@ fn thin_reborrows_allow_flip(
 ///   4. its `callee` `FuncId` matches EXACTLY ONE entry in this body's callee identity ledger
 ///      ([`crate::CalleeRef`]) — the same ledger `crate_module` uses to rewrite intra-crate callee
 ///      ids and the same ledger the lineage digest frames, read under that ledger's own ambiguity
-///      rule. `FuncId` is `DefIndex`-derived and non-injective, so "present" is weaker than
-///      "named": two entries under one `FuncId` mean the callee identity is a guess, and this
-///      fails closed on that set exactly as `to_mir` and `crate_module::resolve_callee` do.
+///      rule. Production allocation gives each exact callee identity one dense body-local
+///      `FuncId`; this check nevertheless requires exactly one row and rejects a malformed or
+///      replayed ledger that places two identities behind one id, matching `to_mir` and
+///      `crate_module::resolve_callee`.
 ///
 /// # Why that property makes the flip safe FOR THIS CLASS
 ///
@@ -490,16 +510,16 @@ fn call_result_reborrow_is_confined(
         return false;
     };
     // (4) TO A LEDGERED CALLEE THE LEDGER CAN NAME — EXACTLY ONE ENTRY, never merely "at least
-    // one". `FuncId` is `DefIndex`-derived and NON-INJECTIVE by construction: `admit_callee_inner`
-    // dedups on FULL identity and deliberately KEEPS two entries under one `FuncId` (a
-    // local/extern index collision, or wave-C's two monomorphizations of one `DefId`) so that
-    // downstream consumers see the ambiguity instead of guessing. An existential is satisfied by
-    // that set, and it would mint a confinement certificate naming a callee that cannot be
-    // resolved — "a record of nothing", the same reason `CallIndirect` is refused above.
+    // one". Production `admit_callee_inner` interns full identity and allocates a fresh dense id
+    // for every new row, so two rows here require a malformed/replayed public input. The consumer
+    // still rejects that set rather than letting an existential mint a confinement certificate
+    // whose callee cannot be named — "a record of nothing", the same reason `CallIndirect` is
+    // refused above.
     //
     // This is the ambiguity rule of BOTH peer consumers of this ledger, stated the same way:
     // `to_mir`'s Call arm (`[c] => .., [] => unsup("Call(unledgered callee FuncId)"), _ =>
-    // unsup("Call(ambiguous callee FuncId: index collision)")`) and `crate_module::resolve_callee`,
+    // unsup("Call(ambiguous callee FuncId: non-singleton ledger)")`) and
+    // `crate_module::resolve_callee`,
     // whose `_ =>` arm declares `!ambiguous_callee_N` rather than link a guessed body.
     //
     // NOT written as `.any()` plus a note that `to_mir` refuses the body first. That would be
@@ -553,6 +573,10 @@ fn body_lane_gates_allow_flip(lowered: &Lowered) -> bool {
         // aggregate takes `&Lowered` and not a tuple of bools: the certificate is about the
         // artifact, not about a summary of it.
         && thin_reborrows_allow_flip(&lowered.module, &lowered.callees, &lowered.thin_reborrows)
+        // Trust (wave-MR): the `&mut` twin, refused as a whole class — see
+        // `mut_reborrows_allow_flip` for why the shared side's confinement certificate does not
+        // transfer to a value someone may write through.
+        && mut_reborrows_allow_flip(&lowered.mut_reborrows)
 }
 
 /// Whether this definition's TrustIR module carries a complete source-loop and
@@ -915,12 +939,22 @@ mod tests {
     const FORWARDED: ValueId = ValueId::new(7);
 
     fn probe_callee_ref(func_id: FuncId) -> CalleeRef {
-        let def_id = DefId { krate: CrateNum::from_u32(0), index: DefIndex::from_u32(11) };
+        let def_id = DefId {
+            krate: CrateNum::from_u32(0),
+            index: DefIndex::from_u32(11),
+        };
+        let definition = crate::lineage::DefinitionIdentity::test_only(0xC0DE, 11);
         CalleeRef {
             func_id,
             is_local: true,
             def_index: 11,
             def_id,
+            definition,
+            concrete_key: Some(crate::lineage::ConcreteCalleeKey::test_only(
+                definition,
+                crate::lineage::ConcreteInstanceKind::Item,
+                Vec::new(),
+            )),
             def_path: "thin_reborrow_probe::callee".to_string(),
             force_havoc: false,
             site_def_id: def_id,
@@ -1107,12 +1141,11 @@ mod tests {
 
         // (i) AN AMBIGUOUS CALLEE: TWO LEDGER IDENTITIES BEHIND ONE `FuncId`. The call is direct
         //     and the `FuncId` IS in the ledger — but it names two different callees, so WHICH
-        //     one minted the pointer is a guess. `FuncId` is `DefIndex`-derived and therefore
-        //     non-injective by construction (`admit_callee_inner` dedups on FULL identity and
-        //     KEEPS both entries precisely so this stays visible: a local/extern index collision,
-        //     or wave-C's two monomorphizations of one `DefId`). Both peer consumers of this exact
-        //     ledger refuse this set by name — `to_mir`'s Call arm ("Call(ambiguous callee FuncId:
-        //     index collision)") and `crate_module::resolve_callee`'s `_ =>` arm, which declares
+        //     one minted the pointer is a guess. The dense producer allocator cannot create this
+        //     set, but the consumer accepts public `CalleeRef` slices and therefore defends
+        //     against a malformed/replayed ledger. Both peer consumers refuse the same set by
+        //     name — `to_mir`'s Call arm ("Call(ambiguous callee FuncId: non-singleton ledger)") and
+        //     `crate_module::resolve_callee`'s `_ =>` arm, which declares
         //     `!ambiguous_callee_N` rather than link. An existential over the ledger would answer
         //     "confined" here, which is strictly MORE PERMISSIVE than crate assembly.
         let mut second_identity = probe_callee_ref(PROBE_CALLEE);
@@ -1179,6 +1212,8 @@ mod tests {
     /// every lane flag clear. The four lane flags are the ONLY thing the callers below vary.
     fn lane_probe_lowered() -> Lowered {
         Lowered {
+            coroutine_frame_ptr: false,
+            mut_reborrows: Vec::new(),
             module: probe_module("lane_gate_probe"),
             // Synthetic probe; see the note in `Lowered::enum_fold_switch_blocks`. Empty
             // keeps this helper at the CLEAN posture its doc comment promises.

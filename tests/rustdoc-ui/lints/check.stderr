@@ -43,7 +43,7 @@ LL | | pub macro bar_v2() {}
    | |_____________________^
    |
    = help: The following guide may be of use:
-           https://doc.rust-lang.org/$CHANNEL/rustdoc/how-to-write-documentation.html
+           the Trust rustdoc book's how to write documentation chapter
 note: the lint level is defined here
   --> $DIR/check.rs:11:9
    |

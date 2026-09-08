@@ -22,11 +22,11 @@ pub(super) fn v2_signed_mul_dominating_facts(
     names: &[String],
 ) -> Vec<(String, BvGuardCmp, i128)> {
     let mut facts = Vec::new();
-    let path_map = v2_build_path_guard_map(func);
+    let path_map = super::guard_map_for(func);
     let Some(paths) = path_map.get(&block.id) else {
         return facts;
     };
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     for name in names {
         for (cmp, constant) in
             v2_dominating_linear_facts_for_var(func, &sv, paths, name, block.id, use_stmt_index)
@@ -183,7 +183,7 @@ pub(super) fn v2_signed_mul_corner_bounds(
         })
         .collect();
     let guard_facts = v2_signed_mul_dominating_facts(func, block, end, &names);
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let a = v2_signed_mul_operand_bounds(func, block, lhs, end, &guard_facts, &sv)?;
     let b = v2_signed_mul_operand_bounds(func, block, rhs, end, &guard_facts, &sv)?;
     Some((a, b))
@@ -1198,7 +1198,7 @@ pub(super) fn v2_signed_bv_accumulator_constraints(
 /// but the bound source is the exclusive-range yield invariant, not a dominating guard.
 ///
 /// SOUNDNESS: `y` is the Some-payload of `Range::next`, single-assigned (`loop_var_const_range` uses
-/// `unique_whole_local_def`), so `start <= y < end` holds at every read — rendered via the validated
+/// `unique_value_def`), so `start <= y < end` holds at every read — rendered via the validated
 /// `v2_bv_guard_constraint`. SELF-LIMITING: a mul that can still overflow given `y < end` (huge end)
 /// is not prevented; a reassigned operand (assigned in this block) is skipped.
 pub(super) fn v2_bv_yield_constraints(
@@ -1253,7 +1253,7 @@ pub(super) fn v2_bv_yield_constraints(
 /// sign, so `-(C-1) <= r <= C-1`. Both are unconditional facts of the defining
 /// statement; constraining a fresh var with a true fact only removes infeasible
 /// counterexamples (monotone — can flip false-Fail to Prove, never mint a false
-/// Prove). Gated on `unique_whole_local_def` (a reassigned local has no single
+/// Prove). Gated on `unique_value_def` (a reassigned local has no single
 /// defining rem) and on the operand NOT being a widening-cast source (those are
 /// structurally encoded already, and the fresh-var name would not match).
 pub(super) fn v2_bv_rem_constraints(
@@ -1273,7 +1273,7 @@ pub(super) fn v2_bv_rem_constraints(
             continue;
         }
         let Some(Rvalue::BinaryOp(BinOp::Rem, _, divisor)) =
-            crate::unique_whole_local_def(func, p.local)
+            crate::local_defs::unique_value_def(func, p.local)
         else {
             continue;
         };
@@ -1779,9 +1779,9 @@ pub(super) fn v2_dominating_shift_amount_bound(
 ) -> Option<Formula> {
     let amt_base = crate::place_to_var_name(func, &Place::local(amt_local));
     let amt_bv = Formula::var_owned(format!("__trust_ovf_bv_amt_{amt_base}"), Sort::BitVec(width));
-    let path_map = v2_build_path_guard_map(func);
+    let path_map = super::guard_map_for(func);
     let paths = path_map.get(&block.id)?;
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
 
     // (1) A direct dominating bound on the shift amount (`_6 < 128` from the SHL
     //     assert), and
@@ -2008,7 +2008,7 @@ fn v2_checked_sub_success_edge_dominates_use(
         return false;
     }
 
-    let path_map = v2_build_path_guard_map(func);
+    let path_map = super::guard_map_for(func);
     let Some(paths) = path_map.get(&use_block).filter(|paths| !paths.is_empty()) else {
         return false;
     };
@@ -2203,11 +2203,11 @@ pub(super) fn v2_bv_mul_dominating_guard_constraints(
         return Vec::new();
     }
 
-    let path_map = v2_build_path_guard_map(func);
+    let path_map = super::guard_map_for(func);
     let Some(paths) = path_map.get(&block.id) else {
         return Vec::new();
     };
-    let sv = StmtVersionCtx::build(func);
+    let sv = super::stmt_versions_for(func);
     let mut constraints = Vec::new();
     for (base, bv_name) in &targets {
         for (cmp, constant) in
@@ -2414,42 +2414,44 @@ pub(super) fn v2_build_terminator_vc(
     func: &VerifiableFunction,
     block: &trust_types::BasicBlock,
 ) -> Option<VerificationCondition> {
+    // Trust (W4/spine-derives-unreachable): the Unreachable-classified arms are
+    // decided by the SHARED classifier — the same definition the trust-ir spine
+    // consumes (`trust_types::terminator_obligations`, one definition, two
+    // callers). Arm order and outcomes are the verbatim move of the match this
+    // replaces:
+    //  * `SwitchInt::exhaustive_enum_unreachable` is serialized public input,
+    //    not proof authority — the bare-`Unreachable` row is ALWAYS kept, never
+    //    erased by an unauthenticated hint;
+    //  * `unreachable!()` lowers to the BARE panic intrinsic with the sentinel
+    //    message, and only an unreachable-chain classification turns a
+    //    panic-call row from `Assertion` into `Unreachable`.
+    if let Some(span) =
+        trust_types::terminator_obligations::unreachable_terminator_span(func, block)
+    {
+        return Some(VerificationCondition {
+            kind: VcKind::Unreachable,
+            function: func.name.clone().into(),
+            location: span,
+            formula: Formula::Bool(true),
+            contract_metadata: None,
+            obligation: None,
+        });
+    }
     let (kind, span) = match &block.terminator {
-        // `SwitchInt::exhaustive_enum_unreachable` is serialized public input,
-        // not proof authority. Even when the compiler normally stamps it after
-        // a TyCtxt check, a caller can construct or replay the same bit. Always
-        // keep the public per-VC `Unreachable` row; compiler-native structural
-        // lanes may use independently rederived facts, but this lane must not
-        // erase an obligation from an unauthenticated hint.
-        Terminator::Unreachable => (VcKind::Unreachable, v2_block_span(func, block)),
-        Terminator::Call { func: callee, span, .. } if v2_is_unreachable_panic_call(callee) => {
-            (VcKind::Unreachable, span.clone())
-        }
-        // Trust: `unreachable!()` lowers to the BARE panic intrinsic
-        // `core::panicking::panic("...entered unreachable code")`, which neither
-        // recognizer above matched — so a dead `unreachable!()` branch got NO VC and
-        // its modulo/path-guard facts had no goal to discharge. Emit an Assertion VC
-        // (fail-closed `Bool(true)` goal that the path guard must refute). Scoped to
-        // the unreachable SENTINEL message so `assert!`/`panic!` panic sites — which
-        // share the `core::panicking::panic` callee but already have an obligation —
-        // do NOT get a second, dataflow-starved VC that false-FAILs them.
+        // The `Assertion`-classified panic-call outcomes (NOT on an unreachable
+        // chain — the shared classifier returned None for them above). Scoped to
+        // the sentinel/assertion recognizers so `assert!`/`panic!` panic sites —
+        // which already have an obligation — do NOT get a second,
+        // dataflow-starved VC that false-FAILs them; the message rendering is
+        // vcgen-local obligation prose, not comparison identity.
         Terminator::Call { func: callee, args, span, .. }
-            if v2_is_unreachable_sentinel_panic(callee, args) =>
+            if v2_is_unreachable_sentinel_panic(callee, args)
+                || v2_is_assertion_panic_call(callee) =>
         {
-            let kind = if v2_is_unreachable_panic_chain(func, block.id) {
-                VcKind::Unreachable
-            } else {
-                VcKind::Assertion { message: v2_panic_call_vc_message(func, callee, args) }
-            };
-            (kind, span.clone())
-        }
-        Terminator::Call { func: callee, args, span, .. } if v2_is_assertion_panic_call(callee) => {
-            let kind = if v2_is_unreachable_panic_chain(func, block.id) {
-                VcKind::Unreachable
-            } else {
-                VcKind::Assertion { message: v2_panic_call_vc_message(func, callee, args) }
-            };
-            (kind, span.clone())
+            (
+                VcKind::Assertion { message: v2_panic_call_vc_message(func, callee, args) },
+                span.clone(),
+            )
         }
         _ => return None,
     };

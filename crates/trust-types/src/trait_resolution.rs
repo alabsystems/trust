@@ -473,16 +473,8 @@ mod tests {
 
     fn make_blanket_impl() -> TraitImpl {
         TraitImpl {
-            implementing_type: Ty::Adt {
-                adt_kind: None,
-                layout: None,
-                variants: Vec::new(),
-                name: "T".to_string(),
-                fields: vec![],
-                disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+            implementing_type: Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
+                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
             trait_name: "MyTrait".to_string(),
             methods: vec![],
             where_clauses: vec![],
@@ -492,16 +484,8 @@ mod tests {
 
     fn make_bounded_blanket_impl() -> TraitImpl {
         TraitImpl {
-            implementing_type: Ty::Adt {
-                adt_kind: None,
-                layout: None,
-                variants: Vec::new(),
-                name: "T".to_string(),
-                fields: vec![],
-                disc_index_safe: false,
-                faithful_enum_repr: None,
-                enum_layout: None,
-            },
+            implementing_type: Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "T".to_string(), fields: vec![],
+                disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
             trait_name: "MyTrait".to_string(),
             methods: vec![],
             where_clauses: vec![TraitBound {
@@ -594,19 +578,8 @@ mod tests {
         let req = MonomorphizationRequest {
             generic_def_path: "std::collections::HashMap::insert".to_string(),
             substitutions: vec![
-                (
-                    "K".to_string(),
-                    Ty::Adt {
-                        adt_kind: None,
-                        layout: None,
-                        variants: Vec::new(),
-                        name: "String".to_string(),
-                        fields: vec![],
-                        disc_index_safe: false,
-                        faithful_enum_repr: None,
-                        enum_layout: None,
-                    },
-                ),
+                ("K".to_string(), Ty::Adt { adt_kind: None, layout: None,  variants: Vec::new(), name: "String".to_string(), fields: vec![],
+                    disc_index_safe: false,  faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }),
                 ("V".to_string(), Ty::i32()),
             ],
             call_site: span(),

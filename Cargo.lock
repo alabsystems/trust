@@ -5177,6 +5177,7 @@ dependencies = [
  "trust-ir",
  "trust-ir-bridge",
  "trust-mir-extract",
+ "trust-thir-lower",
  "trust-types",
 ]
 
@@ -5818,6 +5819,7 @@ dependencies = [
  "trust-certify",
  "trust-clean-carrier",
  "trust-clean-ir",
+ "trust-clean-ir-gate",
  "trust-clean-origin",
  "trust-ir",
  "trust-ir-bridge",
@@ -7550,7 +7552,7 @@ dependencies = [
 
 [[package]]
 name = "trust-backprop"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7568,7 +7570,7 @@ dependencies = [
 
 [[package]]
 name = "trust-binary-parse"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "thiserror 2.0.20",
  "trust-types",
@@ -7576,7 +7578,7 @@ dependencies = [
 
 [[package]]
 name = "trust-bmc"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ay-bindings",
  "ay-chc",
@@ -7584,6 +7586,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "trust-ir",
+ "trust-ir-bridge",
  "trust-ir-build",
  "trust-mc-compiler",
  "trust-mc-core",
@@ -7597,8 +7600,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-budget"
+version = "0.9.0"
+
+[[package]]
 name = "trust-buildcache"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "fs2",
  "proptest",
@@ -7612,7 +7619,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cache"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "fs2",
  "proptest",
@@ -7634,7 +7641,7 @@ dependencies = [
 
 [[package]]
 name = "trust-certify"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-auto",
@@ -7654,7 +7661,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ay",
  "ay-proof",
@@ -7676,7 +7683,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rayon",
  "serde",
@@ -7696,21 +7703,21 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7718,7 +7725,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -7729,7 +7736,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7741,11 +7748,14 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.5.0"
+version = "0.6.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "thiserror 2.0.20",
  "trust-cg-ir",
@@ -7753,7 +7763,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rayon",
  "serde",
@@ -7771,7 +7781,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-carrier"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clean-kernel",
  "trust-symbols",
@@ -7780,7 +7790,7 @@ dependencies = [
 
 [[package]]
 name = "trust-clean-ir"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clean-kernel",
  "trust-certify",
@@ -7791,8 +7801,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-clean-ir-gate"
+version = "0.9.0"
+dependencies = [
+ "clean-kernel",
+ "trust-certify",
+ "trust-clean-carrier",
+ "trust-clean-ir",
+ "trust-clean-origin",
+ "trust-ir",
+ "trust-types",
+]
+
+[[package]]
 name = "trust-clean-origin"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clean-auto",
  "clean-kernel",
@@ -7805,7 +7828,7 @@ dependencies = [
 
 [[package]]
 name = "trust-convergence"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7817,7 +7840,7 @@ dependencies = [
 
 [[package]]
 name = "trust-decompile"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -7845,22 +7868,26 @@ dependencies = [
 
 [[package]]
 name = "trust-disasm"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "trust-ed25519"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ed25519-dalek",
  "trust-sha2",
 ]
 
 [[package]]
+name = "trust-floatbits"
+version = "0.9.0"
+
+[[package]]
 name = "trust-hmac"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "hmac",
  "sha2 0.10.9",
@@ -7868,8 +7895,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-intbound"
+version = "0.9.0"
+
+[[package]]
 name = "trust-integration-tests"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde_json",
  "tempfile",
@@ -7894,7 +7925,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -7904,10 +7935,12 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
+ "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "trust-intbound",
  "trust-ir",
  "trust-ir-build",
  "trust-mir-extract",
@@ -7918,7 +7951,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "clean-kernel",
  "rayon",
@@ -7928,7 +7961,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-conformance"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "trust-ir",
  "trust-ir-build",
@@ -7936,7 +7969,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-contract"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -7944,14 +7977,14 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "trust-ir",
 ]
 
 [[package]]
 name = "trust-lift"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ay",
  "serde_json",
@@ -7964,7 +7997,7 @@ dependencies = [
 
 [[package]]
 name = "trust-loop"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "thiserror 2.0.20",
  "trust-convergence",
@@ -7973,7 +8006,7 @@ dependencies = [
 
 [[package]]
 name = "trust-machine-sem"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "thiserror 2.0.20",
  "trust-disasm",
@@ -8109,7 +8142,7 @@ dependencies = [
 
 [[package]]
 name = "trust-os"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -8118,7 +8151,7 @@ dependencies = [
 
 [[package]]
 name = "trust-proof-cert"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ay-proof-common",
  "bincode 1.3.3",
@@ -8136,7 +8169,7 @@ dependencies = [
 
 [[package]]
 name = "trust-rand"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ed25519-dalek",
  "rand_core 0.6.4",
@@ -8144,7 +8177,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ratio"
-version = "0.8.0"
+version = "0.9.0"
 
 [[package]]
 name = "trust-release"
@@ -8155,7 +8188,7 @@ dependencies = [
 
 [[package]]
 name = "trust-report"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8167,7 +8200,7 @@ dependencies = [
 
 [[package]]
 name = "trust-router"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ay",
  "ay-bindings",
@@ -8183,6 +8216,7 @@ dependencies = [
  "tla-mc-core",
  "tracing",
  "trust-bmc",
+ "trust-budget",
  "trust-cache",
  "trust-certify",
  "trust-cg-bridge",
@@ -8205,7 +8239,7 @@ dependencies = [
 
 [[package]]
 name = "trust-semantics"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "clean-kernel",
  "trust-types",
@@ -8213,7 +8247,7 @@ dependencies = [
 
 [[package]]
 name = "trust-sha2"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "sha2 0.10.9",
 ]
@@ -8236,7 +8270,7 @@ dependencies = [
 
 [[package]]
 name = "trust-strengthen"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8249,14 +8283,14 @@ dependencies = [
 
 [[package]]
 name = "trust-symbols"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "trust-types",
 ]
 
 [[package]]
 name = "trust-symex"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8269,7 +8303,7 @@ dependencies = [
 
 [[package]]
 name = "trust-temporal"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "tla-mc-core",
  "trust-types",
@@ -8289,6 +8323,10 @@ dependencies = [
  "rustc_session",
  "rustc_span",
  "tracing",
+ "trust-certify",
+ "trust-clean-ir",
+ "trust-clean-ir-gate",
+ "trust-clean-origin",
  "trust-ir",
  "trust-ir-bridge",
  "trust-ir-build",
@@ -8299,7 +8337,7 @@ dependencies = [
 
 [[package]]
 name = "trust-toml"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "toml 0.8.23",
@@ -8307,7 +8345,7 @@ dependencies = [
 
 [[package]]
 name = "trust-transval"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proptest",
  "serde",
@@ -8320,7 +8358,7 @@ dependencies = [
 
 [[package]]
 name = "trust-types"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "ay-bindings",
  "bincode 1.3.3",
@@ -8338,7 +8376,7 @@ dependencies = [
 
 [[package]]
 name = "trust-vc-bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -8408,23 +8446,25 @@ dependencies = [
 
 [[package]]
 name = "trust-vcgen"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "trust-certify",
+ "trust-floatbits",
  "trust-lift",
  "trust-report",
  "trust-router",
  "trust-semantics",
  "trust-types",
+ "trust-widthconv",
 ]
 
 [[package]]
 name = "trust-verifier-api"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "rustc-hash 2.1.2",
  "serde",
@@ -8445,7 +8485,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wasm-bridge"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde_json",
  "thiserror 2.0.20",
@@ -8455,6 +8495,10 @@ dependencies = [
  "trust-ir-build",
  "trust-types",
 ]
+
+[[package]]
+name = "trust-widthconv"
+version = "0.9.0"
 
 [[package]]
 name = "trust-witness"
@@ -8473,7 +8517,7 @@ dependencies = [
 
 [[package]]
 name = "trust-wp"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "serde",
  "serde_json",

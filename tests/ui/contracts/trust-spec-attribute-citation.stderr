@@ -1,0 +1,66 @@
+note: Clean island kernel-checked: 1 declaration(s) registered (self_le)
+  --> $DIR/trust-spec-attribute-citation.rs:30:5
+   |
+LL | /     theorem self_le : forall (x : UInt64), Nat.le (UInt64.toNat x) (UInt64.toNat x) :=
+LL | |         fun x => Nat.le.refl (UInt64.toNat x)
+   | |_____________________________________________^
+
+
+=== Trust Verification Report (trust_spec_attribute_citation) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/trust-spec-attribute-citation.rs:36:1
+   |
+LL | / pub fn keep_native(x: u64) -> u64
+LL | |     ensures result <= x by self_le
+LL | | {
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/trust-spec-attribute-citation.rs:44:1
+   |
+LL | / pub fn keep_attribute(x: u64) -> u64 {
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/trust-spec-attribute-citation.rs:55:1
+   |
+LL | / pub fn keep_gated(x: u64) -> u64 {
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: citation `self_le` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `keep_native`, with a clean certification audit
+  --> $DIR/trust-spec-attribute-citation.rs:37:28
+   |
+LL |     ensures result <= x by self_le
+   |                            ^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `self_le` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `keep_attribute`, with a clean certification audit
+  --> $DIR/trust-spec-attribute-citation.rs:43:33
+   |
+LL | #[trust::ensures(result <= x by self_le)]
+   |                                 ^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+
+note: citation `self_le` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `keep_gated`, with a clean certification audit
+  --> $DIR/trust-spec-attribute-citation.rs:54:56
+   |
+LL | #[cfg_attr(trust_verify, trust::ensures(result <= x by self_le))]
+   |                                                        ^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+

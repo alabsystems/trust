@@ -7,7 +7,8 @@
 //!
 //! The coverage companion is the only published record of what the direct
 //! producer could not lower, so this test also pins its HONESTY: the
-//! capability/authority header must still read `structural-parity-only-v1` /
+//! capability/authority header must still read `obligation-bearing-pending-v2` /
+//! (the owner-signed tier move, c2ac761224; authority axes still false) /
 //! `proof_authority: false`, and a body that failed to lower must carry the
 //! leaf-demand histogram that explains why. An empty histogram on a failed body
 //! is indistinguishable, to every downstream consumer, from a body that
@@ -79,7 +80,7 @@ fn main() {
     // published artifact that says otherwise is a soundness event, not a golden
     // to re-bless.
     assert!(
-        cov.contains("\"direct_obligation_capability\": \"structural-parity-only-v1\""),
+        cov.contains("\"direct_obligation_capability\": \"obligation-bearing-pending-v2\""),
         "coverage.json must publish the direct producer's declared capability"
     );
     assert!(

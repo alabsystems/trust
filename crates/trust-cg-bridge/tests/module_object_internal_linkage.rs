@@ -177,6 +177,7 @@ fn compiled_module(linkage: Vec<FunctionLinkage>) -> CompiledModule {
         function_count,
         source_functions: Some(funcs),
         linkage,
+        statics: Vec::new(),
     }
 }
 

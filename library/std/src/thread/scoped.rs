@@ -198,6 +198,8 @@ impl<'scope, 'env> Scope<'scope, 'env> {
     ///
     /// [`join`]: ScopedJoinHandle::join
     #[stable(feature = "scoped_threads", since = "1.63.0")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "thread_scope_spawn")]
     pub fn spawn<F, T>(&'scope self, f: F) -> ScopedJoinHandle<'scope, T>
     where
         F: FnOnce() -> T + Send + 'scope,
@@ -253,6 +255,8 @@ impl Builder {
     /// assert_eq!(x, a.len());
     /// ```
     #[stable(feature = "scoped_threads", since = "1.63.0")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "thread_builder_spawn_scoped")]
     pub fn spawn_scoped<'scope, 'env, F, T>(
         self,
         scope: &'scope Scope<'scope, 'env>,

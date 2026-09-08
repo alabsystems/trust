@@ -188,9 +188,7 @@ fn ty_contains_mut_pointer_recurses_aggregates() {
     let rawmut = || Ty::RawPtr { mutable: true, pointee: Box::new(Ty::u32()) };
     assert!(c(&mref()));
     assert!(c(&rawmut()));
-    assert!(c(&Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    assert!(c(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "W".into(),
         fields: vec![("p".into(), mref())],
@@ -202,9 +200,7 @@ fn ty_contains_mut_pointer_recurses_aggregates() {
     assert!(c(&Ty::Array { elem: Box::new(mref()), len: 4 }));
     // No mutable pointer anywhere -> false.
     assert!(!c(&Ty::u32()));
-    assert!(!c(&Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    assert!(!c(&Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "P".into(),
         fields: vec![("v".into(), Ty::u32())],
@@ -226,9 +222,7 @@ fn mut_pointer_nested_in_aggregate_havoced_at_call() {
     // non-reference Adt local: no syntactic `&mut x` statement and the local's
     // top-level type is not a pointer. The Call must still havoc `s` (whose
     // prefix-overlap kills the nested pointee fact `s.0*`). Round-13 fix.
-    let wrapper = Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    let wrapper = Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         variants: Vec::new(),
         name: "Wrapper".into(),
         fields: vec![("p".into(), Ty::Ref { mutable: true, inner: Box::new(Ty::u32()) })],

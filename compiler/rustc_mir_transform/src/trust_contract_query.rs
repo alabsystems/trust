@@ -193,7 +193,7 @@ pub(crate) fn trust_contracts<'tcx>(
     let signature_domains = signature_variable_domains(tcx, def_id, body, typeck_results);
     let signature_projections =
         signature_projection_environment(&signature_projection_leaves(tcx, body, typeck_results));
-    let function_source_sorts = function_source_sorts(body, typeck_results);
+    let function_source_sorts = function_source_sorts(tcx, body, typeck_results);
     let function_collection_domains =
         function_collection_element_domains(tcx, body, typeck_results);
     for authored_clause in authored_clauses {
@@ -208,6 +208,13 @@ pub(crate) fn trust_contracts<'tcx>(
             clause.payload,
             authored_clause.kind,
             clause.origin,
+            // The citation lane owns a cited clause end to end; the snippet
+            // lane must not widen what that lane's inventory sees.
+            if clause.citation.is_some() {
+                ClauseCitation::Present
+            } else {
+                ClauseCitation::Absent
+            },
             &signature_domains,
             &signature_projections,
             ContractPayloadContext::Function {
@@ -281,6 +288,11 @@ pub(crate) fn trust_contracts<'tcx>(
             Some(clause.payload),
             kind,
             ContractClauseOrigin::Native,
+            if clause.citation.is_some() {
+                ClauseCitation::Present
+            } else {
+                ClauseCitation::Absent
+            },
             &signature_domains,
             &signature_projections,
             ContractPayloadContext::Loop {
@@ -354,6 +366,7 @@ fn lower_predicate<'tcx>(
     payload: Option<Symbol>,
     contract_kind: TrustContractKind,
     origin: ContractClauseOrigin,
+    citation: ClauseCitation,
     signature_domains: &[LoweredVariableDomain],
     signature_projections: &ProjectionEnvironment,
     context: ContractPayloadContext<'_>,
@@ -391,9 +404,48 @@ fn lower_predicate<'tcx>(
         }
         ContractPayloadContext::Function { .. } | ContractPayloadContext::Loop { .. } => None,
     };
-    let validated_native_clause =
-        native_clause_environment.map(|(source_sorts, variable_domains, collection_domains)| {
-            lower_native_clause(
+    // Trust (E6 — a native `requires` may PROJECT A FIELD of a parameter).
+    //
+    // A native function `requires` is admitted by `lower_native_clause`, which
+    // types the AUTHORED text against `function_source_sorts` — bare parameter
+    // bindings only. It carries no `ProjectionEnvironment`, so an authored
+    // chain (`self.patch_size`, `c.patch_size`) resolves NO name there and the
+    // clause is a HARD ERROR ("source-contract variable `self` is not in
+    // scope"). That is what made a precondition about a struct field
+    // unstatable, while the byte-identical `ensures` spelling proved: native
+    // `ensures` is excluded from `native_clause_environment` above and already
+    // reaches the projection-aware lane below.
+    //
+    // The ORDER is the soundness argument. The exact-native lane still runs
+    // FIRST and still WINS whenever it can type the clause, so no clause that
+    // is accepted today changes meaning or lane. Only a clause the exact-native
+    // lane would otherwise REFUSE is offered to the projection lane, and that
+    // lane invents nothing: `SnippetParser::parse_projection_chain` resolves
+    // each chain verbatim through `ProjectionEnvironment` (built by walking the
+    // real field layout of the parameter types) and returns `None` for the
+    // WHOLE clause on any miss, after which
+    // `native_function_clause_is_source_typed` re-types the resulting canonical
+    // text against the signature domains — which include the projected leaves
+    // under their exact `place_to_var_name` spelling. If it also declines, the
+    // exact-native lane's ORIGINAL refusal is emitted verbatim: a refusal is
+    // never downgraded to silence.
+    //
+    // DELIBERATELY NOT DEFERRED — each would be unsound or meaningless here:
+    //   * `decreases` and loop `invariant`: the snippet lane returns their
+    //     payload as an UNRESOLVED opaque string (it short-circuits before
+    //     `SnippetParser` runs), so an authored chain would reach the carrier
+    //     spelled in a namespace nothing downstream can bind.
+    //   * a clause carrying a typed HIR predicate (`predicate_hir_id`): that
+    //     branch never consults `validated_native_clause`, so deferring there
+    //     would drop the diagnostic entirely.
+    let mut deferred_native_refusal: Option<String> = None;
+    let defer_to_projection_lane = matches!(context, ContractPayloadContext::Function { .. })
+        && origin == ContractClauseOrigin::Native
+        && contract_kind == TrustContractKind::Requires
+        && predicate_hir_id.is_none();
+    let validated_native_clause = native_clause_environment.and_then(
+        |(source_sorts, variable_domains, collection_domains)| {
+            match lower_native_clause(
                 tcx,
                 span,
                 payload,
@@ -401,17 +453,26 @@ fn lower_predicate<'tcx>(
                 source_sorts,
                 variable_domains,
                 collection_domains,
-            )
-            .unwrap_or_else(|reason| {
-                let keyword = match contract_kind {
-                    TrustContractKind::Requires => "requires",
-                    TrustContractKind::Decreases => "decreases",
-                    _ => "invariant",
-                };
-                tcx.dcx().span_err(span, format!("invalid `{keyword}` clause: {reason}"));
-                TrustContractPredicateKind::Unsupported { reason: Symbol::intern(&reason) }
-            })
-        });
+            ) {
+                Ok(kind) => Some(kind),
+                Err(reason) if defer_to_projection_lane => {
+                    deferred_native_refusal = Some(reason);
+                    None
+                }
+                Err(reason) => {
+                    let keyword = match contract_kind {
+                        TrustContractKind::Requires => "requires",
+                        TrustContractKind::Decreases => "decreases",
+                        _ => "invariant",
+                    };
+                    tcx.dcx().span_err(span, format!("invalid `{keyword}` clause: {reason}"));
+                    Some(TrustContractPredicateKind::Unsupported {
+                        reason: Symbol::intern(&reason),
+                    })
+                }
+            }
+        },
+    );
 
     let kind = if let Some(predicate_hir_id) = predicate_hir_id {
         // Typed clauses carry an exact identity from AST -> HIR lowering.
@@ -471,23 +532,64 @@ fn lower_predicate<'tcx>(
         if std::env::var_os("TRUST_CONTRACT_INLINE_TRACE").is_some() {
             eprintln!("TRUST_CONTRACT_INLINE_TRACE: path=snippet (no HIR expression identity)");
         }
-        validated_native_clause
-            .or_else(|| {
-                lower_contract_snippet(
-                    tcx,
-                    owner,
-                    span,
-                    payload,
-                    contract_kind,
-                    origin,
-                    signature_domains,
-                    signature_projections,
-                    cited,
-                )
-            })
-            .unwrap_or_else(|| TrustContractPredicateKind::Unsupported {
+        let mut projection_refusal = None;
+        // A pending exact-native refusal means this call is the SECOND opinion
+        // on an already-refused clause, and that lane's reason is the one the
+        // author sees.
+        let is_primary_lane = deferred_native_refusal.is_none();
+        let lowered = validated_native_clause.or_else(|| {
+            lower_contract_snippet(
+                tcx,
+                owner,
+                span,
+                payload,
+                contract_kind,
+                origin,
+                citation,
+                signature_domains,
+                signature_projections,
+                cited,
+                &mut projection_refusal,
+                is_primary_lane,
+            )
+        });
+        match (lowered, deferred_native_refusal) {
+            // Either the exact-native lane admitted it, or the projection lane
+            // rescued a clause the exact-native lane could not name. In the
+            // second case the projection lane bound every leaf to an exact
+            // field of an exact parameter layout, so the deferred refusal is
+            // discharged rather than suppressed.
+            (Some(kind), _) => kind,
+            // Both lanes declined. The exact-native lane's own reason is the
+            // authored-language one, so it is what the author sees — byte for
+            // byte the diagnostic this clause got before the projection lane
+            // existed.
+            (None, Some(reason)) => {
+                let mut diag =
+                    tcx.dcx().struct_span_err(span, format!("invalid `requires` clause: {reason}"));
+                // The refusal above names the chain's HEAD (`self`, `c`) as
+                // out of scope, because that head is not itself a scalar
+                // binding. When the projection lane declined a specific chain,
+                // say so: the head IS a parameter and the author needs to know
+                // it is the FIELD PATH that has no exact place, not the name.
+                if let Some(chain) = projection_refusal {
+                    diag.note(format!(
+                        "the field projection `{chain}` has no exact scalar place here"
+                    ));
+                    diag.help(
+                        "a projection is admitted only when every segment is a field of a \
+                         single-variant struct or a tuple with a known layout, and the leaf is a \
+                         scalar (bool or a primitive integer); enums, unions, generic types, \
+                         reference-typed fields below the head, and method calls are refused",
+                    );
+                }
+                diag.emit();
+                TrustContractPredicateKind::Unsupported { reason: Symbol::intern(&reason) }
+            }
+            (None, None) => TrustContractPredicateKind::Unsupported {
                 reason: unsupported_predicate_reason(tcx, span),
-            })
+            },
+        }
     };
 
     // Native clauses are verifier-language parser islands, not HIR
@@ -1054,9 +1156,29 @@ fn lower_contract_snippet(
     payload: Option<Symbol>,
     contract_kind: TrustContractKind,
     origin: ContractClauseOrigin,
+    citation: ClauseCitation,
     signature_domains: &[LoweredVariableDomain],
     signature_projections: &ProjectionEnvironment,
     cited: bool,
+    // Attribution channel for the FIRST projection chain this lane could not
+    // resolve. The caller owns the diagnostic because only it knows whether
+    // another lane already accepted the clause.
+    projection_refusal: &mut Option<String>,
+    // Whether this lane is the PRIMARY authority for this clause.
+    //
+    // `false` when it is running as the SECOND opinion on a native `requires`
+    // the exact-native lane already refused, which changes two things:
+    //
+    //   * it emits no refusal diagnostic of its own. The exact-native lane's
+    //     reason is precise, authored-language, and already on its way to the
+    //     author; a second attribution for the same clause would report one
+    //     defect twice and name a different token as the fault.
+    //   * transparent-helper expansion is OFF. The second opinion exists to
+    //     resolve FIELD PROJECTIONS, which the exact-native lane cannot name.
+    //     Expanding a helper call there would additionally make
+    //     `requires helper(x) > 0` — a hard error today — start compiling, an
+    //     unrelated and unmeasured capability change riding in on this one.
+    is_primary_lane: bool,
 ) -> Option<TrustContractPredicateKind> {
     let snippet;
     let payload_text = native_clause_payload_text(span, payload);
@@ -1075,7 +1197,7 @@ fn lower_contract_snippet(
     // clause that does not name one.
     // A CITED clause belongs to the two-language citation lane; expanding it
     // here would reroute it to the solver and silently downgrade its authority.
-    let expanded = if cited {
+    let expanded = if cited || !is_primary_lane {
         body.to_string()
     } else {
         let shadowed_names = contract_parameter_binding_names(tcx, owner);
@@ -1088,13 +1210,71 @@ fn lower_contract_snippet(
             &shadowed_names,
         )
     };
-    lower_contract_snippet_body_with_domains(
+    let mut literal_refusal = None;
+    let lowered = lower_contract_snippet_body_with_domains(
         &expanded,
         contract_kind,
         origin,
+        citation,
         signature_domains,
         signature_projections,
-    )
+        &mut literal_refusal,
+        projection_refusal,
+    );
+    // A clause refused BECAUSE OF a literal is the one refusal this lane can
+    // attribute exactly, so it is the one that must never be silent. Everything
+    // else still returns `None` and becomes `Unsupported` as before: naming a
+    // cause we do not have would be worse than naming none.
+    if is_primary_lane
+        && lowered.is_none()
+        && let Some(refusal) = literal_refusal
+    {
+        emit_contract_literal_refusal(tcx, span, contract_kind, &refusal);
+    }
+    lowered
+}
+
+/// Report an integer literal that a contract predicate cannot carry.
+///
+/// This exists because the failure it describes used to be INVISIBLE. The
+/// clause was accepted by the parser that admits clauses, refused by the parser
+/// that reads them, and the only trace was an UNKNOWN row whose message named
+/// the whole predicate and no part of it — so a nine-digit bound written the way
+/// every Rust style guide writes one silently stopped being proved. A refusal
+/// carries the fix, with options (standing ruling v7/D3).
+fn emit_contract_literal_refusal(
+    tcx: TyCtxt<'_>,
+    span: Span,
+    contract_kind: TrustContractKind,
+    refusal: &trust_types::int_literal::IntLiteralRefusal,
+) {
+    // Named, not spelled with a wildcard: the keyword is what tells the author
+    // WHICH clause on the signature to go and edit, and a `_ => "invariant"`
+    // arm would quietly mislabel every future clause kind.
+    let keyword = match contract_kind {
+        TrustContractKind::Requires => "requires",
+        TrustContractKind::Ensures => "ensures",
+        TrustContractKind::Decreases => "decreases",
+        TrustContractKind::Invariant | TrustContractKind::LoopInvariant => "invariant",
+        TrustContractKind::Assumes => "assumes",
+        TrustContractKind::Asserts => "asserts",
+        TrustContractKind::Refinement => "refinement",
+        TrustContractKind::Temporal => "temporal",
+    };
+    tcx.dcx()
+        .struct_span_err(
+            span,
+            format!(
+                "unsupported numeric literal `{}` in this `{keyword}` clause: {}",
+                refusal.literal, refusal.reason,
+            ),
+        )
+        .with_help(refusal.fix.clone())
+        .with_note(
+            "the whole clause is refused fail-closed, so nothing in it is proved; without this \
+             message the only symptom would be an UNKNOWN row naming the entire predicate",
+        )
+        .emit();
 }
 
 fn contract_body_from_clause_snippet(
@@ -1243,6 +1423,20 @@ fn protected_contract_token_end(text: &str, start: usize) -> Option<usize> {
     Some(text.len())
 }
 
+/// Whether the clause being lowered carries an authored `by <theorem>`
+/// citation.
+///
+/// A cited clause is owned end to end by the citation lane, which mints and
+/// grades its own obligation inventory; the snippet lane must not change what
+/// that lane sees. An UNCITED clause has no such owner, which is exactly why
+/// the attribute surface's `result` spelling is admitted only in that case
+/// (see `lower_contract_snippet_body_with_domains`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ClauseCitation {
+    Present,
+    Absent,
+}
+
 #[cfg(test)]
 fn lower_contract_snippet_body(
     body: &str,
@@ -1253,8 +1447,11 @@ fn lower_contract_snippet_body(
         body,
         contract_kind,
         origin,
+        ClauseCitation::Absent,
         &[],
         &ProjectionEnvironment::default(),
+        &mut None,
+        &mut None,
     )
 }
 
@@ -1262,8 +1459,16 @@ fn lower_contract_snippet_body_with_domains(
     body: &str,
     contract_kind: TrustContractKind,
     origin: ContractClauseOrigin,
+    citation: ClauseCitation,
     signature_domains: &[LoweredVariableDomain],
     signature_projections: &ProjectionEnvironment,
+    // See `tokenize_contract_snippet`: set only when the clause is refused
+    // BECAUSE OF a numeric literal, so the caller can attribute the refusal
+    // instead of degrading to a silent `Unsupported`.
+    literal_refusal: &mut Option<trust_types::int_literal::IntLiteralRefusal>,
+    // Set only when a projection chain could not be resolved to an exact field
+    // place. Attribution only; see `SnippetParser::projection_refusal`.
+    projection_refusal: &mut Option<String>,
 ) -> Option<TrustContractPredicateKind> {
     let body = body.trim();
     // Trust: E4/E5 are verifier expressions in a parser island, not Rust HIR
@@ -1284,12 +1489,53 @@ fn lower_contract_snippet_body_with_domains(
         return (!body.is_empty())
             .then(|| TrustContractPredicateKind::Opaque { text: Symbol::intern(body) });
     }
+    // Trust (2026-08-26): the ATTRIBUTE surface has TWO `ensures` spellings and
+    // only one of them was lowered here. The migration spelling is a closure
+    // (`#[ensures(|r| ...)]`); the ratified spelling names the return place
+    // directly (`#[ensures(result >= x)]`), which is also the ONLY spelling an
+    // island-def-calling clause can use. `ensures_closure_snippet_body` returns
+    // `None` for the latter and the `?` propagated that straight into
+    // `Unsupported` — so `#[trust::ensures(result >= x)]` left a pair of
+    // fail-closed sentinel obligations that a non-strict policy downgrades to
+    // warnings, while the byte-identical native `ensures result >= x` lowered
+    // into a real Postcondition VC and was proved (satisfied body) or REFUTED
+    // (violated body). Same predicate, same body, one enforced and one inert:
+    // measured on `veripb-core-proved`, an uncited attribute `result >= x` over
+    // `x.wrapping_sub(1)` reported `0 proved, 0 failed, 2 unknown` and the build
+    // stayed green.
+    //
+    // Binding `result` here is not a NEW reservation. `result` collides with the
+    // source-contract return-place vocabulary
+    // (`trust_types::source_contract_synthetic_name_collision`), so
+    // `reject_unrepresentable_contract_parameter_names` has already emptied the
+    // bundle of any contract-carrying function that has a parameter of that
+    // name. In a non-closure attribute payload the identifier therefore has
+    // exactly one possible meaning — the same one it has in native position.
+    //
+    // Scope is deliberately narrow in two directions:
+    //   * CITED clauses keep the old treatment. The citation lane owns them end
+    //     to end and mints its own obligation inventory; adding rows underneath
+    //     it is a live-inventory change with no upside, since the kernel proof
+    //     already closes the clause.
+    //   * The new path is gated below by the SAME source-typing check native
+    //     clauses must pass, so a clause the canonical formula consumer cannot
+    //     elaborate — an island-definition call such as `eqOkW(machine, truth)`,
+    //     whose callee is a Clean definition and not a signature-domain leaf —
+    //     stays `Unsupported` and keeps flowing to the uncited island-defeq lane
+    //     that owns it. This increment does not touch that lane's inputs.
+    let mut attribute_result_spelling = false;
     let (expr, result_binding) = if contract_kind == TrustContractKind::Ensures {
         match origin {
-            ContractClauseOrigin::Attribute => {
-                let (expr, result_binding) = ensures_closure_snippet_body(body)?;
-                (expr, Some(SnippetResultBinding::ClosureReference(result_binding)))
-            }
+            ContractClauseOrigin::Attribute => match ensures_closure_snippet_body(body) {
+                Some((expr, result_binding)) => {
+                    (expr, Some(SnippetResultBinding::ClosureReference(result_binding)))
+                }
+                None if citation == ClauseCitation::Absent => {
+                    attribute_result_spelling = true;
+                    (body, Some(SnippetResultBinding::NativeValue(ENSURES_RESULT_BINDING)))
+                }
+                None => return None,
+            },
             ContractClauseOrigin::Native => {
                 (body, Some(SnippetResultBinding::NativeValue(ENSURES_RESULT_BINDING)))
             }
@@ -1313,11 +1559,18 @@ fn lower_contract_snippet_body_with_domains(
     if primed_identifier_in_contract_snippet(expr.trim()).is_some() {
         return None;
     }
-    let lowered = SnippetParser::parse(expr.trim(), result_binding, syntax, signature_projections)?;
+    let lowered = SnippetParser::parse(
+        expr.trim(),
+        result_binding,
+        syntax,
+        signature_projections,
+        literal_refusal,
+        projection_refusal,
+    )?;
     if let Some(value) = lowered.bool_literal {
         Some(TrustContractPredicateKind::BoolLiteral { value })
     } else if trust_types::parse_spec_expr(&lowered.text).is_some()
-        && (origin != ContractClauseOrigin::Native
+        && (!(origin == ContractClauseOrigin::Native || attribute_result_spelling)
             || native_function_clause_is_source_typed(
                 &lowered.text,
                 contract_kind,
@@ -1528,12 +1781,18 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
             }
             ExprKind::Unary(UnOp::Deref, inner) => self.lower_deref_expr(expr, inner),
             ExprKind::Binary(op, lhs, rhs) => {
-                // A tuple payload bind may be a numeric ADT whose value itself
-                // is deliberately not encoded as a scalar. Preserve only the
-                // ordering/equality atom between two recognized Ok-payload
-                // bindings. The resulting model terms remain free unless the
-                // VC layer finds the body's dominating, type-matched comparison
-                // witness, so every unsupported path still fails closed.
+                // Ok-payload ORDERING guard `d > c` / `d == c` over two Ok-payload
+                // pattern bindings of a numeric-but-non-scalar type (`Rat` d,c in
+                // `matches!(r, Ok((d,c)) if d > c)` — ny-cert selfcheck/branch). Emits
+                // the pair-term ordering `result.unwrap().__trust_ok_0 <op> …_1` for
+                // vcgen's Ordering-witness grounding (generate.rs b62 F4), which pins
+                // the fact from the body's dominating `<Rat as PartialOrd>::{lt,le,gt,
+                // ge}` guard. SOUND (fail-closed): the pair terms are FREE until that
+                // lane pins them, so an ungroundable pair can only FAIL to prove, never
+                // vacuously prove — adversarially verified (a flipped-false `d>c`
+                // ensures is correctly refuted while the true ones prove). Neither
+                // operand lowers on its own (a `&Rat` bind is non-scalar), so this is
+                // purely additive over the fail-closed status quo.
                 if matches!(
                     op.node,
                     BinOpKind::Lt
@@ -1683,7 +1942,7 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                     }
                     "unwrap"
                         if self.receiver_is_result_option(receiver)
-                            && lowered_expr_ty(self.typeck_results.expr_ty(expr))
+                            && lowered_expr_ty(self.tcx, self.typeck_results.expr_ty(expr))
                                 == Some(LoweredExprTy::Int) =>
                     {
                         return lowered_variable_expr(
@@ -2222,6 +2481,29 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
                         return Some(path.segments[0].ident.name.to_string());
                     }
                 }
+                // Trust: the SIGNATURE-form result binding as a projection base
+                // (`#[ensures(result.coeff <= degree)]`). The arm above matches
+                // only the CLOSURE form, whose `ret` is a real local; written in
+                // signature form `result` resolves to no local at all, so the
+                // base lowered to `None` and the whole predicate was rejected as
+                // "unsupported contract predicate expression".
+                //
+                // That is why a clause had to choose: the closure form is proved
+                // by the native lane but can never be kernel-cited, and the
+                // signature form can be cited but was not lowered, so citing one
+                // cost its native obligations. Emitting the canonical token here
+                // lets the SAME clause be both.
+                //
+                // SOUND, for the reason the closure arm already gives: this is a
+                // free projected term the VC layer binds to the return place, so
+                // it can only fail to prove, never vacuously prove. Restricted to
+                // the exact single-segment identifier `result`, which
+                // `trust_contracts` reserves.
+                if path.segments.len() == 1
+                    && path.segments[0].ident.name.as_str() == ENSURES_RESULT_BINDING
+                {
+                    return Some(ENSURES_RESULT_BINDING.to_string());
+                }
                 None
             }
             ExprKind::Field(base, _field_ident) => {
@@ -2594,7 +2876,7 @@ impl<'tcx> ExprLowerer<'_, 'tcx> {
 
         let mut lowered =
             inline_helper_call_reasoned(self.tcx, local, &actual_texts, self.inline_depth)?;
-        if lowered_expr_ty(signature.output()) != Some(lowered.ty) {
+        if lowered_expr_ty(self.tcx, signature.output()) != Some(lowered.ty) {
             return Err("the lowered helper result does not retain its Rust result type");
         }
         variable_domains.extend(lowered.variable_domains);
@@ -2993,6 +3275,15 @@ enum LoweredExprTy {
     Bool,
     Int,
     Float,
+    /// A sequence: `Vec<T>`, `[T]`, `[T; N]`.
+    ///
+    /// Carried so a clause can NAME one. It has no proposition domain, so it
+    /// follows the `Float` precedent exactly: empty `variable_domains`, which
+    /// feeds the body-bound Trust-WP lane while staying opaque to
+    /// certified-monitor authority until a sequence proposition domain
+    /// exists. The equality arm is already generic over `lhs.ty == rhs.ty`,
+    /// so `ret.terms == c.terms` lowers without touching it.
+    Seq,
 }
 
 /// Trust: the shared core of contract-predicate helper inlining — the gates
@@ -3219,7 +3510,7 @@ fn inline_snippet_helper_call_reasoned<'tcx>(
         return Err("result type has no exact proposition domain");
     };
     let lowered = inline_helper_call_reasoned(tcx, callee, actual_texts, depth)?;
-    if lowered_expr_ty(signature.output()) != Some(lowered.ty) {
+    if lowered_expr_ty(tcx, signature.output()) != Some(lowered.ty) {
         return Err("lowered helper result does not retain its Rust result type");
     }
     if exact_formula_domain(&lowered.text, &lowered.variable_domains) != Some(output_domain) {
@@ -3689,6 +3980,29 @@ fn collection_element_domain_from_ty<'tcx>(
             (*element, Some(u128::from(length.try_to_target_usize(tcx)?)))
         }
         ty::Slice(element) => (*element, None),
+        // `Vec<T>` is an Adt, so it never reached the arms above and a clause
+        // naming one was a HARD ERROR, not a soft refusal: "collection
+        // accessor `len` requires an Array base, found Datatype
+        // `std::vec::Vec<i64>`". Measured, same compiler: `requires
+        // xs.len() == n` proves for `xs: &[i64]` and fails to COMPILE for
+        // `xs: Vec<i64>` -- the identical clause over the identical element
+        // type, refused for the container alone.
+        //
+        // A Vec models as its slice view for this purpose: the collection
+        // domain carries only an element domain and an optional type-level
+        // length, and a Vec has no static length, so it takes `None` exactly
+        // as a slice does. Nothing here depends on the buffer, the capacity,
+        // or the allocator.
+        //
+        // Gated on the DIAGNOSTIC ITEM, never a rendered path: a path test
+        // would also fire on any user type whose path ends in `Vec`
+        // (`mod fake { pub struct Vec<T>(T); }`), and admitting a look-alike
+        // as a sequence is precisely the confusion this gate exists to avoid.
+        ty::Adt(adt_def, args)
+            if tcx.is_diagnostic_item(rustc_span::sym::Vec, adt_def.did()) =>
+        {
+            (args.type_at(0), None)
+        }
         _ => return None,
     };
     Some((
@@ -3733,19 +4047,55 @@ fn opaque_sort_name(ty: Ty<'_>) -> String {
 /// element sort for indexing and collection accessors. Other aggregates stay
 /// opaque: their names remain in scope, but ordinary fields are rejected until
 /// exact source layouts are available.
-fn loop_source_sort_from_ty(ty: Ty<'_>) -> Option<trust_types::Sort> {
+fn loop_source_sort_from_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> Option<trust_types::Sort> {
     match ty.kind() {
         ty::Bool => Some(trust_types::Sort::Bool),
         ty::Int(_) | ty::Uint(_) | ty::Char => Some(trust_types::Sort::Int),
         ty::Array(element, _) | ty::Slice(element) => Some(trust_types::Sort::Array(
             Box::new(trust_types::Sort::Int),
-            Box::new(loop_source_sort_from_ty(*element).unwrap_or_else(|| {
+            Box::new(loop_source_sort_from_ty(tcx, *element).unwrap_or_else(|| {
                 trust_types::Sort::Datatype {
                     name: opaque_sort_name(*element),
                     constructors: Vec::new(),
                 }
             })),
         )),
+        // `Vec<T>` sorts as its SLICE VIEW. Without this it fell to the
+        // generic `ty::Adt` arm below and became an opaque `Sort::Datatype`,
+        // so a clause naming one was a HARD ERROR rather than a soft refusal:
+        // "collection accessor `len` requires an Array base, found Datatype
+        // `std::vec::Vec<i64>`". Measured, same compiler: `requires
+        // xs.len() == n` PROVES for `xs: &[i64]` and fails to COMPILE for
+        // `xs: Vec<i64>` -- the same clause over the same element type,
+        // refused for the container alone.
+        //
+        // The element sort is recovered exactly as the slice arm does,
+        // falling back to an opaque datatype for a non-scalar element, so a
+        // `Vec<Term>` sorts as `Array(Int, Datatype(Term))` just as
+        // `&[Term]` does. Nothing here depends on the buffer, the capacity,
+        // or the allocator: a sort carries the element and the fact that the
+        // base is indexable, and a Vec is indexable exactly as its slice is.
+        //
+        // Gated on the DIAGNOSTIC ITEM, never a rendered path -- a path test
+        // would also fire on a user type whose path ends in `Vec`.
+        ty::Adt(adt_def, args)
+            if tcx.is_diagnostic_item(rustc_span::sym::Vec, adt_def.did())
+                && args.types().next().is_some() =>
+        {
+            let element = args.type_at(0);
+            Some(trust_types::Sort::Array(
+                Box::new(trust_types::Sort::Int),
+                Box::new(loop_source_sort_from_ty(tcx, element).unwrap_or_else(|| {
+                    trust_types::Sort::Datatype {
+                        name: opaque_sort_name(element),
+                        constructors: Vec::new(),
+                    }
+                })),
+            ))
+        }
         ty::Str => Some(trust_types::Sort::Array(
             Box::new(trust_types::Sort::Int),
             Box::new(trust_types::Sort::Int),
@@ -3764,10 +4114,14 @@ fn loop_source_sort_from_ty(ty: Ty<'_>) -> Option<trust_types::Sort> {
 /// references/pointers require the explicit source dereference `*x`, whose
 /// canonical MIR/formula name is `x*`. Slice/array references retain the base
 /// spelling because source indexing and `.len()` use Rust's deref coercion.
-fn loop_source_binding_from_ty(name: String, ty: Ty<'_>) -> Option<(String, trust_types::Sort)> {
+fn loop_source_binding_from_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    name: String,
+    ty: Ty<'tcx>,
+) -> Option<(String, trust_types::Sort)> {
     match ty.kind() {
         ty::Ref(_, inner, _) => {
-            let sort = loop_source_sort_from_ty(*inner)?;
+            let sort = loop_source_sort_from_ty(tcx, *inner)?;
             let source_name = if matches!(inner.kind(), ty::Array(..) | ty::Slice(..) | ty::Str) {
                 name
             } else {
@@ -3779,10 +4133,10 @@ fn loop_source_binding_from_ty(name: String, ty: Ty<'_>) -> Option<(String, trus
         // pointer to a slice must use explicit verifier syntax such as
         // `(*p).len()`, whose canonical source binding is `p*`.
         ty::RawPtr(inner, _) => {
-            let sort = loop_source_sort_from_ty(*inner)?;
+            let sort = loop_source_sort_from_ty(tcx, *inner)?;
             Some((format!("{name}*"), sort))
         }
-        _ => loop_source_sort_from_ty(ty).map(|sort| (name, sort)),
+        _ => loop_source_sort_from_ty(tcx, ty).map(|sort| (name, sort)),
     }
 }
 
@@ -3792,10 +4146,12 @@ fn loop_source_binding_from_ty(name: String, ty: Ty<'_>) -> Option<(String, trus
 /// a scalar as a collection. This is source/type admission only; MIR extraction
 /// still has to rebind every accepted projection before it gains proof authority.
 fn function_source_sorts<'tcx>(
+    tcx: TyCtxt<'tcx>,
     body: &'tcx rustc_hir::Body<'tcx>,
     typeck_results: &TypeckResults<'tcx>,
 ) -> BTreeMap<String, trust_types::Sort> {
     struct Collector<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
         typeck_results: &'a TypeckResults<'tcx>,
         sorts: BTreeMap<String, trust_types::Sort>,
     }
@@ -3805,6 +4161,7 @@ fn function_source_sorts<'tcx>(
             if let PatKind::Binding(_, canonical_id, ident, _) = pat.kind
                 && canonical_id == pat.hir_id
                 && let Some((name, sort)) = loop_source_binding_from_ty(
+                    self.tcx,
                     ident.name.to_string(),
                     self.typeck_results.pat_ty(pat),
                 )
@@ -3815,7 +4172,7 @@ fn function_source_sorts<'tcx>(
         }
     }
 
-    let mut collector = Collector { typeck_results, sorts: BTreeMap::new() };
+    let mut collector = Collector { tcx, typeck_results, sorts: BTreeMap::new() };
     for param in body.params {
         collector.visit_pat(param.pat);
     }
@@ -3913,6 +4270,7 @@ fn visible_loop_source_sorts<'tcx>(
     signature_domains: &[LoweredVariableDomain],
 ) -> BTreeMap<String, trust_types::Sort> {
     struct Collector<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
         typeck_results: &'a TypeckResults<'tcx>,
         scope_tree: &'a ScopeTree,
         target: Scope,
@@ -3952,7 +4310,7 @@ fn visible_loop_source_sorts<'tcx>(
                 let source_binding = if hygienic_non_parameter {
                     None
                 } else {
-                    loop_source_binding_from_ty(rust_name.clone(), self.typeck_results.pat_ty(pat))
+                    loop_source_binding_from_ty(self.tcx, rust_name.clone(), self.typeck_results.pat_ty(pat))
                 };
                 use std::collections::btree_map::Entry;
                 match self.bindings.entry(rust_name) {
@@ -3984,6 +4342,7 @@ fn visible_loop_source_sorts<'tcx>(
     let scope_tree = tcx.region_scope_tree(local_def_id);
     let unique_parameter_hir_local_ids = unique_simple_parameter_hir_local_ids(body);
     let mut collector = Collector {
+        tcx,
         typeck_results,
         scope_tree,
         target: Scope { local_id: loop_id.local_id, data: ScopeData::Node },
@@ -4472,15 +4831,19 @@ fn lowered_constant_expr<'tcx>(
     Some(LoweredExpr::literal(text, LoweredExprTy::Int))
 }
 
-fn lowered_variable_expr(tcx: TyCtxt<'_>, text: String, rust_ty: Ty<'_>) -> Option<LoweredExpr> {
-    let ty = lowered_expr_ty(rust_ty)?;
+fn lowered_variable_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    text: String,
+    rust_ty: Ty<'tcx>,
+) -> Option<LoweredExpr> {
+    let ty = lowered_expr_ty(tcx, rust_ty)?;
     // Compiler-owned executable-monitor identity currently has exact domains
     // only for Bool and primitive integers. Float predicates do not enter the
     // retired TrustWP authority path and remain opaque to certified-monitor
     // authority until a bit-exact float proposition domain exists.
     let variable_domains = match proposition_domain_from_ty(tcx, rust_ty) {
         Some(domain) => synthetic_variable_domains(&text, domain)?,
-        None if ty == LoweredExprTy::Float => Vec::new(),
+        None if ty == LoweredExprTy::Float || ty == LoweredExprTy::Seq => Vec::new(),
         None => return None,
     };
     Some(LoweredExpr { text, ty, variable_domains })
@@ -4586,7 +4949,31 @@ fn merge_variable_domains(
     canonical_variable_domains(lhs.into_iter().chain(rhs).collect())
 }
 
-fn lowered_expr_ty(ty: Ty<'_>) -> Option<LoweredExprTy> {
+/// Is `ty` a sequence the clause language can name?
+///
+/// Slices and arrays, plus `Vec<T>` behind its DIAGNOSTIC ITEM -- never a
+/// rendered path, which would also fire on a user type whose path ends in
+/// `Vec`. A reference to one is transparent: `&[T]` and `&Vec<T>` name the
+/// same sequence as the owned form, and a clause spells them identically.
+fn is_sequence_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    let ty = match ty.kind() {
+        ty::Ref(_, inner, _) => *inner,
+        _ => ty,
+    };
+    match ty.kind() {
+        ty::Slice(_) | ty::Array(..) => true,
+        ty::Adt(adt_def, args) => {
+            tcx.is_diagnostic_item(rustc_span::sym::Vec, adt_def.did())
+                && args.types().next().is_some()
+        }
+        _ => false,
+    }
+}
+
+fn lowered_expr_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<LoweredExprTy> {
+    if is_sequence_ty(tcx, ty) {
+        return Some(LoweredExprTy::Seq);
+    }
     if ty.is_bool() {
         Some(LoweredExprTy::Bool)
     } else if ty.is_integral() {
@@ -4776,7 +5163,15 @@ fn lower_bin_op(op: BinOpKind) -> Option<&'static str> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SnippetToken<'a> {
     Ident(&'a str),
-    Int(&'a str),
+    /// A Rust integer literal, kept as BOTH the authored spelling and the
+    /// single integer it denotes.
+    ///
+    /// The value is what every ordinary use emits, re-spelled in bare decimal:
+    /// that is what lets `999_999_999`, `0x3B9AC9FF` and `1000u32` reach the
+    /// downstream formula parser, which reads decimal digits only. The spelling
+    /// is kept because ONE use — a tuple-field index — must be the canonical
+    /// spelling and not merely the right number.
+    Int { spelling: &'a str, value: u128 },
     Gt,
     Ge,
     Lt,
@@ -4821,6 +5216,13 @@ struct SnippetParser<'a> {
     result_binding: Option<SnippetResultBinding<'a>>,
     syntax: SnippetSyntax,
     projections: &'a ProjectionEnvironment,
+    /// The FIRST authored projection chain `ProjectionEnvironment` could not
+    /// resolve, kept for attribution only. Like `literal_refusal`, this exists
+    /// because the refusal it describes is otherwise INVISIBLE: the chain fails
+    /// the whole clause closed (correctly), and the surviving diagnostic then
+    /// names the chain's HEAD — a real parameter — as "not in scope", which
+    /// points the author at the wrong token. Never proof authority.
+    projection_refusal: Option<String>,
 }
 
 #[derive(Copy, Clone)]
@@ -4838,10 +5240,26 @@ impl<'a> SnippetParser<'a> {
         result_binding: Option<SnippetResultBinding<'a>>,
         syntax: SnippetSyntax,
         projections: &'a ProjectionEnvironment,
+        literal_refusal: &mut Option<trust_types::int_literal::IntLiteralRefusal>,
+        projection_refusal: &mut Option<String>,
     ) -> Option<SnippetExpr> {
-        let tokens = tokenize_contract_snippet(input, syntax)?;
-        let mut parser = Self { tokens, index: 0, result_binding, syntax, projections };
-        let expr = parser.parse_implies()?;
+        let tokens = tokenize_contract_snippet(input, syntax, literal_refusal)?;
+        let mut parser = Self {
+            tokens,
+            index: 0,
+            result_binding,
+            syntax,
+            projections,
+            projection_refusal: None,
+        };
+        let expr = parser.parse_implies();
+        // Reported whether or not the parse survived: an unresolvable chain
+        // makes `parse_implies` fail, which is exactly the case that needs
+        // attributing.
+        if parser.projection_refusal.is_some() {
+            *projection_refusal = parser.projection_refusal.take();
+        }
+        let expr = expr?;
         if parser.is_eof() && expr.ty.can_be_bool() { Some(expr.into_bool()) } else { None }
     }
 
@@ -4994,7 +5412,12 @@ impl<'a> SnippetParser<'a> {
                 self.parse_projection_chain(name)
             }
             SnippetToken::Ident(name) => self.parse_ident(name),
-            SnippetToken::Int(value) => Some(SnippetExpr {
+            // Re-spell the constant in bare decimal. The VALUE is untouched —
+            // this is only the respelling that makes an author's
+            // `999_999_999`, `0x3B9AC9FF` or `1000u32` readable by
+            // `trust_types::parse_spec_expr`, which the lowered text is handed
+            // to next.
+            SnippetToken::Int { value, .. } => Some(SnippetExpr {
                 text: value.to_string(),
                 ty: SnippetExprTy::Value,
                 bool_literal: None,
@@ -5035,7 +5458,14 @@ impl<'a> SnippetParser<'a> {
             let segment = match self.bump()? {
                 // A named struct field (`storage`) or a tuple index (`0`).
                 SnippetToken::Ident(segment) => segment,
-                SnippetToken::Int(segment) => segment,
+                // A tuple index is the CANONICAL bare-decimal spelling and
+                // nothing else. `0_0` and `0x0` denote field 0, but they are
+                // not the name `place_to_var_name` mints for it, and
+                // `spec_parse` re-checks that exact canonicality on the text
+                // this function produces — so admitting a respelled index here
+                // would build a place nothing downstream resolves, and fail the
+                // whole clause at a boundary that could no longer say why.
+                SnippetToken::Int { spelling, value } if spelling == value.to_string() => spelling,
                 _ => return None,
             };
             // `base.method(..)` is a CALL, not a place: it has no stable name
@@ -5046,7 +5476,15 @@ impl<'a> SnippetParser<'a> {
             authored.push('.');
             authored.push_str(segment);
         }
-        let canonical = self.projections.resolve(&authored)?;
+        let Some(canonical) = self.projections.resolve(&authored) else {
+            // Attribution only — the refusal itself is unchanged and still
+            // fails the whole clause closed. Record the FIRST miss so a
+            // diagnostic can name the chain rather than its head.
+            if self.projection_refusal.is_none() {
+                self.projection_refusal = Some(authored);
+            }
+            return None;
+        };
         Some(SnippetExpr {
             text: canonical.to_string(),
             // The leaf's exact sort is enforced downstream from the signature
@@ -5234,7 +5672,21 @@ impl<'a> SnippetParser<'a> {
     }
 }
 
-fn tokenize_contract_snippet(input: &str, syntax: SnippetSyntax) -> Option<Vec<SnippetToken<'_>>> {
+/// Tokenize one contract predicate.
+///
+/// `literal_refusal` is an OUT-PARAMETER, and it is the reason this function
+/// takes one at all: a numeric literal it cannot read fails the whole clause,
+/// and until 2026-08-29 that failure was indistinguishable from every other
+/// parse failure — the caller returned `None`, the clause became `Unsupported`,
+/// and an author who wrote `ensures result <= 999_999_999` got two UNKNOWN rows
+/// and no diagnostic (§13.1, `docs/STRICT_VERIFICATION_FRAGMENT.md`). When the
+/// refusal IS attributable to a literal, it is recorded here so
+/// `lower_contract_snippet` can say so, with the fix (standing ruling v7/D3).
+fn tokenize_contract_snippet<'a>(
+    input: &'a str,
+    syntax: SnippetSyntax,
+    literal_refusal: &mut Option<trust_types::int_literal::IntLiteralRefusal>,
+) -> Option<Vec<SnippetToken<'a>>> {
     let bytes = input.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0usize;
@@ -5248,11 +5700,48 @@ fn tokenize_contract_snippet(input: &str, syntax: SnippetSyntax) -> Option<Vec<S
 
         if byte.is_ascii_digit() {
             let start = index;
-            index += 1;
-            while index < bytes.len() && bytes[index].is_ascii_digit() {
-                index += 1;
+            // Rust's integer-literal token SHAPE, not just its decimal digits:
+            // a digit followed by alphanumerics and `_`. Lexing the whole run
+            // is what makes `999_999_999`, `0x3B9AC9FF` and `1000u32` ONE
+            // literal instead of an integer followed by a stray identifier —
+            // the shape that used to make the entire clause unparseable. It
+            // stops before `.`, so a projection separator and the `..` range
+            // token are unaffected.
+            index += trust_types::int_literal::int_literal_run_len(&input[index..]);
+            let spelling = &input[start..index];
+
+            // A digit run immediately followed by `.<digit>` is a FLOAT
+            // literal — unless the run is itself a tuple-field index, where
+            // `s.0.0` is two nested segments and not `s.<0.0>`. This lane has
+            // no float support in either direction, and saying so is the whole
+            // point: closing only the integer half would leave the next
+            // spelling exactly as invisible as the separator was.
+            let field_index_context = matches!(tokens.last(), Some(SnippetToken::Dot));
+            if !field_index_context
+                && index + 1 < bytes.len()
+                && bytes[index] == b'.'
+                && bytes[index + 1].is_ascii_digit()
+            {
+                let mut end = index + 1;
+                end += trust_types::int_literal::int_literal_run_len(&input[end..]);
+                *literal_refusal = Some(trust_types::int_literal::IntLiteralRefusal {
+                    literal: input[start..end].to_string(),
+                    reason: "a contract predicate on this lane carries integers only".to_string(),
+                    fix: "state the bound over integers — scale both sides by a constant \
+                          (`10 * result <= 15` for `result <= 1.5`) — or move the comparison \
+                          into a helper whose result the clause bounds"
+                        .to_string(),
+                });
+                return None;
             }
-            tokens.push(SnippetToken::Int(&input[start..index]));
+
+            match trust_types::int_literal::read_contract_int_literal(spelling) {
+                Ok(value) => tokens.push(SnippetToken::Int { spelling, value }),
+                Err(refusal) => {
+                    *literal_refusal = Some(refusal);
+                    return None;
+                }
+            }
             continue;
         }
 

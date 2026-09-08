@@ -197,21 +197,52 @@ Run with `{literal}{} -Z{literal:#} {placeholder}[FLAG] [COMMAND]{placeholder:#}
     );
 }
 
+/// A one-line description for every externally-dispatched subcommand `--list`
+/// prints.
+///
+/// A const rather than a local so `every_protected_lane_is_described` can read
+/// it. It was a `HashMap` literal inside `print_list`, unreachable from any
+/// test, and three of the five protected lanes -- `trust`, `tippy`, `miri` --
+/// had no entry and printed blank. `trust` is the flagship lane this binary's
+/// own error paths tell users to type. The mapping each name resolves to is
+/// `main.rs::protected_trust_subcommand_binary`.
+const KNOWN_EXTERNAL_COMMAND_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "trust",
+        "Trust's own verification lane: gates, proofs, and release checks (targo-trust).",
+    ),
+    (
+        "tippy",
+        "Lints a package to catch common mistakes — this toolchain's clippy (targo-tippy).",
+    ),
+    (
+        "clippy",
+        "Alias for `tippy` on this toolchain; both run targo-tippy.",
+    ),
+    (
+        "fmt",
+        "Formats all bin and lib files of the current crate using targo-fmt.",
+    ),
+    (
+        "miri",
+        "Runs a crate's tests under the Miri interpreter (targo-miri).",
+    ),
+];
+
 fn print_list(gctx: &GlobalContext, is_verbose: bool) {
     // Maps from commonly known external commands (not builtin to cargo)
     // to their description, for the help page. Reserved for external
     // subcommands that are core within the rust ecosystem (esp ones that
     // might become internal in the future).
-    let known_external_command_descriptions = HashMap::from([
-        (
-            "clippy",
-            "Checks a package to catch common mistakes and improve your Rust code.",
-        ),
-        (
-            "fmt",
-            "Formats all bin and lib files of the current crate using rustfmt.",
-        ),
-    ]);
+    // Trust: every PROTECTED_TRUST_SUBCOMMAND is described here. Three of the
+    // five (`trust`, `tippy`, `miri`) printed with a blank description until
+    // 2026-09-01 — including `trust`, which is the flagship lane this binary's
+    // own error paths tell users to type. And `fmt` claimed to run `rustfmt`,
+    // a binary this toolchain's installer deletes; it runs `targo-fmt`.
+    // The mapping each name resolves to is
+    // `main.rs::protected_trust_subcommand_binary`.
+    let known_external_command_descriptions: HashMap<&str, &str> =
+        KNOWN_EXTERNAL_COMMAND_DESCRIPTIONS.iter().copied().collect();
     drop_println!(
         gctx,
         color_print::cstr!("<bright-green,bold>Installed Commands:</>")
@@ -1053,5 +1084,54 @@ fn the_version_banner_is_branded_only_for_the_non_cargo_frontend() {
             first.ends_with(&expected_brand),
             "the `{name}` frontend must identify itself: {first}"
         );
+    }
+}
+
+/// Every protected lane `--list` prints carries a description.
+///
+/// `PROTECTED_TRUST_SUBCOMMANDS` (`main.rs`) is the set this frontend inserts
+/// into the command list when their binaries resolve; `--list` then looks each
+/// up in [`KNOWN_EXTERNAL_COMMAND_DESCRIPTIONS`] for the text beside it. Until
+/// 2026-09-01 that map held two of the five, so `trust`, `tippy` and `miri`
+/// printed with a blank description -- including `trust`, the lane this
+/// binary's own error paths tell users to type.
+///
+/// The two sets live in different files, which is how they drifted; this pins
+/// them together.
+#[test]
+fn every_protected_lane_is_described() {
+    let described: Vec<&str> = KNOWN_EXTERNAL_COMMAND_DESCRIPTIONS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    let missing: Vec<&str> = crate::PROTECTED_TRUST_SUBCOMMANDS
+        .iter()
+        .copied()
+        .filter(|c| !described.contains(c))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "`--list` prints {} protected lane(s) with no description: {missing:?}. \
+         A user reading a blank line next to a command cannot tell what it is for, \
+         and `trust` is the one the error paths tell them to type.",
+        missing.len()
+    );
+}
+
+/// No description names a binary this toolchain deletes.
+///
+/// `fmt`'s read "Formats all bin and lib files of the current crate using
+/// rustfmt" -- and the installer removes `rustfmt`; the lane runs `targo-fmt`.
+/// A reader who reached for the named binary got nothing.
+#[test]
+fn no_description_names_a_deleted_binary() {
+    for (name, desc) in KNOWN_EXTERNAL_COMMAND_DESCRIPTIONS {
+        for gone in ["rustfmt", "cargo-clippy", "cargo-fmt"] {
+            assert!(
+                !desc.contains(gone),
+                "the `{name}` description names `{gone}`, which this toolchain \
+                 does not ship"
+            );
+        }
     }
 }

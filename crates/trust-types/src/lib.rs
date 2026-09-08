@@ -45,6 +45,21 @@ pub const TRUST_RUSTC_INTRINSIC_PATH_PREFIX: &str = "@trust-rustc-intrinsic::";
 pub const TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX: &str =
     "@trust-rustc-total-primitive-method::";
 
+/// Prefix stamped onto a direct call path only after rustc's `TyCtxt` confirms
+/// that the callee is one of Trust's modeled overflow-CHECKED signed primitive
+/// methods (`iN::checked_add` / `checked_sub` / `checked_mul`).
+///
+/// Deliberately a THIRD namespace, distinct from both
+/// [`TRUST_RUSTC_TOTAL_PRIMITIVE_METHOD_PATH_PREFIX`] (wrapping semantics —
+/// admitting a checked method there would model `checked_add` as modular
+/// arithmetic) and [`TRUST_RUSTC_INTRINSIC_PATH_PREFIX`] (these are `core`
+/// library methods, not rustc intrinsics). As with the other markers, `@`
+/// cannot occur in a Rust identifier, so authored source cannot manufacture
+/// the namespace; artifact authority still comes from the authenticated
+/// compiler transport/session rather than from a serialized string alone.
+pub const TRUST_RUSTC_CHECKED_PRIMITIVE_METHOD_PATH_PREFIX: &str =
+    "@trust-rustc-checked-primitive-method::";
+
 /// Prefix stamped onto an integer wrapping call whose exact `core` method
 /// identity is needed only by the full-mode assertion-refutation model.
 ///
@@ -1358,6 +1373,67 @@ impl RustcTotalPrimitiveMethod {
     }
 }
 
+/// A compiler-authenticated overflow-CHECKED signed primitive method
+/// (`iN::checked_add` / `checked_sub` / `checked_mul`, returning `Option<iN>`).
+///
+/// SIGNED ONLY, by design (checked-arith spec §5.5): `uN::checked_sub` has
+/// different semantics (underflow below 0, range `[0, 2^N-1]`, a different
+/// `Int` bridge), so unsigned checked methods are a separate, later increment
+/// with their own kernel model — they DECLINE here rather than being admitted
+/// under the signed model. Classification is deliberately strict even though
+/// the marker itself can only be minted by the compiler in an authoritative
+/// run; keeping the grammar here gives facet inference, E6 body recognition,
+/// and the mint one fail-closed source of truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustcCheckedPrimitiveMethod {
+    CheckedAdd(u32),
+    CheckedSub(u32),
+    CheckedMul(u32),
+}
+
+impl RustcCheckedPrimitiveMethod {
+    /// Classify an exact compiler-marked `core` checked primitive method path.
+    ///
+    /// Only SIGNED widths `i8`–`i128` are admitted. Unsigned impls, `isize`,
+    /// foreign roots, extra path segments, unmarked paths, same-suffix
+    /// lookalikes, and every other checked method (`checked_div`,
+    /// `checked_neg`, `checked_shl`, …) all decline.
+    #[must_use]
+    pub fn classify(callee: &str) -> Option<Self> {
+        let path = callee.strip_prefix(TRUST_RUSTC_CHECKED_PRIMITIVE_METHOD_PATH_PREFIX)?;
+        let mut segments = path.split("::");
+        let (Some(root), Some(module), Some(primitive_impl), Some(method)) =
+            (segments.next(), segments.next(), segments.next(), segments.next())
+        else {
+            return None;
+        };
+        if segments.next().is_some() || root != "core" || module != "num" {
+            return None;
+        }
+        let width = match primitive_impl {
+            "<impl i8>" => 8,
+            "<impl i16>" => 16,
+            "<impl i32>" => 32,
+            "<impl i64>" => 64,
+            "<impl i128>" => 128,
+            _ => return None,
+        };
+        match method {
+            "checked_add" => Some(Self::CheckedAdd(width)),
+            "checked_sub" => Some(Self::CheckedSub(width)),
+            "checked_mul" => Some(Self::CheckedMul(width)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn width(self) -> u32 {
+        match self {
+            Self::CheckedAdd(width) | Self::CheckedSub(width) | Self::CheckedMul(width) => width,
+        }
+    }
+}
+
 #[cfg(test)]
 mod rustc_total_primitive_method_tests {
     use super::*;
@@ -1472,6 +1548,70 @@ mod rustc_total_primitive_method_tests {
             );
         }
     }
+
+    #[test]
+    fn checked_primitive_method_classifier_is_exact_and_fail_closed() {
+        for (path, expected) in [
+            (
+                "@trust-rustc-checked-primitive-method::core::num::<impl i8>::checked_add",
+                RustcCheckedPrimitiveMethod::CheckedAdd(8),
+            ),
+            (
+                "@trust-rustc-checked-primitive-method::core::num::<impl i16>::checked_sub",
+                RustcCheckedPrimitiveMethod::CheckedSub(16),
+            ),
+            (
+                "@trust-rustc-checked-primitive-method::core::num::<impl i32>::checked_mul",
+                RustcCheckedPrimitiveMethod::CheckedMul(32),
+            ),
+            (
+                "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_add",
+                RustcCheckedPrimitiveMethod::CheckedAdd(64),
+            ),
+            (
+                "@trust-rustc-checked-primitive-method::core::num::<impl i128>::checked_mul",
+                RustcCheckedPrimitiveMethod::CheckedMul(128),
+            ),
+        ] {
+            assert_eq!(RustcCheckedPrimitiveMethod::classify(path), Some(expected));
+        }
+
+        for bad in [
+            // Unmarked, source-spellable path — never trusted.
+            "core::num::<impl i64>::checked_add",
+            // Wrong marker namespaces (each is a different authority).
+            "@trust-rustc-intrinsic::core::num::<impl i64>::checked_add",
+            "@trust-rustc-total-primitive-method::core::num::<impl i64>::checked_add",
+            "@trust-rustc-wrapping-refutation-method::core::num::<impl i64>::checked_add",
+            // UNSIGNED receivers decline (spec §5.5: different semantics/model).
+            "@trust-rustc-checked-primitive-method::core::num::<impl u8>::checked_add",
+            "@trust-rustc-checked-primitive-method::core::num::<impl u64>::checked_sub",
+            "@trust-rustc-checked-primitive-method::core::num::<impl u128>::checked_mul",
+            "@trust-rustc-checked-primitive-method::core::num::<impl usize>::checked_add",
+            "@trust-rustc-checked-primitive-method::core::num::<impl isize>::checked_add",
+            // Ops outside {add, sub, mul} decline (div/rem/neg/shl have no
+            // overflow-flag form or a different model).
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_div",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_rem",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_neg",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_shl",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::wrapping_add",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_add_signed",
+            // Foreign roots / extra segments / truncated paths.
+            "@trust-rustc-checked-primitive-method::std::num::<impl i64>::checked_add",
+            "@trust-rustc-checked-primitive-method::evil::core::num::<impl i64>::checked_add",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>::checked_add::suffix",
+            "@trust-rustc-checked-primitive-method::core::num::checked_add",
+            "@trust-rustc-checked-primitive-method::core::num::<impl i64>",
+            "@trust-rustc-checked-primitive-method::",
+        ] {
+            assert_eq!(
+                RustcCheckedPrimitiveMethod::classify(bad),
+                None,
+                "malformed or excluded marker must decline: {bad}"
+            );
+        }
+    }
 }
 
 /// Marks a loop contract that could not be paired to a MIR loop header.
@@ -1534,6 +1674,10 @@ pub(crate) mod resilience;
 // SMT-LIB2 pretty printer for formatted solver output.
 pub mod smt_printer;
 pub mod static_truth;
+// Shared terminator-obligation recognizers (Unreachable class): trust-vcgen's
+// v2_build_terminator_vc and the trust-ir spine must agree — one definition,
+// two callers, on the static_truth precedent.
+pub mod terminator_obligations;
 // Shared matchers for modeled total core/std call summaries (bridge + vcgen must agree).
 pub mod admissible_body;
 pub mod facet_allowlist;
@@ -1593,6 +1737,11 @@ pub mod guidance;
 // transport, the report DTOs, and every consumer downstream of them.
 pub mod outcome;
 pub(crate) mod smtlib2_printer;
+// The ONE reader of an integer literal written in a contract predicate. Public
+// because the compiler's own snippet tokenizer
+// (`rustc_mir_transform::trust_contract_query`) reads the same grammar, and two
+// copies of one grammar is how this repo's kind-binding tables drifted before.
+pub mod int_literal;
 pub(crate) mod spec;
 pub(crate) mod spec_attrs;
 mod spec_parse;
@@ -1603,7 +1752,14 @@ mod spec_render;
 pub(crate) mod strengthen;
 pub(crate) mod taint;
 pub(crate) mod trait_resolution;
+// Trust (E5 conservation): the reserved `trust::` attribute vocabulary, enumerated
+// from the code that CONSUMES each name. Deliberately dependency-free so the
+// resolver can key its hard-error refusal on it without pulling in verification IR.
+pub mod trust_attr_namespace;
 pub(crate) mod traits;
+// Allocation-identity/offset model for pointer values (design of record for
+// verified-sysroot-scoping §5 step 3 lives in the module doc).
+pub mod alloc_model;
 // Provenance tracking types for memory model Layer 2.
 pub mod provenance;
 // Unified memory model for trust-wp/trust-vc cross-function proof composition.

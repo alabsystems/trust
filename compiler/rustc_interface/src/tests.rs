@@ -1153,6 +1153,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(translate_remapped_path_to_local_path, false);
     tracked!(trap_unreachable, Some(false));
     tracked!(treat_err_as_bug, NonZero::new(1));
+    tracked!(trust_bundle_foreign_crate, vec!["dep_crate".to_string()]);
     tracked!(trust_certified_test_monitors, true);
     tracked!(trust_cg_output_gate, "allow-unknown".to_string());
     tracked!(trust_ir_flip, false);

@@ -181,6 +181,8 @@ impl Builder {
     /// [`thread::spawn`]: super::spawn
     /// [`spawn`]: super::spawn
     #[stable(feature = "rust1", since = "1.0.0")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "thread_builder_spawn")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub fn spawn<F, T>(self, f: F) -> io::Result<JoinHandle<T>>
     where
@@ -250,6 +252,8 @@ impl Builder {
     /// [`thread::spawn`]: super::spawn
     /// [`spawn`]: super::spawn
     #[stable(feature = "thread_spawn_unchecked", since = "1.82.0")]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "thread_builder_spawn_unchecked")]
     #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
     pub unsafe fn spawn_unchecked<F, T>(self, f: F) -> io::Result<JoinHandle<T>>
     where

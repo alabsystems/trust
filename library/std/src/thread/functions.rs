@@ -121,6 +121,8 @@ use crate::{io, panicking};
 /// [`join`]: JoinHandle::join
 /// [`Err`]: crate::result::Result::Err
 #[stable(feature = "rust1", since = "1.0.0")]
+// Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+#[cfg_attr(not(test), rustc_diagnostic_item = "thread_spawn")]
 #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
 pub fn spawn<F, T>(f: F) -> JoinHandle<T>
 where

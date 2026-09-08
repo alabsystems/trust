@@ -50,6 +50,8 @@ mod syntax;
 mod terminator;
 pub mod traversal;
 pub mod trust_contract;
+// Trust: per-body facts for the once-initializer re-entrancy check.
+pub mod trust_once;
 pub mod trust_proof;
 pub mod trust_proof_item;
 pub mod visit;

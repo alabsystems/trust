@@ -15,13 +15,14 @@
 // halves of the differential cannot drift together.
 
 use trust_types::{
-    BasicBlock, BlockId, Formula, LocalDecl, Operand, Place, Sort, SourceSpan, Terminator, Ty,
-    UnwindEdge, VerifiableBody, VerifiableFunction,
+    BasicBlock, BlockId, ConstValue, Formula, LocalDecl, Operand, Place, Sort, SourceSpan,
+    Terminator, Ty, UnwindEdge, VerifiableBody, VerifiableFunction,
 };
 
 use super::intrinsic_semantics::{
     ValueModeledIntrinsic, bitreverse_bits, bswap_bits, classify_value_modeled_intrinsic,
-    ctpop_value, marked_saturating_intrinsic, value_modeled_intrinsic_facts,
+    ctlz_value, ctpop_value, cttz_value, marked_saturating_intrinsic,
+    value_modeled_intrinsic_facts,
 };
 use super::{saturating_add_sub_method, saturating_call_dest_value};
 
@@ -111,6 +112,26 @@ fn eval(f: &Formula, env: &[(&str, i128)]) -> V {
             let (lo, lw) = eval(b, env).bv();
             V::Bv { val: (hi << lw) | lo, width: hw + lw }
         }
+        Formula::BvAnd(a, b, w) => {
+            let (x, xw) = eval(a, env).bv();
+            let (y, yw) = eval(b, env).bv();
+            assert_eq!(xw, yw, "bvand operand widths must agree");
+            assert_eq!(xw, *w, "declared BvAnd width must match the operands");
+            V::Bv { val: x & y, width: xw }
+        }
+        Formula::BvNot(a, w) => {
+            let (x, xw) = eval(a, env).bv();
+            assert_eq!(xw, *w, "declared BvNot width must match the operand");
+            V::Bv { val: !x & mask(xw), width: xw }
+        }
+        Formula::BvSub(a, b, w) => {
+            let (x, xw) = eval(a, env).bv();
+            let (y, yw) = eval(b, env).bv();
+            assert_eq!(xw, yw, "bvsub operand widths must agree");
+            assert_eq!(xw, *w, "declared BvSub width must match the operands");
+            // SMT-LIB bvsub is modular: wrap, then mask back to the width.
+            V::Bv { val: x.wrapping_sub(y) & mask(xw), width: xw }
+        }
         Formula::BvToInt(a, w, signed) => {
             let (val, width) = eval(a, env).bv();
             assert_eq!(width, *w, "declared BvToInt width must match the term's width");
@@ -183,6 +204,16 @@ fn evaluator_agrees_with_smtlib_by_hand() {
     let ff = || Box::new(Formula::IntToBv(Box::new(Formula::Int(255)), 8));
     assert_eq!(eval(&Formula::BvToInt(ff(), 8, false), &[]).int(), 255);
     assert_eq!(eval(&Formula::BvToInt(ff(), 8, true), &[]).int(), -1);
+    // The three operators the cttz/ctlz mask adds, hand-computed:
+    let b8 = |v: i128| Box::new(Formula::IntToBv(Box::new(Formula::Int(v)), 8));
+    // (bvand #xCC #xAA) = #x88
+    assert_eq!(bv(&Formula::BvAnd(b8(0xCC), b8(0xAA), 8)), (0x88, 8));
+    // (bvnot #x0F) = #xF0
+    assert_eq!(bv(&Formula::BvNot(b8(0x0F), 8)), (0xF0, 8));
+    // (bvsub #x05 #x01) = #x04, and — the wrap the cttz mask RELIES on at
+    // zero — (bvsub #x00 #x01) = #xFF.
+    assert_eq!(bv(&Formula::BvSub(b8(5), b8(1), 8)), (0x04, 8));
+    assert_eq!(bv(&Formula::BvSub(b8(0), b8(1), 8)), (0xFF, 8));
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +240,96 @@ fn ctpop_exhaustive_width8_matches_rust() {
         checked += 1;
     }
     assert_eq!(checked, 256, "all 256 width-8 inputs must be checked");
+}
+
+#[test]
+fn cttz_exhaustive_width8_matches_rust() {
+    let def = cttz_value(&x_var(), 8);
+    let mut checked = 0;
+    for (byte, unsigned_x, signed_x) in all_width8_inputs() {
+        // THE ZERO EDGE INCLUDED: `0u8.trailing_zeros() == 8`, delivered by the
+        // modular wrap of the mask (`0 - 1 == 0xFF`), not by a special case.
+        let expected = i128::from(byte.trailing_zeros());
+        assert_eq!(eval(&def, &[("x", unsigned_x)]).int(), expected, "cttz(u8 {byte:#04x})");
+        assert_eq!(eval(&def, &[("x", signed_x)]).int(), expected, "cttz(i8 {})", byte as i8);
+        checked += 1;
+    }
+    assert_eq!(checked, 256, "all 256 width-8 inputs must be checked");
+}
+
+#[test]
+fn ctlz_exhaustive_width8_matches_rust() {
+    let def = ctlz_value(&x_var(), 8);
+    let mut checked = 0;
+    for (byte, unsigned_x, signed_x) in all_width8_inputs() {
+        // `0u8.leading_zeros() == 8`; and for i8 the count is of the BIT
+        // PATTERN (`(-1i8).leading_zeros() == 0`), which is what `int2bv`
+        // recovers from the negative Int.
+        let expected = i128::from(byte.leading_zeros());
+        assert_eq!(eval(&def, &[("x", unsigned_x)]).int(), expected, "ctlz(u8 {byte:#04x})");
+        assert_eq!(eval(&def, &[("x", signed_x)]).int(), expected, "ctlz(i8 {})", byte as i8);
+        checked += 1;
+    }
+    assert_eq!(checked, 256, "all 256 width-8 inputs must be checked");
+}
+
+#[test]
+fn cttz_width16_and_width32_match_rust_on_edge_patterns() {
+    // Exhaustive at 16 (cheap), edge patterns at 32 — every case chosen so an
+    // off-by-one in the mask (dropping the BvNot, or `x+1` for `x-1`) misses.
+    let d16 = cttz_value(&x_var(), 16);
+    for v in 0u32..=0xFFFF {
+        assert_eq!(
+            eval(&d16, &[("x", i128::from(v))]).int(),
+            i128::from((v as u16).trailing_zeros()),
+            "cttz(u16 {v:#06x})"
+        );
+    }
+    let d32 = cttz_value(&x_var(), 32);
+    for v in [0u32, 1, 2, 8, 0x8000_0000, 0x0001_0000, u32::MAX, u32::MAX - 1] {
+        assert_eq!(
+            eval(&d32, &[("x", i128::from(v))]).int(),
+            i128::from(v.trailing_zeros()),
+            "cttz(u32 {v:#010x})"
+        );
+    }
+}
+
+#[test]
+fn ctlz_width16_matches_rust_exhaustively() {
+    let d16 = ctlz_value(&x_var(), 16);
+    for v in 0u32..=0xFFFF {
+        assert_eq!(
+            eval(&d16, &[("x", i128::from(v))]).int(),
+            i128::from((v as u16).leading_zeros()),
+            "ctlz(u16 {v:#06x})"
+        );
+    }
+    // 32 is the emission cap (constant arguments only), so its term is checked
+    // on edge patterns the way `cttz`'s is — every case asymmetric enough that
+    // a missing or doubled reversal misses.
+    let d32 = ctlz_value(&x_var(), 32);
+    for v in [0u32, 1, 2, 0x8000_0000, 0x0001_0000, 0x0102_0304, u32::MAX] {
+        assert_eq!(
+            eval(&d32, &[("x", i128::from(v))]).int(),
+            i128::from(v.leading_zeros()),
+            "ctlz(u32 {v:#010x})"
+        );
+    }
+}
+
+#[test]
+fn cttz_and_ctlz_are_not_the_same_definition() {
+    // The copy-paste guard, same shape as `bswap_and_bitreverse_are_not_the_
+    // same_definition`: on an asymmetric word the two counts differ, so a
+    // `ctlz` accidentally built WITHOUT the reversal (i.e. `cttz` again — the
+    // exact mistake the composition invites) fails here on every width.
+    let tz = cttz_value(&x_var(), 8);
+    let lz = ctlz_value(&x_var(), 8);
+    // 0b0000_0100: 2 trailing zeros, 5 leading zeros.
+    assert_eq!(eval(&tz, &[("x", 4)]).int(), 2);
+    assert_eq!(eval(&lz, &[("x", 4)]).int(), 5);
+    assert_ne!(eval(&tz, &[("x", 4)]).int(), eval(&lz, &[("x", 4)]).int());
 }
 
 #[test]
@@ -387,6 +508,22 @@ fn i8_fn(name: &str, dest_ty: Ty) -> VerifiableFunction {
     )
 }
 
+/// A counting-intrinsic call whose argument is a compile-time CONSTANT — the
+/// shape a literal call site (`cttz(8u8)`) dumps, and the only shape the exact
+/// counting equation is emitted for.
+fn u8_const_fn(name: &str, value: u8) -> VerifiableFunction {
+    let mut func = intrinsic_fn(
+        Ty::Int { width: 8, signed: false },
+        Ty::Int { width: 32, signed: false },
+        &format!("{MARK}core::intrinsics::{name}::<u8>"),
+    );
+    let Terminator::Call { args, .. } = &mut func.body.blocks[0].terminator else {
+        unreachable!("intrinsic_fn builds a call terminator");
+    };
+    args[0] = Operand::Constant(ConstValue::Uint(u128::from(value), 8));
+    func
+}
+
 fn facts_of(func: &VerifiableFunction) -> Vec<Formula> {
     let subject = Formula::Var("r".into(), Sort::Int);
     let (dest, facts) =
@@ -538,9 +675,47 @@ fn ctlz_and_cttz_facts_are_true_for_every_width8_input_including_zero() {
         true,
     );
 
-    // The bound is deliberately NOT exact here (see the module header), so the
-    // vacuity check is the specific one the facts DO decide: `r == W` forces
-    // `x == 0`, and a nonzero `x` therefore cannot have `W` leading zeros.
+    // The exact counting equation rides the CONSTANT-ARGUMENT gate (see the
+    // module header's measured interference table), so a parameter-argument
+    // fixture must NOT carry it — 4 facts, range + iff, at width 8 too.
+    assert_eq!(
+        facts_of(&u8_fn("cttz", u32_dest.clone())).len(),
+        4,
+        "a free (parameter) argument must not receive the exact counting equation"
+    );
+
+    // Exactness is therefore checked over per-input CONSTANT fixtures: for
+    // every one of the 256 constants, the facts must hold of the true result
+    // and reject both neighbors. This is the same 256-point sweep the
+    // parameter-based tests run for `ctpop`, just with the constant embedded
+    // in the call the way a real literal call site (`cttz(8u8)`) dumps.
+    for (byte, _, _) in all_width8_inputs() {
+        for (name, real) in [
+            ("cttz", i128::from(byte.trailing_zeros())),
+            ("ctlz", i128::from(byte.leading_zeros())),
+        ] {
+            let func = u8_const_fn(name, byte);
+            let facts = facts_of(&func);
+            assert_eq!(facts.len(), 5, "{name}({byte:#04x}): range + iff + exact");
+            for fact in &facts {
+                assert!(
+                    eval(fact, &[("r", real)]).boolean(),
+                    "{name}({byte:#04x}): fact false at the true result {real}: {fact:?}"
+                );
+            }
+            for bad in [real - 1, real + 1] {
+                assert!(
+                    facts.iter().any(|f| !eval(f, &[("r", bad)]).boolean()),
+                    "{name}({byte:#04x}): no fact rejects the wrong result {bad}"
+                );
+            }
+        }
+    }
+
+    // The iff facts are still emitted alongside the exact definition (they are
+    // the Int-only facts the BV-declining trust-wp lane can use), and they must
+    // still decide their own specific question: `r == W` forces `x == 0`, and a
+    // nonzero `x` therefore cannot have `W` leading zeros.
     let facts = facts_of(&u8_fn("ctlz", u32_dest.clone()));
     for (byte, unsigned_x, _) in all_width8_inputs() {
         let env = [("x", unsigned_x), ("r", 8)];
@@ -815,6 +990,56 @@ fn above_the_width_cap_the_exact_expansion_is_declined_and_only_the_bound_remain
     let (_, facts) =
         value_modeled_intrinsic_facts(&func, &func.body.blocks[0].terminator, &subject).unwrap();
     assert_eq!(facts.len(), 3, "range + exact definition at width 32: {facts:?}");
+
+    // The counting pair's exact equation has TWO gates, and both directions
+    // are load-bearing: the argument must be a compile-time CONSTANT (the
+    // measured interference boundary — module header table) and the width must
+    // be within the shared 32 cap. A free argument gets range + iff (4 facts)
+    // at EVERY width, including 8; a constant argument gets the exact equation
+    // (5 facts) up to 32 and falls back to the same 4 above it.
+    let counting = |name: &str, width: u32, const_arg: bool| {
+        let mut func = intrinsic_fn(
+            Ty::Int { width, signed: false },
+            Ty::Int { width: 32, signed: false },
+            &format!("{MARK}core::intrinsics::{name}::<u{width}>"),
+        );
+        if const_arg {
+            let Terminator::Call { args, .. } = &mut func.body.blocks[0].terminator else {
+                unreachable!("intrinsic_fn builds a call terminator");
+            };
+            args[0] = Operand::Constant(ConstValue::Uint(1, width));
+        }
+        let (_, facts) =
+            value_modeled_intrinsic_facts(&func, &func.body.blocks[0].terminator, &subject)
+                .unwrap();
+        facts
+    };
+    assert_eq!(counting("cttz", 32, true).len(), 5, "cttz@32 const: range + iff + exact");
+    assert_eq!(counting("ctlz", 32, true).len(), 5, "ctlz@32 const: range + iff + exact");
+    assert_eq!(counting("cttz", 8, true).len(), 5, "cttz@8 const: range + iff + exact");
+    for (name, width, const_arg) in [
+        // Free arguments: never the exact equation, at any width.
+        ("cttz", 8, false),
+        ("ctlz", 8, false),
+        ("cttz", 16, false),
+        ("ctlz", 16, false),
+        ("cttz", 32, false),
+        ("ctlz", 32, false),
+        // Constants past the width cap: fail closed to range + iff.
+        ("cttz", 64, true),
+        ("cttz", 128, true),
+        ("ctlz", 64, true),
+    ] {
+        let facts = counting(name, width, const_arg);
+        let how = if const_arg { "const" } else { "free" };
+        assert_eq!(facts.len(), 4, "{name}@{width} {how}: range + iff only: {facts:?}");
+        assert!(
+            facts
+                .iter()
+                .all(|f| matches!(f, Formula::Ge(..) | Formula::Le(..) | Formula::Implies(..))),
+            "{name}@{width} {how} must not emit an exact equation: {facts:?}"
+        );
+    }
 }
 
 /// Pins the term-count table in the module header, so a future "optimization"
@@ -824,16 +1049,26 @@ fn above_the_width_cap_the_exact_expansion_is_declined_and_only_the_bound_remain
 fn emitted_term_counts_match_the_documented_cost_table() {
     fn nodes(f: &Formula) -> usize {
         match f {
-            Formula::Add(a, b) | Formula::BvConcat(a, b) => 1 + nodes(a) + nodes(b),
-            Formula::IntToBv(a, _) | Formula::BvToInt(a, _, _) => 1 + nodes(a),
+            Formula::Add(a, b)
+            | Formula::BvConcat(a, b)
+            | Formula::BvAnd(a, b, _)
+            | Formula::BvSub(a, b, _) => 1 + nodes(a) + nodes(b),
+            Formula::IntToBv(a, _) | Formula::BvToInt(a, _, _) | Formula::BvNot(a, _) => {
+                1 + nodes(a)
+            }
             Formula::BvExtract { inner, .. } => 1 + nodes(inner),
             _ => 1,
         }
     }
     fn depth(f: &Formula) -> usize {
         match f {
-            Formula::Add(a, b) | Formula::BvConcat(a, b) => 1 + depth(a).max(depth(b)),
-            Formula::IntToBv(a, _) | Formula::BvToInt(a, _, _) => 1 + depth(a),
+            Formula::Add(a, b)
+            | Formula::BvConcat(a, b)
+            | Formula::BvAnd(a, b, _)
+            | Formula::BvSub(a, b, _) => 1 + depth(a).max(depth(b)),
+            Formula::IntToBv(a, _) | Formula::BvToInt(a, _, _) | Formula::BvNot(a, _) => {
+                1 + depth(a)
+            }
             Formula::BvExtract { inner, .. } => 1 + depth(inner),
             _ => 1,
         }
@@ -864,5 +1099,18 @@ fn emitted_term_counts_match_the_documented_cost_table() {
         assert_eq!(nodes(&ctpop_value(&x_var(), width)), ctpop_n, "ctpop W={width}");
         assert_eq!(nodes(&bitreverse_bits(&x_var(), width)), bitrev_n, "bitreverse W={width}");
         assert_eq!(nodes(&bswap_bits(&x_var(), width).unwrap()), bswap_n, "bswap W={width}");
+    }
+    // The counting pair, only up to each one's own emission cap: `cttz` is
+    // `12W - 1` (linear — the 9-node mask replaces `ctpop`'s bare word), and
+    // `ctlz` is `8W² + 6W - 1` (quadratic — the reversal cascade is duplicated
+    // per extracted bit), which is exactly why `MAX_EXACT_CTLZ_WIDTH` stops at
+    // 16 while `cttz` rides the shared 32 cap.
+    for (width, cttz_n, cttz_d) in [(8u32, 95, 9), (16, 191, 10), (32, 383, 11)] {
+        assert_eq!(nodes(&cttz_value(&x_var(), width)), cttz_n, "cttz W={width}");
+        assert_eq!(depth(&cttz_value(&x_var(), width)), cttz_d, "cttz depth W={width}");
+    }
+    for (width, ctlz_n, ctlz_d) in [(8u32, 559, 13), (16, 2143, 15)] {
+        assert_eq!(nodes(&ctlz_value(&x_var(), width)), ctlz_n, "ctlz W={width}");
+        assert_eq!(depth(&ctlz_value(&x_var(), width)), ctlz_d, "ctlz depth W={width}");
     }
 }

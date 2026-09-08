@@ -134,8 +134,10 @@ pub fn classify<'tcx>(
     // unmodeled call) degrades PER-OBLIGATION to `UnsupportedMir`→Unknown
     // (honest, never a false proof), never a hard whole-body reject. This is
     // the DEFAULT-lane increment; the `-full` native (trust-ir-bridge) lane
-    // stays fail-closed for coroutines (the bridge's `AggregateKind::Coroutine`
-    // arm returns `Err`, which fails OPEN to `spine_module = None` — no native
+    // handles coroutines as OPAQUE frames (CORRECTED 2026-08-29: this comment
+    // claimed the bridge's `AggregateKind::Coroutine` arm returns `Err`; it
+    // returns Ok — lower.rs's admission gate — and the frame is the zero-field
+    // opaque struct whose every read is a havoc, which fails OPEN to `spine_module = None` — no native
     // verdict flip, so the vcgen obligations govern and an Unknown keeps an
     // explicit-`-full` run fail-closed). No skip is minted here anymore.
 

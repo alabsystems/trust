@@ -656,7 +656,19 @@ emit_report() {
         PIN-MISSING)
           printf '      The pin is absent from the local object store; ancestry is not\n'
           printf '      computable and no restore is possible without a fetch (a write).\n'
-          printf '      inspect:  git -C %s fetch --all\n' "$(field "$rec" 2)/$(field "$rec" 3)"
+          # `fetch --all` is the WRONG advice here and used to be what this said.
+          # It fetches each remote's default refspec — branches — and a pin that
+          # needs this branch of the code is typically one that is on NO branch:
+          # that is exactly what `audit_first_party_pins.py --anchor` exists for,
+          # parking such commits under `refs/pins/*`. Measured 2026-08-30 on
+          # first-party/ay b851ff38: `fetch --all` returned 0 and left the object
+          # still absent, so the report kept saying PIN-MISSING after the reader
+          # had done what it asked. Fetch the sha, which works whether the commit
+          # is on a branch, on an anchor ref, or reachable only by identity.
+          printf '      inspect:  git -C %s fetch origin %s\n' \
+            "$(field "$rec" 2)/$(field "$rec" 3)" "$(field "$rec" 8)"
+          printf '                # NOT `fetch --all`: it fetches branches, and an\n'
+          printf '                # anchored pin (refs/pins/*) is on no branch.\n'
           ;;
         UNRELATED)
           printf '      No merge base with the pin. Treat as a re-pin to a different history.\n'

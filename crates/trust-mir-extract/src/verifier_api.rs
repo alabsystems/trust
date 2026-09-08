@@ -3314,6 +3314,21 @@ impl FormulaLowerer {
                 let inner = self.lower_formula(inner, Some(TrustSpecSort::BitVec { width: *w }))?;
                 TrustSpecExpr::int_from_bv(inner, *signed, *w)
             }
+            // Conditional (`if c { a } else { b }`) — the branch-merge a
+            // u128-wrapping clamp/select body produces (`Formula::Ite`,
+            // trust-ir-contract `formula.rs`). Faithful and sort-preserving: the
+            // condition lowers as Bool and BOTH arms lower under one shared result
+            // sort (the else-arm is forced to the then-arm's sort), so this carries
+            // a genuine conditional value and never manufactures one. A
+            // sort-mismatched or unlowerable-arm `Ite` returns `None` here, so the
+            // VC keeps falling to the symbolic schema fail-closed — never a
+            // partial/lossy typed payload.
+            Formula::Ite(cond, then_branch, else_branch) => {
+                let cond = self.lower_formula(cond, Some(TrustSpecSort::Bool))?;
+                let then_expr = self.lower_formula(then_branch, None)?;
+                let else_expr = self.lower_formula(else_branch, Some(then_expr.sort))?;
+                TrustSpecExpr::ite(cond, then_expr, else_expr)
+            }
             _ => return None,
         };
         (expected.map_or(true, |expected| lowered.sort == expected)).then_some(lowered)

@@ -495,6 +495,10 @@ fn classify_body(
 }
 
 /// `A → B → Nat`.
+    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+    // the other line's caller; kept for the lane that owns it. `expect` is
+    // self-expiring — this warns the moment a caller lands.
+#[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 fn fn2_ty(a: &InductiveDecl, b: &InductiveDecl) -> Option<Expr> {
     let a = a.types.first()?;
     let b = b.types.first()?;
@@ -505,6 +509,10 @@ fn fn2_ty(a: &InductiveDecl, b: &InductiveDecl) -> Option<Expr> {
     ))
 }
 
+    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+    // the other line's caller; kept for the lane that owns it. `expect` is
+    // self-expiring — this warns the moment a caller lands.
+#[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 fn register_reducible(env: &mut Environment, name: &str, type_: Expr, value: Expr) -> Option<()> {
     env.add_decl(Declaration::Definition {
         name: Name::from_string(name),
@@ -516,11 +524,19 @@ fn register_reducible(env: &mut Environment, name: &str, type_: Expr, value: Exp
     .ok()
 }
 
+    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+    // the other line's caller; kept for the lane that owns it. `expect` is
+    // self-expiring — this warns the moment a caller lands.
+#[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 fn comp_is_const_named(e: &Expr, name: &str) -> bool {
     matches!(e.kind(), clean_kernel::expr::ExprKind::Const(n, _) if n.to_string() == name)
 }
 
 /// `head #1 #0`.
+    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+    // the other line's caller; kept for the lane that owns it. `expect` is
+    // self-expiring — this warns the moment a caller lands.
+#[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 fn comp_is_app2(e: &Expr, head_name: &str) -> bool {
     use clean_kernel::expr::ExprKind;
     let ExprKind::App(f, a0) = e.kind() else { return false };
@@ -538,6 +554,10 @@ fn comp_is_app2(e: &Expr, head_name: &str) -> bool {
 /// `∀ (s:St)(b:Byte), Eq Nat (tstep #1 #0) (spec #1 #0)` with the heads being the
 /// distinct `full`/composition consts. Built here, so this can only confirm the
 /// intended shape; it blocks a future refactor from silently widening the claim.
+    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+    // the other line's caller; kept for the lane that owns it. `expect` is
+    // self-expiring — this warns the moment a caller lands.
+#[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 fn is_composition_goal(goal: &Expr, st_dom: &InductiveDecl, byte_dom: &InductiveDecl) -> bool {
     use clean_kernel::expr::ExprKind;
     let (Some(st), Some(bt)) = (st_dom.types.first(), byte_dom.types.first()) else {
@@ -567,6 +587,10 @@ fn is_composition_goal(goal: &Expr, st_dom: &InductiveDecl, byte_dom: &Inductive
 /// one byte chunk: `∀ s b, Eq Nat (full s b) (class_matrix s (classify b))`.
 /// Returns `Some(())` iff the clean kernel accepts; `None` (fail-closed) on any
 /// dimension/shape/build/kernel failure.
+    // MERGE NOTE (integrate-e6-perfield-20260831): orphaned when the merge took
+    // the other line's caller; kept for the lane that owns it. `expect` is
+    // self-expiring — this warns the moment a caller lands.
+#[expect(dead_code, reason = "merge-orphaned; see MERGE NOTE above the item")]
 pub(crate) fn kernel_checks_table_composition(
     st_dom: &InductiveDecl,
     byte_dom: &InductiveDecl,

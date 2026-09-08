@@ -114,7 +114,7 @@ fn assert_summary_matches_extractor(
 
     let summary = wrapping_summary(callee, op, left, right);
     assert!(
-        callee_postcondition_is_injectable(&func, dest, &summary, args.len()),
+        callee_postcondition_is_injectable(&func, dest, &summary, args),
         "the wrapping summary must pass the injection gate (the modular-Ite \
          exemption to the machine-arithmetic filter)"
     );
@@ -194,7 +194,7 @@ fn unbounded_add_clause_is_still_not_injectable() {
         .with_param_names(vec!["a".to_string(), "b".to_string()])
         .with_definitional_postcondition(unbounded);
     assert!(
-        !callee_postcondition_is_injectable(&func, dest, &summary, args.len()),
+        !callee_postcondition_is_injectable(&func, dest, &summary, args),
         "the unbounded mathematical-Int reading of a wrapping body is the \
          canonical false-PROVE and must stay filtered"
     );

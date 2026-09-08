@@ -113,8 +113,12 @@ def main():
     args = ap.parse_args()
 
     if not os.path.exists(TRUSTC):
-        print(f"SKIP: no stage2 trustc at {TRUSTC}")
-        return 0
+        # NOT a skip: a ratchet that exits 0 with no compiler present is a false
+        # green — during any stage2 rebuild window the lane would read PASS having
+        # measured nothing (caught 2026-08-30, live, mid-rebuild). Same ruling as
+        # trust_self_verify.sh: distinct nonzero exit, and say what was looked for.
+        print(f"REFUSED: no stage2 trustc at {TRUSTC} — nothing was measured")
+        return 2
 
     v, host = stamp()
     print(f"trustc: {v}\nhost:   {host}\n")

@@ -107,33 +107,54 @@ OPT_LEVELS = (0, 3)
 
 # A path+byte inventory, not merely a count.  Adding, deleting, renaming, or
 # editing a probe requires an explicit review and ratchet update in this file.
+#
+# 2026-08-30: NINE probes re-pinned after 9fc06acc40 ("fmt: tree-wide reformat")
+# edited them without the ratchet update this comment requires, leaving the gate
+# red — mb_joinhead, mf_multiblock, mfr3_bind, mfr3_perm, mfr4_expr, mfr5_branch,
+# mfr5_mixed, rmfz_adversarial, rmfz_adversarial2.
+#
+# REVIEWED, not rubber-stamped. Each drift was proved to be EXACTLY the
+# formatter's output: the pre-commit blob was extracted with `git show 9fc06acc40^:`,
+# reformatted with this repo's own rustfmt.toml, and compared byte-for-byte
+# against the current file. All nine matched, so no probe carries a semantic
+# change and the THIR/MIR each one lowers to is unchanged.
+#
+# The config path is load-bearing in that proof and cost a wrong answer first
+# time: formatting the extracted blobs in a scratch directory made all nine
+# report DIFFERS, because rustfmt walks UP from the file to find rustfmt.toml and
+# a copy in /tmp has no repo above it. With `--config-path` naming this repo's
+# config (style_edition 2024, use_small_heuristics = "Max" — which is what
+# collapses these small bodies onto one line) all nine match. `git diff -w` is NOT
+# a substitute: a formatter reflows tokens across lines, which whitespace-
+# insensitive diffing does not neutralize, and -w reported the full line count
+# for all nine.
 EXPECTED_CORPUS_SHA256 = {
     "crates/trust-thir-lower/probes/mb_adversarial.rs":
         "bcf770689247f81c85b0ba4b1a3e7870b4d146fbbde47c91eea48c41d4b0d3fd",
     "crates/trust-thir-lower/probes/mb_hazard3.rs":
         "bad3f0b6b513d076bb55328cca9e974fa51a7f9b289aefcd86cdd2165809858f",
     "crates/trust-thir-lower/probes/mb_joinhead.rs":
-        "e501f9c903af551cbf18656a93d9f60889cee1dc76ea7012add90d7817b3035c",
+        "0ffed887339c9c304370ce566f3a234128fcd3f65b52100a694701c57e812866",
     "crates/trust-thir-lower/probes/mf_aggregate_adversarial.rs":
         "3eb2cfc5da8c07720d29316cd261c7d21b3c13a2f5511d70caba9a34fae73001",
     "crates/trust-thir-lower/probes/mf_aggregate_temps.rs":
         "f8e8d128ac31d4ed2a3e0fb7ddb9d59fc159a80a768c6fba50d019d2ec8429de",
     "crates/trust-thir-lower/probes/mf_multiblock.rs":
-        "99919fffa7ded8c75ffd54eaafb6eecb3409b1e3a9f7d3005d50780299e0b342",
+        "ee92913a9bd20b1bfe23e1752523adcca2259974a4589fc6c95cf9b25797ca41",
     "crates/trust-thir-lower/probes/mf_operand_temps.rs":
         "e14d384370319d0c6ad2ff93717d139b50536e88fd7ba344e9f06b3736ce48ae",
     "crates/trust-thir-lower/probes/mf_residual.rs":
         "fab7d5f576a52a61f74066ea31286587ff94832b06a6d6ac16710ac36bb7e1f3",
     "crates/trust-thir-lower/probes/mfr3_bind.rs":
-        "ea98ac43c1ef22c3ec9c69f7ce7fd897742bec65a0439dfb32ae8e4f76276167",
+        "d94f63af94e51bf888a300eb741ca2fc432adc5ade39890fef150046a9482fe6",
     "crates/trust-thir-lower/probes/mfr3_perm.rs":
-        "344b640f5361bf8b41809975b85108596abb5a19816aaf8c5d504aca63d06d09",
+        "7c729dd569012d1370a65ebf6ce728b9b3b0c0710e072d2a28dbed73462510b2",
     "crates/trust-thir-lower/probes/mfr3_wclass.rs":
         "a4cd6ff655d003bf71a370eeae388e8465fab28e28ecaffbe9bfa7f1d4d11da5",
     "crates/trust-thir-lower/probes/mfr3_write.rs":
         "a28b42a6298e0c2034f0eecab3c8ca637cd4aebce90639224b304cf23ab20c8e",
     "crates/trust-thir-lower/probes/mfr4_expr.rs":
-        "e5cc02e9c72ce8ec20ad90a77dacf0bc2b7e93a97511c092fbea06fa130cbe7d",
+        "6aad6a667596320aa7419de0dc5473ea09cbecd8436acf15bc221962bde72e2b",
     "crates/trust-thir-lower/probes/mfr4_flow.rs":
         "d49430dcb4fb081dade92b1aa592cd4ebda4c26c07396ab950a2451262bb7272",
     "crates/trust-thir-lower/probes/mfr4_mix.rs":
@@ -141,9 +162,9 @@ EXPECTED_CORPUS_SHA256 = {
     "crates/trust-thir-lower/probes/mfr4_proj.rs":
         "6b9d21555dadd7aef127fd880515c286a11224a74517f7fe04048e880beb4b0b",
     "crates/trust-thir-lower/probes/mfr5_branch.rs":
-        "0255e4c3e980ddef421847f448256309f726c01cc0d2bd38cf096d3dc3907438",
+        "49848827db847fa389b529ccd2f91f2757683b78d876c24bf254f9a5e1011654",
     "crates/trust-thir-lower/probes/mfr5_mixed.rs":
-        "49ec310fb31a84a46d70a7d935c5c348f48a77ca324c045b4235482eca033c6e",
+        "8652272a730de80acc9bc69b872ab40289ff3fbcfea790b39e22f3bc9a02c220",
     "crates/trust-thir-lower/probes/mfr5_pair.rs":
         "db401ed9369d15e4b36978b81c267859827f50dd9bcc739d33244f12a567c9c8",
     "crates/trust-thir-lower/probes/mfr5_plan.rs":
@@ -155,9 +176,9 @@ EXPECTED_CORPUS_SHA256 = {
     "crates/trust-thir-lower/probes/mfz3_gate.rs":
         "66970d0975554d1faaaac2a5c201c655c421f67b2eef4c26188e683da0b76c87",
     "crates/trust-thir-lower/probes/rmfz_adversarial.rs":
-        "a4223a5b0527877469e3303b9bc41150983589025b0d62fd94ef544e58cef383",
+        "4bc1e384b7f8203ad9410ad14682974086a16af0eed85fd6b70d7bcfb56c7ca0",
     "crates/trust-thir-lower/probes/rmfz_adversarial2.rs":
-        "40be046e8660946e2bb0a7e14574714144eb51ab1e9c95c4ec884f02899ea606",
+        "948e06eebfdab7878ef67159eb878ed64841a1f943614aa3719f1081952791e8",
     "crates/trust-thir-lower/probes/rmfz_borrow4.rs":
         "43b990e3c74013f561afa3a3fc791ac68af9cdb6a3b9e2772306841a0718276b",
     "crates/trust-thir-lower/probes/rmfz_write3.rs":

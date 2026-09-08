@@ -33,7 +33,11 @@
 # Author: Andrew Yates | Copyright 2026 | License: Apache-2.0 OR MIT
 set -euo pipefail
 
-RUSTC="${1:-build/aarch64-apple-darwin/stage1/bin/rustc}"
+# Trust: `build/host` symlinks to `build/<host-triple>`, so this resolves on every
+# platform. Naming `aarch64-apple-darwin` literally made this line dead on any
+# non-Apple host (measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
+# directory does not exist). The env/arg override above is unchanged.
+RUSTC="${1:-build/host/stage1/bin/rustc}"
 if [ ! -x "$RUSTC" ]; then
     echo "b4_slot_acceptance: no rustc at $RUSTC" >&2
     exit 2

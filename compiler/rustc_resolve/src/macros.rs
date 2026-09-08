@@ -36,6 +36,11 @@ use rustc_span::edit_distance::find_best_match_for_name;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::{self, AstPass, ExpnData, ExpnKind, LocalExpnId, MacroKind};
 use rustc_span::{DUMMY_SP, Ident, Span, Symbol, kw, sym};
+// Trust (E5 conservation): the reserved `trust::` attribute vocabulary, derived
+// from the code that CONSUMES each name. See the check in `smart_resolve_macro_path`.
+use trust_types::trust_attr_namespace::{
+    TrustAttrVerdict, classify_trust_attr_path, vocabulary_list,
+};
 
 use crate::Namespace::*;
 use crate::def_collector::collect_definitions;
@@ -153,8 +158,40 @@ pub fn registered_tools_ast(
 
     // We implicitly add `rustfmt`, `clippy`, `diagnostic`, `miri` and `rust_analyzer` to known
     // tools, but it's not an error to register them explicitly.
+    //
+    // Trust: `trust` is predefined for the same reason `clippy` is — it is a tool
+    // this compiler ships, not a crate the user is expected to depend on. Before
+    // this, an armed `#[trust::skip]` / `#[trust::assume_total]` / … was
+    // `E0433: cannot find module or crate 'trust'` in every crate that had not
+    // hand-written `#![feature(register_tool)] #![register_tool(trust)]`, so the
+    // verify pass's own opt-out and assumption vocabulary was unusable in exactly
+    // the third-party-shaped crates that need it (measured: ay's `ay-dpll`,
+    // `ay-encode`, `ay-sat`).
+    //
+    // This does NOT shadow the contract attributes. `trust::requires`/`ensures`/
+    // `decreases`/`invariant` are resolved as MACROS against an external crate
+    // named `trust` (the `trust-spec` passthrough shim), which the resolver then
+    // replaces with the compiler-owned contract builtins — see
+    // `trust_spec_contract_attr_extension`. Macro resolution wins over tool-attribute
+    // inertness: measured on a crate carrying BOTH `#![register_tool(trust)]` and
+    // `--extern trust=<shim>`, `#[trust::invariant(false)]` still reaches the
+    // `ExpandTrustInvariant` refusal. That precedence is structural, not a
+    // coincidence to be re-measured: the scope walk in `ident.rs` visits
+    // `ExternPreludeItems` -> `ExternPreludeFlags` -> `ToolPrelude`, so an extern
+    // crate named `trust` is found FIRST and the tool binding is never reached.
+    // It is also why `first-party/ny`'s 88 `#[trust::cite(..)]` sites keep
+    // working — ny's `trust` is `package = "ny-contracts"`, an ordinary
+    // extern-prelude proc-macro crate.
+    //
+    // Tool registration only decides what happens to a `trust::` path that
+    // resolves to no macro at all, which used to be a hard E0433 and is now an
+    // inert tool attribute — which is why registering the tool REQUIRES the
+    // companion E5 conservation check in `smart_resolve_macro_path` below.
+    // Without it, a misspelled or unsupported `#[trust::…]` would be silently
+    // inert, which is strictly worse than the error it replaced. The two are ONE
+    // change and must not be separated.
     let predefined_tools =
-        [sym::clippy, sym::rustfmt, sym::diagnostic, sym::miri, sym::rust_analyzer];
+        [sym::clippy, sym::rustfmt, sym::diagnostic, sym::miri, sym::rust_analyzer, sym::trust];
     registered_tools.extend(predefined_tools.iter().cloned().map(Ident::with_dummy_span));
     registered_tools
 }
@@ -803,6 +840,128 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                 node_id,
                 diagnostics::UnknownDiagnosticAttribute { help },
             );
+        }
+
+        // Trust (E5 CONSERVATION): the `trust::` tool namespace is RESERVED. A name
+        // in it that no consumer claims is a HARD ERROR naming the attribute —
+        // never silence.
+        //
+        // WHAT WAS BROKEN. rustc resolves `#[<tool>::<anything>]` to an INERT tool
+        // attribute without ever looking at `<anything>` (see the tool-module arm
+        // in `ident.rs`), so — measured on the sealed toolchain `trust-e26541e3` —
+        // `#[trust::totally_made_up_clause(whatever @@ nonsense)]` compiled with
+        // ZERO diagnostics and a verification ledger identical, row for row and
+        // solver for solver, to the same file carrying no attribute at all. A
+        // one-keystroke `#[trust::assume_totall]` was likewise nothing, while its
+        // author believed a property had been stated and checked. That reaches the
+        // fake-proof class without writing a single false predicate.
+        //
+        // WHY HERE. This is the seam upstream already uses to validate the
+        // `diagnostic::` namespace immediately above, and for the same reason: it
+        // is the ONE point every tool attribute passes through, exactly once.
+        // Measured via the `diagnostic::` twin on the sealed toolchain, it fires on
+        // item, field, statement, expression, `mod`, `impl`, `trait` and
+        // crate-root-inner positions, on macro-generated attributes, and on an
+        // ACTIVE `cfg_attr` branch — each exactly once. It does NOT fire on a
+        // `cfg`-eliminated branch, which is correct: an attribute that is not part
+        // of this compilation states nothing about it. A HIR attribute walk was the
+        // obvious alternative and is worse: lowering ALIASES one attribute slice
+        // onto several HIR ids (a `let` statement's attrs, tuple-struct ctors), so
+        // it double-reports without an `AttrId` set, and it cannot see an attribute
+        // that expansion consumed. (Should macro resolution ever revisit one path,
+        // `DiagCtxt` already suppresses a byte-identical diagnostic at the same
+        // span, so the error stays one-per-attribute either way. Measured on the
+        // `diagnostic::` twin: exactly one report per occurrence in all ten
+        // positions tested.)
+        //
+        // WHY KEYED ON THE RESOLUTION, NOT THE SPELLING. Trust has a SECOND
+        // attribute surface: a stable-Rust passthrough proc-macro crate literally
+        // named `trust` (`--extern trust=`), intercepted by
+        // `trust_spec_contract_attr_extension` below. Its attributes resolve to
+        // `Res::Def(DefKind::Macro(..), ..)`, not to a tool attribute, and that
+        // surface ALREADY fails closed on an unknown name — an unexported name
+        // simply does not resolve, which is an ordinary hard resolution error.
+        // Matching the literal `trust::` spelling instead of the resolution would
+        // double-diagnose that surface and could reject a legitimate proc macro.
+        //
+        // WHY IT IS *NOT* GATED ON VERIFICATION — this was gated on
+        // `trust_verification_enabled()` when E5 was written, and predefining the
+        // tool (#42, above in `registered_tools_ast`) makes that gate a hole.
+        // The reasoning that justified it — "under `-Ztrust-verify=off` this
+        // compiler is bit-for-bit upstream, and stock rustc accepts any
+        // tool-attribute name" — assumed a crate only ever reached the tool arm by
+        // hand-writing `#![register_tool(trust)]`. It no longer does. Registration
+        // happens in the RESOLVER and is unconditional, so the INERTNESS it
+        // introduces is unconditional too: with the gate in place,
+        // `#[trust::asume_total]` in a dependency unit (targo appends
+        // `-Ztrust-verify=off` to every one of those) goes from `E0433: cannot find
+        // module or crate 'trust'` straight to silence — a strictly worse outcome
+        // than the error it replaced, in exactly the lane nobody is watching.
+        // Running unconditionally preserves the PREVIOUS behaviour rather than
+        // tightening it: the spelling was already fatal under `off`, and only the
+        // error's identity changes. The residual divergence is predefinition
+        // itself, not this refusal, and a crate that registers an unrelated tool it
+        // calls `trust` is the cost of RESERVING the namespace — the same trade
+        // `trust_spec_contract_attr_extension` below already makes for an unrelated
+        // crate named `trust`, with the same `--unverified` route out.
+        //
+        // SCOPE, stated rather than implied: this is a NAME check. It does not
+        // validate PAYLOADS (`#[trust::skip(garbage @@ here)]` keeps compiling —
+        // the consumer owns its payload) and it does not validate POSITIONS (a
+        // claimed name on an item kind no consumer reads is still silently
+        // dropped). Both remain open, and are documented in
+        // `trust_types::trust_attr_namespace`.
+        if res == Res::NonMacroAttr(NonMacroAttrKind::Tool)
+            && let [namespace, ..] = &*path.segments
+            && namespace.ident.name == sym::trust
+        {
+            // `Symbol::as_str` borrows from the symbol; materialize owned strings
+            // first so the `&str` slice handed to the classifier outlives the call.
+            let owned: Vec<String> =
+                path.segments.iter().map(|segment| segment.ident.name.to_string()).collect();
+            let segments: Vec<&str> = owned.iter().map(String::as_str).collect();
+            if let TrustAttrVerdict::Unclaimed { nearest } =
+                classify_trust_attr_path(&segments)
+            {
+                let written = segments[1..].join("::");
+                let mut err = self.dcx().struct_span_err(
+                    path.span,
+                    format!("Trust: `#[trust::{written}]` is not a Trust attribute"),
+                );
+                err.note(
+                    "`trust::` is a RESERVED namespace: every name in it must be claimed by a \
+                     compiler consumer, so a misspelled or invented clause can never be silently \
+                     ignored while its author believes it was verified",
+                );
+                err.note(format!("the claimed vocabulary is: {}", vocabulary_list()));
+                if let Some(nearest) = nearest {
+                    err.help(format!("did you mean `#[trust::{nearest}]`?"));
+                }
+                err.help(
+                    "to state a property this compiler has no name for yet, write it as a \
+                     `requires` / `ensures` clause or a `clean { .. }` island — an unrecognized \
+                     attribute states nothing",
+                );
+                // The escape hatch is spelled differently per driver, and naming
+                // only the compiler flag would be wrong for most users: Targo
+                // REFUSES a caller-supplied `-Ztrust-verify=off` while a
+                // verification session is active ("reserved for Targo's resolved
+                // compilation-unit scope"), so a `targo` user told to pass that
+                // flag would hit a second refusal. `--unverified` lowers onto the
+                // same off-switch for the whole build and is the one they can use.
+                err.help(
+                    "to compile this crate outside the Trust attribute vocabulary: under Targo \
+                     use `targo --unverified`, which lowers onto the same off-switch (Targo \
+                     refuses a caller-supplied `-Ztrust-verify=off` while a verification session \
+                     is active); calling `trustc` directly, pass `-Ztrust-verify=off`",
+                );
+                // A crate that registers a tool it independently calls `trust` lands
+                // here too. That is the cost of RESERVING the namespace, and it is
+                // the same trade `trust_spec_contract_attr_extension` below already
+                // makes for an unrelated crate named `trust`; the help above is
+                // their route.
+                err.emit();
+            }
         }
 
         Ok((ext, res))

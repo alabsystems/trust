@@ -14,6 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 use std::{env, fs, str};
 
@@ -1742,7 +1743,7 @@ impl Step for RustcLink {
         let build_compiler = self.build_compiler;
         let sysroot_compiler = self.sysroot_compiler;
         let target = self.target;
-        add_rustc_to_sysroot(
+        add_to_sysroot(
             builder,
             &builder.sysroot_target_libdir(sysroot_compiler, target),
             &builder.sysroot_target_libdir(sysroot_compiler, sysroot_compiler.host),
@@ -2750,7 +2751,7 @@ impl Step for Assemble {
             // as the separate `trustc-dev` component, and the shared stage2 sysroot
             // it copies from — dist.rs `Rustc` — must not double-bundle these).
             // Reuses the librustc `stamp` read above and the same routing helper
-            // (`add_rustc_to_sysroot`, with its duplicate-rustc-crate guard) that
+            // (`add_to_sysroot`, with its duplicate-rustc-crate guard) that
             // the rustc-private sysroot path uses; copies exactly what
             // restore-rustc-dev.sh copied (whole stamp -> target libdir).
             //
@@ -2762,12 +2763,12 @@ impl Step for Assemble {
             // built for the host the assembled compiler will run on — so the
             // same crate name appears twice, once per architecture. Copying both
             // into one target libdir puts a build-machine dylib in a sysroot that
-            // cannot load it, and trips `add_rustc_to_sysroot`'s
+            // cannot load it, and trips `add_to_sysroot`'s
             // duplicate-rustc-crate guard besides. A cross-host build keeps the
             // clean pruned sysroot, exactly as dist images do; `trustc-dev`
             // remains the supported way to get rustc_private for such a target.
             if builder.kind == Kind::Build && build_compiler.host == host {
-                add_rustc_to_sysroot(builder, &host_libdir, &host_libdir, &stamp);
+                add_to_sysroot(builder, &host_libdir, &host_libdir, &stamp);
             }
             crate::core::build_steps::tool::ensure_user_facing_tools(
                 builder,
@@ -2786,50 +2787,19 @@ impl Step for Assemble {
 ///
 /// For a particular stage this will link the file listed in `stamp` into the
 /// `sysroot_dst` provided.
+// `add_rustc_to_sysroot` used to be a separate entry point whose ONLY difference
+// was passing `SysrootMetadataMode::PreserveMetadataOnlyDeps` rather than
+// `Deduplicate`. That mode chose between "drop metadata-only artifacts whose
+// crate name already has an rlib" and "keep them"; the dropping half was wrong
+// for both populations (see `prune_superseded_sysroot_artifacts`), so the two
+// modes now describe identical behaviour and the enum, the wrapper and the
+// second entry point are gone with it.
 #[track_caller]
 pub fn add_to_sysroot(
     builder: &Builder<'_>,
     sysroot_dst: &Path,
     sysroot_host_dst: &Path,
     stamp: &BuildStamp,
-) {
-    add_to_sysroot_with_metadata_mode(
-        builder,
-        sysroot_dst,
-        sysroot_host_dst,
-        stamp,
-        SysrootMetadataMode::Deduplicate,
-    );
-}
-
-fn add_rustc_to_sysroot(
-    builder: &Builder<'_>,
-    sysroot_dst: &Path,
-    sysroot_host_dst: &Path,
-    stamp: &BuildStamp,
-) {
-    add_to_sysroot_with_metadata_mode(
-        builder,
-        sysroot_dst,
-        sysroot_host_dst,
-        stamp,
-        SysrootMetadataMode::PreserveMetadataOnlyDeps,
-    );
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SysrootMetadataMode {
-    Deduplicate,
-    PreserveMetadataOnlyDeps,
-}
-
-#[track_caller]
-fn add_to_sysroot_with_metadata_mode(
-    builder: &Builder<'_>,
-    sysroot_dst: &Path,
-    sysroot_host_dst: &Path,
-    stamp: &BuildStamp,
-    metadata_mode: SysrootMetadataMode,
 ) {
     let self_contained_dst = &sysroot_dst.join("self-contained");
     t!(fs::create_dir_all(sysroot_dst));
@@ -2838,26 +2808,6 @@ fn add_to_sysroot_with_metadata_mode(
 
     let mut crates = HashMap::new();
     let stamp_entries = builder.read_stamp_file(stamp);
-    let rlib_stems_in_stamp = stamp_entries
-        .iter()
-        .filter_map(|(path, dependency_type)| {
-            let filename = path.file_name().unwrap().to_str().unwrap();
-            let artifact = parse_hashed_rust_artifact(filename)?;
-            (artifact.kind == RustArtifactKind::Rlib).then(|| {
-                (
-                    sysroot_destination(
-                        sysroot_dst,
-                        sysroot_host_dst,
-                        self_contained_dst,
-                        *dependency_type,
-                    )
-                    .to_path_buf(),
-                    artifact.stem.to_owned(),
-                )
-            })
-        })
-        .collect::<HashSet<_>>();
-
     for (path, dependency_type) in stamp_entries {
         let filename = path.file_name().unwrap().to_str().unwrap();
         let dst = match dependency_type {
@@ -2880,19 +2830,12 @@ fn add_to_sysroot_with_metadata_mode(
             DependencyType::TargetSelfContained => self_contained_dst,
         };
 
-        if let Some(artifact) = parse_hashed_rust_artifact(filename)
-            && !prepare_sysroot_artifact_for_copy(
-                &path,
-                dst,
-                artifact,
-                metadata_mode,
-                &rlib_stems_in_stamp,
-            )
-        {
-            continue;
+        if let Some(artifact) = parse_hashed_rust_artifact(filename) {
+            prune_superseded_sysroot_artifacts(dst, artifact);
         }
 
         builder.copy_link(&path, &dst.join(filename), FileType::Regular);
+        record_sysroot_install(dst, filename);
     }
 
     // Check that none of the rustc_* crates have multiple versions. Otherwise using them from
@@ -3030,7 +2973,7 @@ fn prepare_rustc_private_sysroot_with_runtime_identity(
         .join(directory_name);
     let host_dir = directory.join("host");
     let target_dir = directory.join(target);
-    add_rustc_to_sysroot(builder, &target_dir, &host_dir, &stamp);
+    add_to_sysroot(builder, &target_dir, &host_dir, &stamp);
 
     // A rustc crate hash is not a complete metadata-compatibility identity.
     // In particular, the filename of `librustc_driver` can remain unchanged
@@ -3208,19 +3151,6 @@ fn rustc_private_files_identity(domain: &[u8], files: &mut Vec<PathBuf>) -> Stri
     hex_encode(identity.finalize().as_slice())
 }
 
-fn sysroot_destination<'a>(
-    sysroot_dst: &'a Path,
-    sysroot_host_dst: &'a Path,
-    self_contained_dst: &'a Path,
-    dependency_type: DependencyType,
-) -> &'a Path {
-    match dependency_type {
-        DependencyType::Host => sysroot_host_dst,
-        DependencyType::Target => sysroot_dst,
-        DependencyType::TargetSelfContained => self_contained_dst,
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RustArtifactKind {
     Dylib,
@@ -3258,16 +3188,54 @@ fn is_rustc_private_crate(crate_name: &str) -> bool {
         && !crate_name.starts_with("rustc_std_workspace_")
 }
 
-fn should_deduplicate_sysroot_metadata(crate_name: &str) -> bool {
-    // Compiler crates intentionally flow through sysroots as metadata for
-    // rustc_private tools. External and standard-library crates must not keep
-    // metadata-only siblings once an rlib for the same crate is present, because
-    // that makes an rlib dependency resolve ambiguously.
-    !is_rustc_private_crate(crate_name)
+/// Every (directory, filename) this bootstrap run has installed into a sysroot.
+///
+/// `lib/rustlib/<target>/lib` is populated TWICE from two different stamps — once
+/// for std (`add_to_sysroot`, line ~2728) and once for rustc
+/// (the second `add_to_sysroot` call) — and the two populations legitimately
+/// contain the SAME external crates at DIFFERENT versions: std links `hashbrown`,
+/// `libc`, `object`, `memchr`, `gimli` and `miniz_oxide` for backtrace, and the
+/// compiler links its own copies. Neither call can see the other's stamp, so
+/// without this record the second population's prune deletes the first's
+/// artifacts as "stale" purely because the crate NAME matches. They are not
+/// stale; they are the other half of the same build.
+static SYSROOT_INSTALLED_THIS_RUN: LazyLock<Mutex<HashSet<(PathBuf, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn record_sysroot_install(dst: &Path, filename: &str) {
+    SYSROOT_INSTALLED_THIS_RUN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert((dst.to_path_buf(), filename.to_owned()));
+}
+
+fn was_installed_this_run(dst: &Path, filename: &str) -> bool {
+    SYSROOT_INSTALLED_THIS_RUN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&(dst.to_path_buf(), filename.to_owned()))
 }
 
 fn prune_stale_sysroot_metadata(dst: &Path, crate_name: &str, active_stem: &str) {
-    prune_stale_sysroot_artifact_kind(dst, crate_name, active_stem, RustArtifactKind::Rmeta);
+    prune_stale_sysroot_artifact_kind(
+        dst,
+        crate_name,
+        active_stem,
+        RustArtifactKind::Rmeta,
+        MultiVersion::Legitimate,
+    );
+}
+
+/// Whether a same-name, different-hash artifact can be a real second version of
+/// this crate, or is necessarily a leftover from an earlier build.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MultiVersion {
+    /// External and std crates: std and rustc each bring their own copy, so a
+    /// differing hash installed by THIS run must be kept.
+    Legitimate,
+    /// `rustc_*` crates: `add_to_sysroot`'s duplicate-crate check enforces one
+    /// version, so a differing hash is always stale and pruned unconditionally.
+    Impossible,
 }
 
 fn prune_stale_sysroot_artifact_kind(
@@ -3275,6 +3243,7 @@ fn prune_stale_sysroot_artifact_kind(
     crate_name: &str,
     active_stem: &str,
     active_kind: RustArtifactKind,
+    multi_version: MultiVersion,
 ) {
     for entry in t!(fs::read_dir(dst)) {
         let entry = t!(entry);
@@ -3285,6 +3254,24 @@ fn prune_stale_sysroot_artifact_kind(
             && candidate.crate_name == crate_name
             && candidate.stem != active_stem
         {
+            // STALE means "left over from an earlier build", not "belongs to the
+            // other population of this one". Deleting by crate NAME alone removed
+            // artifacts that rustc_public and friends still reference by HASH,
+            // which made every out-of-tree `rustc_private` consumer fail to load
+            // with E0460 ("found possibly newer version of crate `hashbrown`
+            // which `rustc_public` depends on") against a sysroot that had just
+            // been built successfully. Measured 2026-08-30: 12 artifacts across
+            // 9 crate names were missing from a clean stage2, and supplying them
+            // by hand turned a total failure into a clean compile.
+            if multi_version == MultiVersion::Legitimate && was_installed_this_run(dst, filename) {
+                trace!(
+                    path = ?entry.path(),
+                    crate_name,
+                    active_stem,
+                    "keeping same-name artifact installed by this run"
+                );
+                continue;
+            }
             trace!(
                 path = ?entry.path(),
                 crate_name,
@@ -3294,22 +3281,6 @@ fn prune_stale_sysroot_artifact_kind(
             t!(fs::remove_file(entry.path()));
         }
     }
-}
-
-fn sysroot_has_different_rlib_for_crate(dst: &Path, crate_name: &str, metadata_stem: &str) -> bool {
-    for entry in t!(fs::read_dir(dst)) {
-        let entry = t!(entry);
-        let filename = entry.file_name();
-        let Some(filename) = filename.to_str() else { continue };
-        let Some(candidate) = parse_hashed_rust_artifact(filename) else { continue };
-        if candidate.kind == RustArtifactKind::Rlib
-            && candidate.crate_name == crate_name
-            && candidate.stem != metadata_stem
-        {
-            return true;
-        }
-    }
-    false
 }
 
 fn sysroot_has_matching_rlib(dst: &Path, stem: &str) -> bool {
@@ -3360,43 +3331,47 @@ fn prune_public_sysroot_compiler_artifacts(dst: &Path) {
     }
 }
 
-fn prepare_sysroot_artifact_for_copy(
-    _path: &Path,
-    dst: &Path,
-    artifact: RustArtifact<'_>,
-    metadata_mode: SysrootMetadataMode,
-    rlib_stems_in_stamp: &HashSet<(PathBuf, String)>,
-) -> bool {
+/// Remove artifacts an EARLIER build left behind for the crate now being
+/// installed. Everything the current stamps name is copied unconditionally.
+///
+/// This used to additionally SKIP metadata-only artifacts whose crate name
+/// already had an rlib in the sysroot under a different hash, to stop a stray
+/// `.rmeta` making `extern crate foo;` ambiguous. That rule cannot be stated in
+/// terms of the crate name, and as written it discarded artifacts the build
+/// genuinely needs:
+///
+///   * `lib/rustlib/<target>/lib` receives TWO populations from two stamps —
+///     std's and rustc's — and they legitimately share crate names at different
+///     versions (`hashbrown`, `libc`, `object`, `memchr`, `gimli`,
+///     `miniz_oxide`, `cfg_if`, `getopts`, `rustc_demangle`).
+///   * std is built with `-Zno-embed-metadata`, so it ships
+///     `ArtifactKeepMode::BothRlibAndRmeta` precisely BECAUSE the separate
+///     `.rmeta` is required to compile against it. A rule that drops `.rmeta`
+///     files is therefore never safe here, whatever the hashes say.
+///
+/// Measured on a clean stage2 (2026-08-30): 12 artifacts across 9 crate names
+/// were absent, and `extern crate rustc_public;` — nothing else — failed with
+/// E0460 `found possibly newer version of crate hashbrown which rustc_public
+/// depends on`. That is every out-of-tree `rustc_private` consumer, against a
+/// sysroot the build had just reported as successful.
+fn prune_superseded_sysroot_artifacts(dst: &Path, artifact: RustArtifact<'_>) {
     if is_rustc_private_crate(artifact.crate_name) {
-        prune_stale_sysroot_artifact_kind(dst, artifact.crate_name, artifact.stem, artifact.kind);
-        return true;
+        // The duplicate-crate check at the end of `add_to_sysroot` enforces that
+        // these exist at exactly one version, so a different hash under the same
+        // name is unambiguously a leftover.
+        prune_stale_sysroot_artifact_kind(
+            dst,
+            artifact.crate_name,
+            artifact.stem,
+            artifact.kind,
+            MultiVersion::Impossible,
+        );
+        return;
     }
 
-    if !should_deduplicate_sysroot_metadata(artifact.crate_name) {
-        return true;
+    if artifact.kind == RustArtifactKind::Rlib {
+        prune_stale_sysroot_metadata(dst, artifact.crate_name, artifact.stem);
     }
-
-    match artifact.kind {
-        RustArtifactKind::Rlib => {
-            prune_stale_sysroot_metadata(dst, artifact.crate_name, artifact.stem);
-        }
-        RustArtifactKind::Rmeta => {
-            if metadata_mode == SysrootMetadataMode::Deduplicate
-                && !rlib_stems_in_stamp.contains(&(dst.to_path_buf(), artifact.stem.to_owned()))
-                && sysroot_has_different_rlib_for_crate(dst, artifact.crate_name, artifact.stem)
-            {
-                trace!(
-                    path = ?_path,
-                    ?dst,
-                    "skipping metadata-only sysroot artifact with a different rlib already present"
-                );
-                return false;
-            }
-        }
-        RustArtifactKind::Dylib => {}
-    }
-
-    true
 }
 
 #[cfg(test)]

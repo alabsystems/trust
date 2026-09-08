@@ -83,7 +83,15 @@ pub fn succ() -> Term {
 /// assert_eq!(beta(app(pred(), 3.into_church()), NOR, 0), 2.into_church());
 /// ```
 pub fn pred() -> Term {
-    abs!(3, app!(Var(3), abs!(2, app(Var(1), app(Var(2), Var(4)))), abs(Var(2)), abs(Var(1))))
+    abs!(
+        3,
+        app!(
+            Var(3),
+            abs!(2, app(Var(1), app(Var(2), Var(4)))),
+            abs(Var(2)),
+            abs(Var(1))
+        )
+    )
 }
 
 /// Applied to two Church-encoded numbers it produces their sum.
@@ -206,7 +214,14 @@ pub fn leq() -> Term {
 /// assert_eq!(beta(app!(eq(), 1.into_church(), 0.into_church()), NOR, 0), false.into());
 /// ```
 pub fn eq() -> Term {
-    abs!(2, app!(and(), app!(leq(), Var(2), Var(1)), app!(leq(), Var(1), Var(2))))
+    abs!(
+        2,
+        app!(
+            and(),
+            app!(leq(), Var(2), Var(1)),
+            app!(leq(), Var(1), Var(2))
+        )
+    )
 }
 
 /// Applied to two Church-encoded numbers it returns a lambda-encoded boolean indicating whether
@@ -306,7 +321,12 @@ pub fn div() -> Term {
                 Var(2),
                 Var(1),
                 abs(app!(pair(), Var(4), Var(3))),
-                abs(app!(Var(5), app(succ(), Var(4)), app!(sub(), Var(3), Var(2)), Var(2))),
+                abs(app!(
+                    Var(5),
+                    app(succ(), Var(4)),
+                    app!(sub(), Var(3), Var(2)),
+                    Var(2)
+                )),
                 I()
             )
         ),
@@ -340,7 +360,10 @@ pub fn quot() -> Term {
                 Var(2),
                 Var(1),
                 abs(zero()),
-                abs(app(succ(), app!(Var(4), app!(sub(), Var(3), Var(2)), Var(2)))),
+                abs(app(
+                    succ(),
+                    app!(Var(4), app!(sub(), Var(3), Var(2)), Var(2))
+                )),
                 I()
             )
         ),
@@ -398,7 +421,10 @@ pub fn rem() -> Term {
 pub fn fac() -> Term {
     abs(app!(
         Var(1),
-        abs!(3, app!(Var(3), app!(mul(), Var(2), Var(1)), app!(succ(), Var(1)))),
+        abs!(
+            3,
+            app!(Var(3), app!(mul(), Var(2), Var(1)), app!(succ(), Var(1)))
+        ),
         K(),
         one(),
         one()
@@ -450,7 +476,10 @@ pub fn max() -> Term {
 /// assert_eq!(beta(app!(shl(), 2.into_church(), 0.into_church()), NOR, 0), 2.into_church());
 /// ```
 pub fn shl() -> Term {
-    abs!(2, app!(mul(), Var(2), app!(pow(), app(succ(), one()), Var(1))))
+    abs!(
+        2,
+        app!(mul(), Var(2), app!(pow(), app(succ(), one()), Var(1)))
+    )
 }
 
 /// Applied to two Church-encoded numbers `a` and `b` it returns the right [logical

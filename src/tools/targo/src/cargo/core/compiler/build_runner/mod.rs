@@ -80,6 +80,12 @@ pub struct BuildRunner<'a, 'gctx> {
     /// metadata files in addition to the rlib itself.
     rmeta_required: HashSet<Unit>,
 
+    /// Trust: units reachable from `bcx.roots` without crossing a build-script
+    /// target — i.e. everything actually linked into a verified artifact. This
+    /// is the graph fact behind `trust_unit_build_support_only`; it is queried
+    /// several times per unit, so the walk is computed once and cached here.
+    pub(super) trust_artifact_reachable_units: std::cell::OnceCell<HashSet<Unit>>,
+
     /// Map of the LTO-status of each unit. This indicates what sort of
     /// compilation is happening (only object, only bitcode, both, etc), and is
     /// precalculated early on.
@@ -138,6 +144,7 @@ impl<'a, 'gctx> BuildRunner<'a, 'gctx> {
             primary_packages: HashSet::new(),
             files: None,
             rmeta_required: HashSet::new(),
+            trust_artifact_reachable_units: std::cell::OnceCell::new(),
             lto: HashMap::new(),
             metadata_for_doc_units: HashMap::new(),
             failed_scrape_units: Arc::new(Mutex::new(HashSet::new())),

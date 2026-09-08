@@ -32,6 +32,8 @@ use crate::sys::sync as sys;
 /// [`OnceLock<T>`]: crate::sync::OnceLock
 /// [`LazyLock<T, F>`]: crate::sync::LazyLock
 #[stable(feature = "rust1", since = "1.0.0")]
+// Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+#[cfg_attr(not(test), rustc_diagnostic_item = "Once")]
 pub struct Once {
     inner: sys::Once,
 }
@@ -153,6 +155,8 @@ impl Once {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[track_caller]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "once_call_once")]
     pub fn call_once<F>(&self, f: F)
     where
         F: FnOnce(),
@@ -213,6 +217,8 @@ impl Once {
     #[inline]
     #[stable(feature = "once_poison", since = "1.51.0")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "once_call_once_force")]
     pub fn call_once_force<F>(&self, f: F)
     where
         F: FnOnce(&OnceState),
@@ -298,6 +304,8 @@ impl Once {
     /// if this behavior is not desired.
     #[stable(feature = "once_wait", since = "1.86.0")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "once_wait")]
     pub fn wait(&self) {
         if !self.inner.is_completed() {
             self.inner.wait(false);
@@ -311,6 +319,8 @@ impl Once {
     /// becomes completed, unlike [`Once::wait()`], which panics in this case.
     #[stable(feature = "once_wait", since = "1.86.0")]
     #[rustc_should_not_be_called_on_const_items]
+    // Trust: once-initializer re-entrancy check (`trust_once_reentrancy`).
+    #[cfg_attr(not(test), rustc_diagnostic_item = "once_wait_force")]
     pub fn wait_force(&self) {
         if !self.inner.is_completed() {
             self.inner.wait(true);

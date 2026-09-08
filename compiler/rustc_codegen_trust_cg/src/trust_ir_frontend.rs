@@ -1,4 +1,5 @@
-//! trust_ir_frontend: the F1 CONSUMER of `trust_ir_of` (`-Ztrust-cg-frontend=trust-ir`).
+//! trust_ir_frontend: the F1 consumer of finalized direct Trust-IR
+//! (`-Ztrust-cg-frontend=trust-ir`).
 //!
 //! # What this is, and what it is not
 //!
@@ -10,13 +11,17 @@
 //! (F1) had never been executed end to end, only measured offline on dumped
 //! modules.
 //!
-//! This module is that consumer. For each reachable monomorphic function it:
+//! `trust_ir_of` still creates the per-body inputs during analysis. Crate
+//! finalization validates, collision-renames and call-links those bodies, then
+//! stores the resulting Module together with an exact definition-to-FuncId
+//! handoff. This module is the codegen consumer. For each reachable monomorphic
+//! function it:
 //!
-//! 1. resolves the item's `LocalDefId` and forces `tcx.trust_ir_of(def)`,
-//! 2. renames the body function (`FuncId(0)`) to the item's MANGLED SYMBOL
-//!    NAME — the producer labels it with `def_path_str`, which is a human label
-//!    and not a link-time identity, and
-//! 3. routes the module through `trust_cg_bridge::lower_module_to_lir`, whose
+//! 1. resolves the item's non-generic local `LocalDefId`,
+//! 2. selects its assembled FuncId through the conjunctive
+//!    `(DefIndex, DefPathHash)` handoff — never through `def_path_str`,
+//! 3. renames that selected function to the item's MANGLED SYMBOL NAME, and
+//! 4. routes the module through `trust_cg_bridge::lower_module_to_lir`, whose
 //!    LIR feeds the SAME object emitter the MIR path uses.
 //!
 //! It is NOT a second inventory. The mono-item collection, the linkage /
@@ -29,24 +34,21 @@
 //! Every step above is a REFUSAL, never a fallback:
 //!
 //! * an instance whose definition is not a local, non-generic body — refused;
-//! * `trust_ir_of` returning `None` (the producer declined the body, or
-//!   `-Ztrust-ir-lower` is not on) — refused;
-//! * a module whose body function is missing or whose id layout is not the
-//!   producer's `FuncId(0)` convention — refused;
+//! * an absent assembled handoff or absent exact definition entry — refused;
+//! * a handoff whose selected function or function type is absent — refused;
 //! * `lower_module_to_lir` returning any `ModuleLirError` — refused.
 //!
 //! A refusal is `Err` here and `sess.dcx().fatal` at the call site. There is
-//! deliberately no "fall back to MIR for this one item" arm: an earlier probe in
-//! this program (`trust_ir_codegen::probe_module_to_lir`) was log-only and never
-//! altered emission, which is exactly why F1 was never actually measured. A flag
-//! that silently degrades to the shipped path is not evidence of anything.
+//! deliberately no fallback to MIR or to the per-body artifact. The latter has
+//! local callees only as bodyless declarations, and retrying it used to hide an
+//! assembled-selection miss until conversion happened to fail later.
 //!
 //! # How this path IS verified
 //!
 //! The M-POS proven-output gate now has a trust-ir entry point:
 //! `trust_cg_bridge::verify_output_trust_ir`. Its spec side is derived from the
-//! PRODUCER's `trust_ir::Function` — the artifact `trust_ir_of` returned, BEFORE
-//! any lowering — while its machine side is the unchanged
+//! selected function in the producer's finalized assembled Module, BEFORE any
+//! LIR lowering, while its machine side is the unchanged
 //! `PathMergingExecutor` over the EMITTED BYTES. So this module carries the
 //! producer Module alongside the LIR ([`TrustIrLoweredFunction::gate_source`])
 //! and hands it to the gate at emission time.
@@ -63,15 +65,6 @@
 use rustc_middle::ty::{self, TyCtxt};
 use trust_cg_bridge::codegen_backend as bridge_backend;
 use trust_ir::value::FuncId;
-
-/// The producer's body-function id convention.
-///
-/// `trust_thir_lower::finish_body` mints the body as `Function::new(FuncId(0),
-/// ..)` and any producer-synthesized fn-pointer adapters are appended AFTER it
-/// (that ordering is load-bearing for `crate_module::record`, which takes
-/// `functions.remove(0)` as the body). We depend on the same convention, and we
-/// CHECK it rather than assume it: see `body_function_id`.
-const BODY_FUNC_ID: FuncId = FuncId::new(0);
 
 /// Why the trust-ir frontend refused a reachable mono-item.
 ///
@@ -90,12 +83,12 @@ pub(crate) enum FrontendRefusal {
     /// same check the production path runs; it is a property of the instance,
     /// not of the IR, so both frontends must apply it.
     UnsupportedAbi { symbol: String, detail: String },
-    /// `trust_ir_of` returned `None`: the producer declined this body (or the
-    /// direct frontend is not enabled).
-    ProducerDeclined { symbol: String, def_path: String },
-    /// The Module does not carry a body function under the producer's id
-    /// convention.
-    NoBodyFunction { symbol: String, functions: usize },
+    /// Finalization did not install the assembled crate-module handoff.
+    AssembledHandoffUnavailable { symbol: String },
+    /// The handoff exists but carries no entry for the exact local definition.
+    ExactAssembledBodyAbsent { symbol: String, def_index: u32, definition: String },
+    /// The checked handoff selected a FuncId the Module no longer carries.
+    SelectedFunctionMissing { symbol: String, func_id: u32, functions: usize },
     /// The body function references a `FuncTy` the Module does not carry, so
     /// its parameter count — which the ABI cross-check needs — is unknowable.
     MissingFuncType { symbol: String, ty: u32 },
@@ -120,15 +113,21 @@ impl std::fmt::Display for FrontendRefusal {
             Self::UnsupportedAbi { symbol, detail } => {
                 write!(f, "`{symbol}`: unsupported definition ABI: {detail}")
             }
-            Self::ProducerDeclined { symbol, def_path } => write!(
+            Self::AssembledHandoffUnavailable { symbol } => write!(
                 f,
-                "`{symbol}` (`{def_path}`): the direct THIR -> trust-ir producer declined this \
-                 body, so no source-derived Module exists for it (`trust_ir_of` returned None)"
+                "`{symbol}`: finalization installed no validated assembled Trust-IR module; \
+                 refusing to retry a per-body artifact"
             ),
-            Self::NoBodyFunction { symbol, functions } => write!(
+            Self::ExactAssembledBodyAbsent { symbol, def_index, definition } => write!(
                 f,
-                "`{symbol}`: the produced Module carries {functions} function(s) but none under \
-                 the producer's body id `FuncId(0)`"
+                "`{symbol}`: the assembled Trust-IR handoff has no body for exact identity \
+                 (DefIndex({def_index}), {definition}); refusing display-name selection and \
+                 per-body fallback"
+            ),
+            Self::SelectedFunctionMissing { symbol, func_id, functions } => write!(
+                f,
+                "`{symbol}`: the assembled Trust-IR handoff selected missing FuncId({func_id}); \
+                 the Module carries {functions} function(s)"
             ),
             Self::MissingFuncType { symbol, ty } => write!(
                 f,
@@ -167,6 +166,20 @@ fn local_body_def<'tcx>(
             detail: format!("body lives in an upstream crate (`{}`)", tcx.def_path_str(def_id)),
         });
     };
+    // A CONSTRUCTOR used as a function value (`map(Value::Number)`) is a
+    // compiler-synthesized shim: the variant/struct declaration owns no THIR
+    // body, so forcing `trust_ir_of` on it ICEs inside `thir_body`
+    // (`has no associated body`). Refuse it by name instead — it is the same
+    // no-source-body class as the InstanceKind shims above.
+    if matches!(tcx.def_kind(def_id), rustc_hir::def::DefKind::Ctor(..)) {
+        return Err(FrontendRefusal::NotALocalItem {
+            symbol: symbol.to_string(),
+            detail: format!(
+                "constructor shim `{}` has no source body (compiler-synthesized)",
+                tcx.def_path_str(def_id)
+            ),
+        });
+    }
     // A LIFETIME-ONLY instantiation is not a monomorphization.
     //
     // The refusal below exists because `trust_ir_of` lowers a body BEFORE
@@ -193,19 +206,7 @@ fn local_body_def<'tcx>(
     Ok(local)
 }
 
-/// The body function of a producer Module, checked against the producer's id
-/// convention rather than assumed from position.
-fn body_function_id(module: &trust_ir::Module, symbol: &str) -> Result<FuncId, FrontendRefusal> {
-    if module.function_by_id(BODY_FUNC_ID).is_some() {
-        return Ok(BODY_FUNC_ID);
-    }
-    Err(FrontendRefusal::NoBodyFunction {
-        symbol: symbol.to_string(),
-        functions: module.functions.len(),
-    })
-}
-
-/// Lower ONE reachable mono-item through source -> `trust_ir_of` -> LIR.
+/// Lower ONE reachable mono-item through source -> assembled Trust-IR -> LIR.
 ///
 /// `validate_abi` is the production path's instance-ABI check
 /// (`validate_codegen_instance_abi`), threaded in so the two frontends admit
@@ -224,32 +225,88 @@ pub(crate) fn lower_instance<'tcx, V>(
     validate_abi: V,
 ) -> Result<TrustIrLoweredFunction, FrontendRefusal>
 where
-    V: FnOnce(TyCtxt<'tcx>, ty::Instance<'tcx>, usize) -> Result<(), String>,
+    V: Fn(TyCtxt<'tcx>, ty::Instance<'tcx>, usize) -> Result<(), String>,
 {
     let symbol = tcx.symbol_name(instance).name.to_string();
+    // UPSTREAM-INSTANCE lane (-Ztrust-ir-upstream-mir): a body that lives in an
+    // upstream crate can never have a source-first `trust_ir_of` artifact (the
+    // producer is THIR-based and THIR is local-only). Under the explicit flag,
+    // bridge its monomorphized MIR into trust-ir and feed the SAME converter
+    // and proven-output gate; without the flag the refusal below stands. Local
+    // items are NEVER routed here — a local body still comes only from
+    // `trust_ir_of`, so this is not a fallback, it is the only IR there is.
+    if tcx.sess.trust_ir_upstream_mir()
+        && let ty::InstanceKind::Item(item_def_id) = instance.def
+        && !item_def_id.is_local()
+    {
+        return lower_upstream_instance(tcx, instance, &symbol, &validate_abi);
+    }
     let def = local_body_def(tcx, instance, &symbol)?;
 
-    // THE CONSUMPTION. This is the call that did not exist anywhere in codegen
-    // before: the backend asking the source-first producer for its artifact.
-    let Some(produced) = tcx.trust_ir_of(def) else {
-        return Err(FrontendRefusal::ProducerDeclined {
-            symbol,
-            def_path: tcx.def_path_str(def.to_def_id()),
-        });
+    // The assembled module is the only artifact whose local call edges name
+    // real bodies. Selection is by the producer's exact identity handoff, not
+    // by `Function.name`: collision-renamed macro definitions intentionally no
+    // longer equal `tcx.def_path_str(def)`. Any missing handoff/identity or any
+    // lowering failure is final. Retrying the single-body artifact would both
+    // reintroduce display-name ambiguity and turn its local callees back into
+    // bodyless declarations.
+    let selected = match assembled_crate_body(tcx, def) {
+        Ok(selected) => selected,
+        Err(trust_thir_lower::AssembledBodyLookupError::HandoffUnavailable) => {
+            return Err(FrontendRefusal::AssembledHandoffUnavailable { symbol });
+        }
+        Err(trust_thir_lower::AssembledBodyLookupError::ExactBodyAbsent {
+            def_index,
+            definition,
+        }) => {
+            return Err(FrontendRefusal::ExactAssembledBodyAbsent {
+                symbol,
+                def_index,
+                definition,
+            });
+        }
     };
+    lower_from_module(tcx, instance, &symbol, &selected.module, selected.func_id, &validate_abi)
+}
 
-    let func_id = body_function_id(produced, &symbol)?;
+/// Select the exact finalize-assembled body stored for this frontend.
+fn assembled_crate_body(
+    tcx: TyCtxt<'_>,
+    def: rustc_span::def_id::LocalDefId,
+) -> Result<
+    trust_thir_lower::ExactAssembledBodyForCodegen,
+    trust_thir_lower::AssembledBodyLookupError,
+> {
+    tcx.sess.with_trust_compiler_state::<trust_thir_lower::AssembledCrateModuleForCodegen, _>(
+        |slot| slot.exact_body(tcx, def),
+    )
+}
+
+/// The assembled lowering tail: ABI cross-check, symbol stamping on a private
+/// clone, `lower_module_to_lir`, and the gate source.
+fn lower_from_module<'tcx, V>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    symbol: &str,
+    produced: &trust_ir::Module,
+    func_id: FuncId,
+    validate_abi: &V,
+) -> Result<TrustIrLoweredFunction, FrontendRefusal>
+where
+    V: Fn(TyCtxt<'tcx>, ty::Instance<'tcx>, usize) -> Result<(), String>,
+{
     let ir_param_count = {
-        // `body_function_id` just proved this resolves.
-        let function = produced.function_by_id(func_id).ok_or(FrontendRefusal::NoBodyFunction {
-            symbol: symbol.clone(),
-            functions: produced.functions.len(),
-        })?;
+        let function =
+            produced.function_by_id(func_id).ok_or(FrontendRefusal::SelectedFunctionMissing {
+                symbol: symbol.to_string(),
+                func_id: func_id.index(),
+                functions: produced.functions.len(),
+            })?;
         produced
             .func_types
             .get(function.ty.as_usize())
             .ok_or(FrontendRefusal::MissingFuncType {
-                symbol: symbol.clone(),
+                symbol: symbol.to_string(),
                 ty: function.ty.index(),
             })?
             .params
@@ -257,27 +314,27 @@ where
     };
 
     validate_abi(tcx, instance, ir_param_count)
-        .map_err(|detail| FrontendRefusal::UnsupportedAbi { symbol: symbol.clone(), detail })?;
+        .map_err(|detail| FrontendRefusal::UnsupportedAbi { symbol: symbol.to_string(), detail })?;
 
-    // The producer names the body `def_path_str` — deliberately, since that is
-    // "only a label on this single-function module". The object's symbol table
-    // is not a label, so the LINK-TIME identity is stamped here, on a private
-    // clone, exactly where the MIR path stamps it (`func.name = symbol_name`).
-    // The arena-allocated query result is never mutated.
+    // The assembled function still carries a producer operational name: the
+    // display path when unique, or a stable collision name when it is not. The
+    // object's symbol table needs rustc's actual link-time identity, so stamp
+    // the selected FuncId on a private clone exactly where the MIR path stamps
+    // it (`func.name = symbol_name`). The shared crate module is never mutated.
     let mut module = produced.clone();
     if let Some(function) = module.function_by_id_mut(func_id) {
-        function.name = symbol.clone();
+        function.name = symbol.to_string();
     }
 
     let lir = trust_cg_bridge::lower_module_to_lir(&module, func_id).map_err(|e| {
-        FrontendRefusal::ConverterRefused { symbol: symbol.clone(), detail: e.to_string() }
+        FrontendRefusal::ConverterRefused { symbol: symbol.to_string(), detail: e.to_string() }
     })?;
 
     let instructions: usize = lir.blocks.values().map(|block| block.instructions.len()).sum();
     tracing::debug!(
         symbol = %symbol,
         lir_instructions = instructions,
-        "[trust_cg] trust-ir frontend lowered a function source -> trust_ir_of -> LIR"
+        "[trust_cg] trust-ir frontend lowered a function assembled Trust-IR -> LIR"
     );
 
     // The gate's SPEC INPUT: the renamed producer Module, carried whole. This is
@@ -285,15 +342,52 @@ where
     // and the shipped bytes provably describe one function — the gate re-lowers
     // from it and refuses if the resulting symbol is not `symbol`.
     let gate_source = trust_cg_bridge::verify_output_trust_ir::TrustIrGateSource {
-        symbol: symbol.clone(),
+        symbol: symbol.to_string(),
         module,
         func_id,
     };
 
-    Ok(TrustIrLoweredFunction { symbol, lir, gate_source })
+    Ok(TrustIrLoweredFunction { symbol: symbol.to_string(), lir, gate_source })
 }
 
-/// One function that completed source -> `trust_ir_of` -> `lower_module_to_lir`.
+/// The UPSTREAM-INSTANCE lane: bridge a monomorphized upstream body's MIR into
+/// trust-ir and hand it to the shared converter/gate tail.
+///
+/// PROVENANCE IS THE ONLY DIFFERENCE from the local path: the Module here is
+/// derived from rustc MIR (`extract_mono_verifiable_function` — the exact
+/// extraction the shipped MIR path performs — then
+/// `trust_ir_bridge::lower_to_trust_ir`, the same spine the THIR/MIR
+/// differential's oracle side uses), not from the source-first producer. The
+/// converter and the proven-output gate downstream are byte-for-byte the same
+/// code; a shape either refuses honestly or is verified against this Module.
+fn lower_upstream_instance<'tcx, V>(
+    tcx: TyCtxt<'tcx>,
+    instance: ty::Instance<'tcx>,
+    symbol: &str,
+    validate_abi: &V,
+) -> Result<TrustIrLoweredFunction, FrontendRefusal>
+where
+    V: Fn(TyCtxt<'tcx>, ty::Instance<'tcx>, usize) -> Result<(), String>,
+{
+    let vf = crate::extract_mono_verifiable_function_with_abi(tcx, instance, true, validate_abi)
+        .map_err(|detail| FrontendRefusal::NotALocalItem {
+            symbol: symbol.to_string(),
+            detail: format!("upstream MIR extraction refused: {detail}"),
+        })?;
+    let module = trust_ir_bridge::lower_mir_compat_to_trust_ir(&vf).map_err(|e| {
+        FrontendRefusal::NotALocalItem {
+            symbol: symbol.to_string(),
+            detail: format!("upstream MIR -> trust-ir bridge refused: {e}"),
+        }
+    })?;
+    // `lower_to_trust_ir` builds a SINGLE-function Module registered at
+    // FuncId 0; `lower_from_module` re-checks existence and stamps the mangled
+    // symbol on a private clone exactly as the local path does.
+    let func_id = FuncId::new(0);
+    lower_from_module(tcx, instance, symbol, &module, func_id, validate_abi)
+}
+
+/// One function that completed assembled Trust-IR -> `lower_module_to_lir`.
 pub(crate) struct TrustIrLoweredFunction {
     /// The mangled symbol this function is emitted under.
     pub(crate) symbol: String,
@@ -322,11 +416,12 @@ pub(crate) struct TrustIrLoweredFunction {
 /// * each LIR function must carry the MANGLED SYMBOL the item is emitted under.
 ///   The converter takes the name from the trust-ir function, and the rename
 ///   that puts the mangled name there is the only thing standing between this
-///   object and a symbol table full of `def_path_str` labels.
+///   object and a symbol table full of producer operational labels.
 pub(crate) fn compiled_module(
     crate_name: &str,
     lowered: Vec<TrustIrLoweredFunction>,
     linkage: Vec<bridge_backend::FunctionLinkage>,
+    statics: Vec<bridge_backend::ObjectGlobal>,
 ) -> Result<
     (
         bridge_backend::CompiledModule,
@@ -371,6 +466,7 @@ pub(crate) fn compiled_module(
             function_count,
             source_functions: None,
             linkage,
+            statics,
         },
         gate_sources,
     ))

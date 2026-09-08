@@ -83,7 +83,7 @@ fn block(id: usize, stmts: Vec<Statement>, terminator: Terminator) -> BasicBlock
 /// certification; a test of the disjoint-field lane must therefore build the
 /// REAL shape, or it silently exercises the fail-closed path instead.
 fn struct_ty(name: &str, fields: Vec<(String, Ty)>) -> Ty {
-    Ty::Adt {
+    Ty::Adt { arbitrary_precision: None,
         name: name.to_string(),
         fields,
         variants: Vec::new(),

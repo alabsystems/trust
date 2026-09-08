@@ -1993,6 +1993,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-budget"
+version = "0.1.0"
+
+[[package]]
 name = "trust-buildcache"
 version = "0.1.0"
 dependencies = [
@@ -2060,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-codegen"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rayon",
  "serde",
@@ -2080,21 +2084,21 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-dialect"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "trust-cg-ir",
 ]
 
 [[package]]
 name = "trust-cg-drat-trim"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cc",
 ]
 
 [[package]]
 name = "trust-cg-ir"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2102,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-lower"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "thiserror",
@@ -2113,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-opt"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2125,11 +2129,14 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-process-env"
-version = "0.5.0"
+version = "0.6.0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "trust-cg-regalloc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "thiserror",
  "trust-cg-ir",
@@ -2137,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "trust-cg-verify"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rayon",
  "serde",
@@ -2228,6 +2235,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-floatbits"
+version = "0.1.0"
+
+[[package]]
 name = "trust-hmac"
 version = "0.1.0"
 dependencies = [
@@ -2235,8 +2246,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "trust-intbound"
+version = "0.1.0"
+
+[[package]]
 name = "trust-ir"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "bincode 1.3.3",
  "clean-kernel",
@@ -2248,8 +2263,10 @@ dependencies = [
 name = "trust-ir-bridge"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "thiserror",
+ "trust-intbound",
  "trust-ir",
  "trust-types",
  "trust-verifier-api",
@@ -2257,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-build"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "clean-kernel",
  "rayon",
@@ -2267,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-contract"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "rustc-hash",
  "serde",
@@ -2275,7 +2292,7 @@ dependencies = [
 
 [[package]]
 name = "trust-ir-giveback"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "trust-ir",
 ]
@@ -2402,6 +2419,7 @@ dependencies = [
  "tla-mc-core",
  "tracing",
  "trust-bmc",
+ "trust-budget",
  "trust-cache",
  "trust-certify",
  "trust-ir",
@@ -2572,8 +2590,10 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "trust-floatbits",
  "trust-lift",
  "trust-types",
+ "trust-widthconv",
 ]
 
 [[package]]
@@ -2608,6 +2628,10 @@ dependencies = [
  "trust-ir-bridge",
  "trust-types",
 ]
+
+[[package]]
+name = "trust-widthconv"
+version = "0.1.0"
 
 [[package]]
 name = "trust-wp"

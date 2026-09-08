@@ -60,7 +60,7 @@ use std::collections::HashMap;
 use trust_cg_lower::function::{
     BasicBlock as LirBlock, Function as LirFunction, Signature, StackSlotInfo,
 };
-use trust_cg_lower::instructions::{Block, Instruction, IntCC, Opcode, Value};
+use trust_cg_lower::instructions::{Block, DirectCallBinding, Instruction, IntCC, Opcode, Value};
 use trust_cg_lower::types::Type as LirType;
 use trust_ir::inst::{BinOp, CastOp, ICmpOp, Inst, OverflowOp, UnOp};
 use trust_ir::node::InstrNode;
@@ -123,11 +123,19 @@ pub enum ModuleLirError {
     #[error("unsupported type in `{context}`: {ty:?}")]
     UnsupportedType { context: String, ty: Ty },
 
-    /// An `Inst` variant outside the scalar core (memory, call, aggregate,
-    /// cast, float, control-flow, ...). The discriminant name is reported so the
-    /// caller can see exactly which shape forced the fail-closed exit.
-    #[error("unsupported instruction `{inst}` in `{name}` (only Const/BinOp/ICmp/Return mapped)")]
+    /// An `Inst` variant outside the converter's mapped fragment. The
+    /// discriminant name is reported so the caller can see exactly which shape
+    /// forced the fail-closed exit. (A residual `Call` here means the inliner
+    /// declined every splice for it: non-local / body-less / recursive /
+    /// non-flattenable callee — see `inline_local_pure_leaf_calls`.)
+    #[error(
+        "unsupported instruction `{inst}` in `{name}` (outside the converter's mapped fragment)"
+    )]
     UnsupportedInst { name: String, inst: &'static str },
+
+    /// A `GlobalAddr` named a module-global table entry that does not exist.
+    #[error("function `{name}` references missing global id {global}")]
+    MissingGlobal { name: String, global: u32 },
 
     /// A `BinOp`/`ICmp` sub-op outside the integer scalar core: an i128 shift
     /// (multi-register, outside the proven single-instruction shift envelope), an
@@ -181,10 +189,10 @@ pub enum ModuleLirError {
     UnsupportedSignature { name: String, detail: String },
 
     /// A memory instruction (`Load`/`Store`/`GEP`) referenced a pointer/base
-    /// value that was not produced by an `Alloca` (or an `Alloca`-rooted `GEP`)
-    /// in this function body. The scalar-memory slice only models stack slots it
-    /// allocated itself; it cannot reason about an opaque incoming pointer.
-    #[error("function `{name}` memory op uses pointer value {value} not rooted at a local Alloca")]
+    /// value outside the explicitly admitted provenance sets: a local Alloca,
+    /// a shared slice input (Load/GEP only), or an immutable assembled scalar
+    /// global (direct Load only).
+    #[error("function `{name}` memory op uses pointer value {value} with unsupported provenance")]
     NonLocalPointer { name: String, value: u32 },
 
     /// A memory shape outside the scalar-slot AND aggregate-slot slices: a
@@ -749,20 +757,27 @@ fn map_int_cast(
 
     match op {
         CastOp::Trunc | CastOp::SExt | CastOp::ZExt | CastOp::Bitcast => {
-            // Both operands must be scalar integers in the i8..i64 envelope. i128
-            // (register-pair) and non-integer (Bool routes through Select at the
-            // producer, never a Cast; pointers are handled by the fail-closed
-            // pointer arms) fail closed.
+            // Both operands must be scalar integers. The i8..i64 envelope maps
+            // 1:1; the I128 register-pair forms are ALSO in the ISel's
+            // envelope (measured, not hoped: `select_extend` defines BOTH
+            // halves of the pair for an extension to I128 — Uxt*/Sxt* low
+            // plus zero/ASR-#63 high — and `Trunc(I128 -> I64)` reads the low
+            // half; `select_i128_{add,sub,mul,sdiv}` and the I128 `Icmp`
+            // lane consume the pairs). What stays refused: Bitcast involving
+            // I128 (no measured lane), and non-integers (Bool routes through
+            // Select at the producer, never a Cast; pointers are handled by
+            // the fail-closed pointer arms). The trust-ir gate rejects
+            // 128-bit arithmetic in its own fragment, so functions taking
+            // this lane emit UNCERTIFIED under allow-unknown — completeness
+            // now, proofs with the pair-aware gate later.
             let from = map_scalar_int_ty(src_ty, "cast source")
                 .map_err(|_| fail(format!("source type {src_ty:?} is not a scalar integer")))?;
             let to = map_scalar_int_ty(dst_ty, "cast dest")
                 .map_err(|_| fail(format!("dest type {dst_ty:?} is not a scalar integer")))?;
-            if matches!(from, LirType::I128) || matches!(to, LirType::I128) {
-                return Err(fail(
-                    "128-bit int-to-int cast is register-pair, outside the proven \
-                     single-instruction envelope"
-                        .to_string(),
-                ));
+            if (matches!(from, LirType::I128) || matches!(to, LirType::I128))
+                && matches!(op, CastOp::Bitcast)
+            {
+                return Err(fail("128-bit Bitcast has no measured lane (fail-closed)".to_string()));
             }
             let from_bytes = from.bytes();
             let to_bytes = to.bytes();
@@ -836,26 +851,48 @@ fn map_int_cast(
 /// (issue #474) whose ISel lowers Add/Sub via flag-setting ADDS/SUBS+CSET at
 /// I32/I64, and Mul via the SMULH/UMULH high-half idiom at I64 only.
 ///
+/// Add/Sub at I128 map first-class too: the ISel lowers them over the
+/// register pair via the flag-setting carry chain (ADDS lo; ADCS hi; CSET /
+/// SUBS lo; SBCS hi; CSET — overflow read from the FINAL NZCV).
+///
 /// FAIL-CLOSED on the shapes the verified ISel slice does not lower:
-///   * 128-bit operands (no native flag/high-half idiom),
+///   * 128-bit `Mul` (SMULH/UMULH give one high half; no checked idiom),
 ///   * `Mul` narrower than 64-bit (`CheckedSmul`/`CheckedUmul` are I64-only),
 ///   * any non-fixed-width-integer operand type.
 ///
-/// NOTE: i32/u32 checked `Mul` is NOT routed here — the caller intercepts it and
-/// lowers it via exact i64 widening (`{s,z}ext` + `Imul` + range-check Icmps),
-/// so this function only sees `Mul` at i8/i16/u8/u16 (fail closed), i64/u64
-/// (first-class `Checked{S,U}mul`), or i128 (fail closed).
+/// NOTE: checked `Mul` at i8/i16/i32 (and unsigned) is NOT routed here — the
+/// caller intercepts those widths and lowers them via exact i64 widening
+/// (`{s,z}ext` + `Imul` + range-check Icmps), so this function only sees `Mul`
+/// at i64/u64 (first-class `Checked{S,U}mul`) or i128 (fail closed).
 fn map_overflow_op(op: OverflowOp, ty: &Ty, name: &str) -> Result<Opcode, ModuleLirError> {
     let signed = ty.is_signed();
     // The compared operands must be a fixed-width integer the ISel handles.
     let lir_ty = map_scalar_int_ty(ty, "Overflow operand")?;
-    if matches!(lir_ty, LirType::I128) {
+    if matches!(lir_ty, LirType::I128) && matches!(op, OverflowOp::MulOverflow) {
+        // Checked add/sub at I128 lower to the flag-setting carry chain
+        // (ADDS lo; ADCS hi; CSET / SUBS lo; SBCS hi; CSET). Checked mul has
+        // no 128-bit ISel idiom.
         return Err(ModuleLirError::UnsupportedOverflow {
             name: name.to_string(),
             detail: format!("128-bit checked {op:?} has no verified flag/high-half ISel idiom"),
         });
     }
     let opcode = match (op, signed) {
+        // The flag-setting ADDS/SUBS+CSET ISel idiom exists at I32/I64 only
+        // (measured: emit_object refuses I16 with "checked add/sub requires
+        // I32 or I64 operands"). The caller intercepts I8/I16 and lowers them
+        // via exact i64 widening, so narrower widths here are a wiring bug.
+        (OverflowOp::AddOverflow | OverflowOp::SubOverflow, _)
+            if matches!(lir_ty, LirType::I8 | LirType::I16) =>
+        {
+            return Err(ModuleLirError::UnsupportedOverflow {
+                name: name.to_string(),
+                detail: format!(
+                    "checked {op:?} on {lir_ty:?} reached the first-class map (the i64-widening \
+                     interception should have taken it)"
+                ),
+            });
+        }
         (OverflowOp::AddOverflow, true) => Opcode::CheckedSadd,
         (OverflowOp::AddOverflow, false) => Opcode::CheckedUadd,
         (OverflowOp::SubOverflow, true) => Opcode::CheckedSsub,
@@ -988,6 +1025,17 @@ impl ValueMap {
         v
     }
 
+    /// Allocate the next dense LIR value WITHOUT binding a trust-ir `ValueId`
+    /// to it. Used for the split halves of a fat slice parameter, whose
+    /// positional formal slots must stay dense while the fat pointer's own
+    /// `ValueId` deliberately resolves to NOTHING (fail-closed on any use the
+    /// fat-param lanes do not handle).
+    fn define_anonymous(&mut self) -> Value {
+        let v = Value(self.next);
+        self.next += 1;
+        v
+    }
+
     /// The next dense LIR value index. Edge-split / cycle-break temporaries
     /// allocate from here so they never alias an SSA-bound value.
     fn next_value(&self) -> u32 {
@@ -1020,11 +1068,98 @@ struct MemoryCtx {
     /// The scalar pointee LIR type each alloca-rooted pointer addresses, used
     /// to validate that a `Load`/`Store` width matches the slot's element type.
     pointee_ty: HashMap<Value, LirType>,
+    /// FAT SLICE PARAMETERS (`&[T]` formals). Keyed by the trust-ir entry
+    /// param's `ValueId` (which is deliberately NOT in the `ValueMap`, so any
+    /// use of the whole fat pointer other than `PtrData`/`PtrMetadata` fails
+    /// closed as an undefined value). The split (data, len) LIR values occupy
+    /// two consecutive formal-argument positions — bit-for-bit rustc's
+    /// `ScalarPair` passing of a slice reference (data in the first GPR slot,
+    /// length in the next).
+    fat_params: HashMap<ValueId, FatSliceParam>,
+    /// INCOMING READ-ONLY roots: pointer `Value`s derived from a fat slice
+    /// param's data pointer (the `PtrData` result and `GEP`s off it), with the
+    /// scalar element type they address. `Load` accepts them; `Store` does NOT
+    /// (a `&[T]` is shared — writes through it are not admitted), and neither
+    /// does anything requiring slot provenance.
+    incoming_pointee: HashMap<Value, LirType>,
+    /// BY-VALUE STRUCT params passed INDIRECTLY (rustc's hidden pointer for a
+    /// large-aggregate argument). Keyed by the trust-ir param `ValueId`; the
+    /// LIR value is the hidden pointer (one I64 formal), and the layout is the
+    /// RUSTC-RECORDED one ([`recorded_struct_mem_layout`]). `ExtractField` on
+    /// the param loads the field through the pointer at its recorded offset;
+    /// every other use of the whole-struct value fails closed. The F1 ABI
+    /// validator independently confirms the real `PassMode` is `Indirect`.
+    indirect_struct_params: HashMap<ValueId, IndirectStructParam>,
+    /// BY-VALUE 2-scalar-field struct params passed as a register PAIR.
+    /// `ExtractField` on the param is a Copy of the mapped formal; every
+    /// other use of the whole-struct value fails closed.
+    pair_struct_params: HashMap<ValueId, PairStructParam>,
+    /// BY-VALUE NEWTYPE struct params (one plain-scalar field, Direct as the
+    /// field scalar). The param's own value IS the field; `ExtractField 0`
+    /// is a Copy of it.
+    newtype_struct_params: HashMap<ValueId, LirType>,
+    /// ASSEMBLED READ-ONLY GLOBAL roots. Only an immutable, initialized,
+    /// non-TLS, module-local `u64` definition enters this map. `Load` consumes
+    /// it directly; Store, GEP, and copied/escaped aliases remain refused.
+    global_pointee: HashMap<Value, LirType>,
+}
+
+/// Provenance for a pointer produced directly by `GlobalAddr`.
+///
+/// Keeping data symbols in this map is essential: a direct address of known
+/// data is not an "open" function pointer. If it reaches `CallIndirect`, the
+/// call must fail closed instead of taking the conservative open-call lane.
+enum GlobalAddrProvenance {
+    FunctionSymbol(String),
+    DataSymbol,
+}
+
+/// One by-value 2-scalar-field struct formal passed as a register PAIR
+/// (rustc `PassMode::Pair` — `Range<usize>`-class shapes).
+struct PairStructParam {
+    /// The two LIR formals, indexed by the struct's DECLARATION field order
+    /// (the formals themselves are emitted in LAYOUT/offset order; this
+    /// mapping absorbs any repr(Rust) reorder).
+    by_decl_index: [Value; 2],
+    /// The two field LIR types, by declaration index.
+    tys: [LirType; 2],
+    /// Declaration indices in LAYOUT (offset) order — the order the two
+    /// formals were emitted in the signature.
+    layout_order: [usize; 2],
+}
+
+/// One by-value struct formal passed via rustc's hidden pointer.
+struct IndirectStructParam {
+    /// The LIR value carrying the hidden pointer.
+    ptr: Value,
+    /// The rustc-recorded layout of the pointee struct.
+    layout: AggMemLayout,
+    /// The struct's field types in declaration order (for nested
+    /// fieldless-enum registration at extract time).
+    field_tys: Vec<Ty>,
+}
+
+/// One split `&[T]` formal: the two LIR values carrying (data, len) and the
+/// scalar element type loads through the data pointer must match.
+struct FatSliceParam {
+    data: Value,
+    len: Value,
+    elem: LirType,
 }
 
 impl MemoryCtx {
     fn new() -> Self {
-        Self { stack_slots: Vec::new(), slot_of: HashMap::new(), pointee_ty: HashMap::new() }
+        Self {
+            stack_slots: Vec::new(),
+            slot_of: HashMap::new(),
+            pointee_ty: HashMap::new(),
+            fat_params: HashMap::new(),
+            incoming_pointee: HashMap::new(),
+            global_pointee: HashMap::new(),
+            indirect_struct_params: HashMap::new(),
+            pair_struct_params: HashMap::new(),
+            newtype_struct_params: HashMap::new(),
+        }
     }
 
     /// Allocate a fresh fixed-size stack slot for `lir_ty`, returning its index.
@@ -1251,6 +1386,195 @@ fn aggregate_mem_layout(
     Ok(AggMemLayout { size, align: max_align, field_offsets })
 }
 
+/// The TAG-CARRIER read view of an ENUM-typed struct field, or `None` when
+/// the enum's recorded layout cannot support one.
+///
+/// A FIELDLESS enum's value IS its tag ([`fieldless_enum_carrier`]). A
+/// PAYLOAD-carrying enum is admitted for READING ONLY through its tag: the
+/// producer-recorded [`trust_ir::EnumLayoutDescriptor`] must place a `Direct`
+/// tag at offset 0, and the canonical tag repr names the carrier scalar. The
+/// PAYLOAD region is never loaded — and every way the whole enum value could
+/// escape (return, call argument, store) already fails closed on the enum
+/// type in the scalar type maps, so a tag-only read cannot masquerade as the
+/// full value anywhere it would matter. Returns
+/// `(carrier_ty, full_size, full_align)`; `full_size` is the ENUM's recorded
+/// size (for bounds checks), not the carrier's.
+fn enum_tag_read_view(module: &Module, ty: &Ty) -> Option<(Ty, u64, u64)> {
+    if let Some(carrier) = fieldless_enum_carrier(module, ty) {
+        let Ty::Enum(id) = ty else { return None };
+        let layout = module.enums.get(id.as_usize())?.layout.as_ref()?;
+        return Some((carrier, layout.size, layout.align));
+    }
+    let Ty::Enum(id) = ty else { return None };
+    let def = module.enums.get(id.as_usize())?;
+    let layout = def.layout.as_ref()?;
+    if !matches!(layout.encoding, trust_ir::EnumTagEncoding::Direct { tag_offset: 0 }) {
+        return None;
+    }
+    let repr = def.canonical_tag_repr()?;
+    Some((repr.ty(), layout.size, layout.align))
+}
+
+/// The TWO-SLOT REGISTER VIEW of a small Direct-tagged enum — `Option<u64>`,
+/// `Option<&T>`-without-niche, small `Result` shapes: `(tag, payload)`.
+///
+/// Demands, all from the PRODUCER-RECORDED descriptor (nothing guessed):
+/// * a recorded [`trust_ir::EnumLayoutDescriptor`] with `Direct { tag_offset: 0 }`
+///   (a NICHE encoding has no separate tag lane — refused);
+/// * a canonical tag repr naming the tag scalar;
+/// * total size <= 16 bytes (the machine value is a register ScalarPair);
+/// * every variant carries AT MOST ONE field, and every fielded variant's
+///   field is the SAME plain scalar type (they share the payload lane).
+///
+/// The trust-ir field-index convention over such a value is the producer's:
+/// `extractfield 0` = the tag, `extractfield 1` = the payload.
+struct PairEnumView {
+    tag: LirType,
+    payload: LirType,
+}
+
+fn pair_enum_view(module: &Module, ty: &Ty) -> Option<PairEnumView> {
+    let Ty::Enum(id) = ty else { return None };
+    let def = module.enums.get(id.as_usize())?;
+    let layout = def.layout.as_ref()?;
+    if !matches!(layout.encoding, trust_ir::EnumTagEncoding::Direct { tag_offset: 0 }) {
+        return None;
+    }
+    if layout.size > 16 {
+        return None;
+    }
+    let repr = def.canonical_tag_repr()?;
+    let tag = map_scalar_int_ty(&repr.ty(), "pair-enum tag").ok()?;
+    let mut payload: Option<LirType> = None;
+    for variant in &def.variants {
+        match variant.fields.as_slice() {
+            [] => {}
+            [f] => {
+                let lir = map_scalar_int_ty(f, "pair-enum payload").ok()?;
+                match &payload {
+                    None => payload = Some(lir),
+                    Some(existing) if *existing == lir => {}
+                    Some(_) => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+    // A payload-less def is the fieldless-enum lane's business, not this one.
+    let payload = payload?;
+    Some(PairEnumView { tag, payload })
+}
+
+/// The RUSTC-RECORDED memory layout of a `Ty::Struct` — for reading memory a
+/// CALLER laid out (the incoming-pointer aggregate lane).
+///
+/// SOUNDNESS — this is deliberately NOT [`aggregate_mem_layout`]. The
+/// canonical sequential layout matches the trust-ir reference interpreter and
+/// is correct for slots this converter itself allocates and fills; memory
+/// reached through an INCOMING pointer was laid out by rustc, and repr(Rust)
+/// reorders fields, so canonical offsets can read the wrong bytes. This
+/// function therefore uses only what the PRODUCER recorded off rustc's layout
+/// — the struct's `size`/`align` and every field's `offset` — and FAILS
+/// CLOSED when any of them is absent (degraded defs, e.g. a `Vec` field
+/// spelled `()`), and on `Ty::Tuple` entirely (tuples carry no recorded
+/// offsets and also reorder).
+fn recorded_struct_mem_layout(
+    ty: &Ty,
+    module: &Module,
+    name: &str,
+) -> Result<AggMemLayout, ModuleLirError> {
+    let Ty::Struct(sid) = ty else {
+        return Err(ModuleLirError::UnsupportedAggregate {
+            name: name.to_string(),
+            detail: format!(
+                "incoming-pointer aggregate load needs a rustc-recorded layout; {ty:?} carries \
+                 none (repr(Rust) may reorder fields, so a canonical guess could read the wrong \
+                 bytes)"
+            ),
+        });
+    };
+    let def = module.structs.get(sid.as_usize()).ok_or_else(|| {
+        ModuleLirError::UnsupportedAggregate {
+            name: name.to_string(),
+            detail: format!("struct id {} not in module", sid.as_usize()),
+        }
+    })?;
+    let (Some(size), Some(align)) = (def.size, def.align) else {
+        return Err(ModuleLirError::UnsupportedAggregate {
+            name: name.to_string(),
+            detail: format!(
+                "struct `{}` has no recorded size/align; refusing to guess a caller layout",
+                def.name
+            ),
+        });
+    };
+    let size = u32::try_from(size).map_err(|_| ModuleLirError::UnsupportedAggregate {
+        name: name.to_string(),
+        detail: format!("struct `{}` size exceeds u32", def.name),
+    })?;
+    let align = u32::try_from(align).map_err(|_| ModuleLirError::UnsupportedAggregate {
+        name: name.to_string(),
+        detail: format!("struct `{}` align exceeds u32", def.name),
+    })?;
+    let mut field_offsets = Vec::with_capacity(def.fields.len());
+    for field in &def.fields {
+        let Some(offset) = field.offset else {
+            return Err(ModuleLirError::UnsupportedAggregate {
+                name: name.to_string(),
+                detail: format!(
+                    "struct `{}` field `{}` has no recorded offset; refusing to guess a caller \
+                     layout",
+                    def.name, field.name
+                ),
+            });
+        };
+        let offset = u32::try_from(offset).map_err(|_| ModuleLirError::UnsupportedAggregate {
+            name: name.to_string(),
+            detail: format!("struct `{}` field offset exceeds u32", def.name),
+        })?;
+        // An ENUM field reads through its TAG CARRIER (fieldless: the whole
+        // value; payload-carrying: the tag lane at offset 0 — the payload is
+        // never loaded, see enum_tag_read_view). The bounds check uses the
+        // enum's FULL recorded size. Every other non-scalar field keeps
+        // failing closed in scalar_field_size_align.
+        let (field_scalar_ty, bounds_size) = match enum_tag_read_view(module, &field.ty) {
+            Some((carrier, full_size, _)) => {
+                let full = u32::try_from(full_size).map_err(|_| {
+                    ModuleLirError::UnsupportedAggregate {
+                        name: name.to_string(),
+                        detail: format!(
+                            "struct `{}` enum field `{}` size exceeds u32",
+                            def.name, field.name
+                        ),
+                    }
+                })?;
+                (carrier, Some(full))
+            }
+            None => (field.ty.clone(), None),
+        };
+        let (f_size, _f_align, f_lir) = scalar_field_size_align(&field_scalar_ty, name)?;
+        let f_size = bounds_size.unwrap_or(f_size).max(f_size);
+        if offset.checked_add(f_size).is_none_or(|end| end > size) {
+            return Err(ModuleLirError::UnsupportedAggregate {
+                name: name.to_string(),
+                detail: format!(
+                    "struct `{}` field `{}` at recorded offset {offset} overruns the recorded \
+                     size {size}",
+                    def.name, field.name
+                ),
+            });
+        }
+        field_offsets.push((offset, f_lir));
+    }
+    if field_offsets.is_empty() {
+        return Err(ModuleLirError::UnsupportedAggregate {
+            name: name.to_string(),
+            detail: format!("zero-field struct `{}` has nothing to load", def.name),
+        });
+    }
+    Ok(AggMemLayout { size, align, field_offsets })
+}
+
 /// Convert the function with id `func_id` in `module` into a LIR `Function`.
 ///
 /// Fail-closed on every shape outside the scalar slice — see
@@ -1288,7 +1612,7 @@ pub fn lower_trust_ir_function_to_lir(
 /// Like [`lower_trust_ir_function_to_lir`], but a `Call` to a LOCAL pure callee
 /// in the gate's single-register AAPCS64 scalar fragment
 /// ([`callee_is_real_call_composable`]) is lowered to a REAL LIR
-/// `Opcode::Call { name }` (ISel: `Bl` + an `ARM64_RELOC_BRANCH26` naming the
+/// `Opcode::Call { name, .. }` (ISel: `Bl` + an `ARM64_RELOC_BRANCH26` naming the
 /// callee) INSTEAD of being inlined. Every OTHER call (impure / non-local /
 /// non-fragment / not-yet-composable) is still routed through the inliner and, if
 /// that too declines, fails closed — a real Call is NEVER emitted for a callee
@@ -1332,19 +1656,225 @@ fn lower_trust_ir_function_to_lir_impl(
             detail: "variadic functions are unsupported".to_string(),
         });
     }
-    if func_ty.returns.len() != 1 {
-        return Err(ModuleLirError::UnsupportedSignature {
-            name: name.clone(),
-            detail: format!("expected exactly 1 return value, got {}", func_ty.returns.len()),
-        });
-    }
-
+    // FAT SLICE PARAMETERS (`&[T]`): rustc passes a slice reference as a
+    // ScalarPair — data pointer in one GPR slot, length in the next — and the
+    // AArch64 classifier assigns two consecutive I64 params exactly those
+    // slots. So a `FatPtr(Slice(elem))` formal SPLITS into two I64 LIR params
+    // in place, provided the element is a scalar the memory slice can load;
+    // every other fat-pointer position (returns, block params, values) stays
+    // fail-closed. `Str` and trait objects stay refused here too — only the
+    // measured slice shape is admitted.
     let mut params = Vec::with_capacity(func_ty.params.len());
+    let mut fat_param_sig: Vec<Option<LirType>> = Vec::with_capacity(func_ty.params.len());
+    // Positional record of UNIT (`()`) formals. A unit value is a ZST with no
+    // machine content: rustc's ABI ignores it (PassMode::Ignore), so it
+    // occupies NO LIR parameter slot — the contraction twin of the fat-slice
+    // expansion above. The param's ValueId is deliberately left UNBOUND, so
+    // any body use of the unit value fails closed as an undefined value; the
+    // measured shape (a captureless closure's `()` environment formal) never
+    // reads it.
+    let mut unit_param_sig: Vec<bool> = Vec::with_capacity(func_ty.params.len());
+    // Positional record of BY-VALUE INDIRECT struct formals (the recorded
+    // layout of each; `None` for every other param kind).
+    let mut indirect_struct_sig: Vec<Option<AggMemLayout>> =
+        Vec::with_capacity(func_ty.params.len());
+    // Positional record of BY-VALUE PAIR struct formals (<=16 bytes, exactly
+    // two plain-scalar fields).
+    let mut pair_struct_sig: Vec<Option<AggMemLayout>> =
+        Vec::with_capacity(func_ty.params.len());
+    // Positional record of BY-VALUE NEWTYPE struct formals (one plain-scalar
+    // field riding Direct as the field scalar).
+    let mut newtype_struct_sig: Vec<Option<LirType>> =
+        Vec::with_capacity(func_ty.params.len());
+    // Positional record of PAIR-ENUM formals ((tag, payload) register pairs).
+    let mut pair_enum_sig: Vec<Option<PairEnumView>> =
+        Vec::with_capacity(func_ty.params.len());
     for p in &func_ty.params {
-        params.push(map_scalar_int_ty_in(module, p, "function parameter")?);
+        if matches!(p, Ty::Unit) {
+            fat_param_sig.push(None);
+            unit_param_sig.push(true);
+            indirect_struct_sig.push(None);
+            pair_struct_sig.push(None);
+            newtype_struct_sig.push(None);
+            pair_enum_sig.push(None);
+            continue;
+        }
+        unit_param_sig.push(false);
+        if let Ty::FatPtr(trust_ir::ty::FatPtrKind::Slice(elem_tid)) = p {
+            let elem_ty = module.types.get(elem_tid.as_usize()).ok_or_else(|| {
+                ModuleLirError::UnsupportedSignature {
+                    name: name.clone(),
+                    detail: format!(
+                        "slice parameter names element type id {} the module lacks",
+                        elem_tid.as_usize()
+                    ),
+                }
+            })?;
+            let elem = map_scalar_mem_ty(elem_ty, name, "slice element")?;
+            params.push(LirType::I64); // data pointer
+            params.push(LirType::I64); // length
+            fat_param_sig.push(Some(elem));
+            indirect_struct_sig.push(None);
+            pair_struct_sig.push(None);
+            newtype_struct_sig.push(None);
+            pair_enum_sig.push(None);
+        } else if let Some(view) = pair_enum_view(module, p) {
+            // A small Direct-tagged enum rides rustc's ScalarPair: (tag,
+            // payload) in two register formals — `Option<u64>`-class shapes.
+            params.push(view.tag.clone());
+            params.push(view.payload.clone());
+            pair_enum_sig.push(Some(view));
+            fat_param_sig.push(None);
+            indirect_struct_sig.push(None);
+            pair_struct_sig.push(None);
+            newtype_struct_sig.push(None);
+            continue;
+        } else if let Ty::Struct(_) = p {
+            // A BY-VALUE struct larger than 16 bytes: AAPCS64 passes it
+            // INDIRECTLY (a hidden pointer in one GPR). The recorded rustc
+            // layout is required (field reads go through the pointer at
+            // recorded offsets), and the F1 ABI validator independently
+            // refuses the item unless rustc's real PassMode is Indirect —
+            // a converter/ABI disagreement is a refusal, never a miscompile.
+            // A <=16-byte struct (Direct/Pair modes) stays refused, and a
+            // layout the recorded lane cannot admit carries ITS OWN reason.
+            let layout = recorded_struct_mem_layout(p, module, name).map_err(|e| {
+                ModuleLirError::UnsupportedSignature {
+                    name: name.clone(),
+                    detail: format!("by-value struct parameter not admitted: {e}"),
+                }
+            })?;
+            if layout.size <= 16 {
+                // EXACTLY TWO plain-scalar fields ride rustc's PassMode::Pair:
+                // two register formals in LAYOUT (offset) order. The
+                // declaration-order mapping absorbs a repr(Rust) reorder.
+                // Anything else at <=16 bytes (1 or 3+ fields, enum-typed
+                // fields whose register scalar is a niche encoding) stays
+                // refused by name.
+                // A SINGLE plain-scalar field is a newtype: rustc passes it
+                // Direct as the field scalar itself — one formal.
+                if layout.field_offsets.len() == 1 {
+                    let field_plain = match p {
+                        Ty::Struct(sid) => module.structs.get(sid.as_usize()).is_some_and(|def| {
+                            def.fields
+                                .iter()
+                                .all(|f| scalar_field_size_align(&f.ty, name).is_ok())
+                        }),
+                        _ => false,
+                    };
+                    if !field_plain {
+                        return Err(ModuleLirError::UnsupportedSignature {
+                            name: name.clone(),
+                            detail: "by-value newtype struct parameter has a non-plain-scalar \
+                                     field"
+                                .to_string(),
+                        });
+                    }
+                    params.push(layout.field_offsets[0].1.clone());
+                    newtype_struct_sig.push(Some(layout.field_offsets[0].1.clone()));
+                    pair_enum_sig.push(None);
+                    pair_struct_sig.push(None);
+                    indirect_struct_sig.push(None);
+                    fat_param_sig.push(None);
+                    continue;
+                }
+                if layout.field_offsets.len() != 2 {
+                    return Err(ModuleLirError::UnsupportedSignature {
+                        name: name.clone(),
+                        detail: format!(
+                            "by-value struct parameter of {} bytes with {} fields does not ride \
+                             the two-register Pair form this lane admits",
+                            layout.size,
+                            layout.field_offsets.len()
+                        ),
+                    });
+                }
+                let field_tys_plain = match p {
+                    Ty::Struct(sid) => module
+                        .structs
+                        .get(sid.as_usize())
+                        .is_some_and(|def| {
+                            def.fields
+                                .iter()
+                                .all(|f| scalar_field_size_align(&f.ty, name).is_ok())
+                        }),
+                    _ => false,
+                };
+                if !field_tys_plain {
+                    return Err(ModuleLirError::UnsupportedSignature {
+                        name: name.clone(),
+                        detail: "by-value Pair struct parameter has a non-plain-scalar field \
+                                 (an enum's register scalar may be a niche encoding this lane \
+                                 cannot decode)"
+                            .to_string(),
+                    });
+                }
+                pair_struct_sig.push(Some(layout.clone()));
+                newtype_struct_sig.push(None);
+                pair_enum_sig.push(None);
+                // Formals in LAYOUT order.
+                let mut order: Vec<usize> = vec![0, 1];
+                order.sort_by_key(|&i| layout.field_offsets[i].0);
+                for &i in &order {
+                    params.push(layout.field_offsets[i].1.clone());
+                }
+                indirect_struct_sig.push(None);
+                fat_param_sig.push(None);
+                continue;
+            }
+            params.push(LirType::I64); // hidden pointer to the caller's copy
+            indirect_struct_sig.push(Some(layout));
+            pair_struct_sig.push(None);
+            newtype_struct_sig.push(None);
+            pair_enum_sig.push(None);
+            fat_param_sig.push(None);
+            continue;
+        } else if matches!(p, Ty::FatPtr(trust_ir::ty::FatPtrKind::Str)) {
+            // `&str` is `&[u8]` at the machine level: the SAME ScalarPair
+            // (data pointer, byte length) in two consecutive GPR slots, with
+            // BYTE element loads through the data pointer. UTF-8 validity is a
+            // producer-side type-system fact, not a machine-level one — no
+            // byte this lane can load or compare depends on it.
+            params.push(LirType::I64); // data pointer
+            params.push(LirType::I64); // byte length
+            fat_param_sig.push(Some(LirType::I8));
+            indirect_struct_sig.push(None);
+            pair_struct_sig.push(None);
+            newtype_struct_sig.push(None);
+            pair_enum_sig.push(None);
+        } else {
+            params.push(map_scalar_int_ty_in(module, p, "function parameter")?);
+            fat_param_sig.push(None);
+            indirect_struct_sig.push(None);
+            pair_struct_sig.push(None);
+            newtype_struct_sig.push(None);
+            pair_enum_sig.push(None);
+        }
     }
-    let return_ty = map_scalar_int_ty_in(module, &func_ty.returns[0], "function return")?;
-    let signature = Signature { params, returns: vec![return_ty] };
+    // ZERO returns is a VOID function (`fn f()` is `(…) -> ()` with an empty
+    // returns list): the established MIR path already emits these as an empty
+    // LIR `returns` plus a bare `Opcode::Return` (see lower.rs
+    // `ordinary_unit_function_remains_void`), so the shape is backend-proven.
+    // ONE return maps through the scalar slice; more than one stays refused.
+    let signature = match func_ty.returns.as_slice() {
+        [] => Signature { params, returns: vec![] },
+        [r] if pair_enum_view(module, r).is_some() => {
+            // A small Direct-tagged enum RETURNS as its (tag, payload)
+            // register pair — x0/x1, exactly the ScalarPair rustc assigns.
+            let view = pair_enum_view(module, r).expect("guarded");
+            Signature { params, returns: vec![view.tag, view.payload] }
+        }
+        [r] => {
+            let return_ty = map_scalar_int_ty_in(module, r, "function return")?;
+            Signature { params, returns: vec![return_ty] }
+        }
+        more => {
+            return Err(ModuleLirError::UnsupportedSignature {
+                name: name.clone(),
+                detail: format!("expected at most 1 return value, got {}", more.len()),
+            });
+        }
+    };
 
     // --- Body: one OR MORE basic blocks with SSA block-param merges. ---
     if function.blocks.is_empty() {
@@ -1384,8 +1914,30 @@ fn lower_trust_ir_function_to_lir_impl(
             expected: func_ty.params.len(),
         });
     }
-    for ((param_id, param_ty), sig_ty) in entry_block.params.iter().zip(&func_ty.params) {
-        let lir_ty = map_scalar_int_ty_in(module, param_ty, "entry block param")?;
+    let mut entry_fat_params: HashMap<ValueId, FatSliceParam> = HashMap::new();
+    let mut entry_indirect_structs: HashMap<ValueId, IndirectStructParam> = HashMap::new();
+    let mut entry_pair_structs: HashMap<ValueId, PairStructParam> = HashMap::new();
+    let mut entry_newtype_structs: HashMap<ValueId, LirType> = HashMap::new();
+    // PAIR-ENUM SSA values: trust-ir ValueId -> (tag LIR value, payload LIR
+    // value). Params, block params, and instruction results all register
+    // here; any use of a pair-enum value outside the supported arms fails
+    // closed as an undefined value (the id is never in the ValueMap).
+    let mut pair_enum_values: HashMap<ValueId, (Value, Value)> = HashMap::new();
+    // FIELDLESS-ENUM tag carriers, by trust-ir ValueId. A value recorded here
+    // was admitted through `fieldless_enum_carrier` (its whole machine value IS
+    // the discriminant tag), so an `ExtractField { field: 0 }` typed at the tag
+    // repr is an identity read — see the ExtractField arm in
+    // `lower_value_inst`. Only param/block-param bindings populate it; every
+    // other enum-typed position keeps failing closed.
+    let mut enum_tag_values: HashMap<ValueId, LirType> = HashMap::new();
+    // Entry params of opaque pointer type (`Ty::Ptr` — `&self`, `&T` thin
+    // references). The aggregate slice admits WHOLE-AGGREGATE LOADS through
+    // these as read-only roots (the aggregate analogue of the fat-slice
+    // element loads); stores through them stay fail-closed.
+    let mut ptr_params: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
+    for (index, ((param_id, param_ty), sig_ty)) in
+        entry_block.params.iter().zip(&func_ty.params).enumerate()
+    {
         if param_ty != sig_ty {
             return Err(ModuleLirError::UnsupportedSignature {
                 name: name.clone(),
@@ -1393,6 +1945,91 @@ fn lower_trust_ir_function_to_lir_impl(
                     "entry block param type {param_ty:?} disagrees with signature {sig_ty:?}"
                 ),
             });
+        }
+        // A UNIT (`()`) param binds NOTHING: no LIR slot, no Value. Any body
+        // use of it fails closed as an undefined value.
+        if unit_param_sig.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        // A PAIR-ENUM param binds TWO anonymous formals: (tag, payload).
+        if pair_enum_sig.get(index).and_then(|o| o.as_ref()).is_some() {
+            let tag = vmap.define_anonymous();
+            let pay = vmap.define_anonymous();
+            let view = pair_enum_sig[index].as_ref().expect("guarded");
+            value_types.insert(tag, view.tag.clone());
+            value_types.insert(pay, view.payload.clone());
+            pair_enum_values.insert(*param_id, (tag, pay));
+            continue;
+        }
+        // A BY-VALUE NEWTYPE struct param binds ONE value of the field's
+        // scalar type; `ExtractField 0` is a Copy of it.
+        if let Some(field_lir) = newtype_struct_sig.get(index).and_then(|o| o.clone()) {
+            let v = vmap.define(*param_id);
+            value_types.insert(v, field_lir.clone());
+            entry_newtype_structs.insert(*param_id, field_lir);
+            continue;
+        }
+        // A BY-VALUE PAIR struct param binds TWO anonymous formals (layout
+        // order); the param's own ValueId maps extracts to them by
+        // declaration index and any whole-value use fails closed.
+        if let Some(layout) = pair_struct_sig.get(index).and_then(|o| o.clone()) {
+            let mut order: Vec<usize> = vec![0, 1];
+            order.sort_by_key(|&i| layout.field_offsets[i].0);
+            let mut by_decl: [Value; 2] = [Value(u32::MAX); 2];
+            let mut tys: [LirType; 2] =
+                [layout.field_offsets[0].1.clone(), layout.field_offsets[1].1.clone()];
+            for &decl_idx in &order {
+                let v = vmap.define_anonymous();
+                value_types.insert(v, layout.field_offsets[decl_idx].1.clone());
+                by_decl[decl_idx] = v;
+                tys[decl_idx] = layout.field_offsets[decl_idx].1.clone();
+            }
+            entry_pair_structs.insert(
+                *param_id,
+                PairStructParam {
+                    by_decl_index: by_decl,
+                    tys,
+                    layout_order: [order[0], order[1]],
+                },
+            );
+            continue;
+        }
+        // A BY-VALUE INDIRECT struct param binds ONE I64 value (the hidden
+        // pointer). The trust-ir param id maps to that pointer; ExtractField
+        // loads fields through it at the recorded offsets, and every other
+        // use of the whole-struct value fails closed.
+        if let Some(layout) = indirect_struct_sig.get(index).and_then(|o| o.clone()) {
+            let field_tys = match param_ty {
+                Ty::Struct(sid) => module
+                    .structs
+                    .get(sid.as_usize())
+                    .map(|def| def.fields.iter().map(|f| f.ty.clone()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            let v = vmap.define(*param_id);
+            value_types.insert(v, LirType::I64);
+            entry_indirect_structs
+                .insert(*param_id, IndirectStructParam { ptr: v, layout, field_tys });
+            continue;
+        }
+        // A fat slice param binds TWO anonymous dense values (data, len) at its
+        // positional slots; the fat pointer's own ValueId is deliberately NOT
+        // bound, so any use outside the PtrData/PtrMetadata lanes fails closed.
+        if let Some(elem) = fat_param_sig.get(index).and_then(|o| o.clone()) {
+            let data = vmap.define_anonymous();
+            let len = vmap.define_anonymous();
+            value_types.insert(data, LirType::I64);
+            value_types.insert(len, LirType::I64);
+            entry_fat_params.insert(*param_id, FatSliceParam { data, len, elem });
+            continue;
+        }
+        let lir_ty = map_scalar_int_ty_in(module, param_ty, "entry block param")?;
+        if fieldless_enum_carrier(module, param_ty).is_some() {
+            enum_tag_values.insert(*param_id, lir_ty.clone());
+        }
+        if matches!(param_ty, Ty::Ptr) {
+            ptr_params.insert(*param_id);
         }
         let v = vmap.define(*param_id);
         value_types.insert(v, lir_ty);
@@ -1405,7 +2042,18 @@ fn lower_trust_ir_function_to_lir_impl(
         let block = blocks_by_id[&bid];
         if bid != function.entry.index() {
             for (param_id, param_ty) in &block.params {
+                if let Some(view) = pair_enum_view(module, param_ty) {
+                    let tag = vmap.define_anonymous();
+                    let pay = vmap.define_anonymous();
+                    value_types.insert(tag, view.tag.clone());
+                    value_types.insert(pay, view.payload.clone());
+                    pair_enum_values.insert(*param_id, (tag, pay));
+                    continue;
+                }
                 let lir_ty = map_scalar_int_ty_in(module, param_ty, "block param")?;
+                if fieldless_enum_carrier(module, param_ty).is_some() {
+                    enum_tag_values.insert(*param_id, lir_ty.clone());
+                }
                 let v = vmap.define(*param_id);
                 value_types.insert(v, lir_ty);
             }
@@ -1455,7 +2103,8 @@ fn lower_trust_ir_function_to_lir_impl(
     // scalar Undef analysis so the aggregate `Undef`/`Const` seeds are excluded
     // from the scalar memory-merge scan. Fail-closes on any aggregate it cannot
     // lay out 1:1.
-    let agg_mem = analyze_aggregate_memory(module, &order, &blocks_by_id, &tuple_decompose, name)?;
+    let agg_mem =
+        analyze_aggregate_memory(module, &order, &blocks_by_id, &tuple_decompose, &ptr_params, name)?;
 
     // `admitted_undef_seeds` is the set of `Undef` result ValueIds we have
     // PROVEN to be exactly this dead-seed shape. Only those may be lowered (to a
@@ -1495,15 +2144,16 @@ fn lower_trust_ir_function_to_lir_impl(
     // Function-scoped memory state: stack slots accumulate across all blocks and
     // alloca-pointer provenance flows along the straight-line bodies.
     let mut mem = MemoryCtx::new();
+    mem.fat_params = entry_fat_params;
+    mem.indirect_struct_params = entry_indirect_structs;
+    mem.pair_struct_params = entry_pair_structs;
+    mem.newtype_struct_params = entry_newtype_structs;
 
-    // KNOWN-TARGET INDIRECT-CALL provenance: LIR pointer `Value` -> the symbol
-    // name a `GlobalAddr` materialized into it (via `Opcode::GlobalRef`). A
-    // `CallIndirect` whose function-pointer operand resolves to a Value in this
-    // map is a KNOWN target — it is admitted (and composed by the executor)
-    // exactly like a direct `Call` to that symbol. An operand NOT in this map is
-    // an OPEN target (a fn-pointer not traceable to a concrete local pure fn) and
-    // fails closed (a future havoc-only slice).
-    let mut global_addr_syms: HashMap<Value, String> = HashMap::new();
+    // DIRECT-GLOBAL provenance: every `GlobalAddr` result is recorded, while
+    // function-symbol proxies and data symbols remain distinct. A direct data
+    // address passed to `CallIndirect` must fail closed; only a value with no
+    // direct-global provenance at all is an OPEN target.
+    let mut global_addr_provenance: HashMap<Value, GlobalAddrProvenance> = HashMap::new();
 
     // Function-scoped per-aggregate field-value bookkeeping for the aggregate-
     // memory slice: each tracked aggregate SSA value -> its per-field LIR Values
@@ -1574,15 +2224,50 @@ fn lower_trust_ir_function_to_lir_impl(
 
                 // Finalize the current segment.
                 let seg_params: Vec<(Value, LirType)> = if is_first_segment {
-                    block
-                        .params
-                        .iter()
-                        .map(|(pid, pty)| {
-                            let v = vmap.resolve(*pid, name)?;
-                            let lty = map_scalar_int_ty_in(module, pty, "block param")?;
-                            Ok((v, lty))
-                        })
-                        .collect::<Result<_, ModuleLirError>>()?
+                    let mut out = Vec::with_capacity(block.params.len());
+                    for (pid, pty) in &block.params {
+                        if matches!(pty, Ty::Unit) {
+                            continue;
+                        }
+                        if let Some(fat) = mem.fat_params.get(pid) {
+                            out.push((fat.data, LirType::I64));
+                            out.push((fat.len, LirType::I64));
+                            continue;
+                        }
+                        if let Some(psp) = mem.pair_struct_params.get(pid) {
+                            // Formals in LAYOUT order (the smaller offset
+                            // first) — the same order the signature emitted.
+                            for &i in &psp.layout_order {
+                                out.push((psp.by_decl_index[i], psp.tys[i].clone()));
+                            }
+                            continue;
+                        }
+                        if let Some((tag, pay)) = pair_enum_values.get(pid) {
+                            let tag_ty = value_types
+                                .get(tag)
+                                .cloned()
+                                .unwrap_or(LirType::I64);
+                            let pay_ty = value_types
+                                .get(pay)
+                                .cloned()
+                                .unwrap_or(LirType::I64);
+                            out.push((*tag, tag_ty));
+                            out.push((*pay, pay_ty));
+                            continue;
+                        }
+                        let v = vmap.resolve(*pid, name)?;
+                        if mem.indirect_struct_params.contains_key(pid) {
+                            out.push((v, LirType::I64));
+                            continue;
+                        }
+                        if let Some(field_lir) = mem.newtype_struct_params.get(pid) {
+                            out.push((v, field_lir.clone()));
+                            continue;
+                        }
+                        let lty = map_scalar_int_ty_in(module, pty, "block param")?;
+                        out.push((v, lty));
+                    }
+                    out
                 } else {
                     vec![]
                 };
@@ -1616,13 +2301,15 @@ fn lower_trust_ir_function_to_lir_impl(
                 &vmap,
                 &mut value_types,
                 &mut mem,
-                &mut global_addr_syms,
+                &mut global_addr_provenance,
                 &mut seg,
                 &mut next_value,
                 &admitted_undef_seeds,
                 &tuple_decompose,
                 &agg_mem,
                 &mut agg_field_values,
+                &mut enum_tag_values,
+                &mut pair_enum_values,
                 real_calls,
                 name,
             )?;
@@ -1632,6 +2319,7 @@ fn lower_trust_ir_function_to_lir_impl(
         lower_terminator(
             terminator,
             &vmap,
+            &pair_enum_values,
             &blocks_by_id,
             &mut seg,
             &mut edge_blocks,
@@ -1643,15 +2331,46 @@ fn lower_trust_ir_function_to_lir_impl(
         // Finalize the final segment (which is `lir_id` itself when no Assert
         // split occurred — the common, prior-slice-preserving path).
         let final_params: Vec<(Value, LirType)> = if is_first_segment {
-            block
-                .params
-                .iter()
-                .map(|(pid, pty)| {
-                    let v = vmap.resolve(*pid, name)?;
-                    let lty = map_scalar_int_ty_in(module, pty, "block param")?;
-                    Ok((v, lty))
-                })
-                .collect::<Result<_, ModuleLirError>>()?
+            let mut out: Vec<(Value, LirType)> = Vec::with_capacity(block.params.len());
+            for (pid, pty) in &block.params {
+                // A fat slice ENTRY param expands to its two split halves
+                // (data, len) at the same positional slots the signature
+                // declared. Only the entry block can carry one (non-entry
+                // fat block params already failed pre-allocation).
+                if matches!(pty, Ty::Unit) {
+                    continue;
+                }
+                if let Some(fat) = mem.fat_params.get(pid) {
+                    out.push((fat.data, LirType::I64));
+                    out.push((fat.len, LirType::I64));
+                    continue;
+                }
+                if let Some(isp) = mem.indirect_struct_params.get(pid) {
+                    out.push((isp.ptr, LirType::I64));
+                    continue;
+                }
+                if let Some(psp) = mem.pair_struct_params.get(pid) {
+                    for &i in &psp.layout_order {
+                        out.push((psp.by_decl_index[i], psp.tys[i].clone()));
+                    }
+                    continue;
+                }
+                if let Some((tag, pay)) = pair_enum_values.get(pid) {
+                    let tag_ty = value_types.get(tag).cloned().unwrap_or(LirType::I64);
+                    let pay_ty = value_types.get(pay).cloned().unwrap_or(LirType::I64);
+                    out.push((*tag, tag_ty));
+                    out.push((*pay, pay_ty));
+                    continue;
+                }
+                let v = vmap.resolve(*pid, name)?;
+                if let Some(field_lir) = mem.newtype_struct_params.get(pid) {
+                    out.push((v, field_lir.clone()));
+                    continue;
+                }
+                let lty = map_scalar_int_ty_in(module, pty, "block param")?;
+                out.push((v, lty));
+            }
+            out
         } else {
             vec![]
         };
@@ -1718,17 +2437,24 @@ fn lower_trust_ir_function_to_lir_impl(
 // the converter fail-closes — the inliner never produces a wrong splice):
 //
 //   * LOCAL    — the callee `FuncId` resolves to a `Function` in this Module.
-//   * ACYCLIC  — the callee is not the caller itself (no self-recursion). A
-//                leaf callee cannot mutually recurse because it makes no calls.
-//   * SINGLE-BLOCK — the callee has exactly one basic block (this first slice
-//                scopes to the straight-line splice; multi-block is a sound but
-//                unimplemented follow-on, reported below).
-//   * SINGLE-RETURN — that block ends in `Return` with exactly one value, and
-//                no other terminator appears in it.
-//   * LEAF + PURE — every non-terminator instruction in the callee body is a
-//                value-producing op with NO observable effect and NO nested
-//                call: it is drawn from the remappable pure-scalar set
-//                {Const, BinOp, ICmp, Cast, Copy, Select}. Anything else
+//   * ACYCLIC  — the callee is not the caller itself, and a call CYCLE is
+//                broken by the recursive-flatten stack: a non-leaf callee is
+//                first flattened by this same inliner (its own admitted calls
+//                spliced away) and the splice runs against that call-free
+//                copy, but a callee already on the flatten path is never
+//                flattened again — its call survives and fail-closes.
+//   * SINGLE-BLOCK fast path — a one-block callee takes the straight-line
+//                splice; a multi-block callee takes the block-cloning splice
+//                (`try_inline_call_multiblock`) with the caller block split at
+//                the call site.
+//   * SINGLE-RETURN — every `Return` carries exactly one value.
+//   * LEAF + PURE — every non-terminator instruction in the (possibly
+//                flattened) callee body is a value-producing op with NO
+//                observable effect and NO nested call: it is drawn from the
+//                remappable pure-scalar set
+//                {Const, BinOp, UnOp, ICmp, Cast, Copy, Select} (the
+//                multi-block splice additionally admits Overflow, Undef,
+//                Insert/ExtractField, Assume, Assert). Anything else
 //                (Call/CallIndirect, any Store/Load/Alloca/atomic/borrow/ARC,
 //                a terminator mid-body, ...) makes the callee inadmissible. We
 //                deliberately exclude memory ops here even though some are
@@ -1741,6 +2467,16 @@ fn lower_trust_ir_function_to_lir_impl(
 /// contains no `Call` at all, so the non-call paths (scalar / CFG / memory) are
 /// completely unaffected.
 ///
+/// Runs [`inline_local_pure_leaf_calls_one_pass`] to a FIXPOINT: a pass
+/// handles at most one call per block, so a block carrying two calls (the
+/// producer emits `f(g(x), y)` as two `Inst::Call`s in ONE block) — or a
+/// multi-block splice whose continuation block still carries the next call —
+/// needs another pass over the rewritten function. Termination is structural:
+/// an admitted callee is a LEAF (its spliced body contains no `Call`), so
+/// every successful inline strictly decreases the function's total `Call`
+/// count and no pass ever increases it; the loop exits as soon as a pass makes
+/// no progress (only inadmissible or real-call-deferred calls remain).
+///
 /// A `Call` that is present but NOT admissible is left in the body verbatim;
 /// the downstream converter then fail-closes on it. This function only ever
 /// returns `Err` when a *would-be* inline cannot be performed soundly — it
@@ -1750,16 +2486,66 @@ fn inline_local_pure_leaf_calls<'a>(
     function: &'a IrFunction,
     real_calls: bool,
 ) -> Result<Cow<'a, IrFunction>, ModuleLirError> {
+    // The flatten stack carries every FuncId on the current recursive-flatten
+    // path (see `inline_local_pure_leaf_calls_with_stack`); seeding it with the
+    // root function also re-states the no-self-recursion rule.
+    let mut flatten_stack = vec![function.id];
+    inline_local_pure_leaf_calls_with_stack(module, function, real_calls, &mut flatten_stack)
+}
+
+/// The fixpoint driver behind [`inline_local_pure_leaf_calls`], carrying the
+/// recursive-flatten cycle guard. `flatten_stack` holds the `FuncId`s currently
+/// being flattened (root caller included): a callee already on the stack is
+/// NEVER flattened again, which breaks direct and mutual recursion — the
+/// recursive call is left in the body and fail-closes downstream. Termination:
+/// the stack grows strictly along a flatten path and is bounded by the number
+/// of functions in the module, and each fixpoint pass strictly decreases the
+/// (finite) call count of its own function copy.
+fn inline_local_pure_leaf_calls_with_stack<'a>(
+    module: &Module,
+    function: &'a IrFunction,
+    real_calls: bool,
+    flatten_stack: &mut Vec<FuncId>,
+) -> Result<Cow<'a, IrFunction>, ModuleLirError> {
+    fn count_calls(f: &IrFunction) -> usize {
+        f.blocks
+            .iter()
+            .flat_map(|b| b.body.iter())
+            .filter(|n| matches!(n.inst, Inst::Call { .. }))
+            .count()
+    }
+
     // Fast path: no calls anywhere -> borrow unchanged.
-    let has_call = function
-        .blocks
-        .iter()
-        .flat_map(|b| b.body.iter())
-        .any(|n| matches!(n.inst, Inst::Call { .. }));
-    if !has_call {
+    let mut remaining = count_calls(function);
+    if remaining == 0 {
         return Ok(Cow::Borrowed(function));
     }
 
+    let mut current =
+        inline_local_pure_leaf_calls_one_pass(module, function, real_calls, flatten_stack)?;
+    loop {
+        let after = count_calls(&current);
+        if after == 0 || after >= remaining {
+            // Call-free, or no progress (the residue is inadmissible / deferred
+            // real calls): either way this pass is the fixpoint.
+            break;
+        }
+        remaining = after;
+        current =
+            inline_local_pure_leaf_calls_one_pass(module, &current, real_calls, flatten_stack)?;
+    }
+    Ok(Cow::Owned(current))
+}
+
+/// One inlining pass: handle at most the FIRST admitted call in each block.
+/// See [`inline_local_pure_leaf_calls`] for the fixpoint driver and the
+/// admission predicate above for what qualifies.
+fn inline_local_pure_leaf_calls_one_pass(
+    module: &Module,
+    function: &IrFunction,
+    real_calls: bool,
+    flatten_stack: &mut Vec<FuncId>,
+) -> Result<IrFunction, ModuleLirError> {
     // Fresh-ValueId / fresh-BlockId allocators: start past every id mentioned
     // anywhere in the caller so a spliced callee id can never alias a caller id
     // (or a previously-spliced callee id, since the counters only grow).
@@ -1778,12 +2564,13 @@ fn inline_local_pure_leaf_calls<'a>(
     // block carrying neither is copied through unchanged.
     //
     // A single inlining pass handles AT MOST ONE call per original caller block
-    // (the first admitted one). The cab/add shape — and every bridge-produced
-    // call shape — places the call in its own block (the MIR call terminator
-    // becomes `Inst::Call` + a `Br`), so one-call-per-block is the real case.
-    // A second call in the same block is left for the converter to fail-close on
-    // (it is NOT mis-inlined); the multi-call-per-block generalization is a
-    // sound follow-on, not a correctness gap.
+    // (the first admitted one). The bridge-produced MIR call shape places the
+    // call in its own block (the MIR call terminator becomes `Inst::Call` + a
+    // `Br`), but the direct THIR producer emits nested calls (`f(g(x), y)`) as
+    // consecutive `Inst::Call`s in ONE block. A call this pass does not reach
+    // is picked up by the caller's fixpoint loop re-running the pass over the
+    // rewritten function; a call NO pass admits is left verbatim for the
+    // converter to fail-close on (it is NOT mis-inlined).
     let original_blocks = std::mem::take(&mut new_function.blocks);
     let mut out_blocks: Vec<trust_ir::Block> = Vec::with_capacity(original_blocks.len());
 
@@ -1819,9 +2606,49 @@ fn inline_local_pure_leaf_calls<'a>(
             }
         }
 
+        // Resolve the callee once. A NON-LOCAL callee (no `Function` in this
+        // Module) can never be inlined: leave the Call in place so the
+        // converter fail-closes on it.
+        let Some(callee_fn) = module.function_by_id(*callee) else {
+            out_blocks.push(block);
+            continue;
+        };
+
+        // RECURSIVE FLATTEN. A local NON-LEAF callee (its body itself calls)
+        // fails the splices' leaf check as-is — but if its own calls inline
+        // away, the flattened copy is a legitimate leaf and the ordinary
+        // splice admission runs against THAT. The flatten stack breaks call
+        // cycles (a callee already being flattened is skipped, so its call
+        // survives and fail-closes); a flatten that errors or makes no
+        // progress declines soundly — the original call stays for the
+        // converter to reject. The flatten itself always runs with
+        // `real_calls=false`: a body about to be spliced inline must become
+        // call-FREE, so deferring composable calls inside it would only
+        // manufacture admission failures.
+        let flattened: Option<IrFunction> = if callee_fn.id != function.id
+            && !flatten_stack.contains(&callee_fn.id)
+            && callee_fn
+                .blocks
+                .iter()
+                .flat_map(|b| b.body.iter())
+                .any(|n| matches!(n.inst, Inst::Call { .. }))
+        {
+            flatten_stack.push(callee_fn.id);
+            let out =
+                inline_local_pure_leaf_calls_with_stack(module, callee_fn, false, flatten_stack);
+            flatten_stack.pop();
+            match out {
+                Ok(Cow::Owned(f)) => Some(f),
+                Ok(Cow::Borrowed(_)) | Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let callee_view: &IrFunction = flattened.as_ref().unwrap_or(callee_fn);
+
         // SINGLE-BLOCK fast path (the established, prior-slice-preserving splice):
         // splice the callee body inline, replacing just the call node.
-        match try_inline_call(module, function, *callee, args, &call_node, &mut next_value) {
+        match try_inline_call(module, function, callee_view, args, &call_node, &mut next_value) {
             Ok(spliced) => {
                 let mut new_body: Vec<InstrNode> =
                     Vec::with_capacity(block.body.len() + spliced.len());
@@ -1846,7 +2673,7 @@ fn inline_local_pure_leaf_calls<'a>(
         match try_inline_call_multiblock(
             module,
             function,
-            *callee,
+            callee_view,
             args,
             &call_node,
             &block,
@@ -1868,13 +2695,13 @@ fn inline_local_pure_leaf_calls<'a>(
 
     new_function.blocks = out_blocks;
 
-    // Defensive: the splice should have removed every admitted call. Any Call
-    // that REMAINS is an inadmissible one we intentionally left for the
-    // converter to reject — that is the designed fail-closed boundary, NOT an
-    // inliner error, so we simply return the rewritten function and let the
-    // downstream converter produce its `UnsupportedInst { inst: "Call" }`.
+    // Any Call that REMAINS is either one this pass could not reach (a second
+    // call in a block, or a call in a freshly spliced continuation block — the
+    // fixpoint caller re-runs the pass for those) or an inadmissible one we
+    // intentionally left for the converter to reject — the designed fail-closed
+    // boundary, NOT an inliner error.
     let _ = &name;
-    Ok(Cow::Owned(new_function))
+    Ok(new_function)
 }
 
 /// The largest `BlockId` index appearing anywhere in `function` (every block's
@@ -1946,16 +2773,14 @@ fn max_value_id(function: &IrFunction) -> u32 {
 fn try_inline_call(
     module: &Module,
     caller: &IrFunction,
-    callee_id: FuncId,
+    // The callee VIEW: the module's function, or the caller pass's recursively
+    // flattened copy of it (same id/ty, call-free body). Locality was already
+    // established by the caller pass's lookup.
+    callee: &IrFunction,
     args: &[ValueId],
     call_node: &InstrNode,
     next_value: &mut u32,
 ) -> Result<Vec<InstrNode>, String> {
-    // ---- LOCAL ----
-    let callee = module.function_by_id(callee_id).ok_or_else(|| {
-        format!("callee FuncId {} is not local to this module", callee_id.index())
-    })?;
-
     // ---- ACYCLIC (no self-recursion) ----
     if callee.id == caller.id {
         return Err("self-recursive call".to_string());
@@ -2133,6 +2958,7 @@ fn is_multiblock_inlinable_value(inst: &Inst) -> bool {
         inst,
         Inst::Const { .. }
             | Inst::BinOp { .. }
+            | Inst::UnOp { .. }
             | Inst::Overflow { .. }
             | Inst::ICmp { .. }
             | Inst::Cast { .. }
@@ -2146,6 +2972,20 @@ fn is_multiblock_inlinable_value(inst: &Inst) -> bool {
             // the converter's supported set.
             | Inst::Assume { .. }
             | Inst::Assert { .. }
+            // The READ-ONLY slice lane: a slice-taking callee's body is
+            // PtrData/PtrMetadata on its fat formal (which the splice rebinds
+            // to the CALLER's fat formal), GEP off the data root, and element
+            // Loads. All single-result, none writes. SOUNDNESS of admitting
+            // the memory reads: `Alloca` and `Store` stay OUT of this set, so
+            // a spliced Load's pointer can only root at a fat formal the
+            // caller's own lowering recognizes — any other rooting reaches
+            // the converter as an unresolvable pointer and fails closed —
+            // and splicing preserves program order, so a read cannot move
+            // across the caller's own stores.
+            | Inst::PtrData { .. }
+            | Inst::PtrMetadata { .. }
+            | Inst::GEP { .. }
+            | Inst::Load { .. }
     )
 }
 
@@ -2166,6 +3006,9 @@ fn remap_multiblock_inst(
         }
         Inst::Overflow { op, ty, lhs, rhs } => {
             Inst::Overflow { op: *op, ty: ty.clone(), lhs: resolve(*lhs)?, rhs: resolve(*rhs)? }
+        }
+        Inst::UnOp { op, ty, operand } => {
+            Inst::UnOp { op: *op, ty: ty.clone(), operand: resolve(*operand)? }
         }
         Inst::ICmp { op, ty, lhs, rhs } => {
             Inst::ICmp { op: *op, ty: ty.clone(), lhs: resolve(*lhs)?, rhs: resolve(*rhs)? }
@@ -2195,6 +3038,24 @@ fn remap_multiblock_inst(
         }
         Inst::Assume { cond } => Inst::Assume { cond: resolve(*cond)? },
         Inst::Assert { cond } => Inst::Assert { cond: resolve(*cond)? },
+        // The read-only slice lane (see `is_multiblock_inlinable_value`).
+        Inst::PtrData { ptr_ty, ptr } => {
+            Inst::PtrData { ptr_ty: ptr_ty.clone(), ptr: resolve(*ptr)? }
+        }
+        Inst::PtrMetadata { ptr_ty, metadata_ty, ptr } => Inst::PtrMetadata {
+            ptr_ty: ptr_ty.clone(),
+            metadata_ty: metadata_ty.clone(),
+            ptr: resolve(*ptr)?,
+        },
+        Inst::GEP { pointee_ty, base, indices, inbounds } => Inst::GEP {
+            pointee_ty: pointee_ty.clone(),
+            base: resolve(*base)?,
+            indices: indices.iter().map(|i| resolve(*i)).collect::<Result<_, _>>()?,
+            inbounds: *inbounds,
+        },
+        Inst::Load { ty, ptr, volatile, align } => {
+            Inst::Load { ty: ty.clone(), ptr: resolve(*ptr)?, volatile: *volatile, align: *align }
+        }
         // --- Terminators (intra-callee targets rewritten; edge args remapped). ---
         Inst::Br { target, args } => Inst::Br {
             target: remap_block(*target)?,
@@ -2248,7 +3109,10 @@ fn remap_multiblock_inst(
 fn try_inline_call_multiblock(
     module: &Module,
     caller: &IrFunction,
-    callee_id: FuncId,
+    // The callee VIEW: the module's function, or the caller pass's recursively
+    // flattened copy of it (same id/ty, call-free body). Locality was already
+    // established by the caller pass's lookup.
+    callee: &IrFunction,
     args: &[ValueId],
     call_node: &InstrNode,
     caller_block: &trust_ir::Block,
@@ -2256,11 +3120,6 @@ fn try_inline_call_multiblock(
     next_value: &mut u32,
     next_block: &mut u32,
 ) -> Result<Vec<trust_ir::Block>, String> {
-    // ---- LOCAL ----
-    let callee = module.function_by_id(callee_id).ok_or_else(|| {
-        format!("callee FuncId {} is not local to this module", callee_id.index())
-    })?;
-
     // ---- ACYCLIC (no self-recursion); leaf check below closes transitivity ----
     if callee.id == caller.id {
         return Err("self-recursive call".to_string());
@@ -2478,6 +3337,7 @@ fn is_pure_leaf_inlinable(inst: &Inst) -> bool {
         inst,
         Inst::Const { .. }
             | Inst::BinOp { .. }
+            | Inst::UnOp { .. }
             | Inst::ICmp { .. }
             | Inst::Cast { .. }
             | Inst::Copy { .. }
@@ -2497,6 +3357,9 @@ fn remap_pure_leaf_inst(
         Inst::Const { ty, value } => Inst::Const { ty: ty.clone(), value: value.clone() },
         Inst::BinOp { op, ty, lhs, rhs } => {
             Inst::BinOp { op: *op, ty: ty.clone(), lhs: resolve(*lhs)?, rhs: resolve(*rhs)? }
+        }
+        Inst::UnOp { op, ty, operand } => {
+            Inst::UnOp { op: *op, ty: ty.clone(), operand: resolve(*operand)? }
         }
         Inst::ICmp { op, ty, lhs, rhs } => {
             Inst::ICmp { op: *op, ty: ty.clone(), lhs: resolve(*lhs)?, rhs: resolve(*rhs)? }
@@ -2638,7 +3501,7 @@ fn is_terminator(inst: &Inst) -> bool {
 //
 // The default converter path INLINES an admitted local pure leaf callee (so the
 // emitted __text carries NO `Bl`). This is the OPPOSITE capability: emit a REAL
-// LIR `Opcode::Call { name }` (which ISel lowers to `Bl` + an
+// LIR `Opcode::Call { name, .. }` (which ISel lowers to `Bl` + an
 // `ARM64_RELOC_BRANCH26` naming the callee symbol), so the call survives as a
 // genuine cross-function edge. The proven-output gate / test executor then
 // COMPOSES the callee at the reloc target — exactly mirroring the bundle gate's
@@ -2985,6 +3848,51 @@ fn lower_aggregate_inst(
             }
             Ok(true)
         }
+        // ---- Whole-aggregate Load through an INCOMING read-only root ->
+        //      per-field Ldr at `ptr + offset`. ----
+        Inst::Load { ty: Ty::Tuple(_) | Ty::Struct(_), ptr, .. }
+            if result0.is_some_and(|r| agg_mem.agg_incoming_load_layout.contains_key(&r)) =>
+        {
+            let result = result0.expect("guarded");
+            let layout = agg_mem.agg_incoming_load_layout[&result].clone();
+            let base = vmap.resolve(*ptr, name)?;
+            let mut loaded = Vec::with_capacity(layout.field_offsets.len());
+            for (offset, lir_ty) in &layout.field_offsets {
+                // addr = base + offset (byte GEP, offset 0 folds away).
+                let addr = if *offset == 0 {
+                    base
+                } else {
+                    let idx = Value(*next_value);
+                    *next_value += 1;
+                    value_types.insert(idx, LirType::I64);
+                    instructions.push(Instruction {
+                        opcode: Opcode::Iconst { ty: LirType::I64, imm: i64::from(*offset) },
+                        args: vec![],
+                        results: vec![idx],
+                    });
+                    let addr = Value(*next_value);
+                    *next_value += 1;
+                    value_types.insert(addr, LirType::I64);
+                    instructions.push(Instruction {
+                        opcode: Opcode::ArrayGep { elem_ty: LirType::I8 },
+                        args: vec![base, idx],
+                        results: vec![addr],
+                    });
+                    addr
+                };
+                let dst = Value(*next_value);
+                *next_value += 1;
+                value_types.insert(dst, lir_ty.clone());
+                instructions.push(Instruction {
+                    opcode: Opcode::Load { ty: lir_ty.clone(), align: None },
+                    args: vec![addr],
+                    results: vec![dst],
+                });
+                loaded.push(dst);
+            }
+            agg_field_values.insert(result, loaded);
+            Ok(true)
+        }
         // ---- Whole-aggregate Load -> per-field Ldr at field offsets. ----
         Inst::Load { ty: Ty::Tuple(_) | Ty::Struct(_), ptr, .. }
             if result0.is_some_and(|r| agg_mem.agg_load_results.contains(&r)) =>
@@ -3072,13 +3980,15 @@ fn lower_value_inst(
     vmap: &ValueMap,
     value_types: &mut HashMap<Value, LirType>,
     mem: &mut MemoryCtx,
-    global_addr_syms: &mut HashMap<Value, String>,
+    global_addr_provenance: &mut HashMap<Value, GlobalAddrProvenance>,
     instructions: &mut Vec<Instruction>,
     next_value: &mut u32,
     admitted_undef_seeds: &std::collections::HashSet<ValueId>,
     tuple_decompose: &TupleDecompose,
     agg_mem: &AggMemDecompose,
     agg_field_values: &mut HashMap<ValueId, Vec<Value>>,
+    enum_tag_values: &mut HashMap<ValueId, LirType>,
+    pair_enum_values: &mut HashMap<ValueId, (Value, Value)>,
     real_calls: bool,
     name: &str,
 ) -> Result<(), ModuleLirError> {
@@ -3162,6 +4072,293 @@ fn lower_value_inst(
                 results: vec![dst],
             });
         }
+        // ---- FIELDLESS-ENUM tag read: `ExtractField { field: 0 }` on a value
+        // admitted through `fieldless_enum_carrier` (a param or block param whose
+        // enum type IS its tag — offset 0, whole size). The extract is an
+        // IDENTITY at the machine level, so it lowers to a `Copy` of the carrier
+        // value. Fail-closed on any other field index and on a field type whose
+        // LIR carrier disagrees with the admitted one (the producer types the
+        // tag read at the def's canonical repr, so a mismatch is a producer/def
+        // drift this converter must not paper over). This is the
+        // `fn f(e: FieldlessEnum)` + `extractfield u8 %e, 0` + `switch` shape.
+        Inst::ExtractField { ty, aggregate, field }
+            if enum_tag_values.contains_key(aggregate) =>
+        {
+            let result = expect_single_result(node, name)?;
+            if *field != 0 {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "ExtractField field {field} on a fieldless-enum value (only the tag at \
+                         field 0 exists)"
+                    ),
+                });
+            }
+            let carrier = enum_tag_values[aggregate].clone();
+            let field_lir = map_scalar_int_ty(ty, "fieldless-enum tag ExtractField")?;
+            if field_lir != carrier {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "fieldless-enum tag ExtractField typed {field_lir:?} but the admitted \
+                         carrier is {carrier:?}"
+                    ),
+                });
+            }
+            let src = vmap.resolve(*aggregate, name)?;
+            let dst = vmap.resolve(result, name)?;
+            value_types.insert(dst, field_lir);
+            instructions.push(Instruction {
+                opcode: Opcode::Copy,
+                args: vec![src],
+                results: vec![dst],
+            });
+        }
+        // ---- PAIR-ENUM constant: `const enum.N { tag }` (payload-less
+        // variant) or `const enum.N { tag, payload }`. The value is a
+        // (tag, payload) register pair; a payload-less constant materializes
+        // a DEFINED zero payload — a sound refinement of the ABI's undef
+        // payload lane (type safety forbids reading the payload under that
+        // tag, and copying propagates a defined value either way). ----
+        Inst::Const { ty, value: Constant::Aggregate(fields) }
+            if pair_enum_view(module, ty).is_some() =>
+        {
+            let result = expect_single_result(node, name)?;
+            let view = pair_enum_view(module, ty).expect("guarded");
+            let (tag_const, payload_const) = match fields.as_slice() {
+                [Constant::Int(t)] => (*t, 0),
+                [Constant::Int(t), Constant::Int(p)] => (*t, *p),
+                _ => {
+                    return Err(ModuleLirError::UnsupportedConstant { name: name.to_string() });
+                }
+            };
+            let tag_v = Value(*next_value);
+            *next_value += 1;
+            value_types.insert(tag_v, view.tag.clone());
+            instructions.push(Instruction {
+                opcode: Opcode::Iconst { ty: view.tag.clone(), imm: i128_to_i64(tag_const, name)? },
+                args: vec![],
+                results: vec![tag_v],
+            });
+            let pay_v = Value(*next_value);
+            *next_value += 1;
+            value_types.insert(pay_v, view.payload.clone());
+            instructions.push(Instruction {
+                opcode: Opcode::Iconst {
+                    ty: view.payload.clone(),
+                    imm: i128_to_i64(payload_const, name)?,
+                },
+                args: vec![],
+                results: vec![pay_v],
+            });
+            pair_enum_values.insert(result, (tag_v, pay_v));
+            return Ok(());
+        }
+        // ---- PAIR-ENUM insertfield: replace one lane of a tracked pair. ----
+        Inst::InsertField { ty, aggregate, field, value }
+            if pair_enum_values.contains_key(aggregate) && pair_enum_view(module, ty).is_some() =>
+        {
+            let result = expect_single_result(node, name)?;
+            let (tag_v, pay_v) = pair_enum_values[aggregate];
+            let new_v = vmap.resolve(*value, name)?;
+            let pair = match field {
+                0 => (new_v, pay_v),
+                1 => (tag_v, new_v),
+                other => {
+                    return Err(ModuleLirError::UnsupportedAggregate {
+                        name: name.to_string(),
+                        detail: format!("InsertField field {other} on a (tag, payload) pair enum"),
+                    });
+                }
+            };
+            pair_enum_values.insert(result, pair);
+            return Ok(());
+        }
+        // ---- PAIR-ENUM extractfield: 0 = tag, 1 = payload — a Copy. ----
+        Inst::ExtractField { ty, aggregate, field }
+            if pair_enum_values.contains_key(aggregate) =>
+        {
+            let result = expect_single_result(node, name)?;
+            let (tag_v, pay_v) = pair_enum_values[aggregate];
+            let src = match field {
+                0 => tag_v,
+                1 => pay_v,
+                other => {
+                    return Err(ModuleLirError::UnsupportedAggregate {
+                        name: name.to_string(),
+                        detail: format!(
+                            "ExtractField field {other} on a (tag, payload) pair enum"
+                        ),
+                    });
+                }
+            };
+            let declared_lir = map_scalar_int_ty_in(module, ty, "pair-enum lane")?;
+            let carried = value_types.get(&src).cloned();
+            if carried.as_ref() != Some(&declared_lir) {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "pair-enum lane {field} declared {declared_lir:?} but carries {carried:?}"
+                    ),
+                });
+            }
+            let dst = vmap.resolve(result, name)?;
+            value_types.insert(dst, declared_lir);
+            instructions.push(Instruction {
+                opcode: Opcode::Copy,
+                args: vec![src],
+                results: vec![dst],
+            });
+            return Ok(());
+        }
+        // ---- Field read on a BY-VALUE NEWTYPE struct param: the param's own
+        // value IS the single field. ----
+        Inst::ExtractField { ty, aggregate, field }
+            if mem.newtype_struct_params.contains_key(aggregate) =>
+        {
+            let result = expect_single_result(node, name)?;
+            if *field != 0 {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "ExtractField field {field} on a single-field newtype struct param"
+                    ),
+                });
+            }
+            let carried = mem.newtype_struct_params[aggregate].clone();
+            let declared_lir = map_scalar_int_ty_in(module, ty, "newtype struct field")?;
+            if declared_lir != carried {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "newtype struct field declared {declared_lir:?} but the formal carries \
+                         {carried:?}"
+                    ),
+                });
+            }
+            let src = vmap.resolve(*aggregate, name)?;
+            let dst = vmap.resolve(result, name)?;
+            value_types.insert(dst, declared_lir);
+            instructions.push(Instruction {
+                opcode: Opcode::Copy,
+                args: vec![src],
+                results: vec![dst],
+            });
+            return Ok(());
+        }
+        // ---- Field read on a BY-VALUE PAIR struct param: a Copy of the
+        // mapped register formal (declaration index -> layout slot). ----
+        Inst::ExtractField { ty, aggregate, field }
+            if mem.pair_struct_params.contains_key(aggregate) =>
+        {
+            let result = expect_single_result(node, name)?;
+            let psp = &mem.pair_struct_params[aggregate];
+            let idx = *field as usize;
+            if idx >= 2 {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "ExtractField field {idx} out of range for the two-field Pair struct \
+                         param"
+                    ),
+                });
+            }
+            let declared_lir = map_scalar_int_ty_in(module, ty, "pair struct field")?;
+            if declared_lir != psp.tys[idx] {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "pair struct field {idx} declared {declared_lir:?} but the formal \
+                         carries {:?}",
+                        psp.tys[idx]
+                    ),
+                });
+            }
+            let src = psp.by_decl_index[idx];
+            let dst = vmap.resolve(result, name)?;
+            value_types.insert(dst, declared_lir);
+            instructions.push(Instruction {
+                opcode: Opcode::Copy,
+                args: vec![src],
+                results: vec![dst],
+            });
+            return Ok(());
+        }
+        // ---- Field read on a BY-VALUE INDIRECT struct param: one Ldr through
+        // the hidden pointer at the field's RECORDED offset. A field whose
+        // type is a fieldless enum registers its result as a tag carrier, so
+        // the follow-on `extractfield <tag> %field, 0` lowers as the identity
+        // read above. ----
+        Inst::ExtractField { ty, aggregate, field }
+            if mem.indirect_struct_params.contains_key(aggregate) =>
+        {
+            let result = expect_single_result(node, name)?;
+            let isp = &mem.indirect_struct_params[aggregate];
+            let idx = *field as usize;
+            let Some((offset, field_lir)) = isp.layout.field_offsets.get(idx).cloned() else {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "ExtractField field {idx} out of range for the indirect struct param \
+                         ({} recorded fields)",
+                        isp.layout.field_offsets.len()
+                    ),
+                });
+            };
+            // The declared field type must map to the SAME carrier the
+            // recorded layout laid out (an enum maps through its tag carrier,
+            // payload enums included — see enum_tag_read_view) — a mismatch
+            // is producer/def drift, fail closed.
+            let declared_lir = match enum_tag_read_view(module, ty) {
+                Some((carrier, _, _)) => map_scalar_int_ty(&carrier, "indirect struct field")?,
+                None => map_scalar_int_ty_in(module, ty, "indirect struct field")?,
+            };
+            if declared_lir != field_lir {
+                return Err(ModuleLirError::UnsupportedAggregate {
+                    name: name.to_string(),
+                    detail: format!(
+                        "indirect struct field {idx} declared {declared_lir:?} but the recorded \
+                         layout carries {field_lir:?}"
+                    ),
+                });
+            }
+            let base = isp.ptr;
+            let addr = if offset == 0 {
+                base
+            } else {
+                let off = Value(*next_value);
+                *next_value += 1;
+                value_types.insert(off, LirType::I64);
+                instructions.push(Instruction {
+                    opcode: Opcode::Iconst { ty: LirType::I64, imm: i64::from(offset) },
+                    args: vec![],
+                    results: vec![off],
+                });
+                let addr = Value(*next_value);
+                *next_value += 1;
+                value_types.insert(addr, LirType::I64);
+                instructions.push(Instruction {
+                    opcode: Opcode::ArrayGep { elem_ty: LirType::I8 },
+                    args: vec![base, off],
+                    results: vec![addr],
+                });
+                addr
+            };
+            let dst = vmap.resolve(result, name)?;
+            value_types.insert(dst, field_lir.clone());
+            instructions.push(Instruction {
+                opcode: Opcode::Load { ty: field_lir, align: None },
+                args: vec![addr],
+                results: vec![dst],
+            });
+            if isp
+                .field_tys
+                .get(idx)
+                .is_some_and(|fty| enum_tag_read_view(module, fty).is_some())
+            {
+                enum_tag_values.insert(result, declared_lir);
+            }
+        }
         // ---- Dead cross-block memory-merge seed (`Inst::Undef` -> slot). ----
         //
         // Reached ONLY for an `Undef` the PASS-1.5 analysis PROVED to be a dead
@@ -3202,8 +4399,29 @@ fn lower_value_inst(
         Inst::Const { ty, value } => {
             let result = expect_single_result(node, name)?;
             let lir_ty = map_scalar_int_ty_in(module, ty, "Const")?;
+            // A 128-bit constant takes the register-pair materialization
+            // (`Iconst128 { lo, hi }` — the ISel's `select_i128_iconst_wide`),
+            // which carries the FULL value; the i64-immediate carrier below is
+            // for the single-register widths.
+            if matches!(lir_ty, LirType::I128) {
+                let Constant::Int(v) = value else {
+                    return Err(ModuleLirError::UnsupportedConstant { name: name.to_string() });
+                };
+                let bits = *v as u128;
+                let dst = vmap.resolve(result, name)?;
+                value_types.insert(dst, LirType::I128);
+                instructions.push(Instruction {
+                    opcode: Opcode::Iconst128 {
+                        lo: (bits as u64) as i64,
+                        hi: ((bits >> 64) as u64) as i64,
+                    },
+                    args: vec![],
+                    results: vec![dst],
+                });
+                return Ok(());
+            }
             let imm = match value {
-                Constant::Int(v) => i128_to_i64(*v, name)?,
+                Constant::Int(v) => i128_const_to_i64_imm(*v, ty, name)?,
                 Constant::Bool(b) => i64::from(*b),
                 // A FIELDLESS-ENUM literal. The producer spells it as the
                 // canonical `(Ty::Enum, Aggregate([Int(disc), fields...]))` seed
@@ -3338,32 +4556,56 @@ fn lower_value_inst(
             let value_dst = vmap.resolve(*value_res, name)?;
             let overflow_dst = vmap.resolve(*overflow_res, name)?;
 
-            // ---- i32/u32 CHECKED MULTIPLY via exact i64 widening. ----
+            // ---- NARROW CHECKED ARITHMETIC via exact i64 widening. ----
             //
-            // `CheckedSmul`/`CheckedUmul` lower only at I64 in the pinned ISel
-            // (SMULH/UMULH are 64-bit). Rather than change the pinned ISel, we
-            // widen the narrow mul into a plain i64 `Imul` whose result is EXACT
-            // (a 32-bit product never exceeds 2^63), then detect overflow as an
-            // i32/u32-RANGE check on that exact 64-bit product:
+            // Two ISel envelopes force this lane: `CheckedSmul`/`CheckedUmul`
+            // lower only at I64 (SMULH/UMULH are 64-bit), and
+            // `CheckedS/Uadd`/`sub` lower only at I32/I64 (the flag-setting
+            // ADDS/SUBS+CSET idiom — MEASURED: emit_object refuses I16 with
+            // "checked add/sub requires I32 or I64 operands", the
+            // trust-checksum `fletcher_pack` blocker). Rather than change the
+            // pinned ISel, widen the narrow op into a plain i64 op whose
+            // result is EXACT, then detect overflow as a WIDTH-RANGE check:
             //
-            //   signed   (i32): a64 = sext a; b64 = sext b; p = a64 * b64
-            //                   value    = trunc_i32(p)
-            //                   overflow = (p < i32::MIN) OR (p > i32::MAX)
-            //   unsigned (u32): a64 = zext a; b64 = zext b; p = a64 * b64
-            //                   value    = trunc_i32(p)            (low 32 bits)
-            //                   overflow = (p > u32::MAX)          (unsigned cmp)
+            //   signed   (iN): a64 = sext a; b64 = sext b; r = a64 <op> b64
+            //                  value    = trunc_iN(r)
+            //                  overflow = (r < iN::MIN) OR (r > iN::MAX)
+            //   unsigned (uN): a64 = zext a; b64 = zext b; r = a64 <op> b64
+            //                  value    = trunc_iN(r)             (low N bits)
+            //                  overflow = (r > uN::MAX)           (unsigned cmp)
             //
-            // SOUNDNESS: for signed i32, |a*b| <= (2^31)^2 = 2^62 < 2^63, so the
-            // 64-bit two's-complement product is the exact mathematical product;
-            // i32 overflow ⟺ that product falls outside [i32::MIN, i32::MAX], and
-            // the low 32 bits are the wrapping value. For u32, a*b <= (2^32-1)^2 <
-            // 2^64 and both operands are non-negative after zero-extension, so the
-            // 64-bit product is exact and non-negative; u32 overflow ⟺ product >
-            // u32::MAX, value = low 32 bits. A wrong bound/compare-direction here
-            // would miscompile, so this is gated by the proven-output test.
-            if matches!(op, OverflowOp::MulOverflow) && matches!(value_lir_ty, LirType::I32) {
+            // SOUNDNESS: for signed iN (N <= 32), |a op b| <= (2^31)^2 = 2^62
+            // < 2^63, so the 64-bit two's-complement result is the exact
+            // mathematical result; iN overflow ⟺ it falls outside
+            // [iN::MIN, iN::MAX], and the low N bits are the wrapping value.
+            // For uN mul/add, the result <= (2^32-1)^2 < 2^64 is exact as an
+            // UNSIGNED quantity (the u32 corner product may set bit 63; the
+            // overflow compare below is unsigned, so that is still classified
+            // correctly); uN overflow ⟺ result > uN::MAX. For uN SUB, a-b < 0
+            // (the borrow case) yields a NEGATIVE i64 whose unsigned reading
+            // exceeds 2^63 > uN::MAX, so the same unsigned compare flags it,
+            // and the truncated low N bits are exactly the wrapping
+            // difference. A wrong bound/compare-direction here would
+            // miscompile, so this is gated by the proven-output test.
+            //
+            // Widths: mul widens at I8/I16/I32 (no narrow Checked*mul at
+            // all); add/sub widen at I8/I16 only (I32 is first-class).
+            let needs_widening = match op {
+                OverflowOp::MulOverflow => {
+                    matches!(value_lir_ty, LirType::I8 | LirType::I16 | LirType::I32)
+                }
+                OverflowOp::AddOverflow | OverflowOp::SubOverflow => {
+                    matches!(value_lir_ty, LirType::I8 | LirType::I16)
+                }
+            };
+            if needs_widening {
                 let signed = ty.is_signed();
-                // Fresh I64 temps for the widened operands and the exact product.
+                let wide_opcode = match op {
+                    OverflowOp::MulOverflow => Opcode::Imul,
+                    OverflowOp::AddOverflow => Opcode::Iadd,
+                    OverflowOp::SubOverflow => Opcode::Isub,
+                };
+                // Fresh I64 temps for the widened operands and the exact result.
                 let a64 = Value(*next_value);
                 *next_value += 1;
                 let b64 = Value(*next_value);
@@ -3381,34 +4623,41 @@ fn lower_value_inst(
                         Opcode::Uextend { from_ty: from, to_ty: to }
                     }
                 };
-                // a64 = {s,z}ext_i32->i64 a ; b64 = {s,z}ext_i32->i64 b
+                // a64 = {s,z}ext_iN->i64 a ; b64 = {s,z}ext_iN->i64 b
                 instructions.push(Instruction {
-                    opcode: ext_opcode(LirType::I32, LirType::I64),
+                    opcode: ext_opcode(value_lir_ty.clone(), LirType::I64),
                     args: vec![a],
                     results: vec![a64],
                 });
                 instructions.push(Instruction {
-                    opcode: ext_opcode(LirType::I32, LirType::I64),
+                    opcode: ext_opcode(value_lir_ty.clone(), LirType::I64),
                     args: vec![b],
                     results: vec![b64],
                 });
-                // prod = a64 * b64   (exact 64-bit product)
+                // prod = a64 <op> b64   (exact 64-bit result)
                 instructions.push(Instruction {
-                    opcode: Opcode::Imul,
+                    opcode: wide_opcode,
                     args: vec![a64, b64],
                     results: vec![prod],
                 });
-                // value = trunc_i64->i32(prod)   (the wrapping low 32 bits)
-                value_types.insert(value_dst, value_lir_ty);
+                // value = trunc_i64->iN(prod)   (the wrapping low N bits)
+                value_types.insert(value_dst, value_lir_ty.clone());
                 instructions.push(Instruction {
-                    opcode: Opcode::Trunc { to_ty: LirType::I32 },
+                    opcode: Opcode::Trunc { to_ty: value_lir_ty.clone() },
                     args: vec![prod],
                     results: vec![value_dst],
                 });
 
+                // The width-dependent range bounds for the overflow check.
+                let (signed_lo, signed_hi, unsigned_hi) = match value_lir_ty {
+                    LirType::I8 => (i8::MIN as i64, i8::MAX as i64, u8::MAX as i64),
+                    LirType::I16 => (i16::MIN as i64, i16::MAX as i64, u16::MAX as i64),
+                    _ => (i32::MIN as i64, i32::MAX as i64, u32::MAX as i64),
+                };
+
                 // overflow flag (B1).
                 if signed {
-                    // overflow = (prod < i32::MIN) OR (prod > i32::MAX)
+                    // overflow = (prod < iN::MIN) OR (prod > iN::MAX)
                     let lo_bound = Value(*next_value);
                     *next_value += 1;
                     let hi_bound = Value(*next_value);
@@ -3422,12 +4671,12 @@ fn lower_value_inst(
                     value_types.insert(lt_lo, LirType::B1);
                     value_types.insert(gt_hi, LirType::B1);
                     instructions.push(Instruction {
-                        opcode: Opcode::Iconst { ty: LirType::I64, imm: i32::MIN as i64 },
+                        opcode: Opcode::Iconst { ty: LirType::I64, imm: signed_lo },
                         args: vec![],
                         results: vec![lo_bound],
                     });
                     instructions.push(Instruction {
-                        opcode: Opcode::Iconst { ty: LirType::I64, imm: i32::MAX as i64 },
+                        opcode: Opcode::Iconst { ty: LirType::I64, imm: signed_hi },
                         args: vec![],
                         results: vec![hi_bound],
                     });
@@ -3448,12 +4697,13 @@ fn lower_value_inst(
                         results: vec![overflow_dst],
                     });
                 } else {
-                    // overflow = (prod > u32::MAX)   (unsigned compare; prod >= 0)
+                    // overflow = (prod > uN::MAX)   (unsigned compare; prod is
+                    // the exact unsigned product)
                     let hi_bound = Value(*next_value);
                     *next_value += 1;
                     value_types.insert(hi_bound, LirType::I64);
                     instructions.push(Instruction {
-                        opcode: Opcode::Iconst { ty: LirType::I64, imm: u32::MAX as i64 },
+                        opcode: Opcode::Iconst { ty: LirType::I64, imm: unsigned_hi },
                         args: vec![],
                         results: vec![hi_bound],
                     });
@@ -3564,17 +4814,47 @@ fn lower_value_inst(
             }
             let result = expect_single_result(node, name)?;
             let lir_ty = map_scalar_mem_ty(ty, name, "Load")?;
-            let ptr_v = resolve_local_pointer(*ptr, vmap, mem, name)?;
-            // The load width must match the slot's element type.
-            if let Some(slot_ty) = mem.pointee_ty.get(&ptr_v) {
-                if *slot_ty != lir_ty {
+            // Three admitted rootings: an Alloca-rooted stack slot; an INCOMING
+            // READ-ONLY slice root; or a direct immutable assembled-global root.
+            // Global roots deliberately do not flow through GEP/Copy/Store in
+            // this first object-relocation rung.
+            let ptr_v = vmap.resolve(*ptr, name)?;
+            if mem.slot_of.contains_key(&ptr_v) {
+                // The load width must match the slot's element type.
+                if let Some(slot_ty) = mem.pointee_ty.get(&ptr_v) {
+                    if *slot_ty != lir_ty {
+                        return Err(ModuleLirError::UnsupportedMemory {
+                            name: name.to_string(),
+                            detail: format!(
+                                "Load width {lir_ty:?} does not match slot element {slot_ty:?}"
+                            ),
+                        });
+                    }
+                }
+            } else if let Some(elem) = mem.incoming_pointee.get(&ptr_v) {
+                if *elem != lir_ty {
                     return Err(ModuleLirError::UnsupportedMemory {
                         name: name.to_string(),
                         detail: format!(
-                            "Load width {lir_ty:?} does not match slot element {slot_ty:?}"
+                            "Load width {lir_ty:?} does not match the slice element {elem:?}"
                         ),
                     });
                 }
+            } else if let Some(elem) = mem.global_pointee.get(&ptr_v) {
+                if *elem != lir_ty {
+                    return Err(ModuleLirError::UnsupportedMemory {
+                        name: name.to_string(),
+                        detail: format!(
+                            "Load width {lir_ty:?} does not match assembled global element \
+                             {elem:?}"
+                        ),
+                    });
+                }
+            } else {
+                return Err(ModuleLirError::NonLocalPointer {
+                    name: name.to_string(),
+                    value: ptr.index(),
+                });
             }
             let dst = vmap.resolve(result, name)?;
             value_types.insert(dst, lir_ty.clone());
@@ -3634,23 +4914,90 @@ fn lower_value_inst(
                     ),
                 });
             };
-            let base_v = resolve_local_pointer(*base, vmap, mem, name)?;
+            // Same two rootings as `Load`: an Alloca-rooted slot, or an
+            // incoming read-only slice-data root (result inherits the root
+            // kind and pointee).
+            let base_v = vmap.resolve(*base, name)?;
+            let incoming = mem.incoming_pointee.get(&base_v).cloned();
+            if !mem.slot_of.contains_key(&base_v) && incoming.is_none() {
+                return Err(ModuleLirError::NonLocalPointer {
+                    name: name.to_string(),
+                    value: base.index(),
+                });
+            }
             let index_v = vmap.resolve(*index, name)?;
             let dst = vmap.resolve(result, name)?;
-            // The GEP result is still an alloca-rooted pointer into the SAME
-            // slot, addressing an element of `elem_ty`.
             value_types.insert(dst, LirType::I64);
             if let Some(&slot) = mem.slot_of.get(&base_v) {
                 mem.slot_of.insert(dst, slot);
+                mem.pointee_ty.insert(dst, elem_ty.clone());
             }
-            mem.pointee_ty.insert(dst, elem_ty.clone());
+            if incoming.is_some() {
+                mem.incoming_pointee.insert(dst, elem_ty.clone());
+            }
             instructions.push(Instruction {
                 opcode: Opcode::ArrayGep { elem_ty },
                 args: vec![base_v, index_v],
                 results: vec![dst],
             });
         }
-        // ---- GlobalAddr (a function's address as a fn-pointer) -> Opcode::GlobalRef. ----
+        // ---- Fat slice parameter lanes: PtrData / PtrMetadata. ----
+        //
+        // The ONLY admitted fat-pointer source is a `&[T]` FORMAL, whose two
+        // split halves the entry binding placed in `mem.fat_params` (the fat
+        // pointer's own ValueId is unbound, so every other use of it fails
+        // closed as an undefined value — including these two lanes when the
+        // operand is anything but a fat formal).
+        Inst::PtrData { ptr, .. } => {
+            let result = expect_single_result(node, name)?;
+            let Some(fat) = mem.fat_params.get(ptr) else {
+                return Err(ModuleLirError::UnsupportedMemory {
+                    name: name.to_string(),
+                    detail: "PtrData on a value that is not a fat slice formal (only the \
+                             split `&[T]` parameter lane is mapped)"
+                        .to_string(),
+                });
+            };
+            let (data, elem) = (fat.data, fat.elem.clone());
+            let dst = vmap.resolve(result, name)?;
+            value_types.insert(dst, LirType::I64);
+            // The data pointer is an INCOMING READ-ONLY root for later GEP/Load.
+            mem.incoming_pointee.insert(dst, elem);
+            instructions.push(Instruction {
+                opcode: Opcode::Copy,
+                args: vec![data],
+                results: vec![dst],
+            });
+        }
+        Inst::PtrMetadata { ptr, metadata_ty, .. } => {
+            let result = expect_single_result(node, name)?;
+            let Some(fat) = mem.fat_params.get(ptr) else {
+                return Err(ModuleLirError::UnsupportedMemory {
+                    name: name.to_string(),
+                    detail: "PtrMetadata on a value that is not a fat slice formal (only the \
+                             split `&[T]` parameter lane is mapped)"
+                        .to_string(),
+                });
+            };
+            let lir_ty = map_scalar_int_ty(metadata_ty, "PtrMetadata result")?;
+            if lir_ty != LirType::I64 {
+                return Err(ModuleLirError::UnsupportedMemory {
+                    name: name.to_string(),
+                    detail: format!(
+                        "slice length metadata must be the 64-bit count, got {lir_ty:?}"
+                    ),
+                });
+            }
+            let len = fat.len;
+            let dst = vmap.resolve(result, name)?;
+            value_types.insert(dst, LirType::I64);
+            instructions.push(Instruction {
+                opcode: Opcode::Copy,
+                args: vec![len],
+                results: vec![dst],
+            });
+        }
+        // ---- GlobalAddr -> Opcode::GlobalRef. ----
         //
         // A `GlobalAddr { global }` materializes the address of a module global
         // into a register. ISel lowers `Opcode::GlobalRef { name }` to
@@ -3659,28 +5006,42 @@ fn lower_value_inst(
         // LOCAL symbol. This is the foundation for a KNOWN-target indirect call: a
         // subsequent `CallIndirect` through this register BLRs to the callee.
         //
-        // We record the materialized symbol name in `global_addr_syms` keyed by the
-        // result Value, so the `CallIndirect` arm can trace its function-pointer
-        // operand back to a concrete symbol (a KNOWN target) — and so the executor
-        // composes the BLR from the SAME real PAGE21/PAGEOFF12 relocations the
-        // linker resolves, not the IR's claim.
+        // We record every direct-global result in `global_addr_provenance`, with
+        // function-symbol proxies distinct from data. That lets `CallIndirect`
+        // trace a legitimate function pointer while rejecting a known data address
+        // instead of misclassifying it as an OPEN target.
         //
-        // The result is an I64 pointer. Taking a global's address is always pure,
-        // so `GlobalAddr` is admitted regardless of `real_calls` (a plain address
-        // computation) — but it is USEFUL only under `real_calls`, where a
-        // `CallIndirect` through it is emitted rather than rejected.
+        // The result is an I64 pointer. Existing function-symbol proxy globals
+        // retain their CallIndirect provenance. Separately, the exact first data
+        // slice — immutable initialized non-TLS Internal/Private u64 — receives
+        // read-only provenance so one or more direct exact-width Loads can lower.
+        // No Store/GEP/Copy provenance is granted, and object emission rechecks
+        // the same shape through the canonical Trust-IR global encoder.
         Inst::GlobalAddr { global } => {
             let g = module.globals.get(global.as_usize()).ok_or_else(|| {
-                ModuleLirError::UnsupportedInst {
-                    name: name.to_string(),
-                    inst: inst_name(&node.inst),
-                }
+                ModuleLirError::MissingGlobal { name: name.to_string(), global: global.index() }
             })?;
             let result = expect_single_result(node, name)?;
             let dst = vmap.resolve(result, name)?;
             value_types.insert(dst, LirType::I64);
-            // Record the symbol the address points at (for CallIndirect tracing).
-            global_addr_syms.insert(dst, g.name.clone());
+            let assembled_read_only_data = !g.mutable
+                && g.initializer.is_some()
+                && g.tls.is_none()
+                && matches!(g.linkage, trust_ir::Linkage::Internal | trust_ir::Linkage::Private)
+                && g.ty == Ty::U64
+                && g.align.is_none_or(|align| align >= 8 && align.is_power_of_two());
+            if assembled_read_only_data {
+                mem.global_pointee.insert(dst, LirType::I64);
+            }
+            if crate::codegen_backend::function_symbol_proxy(module, g) {
+                // Legacy function-symbol proxies have no initializer and are
+                // used only to identify a known indirect-call target. Keep
+                // that provenance disjoint from real data definitions.
+                global_addr_provenance
+                    .insert(dst, GlobalAddrProvenance::FunctionSymbol(g.name.clone()));
+            } else {
+                global_addr_provenance.insert(dst, GlobalAddrProvenance::DataSymbol);
+            }
             instructions.push(Instruction {
                 opcode: Opcode::GlobalRef { name: g.name.clone() },
                 args: vec![],
@@ -3692,10 +5053,10 @@ fn lower_value_inst(
         //
         // Reached ONLY when `real_calls` is set. `callee` is the function-pointer
         // operand; `args` are the call arguments. Two dispositions, split on
-        // whether the fn-pointer traces (via `global_addr_syms`) to a concrete
+        // whether the fn-pointer traces (via `global_addr_provenance`) to a concrete
         // GlobalAddr'd symbol:
         //
-        //  * KNOWN target (a `global_addr_syms` HIT that names a LOCAL pure fn in
+        //  * KNOWN target (a function-symbol provenance entry naming a LOCAL pure fn in
         //    the SAME gate-composable fragment as the direct-call path,
         //    `callee_is_real_call_composable`): emit `Opcode::CallIndirect` (args[0]
         //    = fn ptr, args[1..] = the call args) -> `BLR <fn-ptr-reg>` (a genuine
@@ -3703,12 +5064,12 @@ fn lower_value_inst(
         //    like the direct case: trace the BLR's target register to its GlobalRef
         //    symbol via the emitted PAGE21/PAGEOFF12 relocations, substitute that
         //    callee's derived pure output into X0, havoc caller-saved registers.
-        //    A `global_addr_syms` HIT that resolves to a data global or an
+        //    A direct data-global provenance entry, or a function entry that resolves to an
         //    impure/nonlocal fn is a TRACEABLE-but-not-composable target and FAILS
         //    CLOSED (it is not OPEN — its identity is known, but a BLR into data or
         //    an effectful callee cannot be soundly modeled as a pure formula).
         //
-        //  * OPEN target (a `global_addr_syms` MISS: an incoming fn-pointer arg, a
+        //  * OPEN target (a provenance MISS: an incoming fn-pointer arg, a
         //    vtable-slot load, or a closure-env field — the shape trait-object /
         //    closure dynamic dispatch produces): its target is NOT statically known,
         //    so we CANNOT compose a specific callee. We admit a HAVOC-ONLY BLR: the
@@ -3721,9 +5082,9 @@ fn lower_value_inst(
         Inst::CallIndirect { callee, args, sig, .. } if real_calls => {
             let ptr_v = vmap.resolve(*callee, name)?;
             // Does the fn-pointer trace to a GlobalAddr'd symbol (a KNOWN target)?
-            match global_addr_syms.get(&ptr_v) {
+            match global_addr_provenance.get(&ptr_v) {
                 // ---- KNOWN target: trace to a symbol. ----
-                Some(sym) => {
+                Some(GlobalAddrProvenance::FunctionSymbol(sym)) => {
                     // The symbol must name a LOCAL pure function in the composable
                     // fragment (same gate as the direct-call path). A symbol that
                     // resolves to a data global or an impure/nonlocal function is a
@@ -3776,6 +5137,14 @@ fn lower_value_inst(
                         opcode: Opcode::CallIndirect,
                         args: call_args,
                         results: vec![dst],
+                    });
+                }
+                // A direct data address is traceable and definitely not an open
+                // function pointer. Executing it as code would be unsound.
+                Some(GlobalAddrProvenance::DataSymbol) => {
+                    return Err(ModuleLirError::UnsupportedInst {
+                        name: name.to_string(),
+                        inst: inst_name(&node.inst),
                     });
                 }
                 // ---- OPEN target: NOT traceable to a concrete symbol. ----
@@ -3850,7 +5219,7 @@ fn lower_value_inst(
         //
         // Reached ONLY when `real_calls` is set AND the inlining pre-pass DEFERRED
         // this call (it is a LOCAL callee in the gate's single-register scalar-pure
-        // fragment). We emit a genuine LIR `Opcode::Call { name }` — ISel lowers it
+        // fragment). We emit a genuine LIR `Opcode::Call { name, .. }` — ISel lowers it
         // to `Bl <callee>` + an `ARM64_RELOC_BRANCH26` naming the callee symbol —
         // instead of splicing the body inline. The proven-output gate / executor
         // then COMPOSES the callee at the reloc target (substitute its derived pure
@@ -3901,8 +5270,21 @@ fn lower_value_inst(
                 args.iter().map(|a| vmap.resolve(*a, name)).collect::<Result<_, _>>()?;
             let dst = vmap.resolve(result, name)?;
             value_types.insert(dst, lir_ret);
+            // `DirectCallBinding` arrived with the trust-cg pin advance. It is
+            // `Interposable` here — the field's own `#[default]` and
+            // `#[serde(default)]` — because that is exactly the semantics this
+            // edge had before the field existed: resolve by the platform's
+            // ordinary named-symbol rules.
+            //
+            // `ExactModuleFunction { function }` is the STRONGER claim ("resolve
+            // only to this validated module-local function identity, or fail
+            // closed"), and this producer has authenticated no such numeric
+            // identity against the module. Even though `callee_fn` is
+            // module-local, minting that claim here would assert an
+            // authentication that never happened. Tightening this is a separate,
+            // deliberate change that must first establish the identity.
             instructions.push(Instruction {
-                opcode: Opcode::Call { name: callee_fn.name.clone() },
+                opcode: Opcode::Call { name: callee_fn.name.clone(), binding: DirectCallBinding::Interposable },
                 args: arg_vals,
                 results: vec![dst],
             });
@@ -3930,7 +5312,7 @@ fn lower_value_inst(
 /// spilled/reloaded through a stack slot: a `Load{ty:Ptr}` off an alloca-rooted
 /// slot models a VTABLE-SLOT / CLOSURE-ENV-FIELD read (the shape real
 /// trait-object / closure dispatch produces). A fn-ptr read from memory is a
-/// `global_addr_syms` MISS (only `GlobalAddr` results are tagged), so a
+/// `global_addr_provenance` MISS (only `GlobalAddr` results are tagged), so a
 /// `CallIndirect` through it routes to the ALREADY-PROVEN OPEN-target havoc BLR
 /// arm — the most conservative over-approximation of an arbitrary callee. This
 /// admits NO arithmetic-on-`Ptr` path: the BinOp/Cast/UnOp/ICmp arms consult
@@ -3987,6 +5369,7 @@ fn resolve_local_pointer(
 fn lower_terminator(
     term: &Inst,
     vmap: &ValueMap,
+    pair_enum_values: &HashMap<ValueId, (Value, Value)>,
     blocks_by_id: &HashMap<u32, &trust_ir::Block>,
     instructions: &mut Vec<Instruction>,
     edge_blocks: &mut Vec<(Block, LirBlock)>,
@@ -3996,15 +5379,27 @@ fn lower_terminator(
 ) -> Result<(), ModuleLirError> {
     match term {
         Inst::Return { values } => {
-            if values.len() != 1 {
-                return Err(ModuleLirError::MalformedReturn { name: name.to_string() });
+            // A VOID return (`ret` with no values) carries no args — the twin
+            // of the empty `Signature::returns`; a single value resolves and
+            // rides the return slot. More than one return value stays refused.
+            // A PAIR-ENUM return carries both lanes: (tag, payload) — the
+            // signature declared two returns for it.
+            if let [v] = values.as_slice()
+                && let Some((tag_v, pay_v)) = pair_enum_values.get(v)
+            {
+                instructions.push(Instruction {
+                    opcode: Opcode::Return,
+                    args: vec![*tag_v, *pay_v],
+                    results: vec![],
+                });
+                return Ok(());
             }
-            let v = vmap.resolve(values[0], name)?;
-            instructions.push(Instruction {
-                opcode: Opcode::Return,
-                args: vec![v],
-                results: vec![],
-            });
+            let args = match values.as_slice() {
+                [] => vec![],
+                [v] => vec![vmap.resolve(*v, name)?],
+                _ => return Err(ModuleLirError::MalformedReturn { name: name.to_string() }),
+            };
+            instructions.push(Instruction { opcode: Opcode::Return, args, results: vec![] });
         }
         Inst::Unreachable => {
             // A diverging terminator; model as a bare Trap so no fall-through
@@ -4018,6 +5413,7 @@ fn lower_terminator(
                 *target,
                 args,
                 vmap,
+                pair_enum_values,
                 blocks_by_id,
                 instructions,
                 next_value,
@@ -4035,6 +5431,7 @@ fn lower_terminator(
                 *then_target,
                 then_args,
                 vmap,
+                pair_enum_values,
                 blocks_by_id,
                 edge_blocks,
                 next_edge_block,
@@ -4045,6 +5442,7 @@ fn lower_terminator(
                 *else_target,
                 else_args,
                 vmap,
+                pair_enum_values,
                 blocks_by_id,
                 edge_blocks,
                 next_edge_block,
@@ -4074,6 +5472,7 @@ fn lower_terminator(
                     case.target,
                     &case.args,
                     vmap,
+                    pair_enum_values,
                     blocks_by_id,
                     edge_blocks,
                     next_edge_block,
@@ -4086,6 +5485,7 @@ fn lower_terminator(
                 *default,
                 default_args,
                 vmap,
+                pair_enum_values,
                 blocks_by_id,
                 edge_blocks,
                 next_edge_block,
@@ -4118,6 +5518,7 @@ fn conditional_edge_dest(
     target: trust_ir::value::BlockId,
     args: &[ValueId],
     vmap: &ValueMap,
+    pair_enum_values: &HashMap<ValueId, (Value, Value)>,
     blocks_by_id: &HashMap<u32, &trust_ir::Block>,
     edge_blocks: &mut Vec<(Block, LirBlock)>,
     next_edge_block: &mut u32,
@@ -4143,7 +5544,7 @@ fn conditional_edge_dest(
     // The target has params: build a trampoline that copies the edge args into
     // the target's param Values, then jumps to the real target.
     let mut tramp = Vec::new();
-    emit_edge_arg_copies(target, args, vmap, blocks_by_id, &mut tramp, next_value, name)?;
+    emit_edge_arg_copies(target, args, vmap, pair_enum_values, blocks_by_id, &mut tramp, next_value, name)?;
     tramp.push(Instruction {
         opcode: Opcode::Jump { dest: Block(target.index()) },
         args: vec![],
@@ -4167,6 +5568,7 @@ fn emit_edge_arg_copies(
     target: trust_ir::value::BlockId,
     args: &[ValueId],
     vmap: &ValueMap,
+    pair_enum_values: &HashMap<ValueId, (Value, Value)>,
     blocks_by_id: &HashMap<u32, &trust_ir::Block>,
     instructions: &mut Vec<Instruction>,
     next_value: &mut u32,
@@ -4187,6 +5589,29 @@ fn emit_edge_arg_copies(
     // (src_value, dst_param_value) pairs, skipping identity copies.
     let mut pending: Vec<(Value, Value)> = Vec::with_capacity(args.len());
     for (arg, (param_id, _)) in args.iter().zip(&target_block.params) {
+        // A PAIR-ENUM edge argument copies BOTH lanes into the target's pair
+        // params. Arg and param must agree on pairness — a mismatch is
+        // producer type drift, fail closed.
+        match (pair_enum_values.get(arg), pair_enum_values.get(param_id)) {
+            (Some((s_tag, s_pay)), Some((d_tag, d_pay))) => {
+                if s_tag != d_tag {
+                    pending.push((*s_tag, *d_tag));
+                }
+                if s_pay != d_pay {
+                    pending.push((*s_pay, *d_pay));
+                }
+                continue;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(ModuleLirError::EdgeArgArity {
+                    name: name.to_string(),
+                    target: target.index(),
+                    got: args.len(),
+                    expected: target_block.params.len(),
+                });
+            }
+        }
         let src = vmap.resolve(*arg, name)?;
         let dst = vmap.resolve(*param_id, name)?;
         if src != dst {
@@ -4664,6 +6089,11 @@ struct AggMemDecompose {
     /// `ExtractField` result `ValueId`s that read a tracked aggregate — the field
     /// index they read (resolved against the live per-field map at lowering).
     agg_extract_field: std::collections::HashMap<ValueId, u32>,
+    /// Whole-aggregate `Load` results whose POINTER is an incoming `Ty::Ptr`
+    /// entry param (a read-only root: `&self`/`&T`). Lowered to per-field Ldr
+    /// through the incoming pointer at the C-layout field offsets. The layout
+    /// is keyed by the LOAD RESULT because the root has no slot.
+    agg_incoming_load_layout: std::collections::HashMap<ValueId, AggMemLayout>,
 }
 
 impl AggMemDecompose {
@@ -4676,11 +6106,12 @@ impl AggMemDecompose {
             agg_store_values: std::collections::HashSet::new(),
             agg_load_results: std::collections::HashSet::new(),
             agg_extract_field: std::collections::HashMap::new(),
+            agg_incoming_load_layout: std::collections::HashMap::new(),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.agg_alloca_layout.is_empty()
+        self.agg_alloca_layout.is_empty() && self.agg_incoming_load_layout.is_empty()
     }
 }
 
@@ -4697,6 +6128,7 @@ fn analyze_aggregate_memory(
     order: &[u32],
     blocks_by_id: &HashMap<u32, &trust_ir::Block>,
     tuple_decompose: &TupleDecompose,
+    ptr_params: &std::collections::HashSet<ValueId>,
     name: &str,
 ) -> Result<AggMemDecompose, ModuleLirError> {
     use std::collections::{HashMap as Map, HashSet as Set};
@@ -4737,9 +6169,16 @@ fn analyze_aggregate_memory(
         }
     }
 
-    // Fast path: no aggregate slot -> nothing to decompose (the scalar/checked
-    // slices handle everything).
-    if agg_alloca_layout.is_empty() {
+    // Fast path: no aggregate slot AND no incoming-root aggregate load ->
+    // nothing to decompose (the scalar/checked slices handle everything).
+    let has_incoming_agg_load = order.iter().any(|bid| {
+        blocks_by_id[bid].body.iter().any(|node| {
+            matches!(&node.inst,
+                Inst::Load { ty: Ty::Tuple(_) | Ty::Struct(_), ptr, volatile: false, .. }
+                    if ptr_params.contains(ptr))
+        })
+    });
+    if agg_alloca_layout.is_empty() && !has_incoming_agg_load {
         return Ok(AggMemDecompose::empty());
     }
 
@@ -4755,6 +6194,7 @@ fn analyze_aggregate_memory(
     let mut agg_store_values: Set<ValueId> = Set::new();
     let mut agg_load_results: Set<ValueId> = Set::new();
     let mut agg_extract_field: Map<ValueId, u32> = Map::new();
+    let mut agg_incoming_load_layout: Map<ValueId, AggMemLayout> = Map::new();
 
     // Arity is per-aggregate (N fields, generalized from the initial 2-field
     // slice): each Const/Undef/Insert/Extract node's field count is resolved from
@@ -4927,6 +6367,33 @@ fn analyze_aggregate_memory(
                     agg_store_values.insert(*value);
                 }
                 // ---- Whole-aggregate Load from a tracked slot. ----
+                Inst::Load { ty, ptr, volatile, align: _ }
+                    if matches!(ty, Ty::Tuple(_) | Ty::Struct(_)) && ptr_params.contains(ptr) =>
+                {
+                    // INCOMING READ-ONLY ROOT: a whole-aggregate load through a
+                    // `Ty::Ptr` entry param (`&self`, `&T`). The layout comes from
+                    // the LOAD's own aggregate type (the opaque pointer carries
+                    // none); every field must be a scalar the slice lays out.
+                    // Stores through the same root stay fail-closed below (an
+                    // incoming pointer is never a slot).
+                    if *volatile {
+                        return Err(ModuleLirError::UnsupportedMemory {
+                            name: name.to_string(),
+                            detail: "volatile aggregate Load is out of the slice".to_string(),
+                        });
+                    }
+                    let [result] = node.results.as_slice() else {
+                        return Err(ModuleLirError::UnsupportedAggregate {
+                            name: name.to_string(),
+                            detail: "aggregate Load must bind one result".to_string(),
+                        });
+                    };
+                    let layout = recorded_struct_mem_layout(ty, module, name)?;
+                    let n = layout.field_offsets.len();
+                    fields.insert(*result, vec![Some(*result); n]);
+                    agg_load_results.insert(*result);
+                    agg_incoming_load_layout.insert(*result, layout);
+                }
                 Inst::Load { ty: Ty::Tuple(_) | Ty::Struct(_), ptr, volatile, align: _ } => {
                     if *volatile {
                         return Err(ModuleLirError::UnsupportedMemory {
@@ -5018,6 +6485,7 @@ fn analyze_aggregate_memory(
         agg_store_values,
         agg_load_results,
         agg_extract_field,
+        agg_incoming_load_layout,
     })
 }
 
@@ -5341,6 +6809,26 @@ fn i128_to_i64(v: i128, name: &str) -> Result<i64, ModuleLirError> {
     i64::try_from(v).map_err(|_| ModuleLirError::UnsupportedConstant { name: name.to_string() })
 }
 
+/// Like [`i128_to_i64`], but TYPE-AWARE for a scalar `Inst::Const`: a `u64`
+/// (or 64-bit-target `usize`) literal in `(i64::MAX, u64::MAX]` — e.g. the
+/// ubiquitous `u64::MAX` sentinel — is representable in the LIR `Iconst` i64
+/// carrier as its two's-complement BIT PATTERN, which is exactly what the
+/// backend materializes into a 64-bit register. Every other overflow (a wide
+/// i128 constant, an unsigned literal exceeding u64) stays fail-closed. A
+/// 32-bit-target `usize` can never validly exceed `i64::MAX`, so the unsigned
+/// branch is unreachable for it and the plain conversion already covers it.
+fn i128_const_to_i64_imm(v: i128, ty: &Ty, name: &str) -> Result<i64, ModuleLirError> {
+    if let Ok(x) = i64::try_from(v) {
+        return Ok(x);
+    }
+    if matches!(ty, Ty::U64 | Ty::Usize) {
+        if let Ok(x) = u64::try_from(v) {
+            return Ok(x as i64);
+        }
+    }
+    Err(ModuleLirError::UnsupportedConstant { name: name.to_string() })
+}
+
 #[cfg(test)]
 mod tests {
     use trust_ir::Block;
@@ -5405,6 +6893,119 @@ mod tests {
         assert!(matches!(block.instructions[1].opcode, Opcode::Iadd));
         assert!(matches!(block.instructions[2].opcode, Opcode::Icmp { .. }));
         assert!(matches!(block.instructions[3].opcode, Opcode::Return));
+    }
+
+    /// A `u64` literal above `i64::MAX` (here the ubiquitous `u64::MAX`
+    /// sentinel, the trust-checksum `message_bit_len` blocker) lowers as its
+    /// two's-complement bit pattern in the i64 `Iconst` carrier; a wide i128
+    /// constant stays fail-closed.
+    #[test]
+    fn maps_u64_max_const_as_bit_pattern() {
+        let mut module = Module::new("t");
+        module.func_types.push(FuncTy {
+            params: vec![Ty::U64, Ty::U64],
+            returns: vec![Ty::U64],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "umax", FuncTyId::new(0), BlockId::new(0));
+        let mut block = Block::new(BlockId::new(0));
+        block.params.push((ValueId::new(0), Ty::U64));
+        block.params.push((ValueId::new(1), Ty::U64));
+        block.body = vec![
+            InstrNode::new(Inst::Const { ty: Ty::U64, value: Constant::Int(u64::MAX as i128) })
+                .with_result(ValueId::new(2)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }),
+        ];
+        f.blocks.push(block);
+        module.functions.push(f);
+
+        let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("u64::MAX const maps");
+        let imm = lir
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i.opcode {
+                Opcode::Iconst { imm, .. } => Some(imm),
+                _ => None,
+            })
+            .expect("an Iconst was emitted");
+        assert_eq!(imm, -1i64, "u64::MAX must materialize as the all-ones bit pattern");
+
+        // CAPABILITY (was a refusal boundary): a genuinely wide i128
+        // constant now materializes through the register-pair
+        // `Iconst128 { lo, hi }` the ISel's `select_i128_iconst_wide`
+        // consumes, carrying the full value.
+        let mut wide = Module::new("t");
+        wide.func_types.push(FuncTy {
+            params: vec![Ty::U64, Ty::U64],
+            returns: vec![Ty::I128],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "wide", FuncTyId::new(0), BlockId::new(0));
+        let mut block = Block::new(BlockId::new(0));
+        block.params.push((ValueId::new(0), Ty::U64));
+        block.params.push((ValueId::new(1), Ty::U64));
+        block.body = vec![
+            InstrNode::new(Inst::Const {
+                ty: Ty::I128,
+                value: Constant::Int(u64::MAX as i128 + 1),
+            })
+            .with_result(ValueId::new(2)),
+            InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }),
+        ];
+        f.blocks.push(block);
+        wide.functions.push(f);
+        let lir = lower_module_to_lir(&wide, FuncId::new(0)).expect("wide i128 const maps");
+        let (lo, hi) = lir
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .find_map(|i| match i.opcode {
+                Opcode::Iconst128 { lo, hi } => Some((lo, hi)),
+                _ => None,
+            })
+            .expect("an Iconst128 was emitted");
+        assert_eq!(lo, 0, "u64::MAX + 1 has a zero low half");
+        assert_eq!(hi, 1, "u64::MAX + 1 has a one high half");
+    }
+
+    /// A VOID function (`(…) -> ()`, empty returns list, bare `ret`) lowers to
+    /// an empty LIR `returns` and a no-arg `Opcode::Return` — the same shape
+    /// the established MIR path emits for unit functions.
+    #[test]
+    fn maps_void_function_bare_return() {
+        let mut module = Module::new("t");
+        module.func_types.push(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "void_fn", FuncTyId::new(0), BlockId::new(0));
+        let mut block = Block::new(BlockId::new(0));
+        block.params.push((ValueId::new(0), Ty::I32));
+        block.params.push((ValueId::new(1), Ty::I32));
+        block.body = vec![
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Ule,
+                ty: Ty::I32,
+                lhs: ValueId::new(0),
+                rhs: ValueId::new(1),
+            })
+            .with_result(ValueId::new(2)),
+            InstrNode::new(Inst::Assert { cond: ValueId::new(2) }),
+            InstrNode::new(Inst::Return { values: vec![] }),
+        ];
+        f.blocks.push(block);
+        module.functions.push(f);
+
+        let lir = lower_module_to_lir(&module, FuncId::new(0)).expect("void function lowers");
+        assert_eq!(lir.signature.returns, Vec::<LirType>::new());
+        let bare_return = lir
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .any(|i| matches!(i.opcode, Opcode::Return) && i.args.is_empty());
+        assert!(bare_return, "a no-arg Return must be emitted");
     }
 
     #[test]
@@ -5572,6 +7173,109 @@ mod tests {
         ]
     }
 
+    /// Narrow checked MULTIPLY (i16/u16/i8/u8) lowers via the same exact-i64
+    /// widening as i32 — {s,z}ext + Imul + width-range Icmps — never via
+    /// `Checked{S,U}mul` (whose ISel is I64-only) and never fail-closed. This
+    /// is the trust-endian `u16_le`/`u16_be` and trust-hex `hex_pair_value`
+    /// blocker.
+    #[test]
+    fn maps_checked_mul_overflow_idiom_narrow_widths() {
+        for (ty, signed) in [(Ty::I16, true), (Ty::U16, false), (Ty::I8, true), (Ty::U8, false)] {
+            let mut module = Module::new("t");
+            module.func_types.push(FuncTy {
+                params: vec![ty.clone(), ty.clone()],
+                returns: vec![ty.clone()],
+                is_vararg: false,
+            });
+            let mut f = IrFunction::new(FuncId::new(0), "cmul", FuncTyId::new(0), BlockId::new(0));
+            let mut block = Block::new(BlockId::new(0));
+            block.params.push((ValueId::new(0), ty.clone()));
+            block.params.push((ValueId::new(1), ty.clone()));
+            block.body = checked_add_idiom_body(OverflowOp::MulOverflow, ty.clone());
+            f.blocks.push(block);
+            module.functions.push(f);
+
+            let lir = lower_module_to_lir(&module, FuncId::new(0))
+                .unwrap_or_else(|e| panic!("narrow checked-mul at {ty:?} maps: {e}"));
+
+            let mut extends = 0;
+            let mut imul = 0;
+            let mut trunc = 0;
+            let mut checked_mul = 0;
+            for b in lir.blocks.values() {
+                for inst in &b.instructions {
+                    match inst.opcode {
+                        Opcode::Sextend { .. } => {
+                            assert!(signed, "{ty:?}: Sextend in an unsigned widening");
+                            extends += 1;
+                        }
+                        Opcode::Uextend { .. } => {
+                            assert!(!signed, "{ty:?}: Uextend in a signed widening");
+                            extends += 1;
+                        }
+                        Opcode::Imul => imul += 1,
+                        Opcode::Trunc { .. } => trunc += 1,
+                        Opcode::CheckedSmul | Opcode::CheckedUmul => checked_mul += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(extends, 2, "{ty:?}: both operands widened");
+            assert_eq!(imul, 1, "{ty:?}: exactly one exact i64 Imul");
+            assert_eq!(trunc, 1, "{ty:?}: exactly one trunc to the value width");
+            assert_eq!(checked_mul, 0, "{ty:?}: no I64-only Checked*mul emitted");
+        }
+    }
+
+    /// Narrow checked ADD/SUB (i16/u16/i8/u8) lower via the same exact-i64
+    /// widening as narrow mul — the ISel's flag-setting Checked{S,U}{add,sub}
+    /// idiom exists at I32/I64 only (measured emit_object refusal:
+    /// "checked add/sub requires I32 or I64 operands", the trust-checksum
+    /// `fletcher_pack` blocker at u16).
+    #[test]
+    fn maps_checked_add_sub_narrow_widths_via_widening() {
+        for (op, want_wide) in
+            [(OverflowOp::AddOverflow, "Iadd"), (OverflowOp::SubOverflow, "Isub")]
+        {
+            for ty in [Ty::I16, Ty::U16, Ty::I8, Ty::U8] {
+                let mut module = Module::new("t");
+                module.func_types.push(FuncTy {
+                    params: vec![ty.clone(), ty.clone()],
+                    returns: vec![ty.clone()],
+                    is_vararg: false,
+                });
+                let mut f =
+                    IrFunction::new(FuncId::new(0), "cnarrow", FuncTyId::new(0), BlockId::new(0));
+                let mut block = Block::new(BlockId::new(0));
+                block.params.push((ValueId::new(0), ty.clone()));
+                block.params.push((ValueId::new(1), ty.clone()));
+                block.body = checked_add_idiom_body(op, ty.clone());
+                f.blocks.push(block);
+                module.functions.push(f);
+
+                let lir = lower_module_to_lir(&module, FuncId::new(0))
+                    .unwrap_or_else(|e| panic!("narrow checked {op:?} at {ty:?} maps: {e}"));
+                let mut wide = 0;
+                let mut checked = 0;
+                for b in lir.blocks.values() {
+                    for inst in &b.instructions {
+                        match inst.opcode {
+                            Opcode::Iadd if want_wide == "Iadd" => wide += 1,
+                            Opcode::Isub if want_wide == "Isub" => wide += 1,
+                            Opcode::CheckedSadd
+                            | Opcode::CheckedUadd
+                            | Opcode::CheckedSsub
+                            | Opcode::CheckedUsub => checked += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                assert!(wide >= 1, "{op:?}@{ty:?}: the widened 64-bit op must be emitted");
+                assert_eq!(checked, 0, "{op:?}@{ty:?}: no narrow Checked* op may be emitted");
+            }
+        }
+    }
+
     #[test]
     fn maps_checked_add_overflow_idiom_i32() {
         let module = module_with_body(
@@ -5709,36 +7413,47 @@ mod tests {
         assert_eq!(icmp, 1, "one unsigned range-check Icmp (> u32::MAX)");
     }
 
+    // NOTE: the historical `fail_closed_on_checked_mul_i16` pin is retired by
+    // capability: narrow checked mul now lowers via the exact-i64 widening
+    // (`maps_checked_mul_overflow_idiom_narrow_widths` is the positive twin).
+    // The historical `fail_closed_on_checked_overflow_i128` ADD pin is likewise
+    // retired by capability: checked i128 add/sub now map first-class to the
+    // flag-setting carry chain. The surviving 128-bit fail-closed boundary is
+    // checked MUL, pinned just below its positive add twin.
+
     #[test]
-    fn fail_closed_on_checked_mul_i16() {
-        // i16/i8 checked mul has no verified widening lowering yet (only i32/u32
-        // is widened, i64/u64 uses the first-class op) — it must fail closed.
+    fn maps_checked_add_overflow_idiom_i128() {
+        // Checked i128 add maps first-class: one CheckedSadd over the pair
+        // (the ISel expands it to ADDS lo; ADCS hi; CSET VS).
         let module = module_with_body(
-            "cmul16",
-            vec![Ty::I16],
-            checked_add_idiom_body(OverflowOp::MulOverflow, Ty::I16),
+            "cadd128",
+            vec![Ty::I128],
+            checked_add_idiom_body(OverflowOp::AddOverflow, Ty::I128),
         );
-        let module = {
-            let mut m = module;
-            m.func_types[0].params = vec![Ty::I16, Ty::I16];
-            m.func_types[0].returns = vec![Ty::I16];
-            m.functions[0].blocks[0].params =
-                vec![(ValueId::new(0), Ty::I16), (ValueId::new(1), Ty::I16)];
-            m
-        };
-        assert!(matches!(
-            lower_module_to_lir(&module, FuncId::new(0)),
-            Err(ModuleLirError::UnsupportedOverflow { .. })
-        ));
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("checked-i128 add idiom maps first-class");
+        let checked: Vec<_> = lir
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .filter(|i| matches!(i.opcode, Opcode::CheckedSadd))
+            .collect();
+        assert_eq!(checked.len(), 1, "exactly one CheckedSadd at I128");
+        assert_eq!(
+            checked[0].results.len(),
+            2,
+            "CheckedSadd binds [value_i128, overflow_b1]"
+        );
     }
 
     #[test]
-    fn fail_closed_on_checked_overflow_i128() {
-        // 128-bit checked arithmetic has no verified flag/high-half ISel idiom.
+    fn fail_closed_on_checked_mul_i128() {
+        // 128-bit checked MUL has no verified flag/high-half ISel idiom
+        // (SMULH/UMULH produce one high half of a 64x64 product only).
         let module = module_with_body(
-            "cadd128",
+            "cmul128",
             vec![Ty::I32],
-            checked_add_idiom_body(OverflowOp::AddOverflow, Ty::I128),
+            checked_add_idiom_body(OverflowOp::MulOverflow, Ty::I128),
         );
         assert!(matches!(
             lower_module_to_lir(&module, FuncId::new(0)),
@@ -6196,6 +7911,945 @@ mod tests {
         assert_eq!(calls, 0, "inliner left a Call node in the caller body");
     }
 
+    /// The trust-ratio `span_width` shape: `caller(lo,hi) = f2(f1(lo,hi), hi)`.
+    /// The direct THIR producer emits BOTH calls in ONE caller block, and both
+    /// callees are MULTI-BLOCK diamonds, so the first splice leaves the second
+    /// call sitting in the freshly created continuation block — only the
+    /// fixpoint driver re-running the pass reaches it.
+    fn two_calls_one_block_module() -> Module {
+        let mut module = Module::new("fix");
+        // ty 0: (i32,i32)->i32 for all three functions.
+        module.func_types.push(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            is_vararg: false,
+        });
+
+        // A 4-block diamond callee: f(a,b) = if a <op> b { a } else { b }.
+        let diamond = |id: u32, name: &str, op: ICmpOp| {
+            let mut f = IrFunction::new(FuncId::new(id), name, FuncTyId::new(0), BlockId::new(0));
+            let a = ValueId::new(20);
+            let b = ValueId::new(21);
+            let c = ValueId::new(22);
+            let p = ValueId::new(23);
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((a, Ty::I32));
+            b0.params.push((b, Ty::I32));
+            b0.body.push(
+                InstrNode::new(Inst::ICmp { op, ty: Ty::I32, lhs: a, rhs: b }).with_result(c),
+            );
+            b0.body.push(InstrNode::new(Inst::CondBr {
+                cond: c,
+                then_target: BlockId::new(1),
+                then_args: vec![],
+                else_target: BlockId::new(2),
+                else_args: vec![],
+            }));
+            let mut b1 = Block::new(BlockId::new(1));
+            b1.body.push(InstrNode::new(Inst::Br { target: BlockId::new(3), args: vec![a] }));
+            let mut b2 = Block::new(BlockId::new(2));
+            b2.body.push(InstrNode::new(Inst::Br { target: BlockId::new(3), args: vec![b] }));
+            let mut b3 = Block::new(BlockId::new(3));
+            b3.params.push((p, Ty::I32));
+            b3.body.push(InstrNode::new(Inst::Return { values: vec![p] }));
+            f.blocks.extend([b0, b1, b2, b3]);
+            f
+        };
+
+        // caller(lo,hi): %2 = call f1(lo,hi); %3 = call f2(%2,hi); ret %3 —
+        // TWO calls in ONE block.
+        let mut caller =
+            IrFunction::new(FuncId::new(0), "caller", FuncTyId::new(0), BlockId::new(0));
+        let lo = ValueId::new(0);
+        let hi = ValueId::new(1);
+        let r1 = ValueId::new(2);
+        let r2 = ValueId::new(3);
+        let mut cb = Block::new(BlockId::new(0));
+        cb.params.push((lo, Ty::I32));
+        cb.params.push((hi, Ty::I32));
+        cb.body.push(
+            InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![lo, hi] })
+                .with_result(r1),
+        );
+        cb.body.push(
+            InstrNode::new(Inst::Call { callee: FuncId::new(2), args: vec![r1, hi] })
+                .with_result(r2),
+        );
+        cb.body.push(InstrNode::new(Inst::Return { values: vec![r2] }));
+        caller.blocks.push(cb);
+
+        module.functions.push(caller);
+        module.functions.push(diamond(1, "rawish", ICmpOp::Ult));
+        module.functions.push(diamond(2, "clampish", ICmpOp::Ugt));
+        module
+    }
+
+    #[test]
+    fn fixpoint_inlines_two_calls_in_one_block() {
+        let module = two_calls_one_block_module();
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("both nested calls inline via the fixpoint");
+        for (id, block) in &lir.blocks {
+            for inst in &block.instructions {
+                assert!(
+                    !matches!(inst.opcode, Opcode::Call { .. } | Opcode::CallIndirect),
+                    "a call opcode survived fixpoint inlining in {id:?}: {:?}",
+                    inst.opcode
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inlines_callee_with_unop() {
+        // The trust-align `raw_up_from_mask` blocker: a local pure leaf whose
+        // body carries a bare `UnOp` (`not`). UnOp is converter-supported, so
+        // excluding it from the inlinable sets was a pure omission — pin both
+        // the single-block path (all-single-result body) and, via the caller's
+        // second call, the multiblock path (diamond containing the UnOp).
+        let mut module = two_calls_one_block_module();
+        // Rewrite callee 1 (single-block admissible shape): mask(a,b) = !a & b.
+        {
+            let f = module.function_by_id_mut(FuncId::new(1)).expect("callee 1");
+            let a = ValueId::new(20);
+            let b = ValueId::new(21);
+            let n = ValueId::new(22);
+            let r = ValueId::new(23);
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((a, Ty::I32));
+            b0.params.push((b, Ty::I32));
+            b0.body.push(
+                InstrNode::new(Inst::UnOp { op: UnOp::Not, ty: Ty::I32, operand: a })
+                    .with_result(n),
+            );
+            b0.body.push(
+                InstrNode::new(Inst::BinOp { op: BinOp::And, ty: Ty::I32, lhs: n, rhs: b })
+                    .with_result(r),
+            );
+            b0.body.push(InstrNode::new(Inst::Return { values: vec![r] }));
+            f.blocks = vec![b0];
+        }
+        // Inject a UnOp into callee 2's diamond (multiblock path).
+        {
+            let f = module.function_by_id_mut(FuncId::new(2)).expect("callee 2");
+            let a = f.blocks[0].params[0].0;
+            let inv = ValueId::new(30);
+            f.blocks[1].body.insert(
+                0,
+                InstrNode::new(Inst::UnOp { op: UnOp::Not, ty: Ty::I32, operand: a })
+                    .with_result(inv),
+            );
+            let Inst::Br { args, .. } = &mut f.blocks[1].body.last_mut().unwrap().inst else {
+                unreachable!("diamond then-arm ends in Br");
+            };
+            args[0] = inv;
+        }
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("UnOp-bearing callees inline on both splice paths");
+        for (id, block) in &lir.blocks {
+            for inst in &block.instructions {
+                assert!(
+                    !matches!(inst.opcode, Opcode::Call { .. } | Opcode::CallIndirect),
+                    "a call opcode survived UnOp inlining in {id:?}: {:?}",
+                    inst.opcode
+                );
+            }
+        }
+    }
+
+    /// caller -> mid -> leaf call chain: `mid` is a local NON-LEAF callee (its
+    /// body calls `leaf`), so plain splice admission rejects it; the recursive
+    /// flatten must first inline `leaf` into a copy of `mid` and then splice
+    /// that call-free copy into `caller`.
+    #[test]
+    fn flattens_local_nonleaf_callee_chain() {
+        let mut module = Module::new("chain");
+        module.func_types.push(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            is_vararg: false,
+        });
+
+        // leaf(x,y) = x + y  (FuncId 2).
+        let mut leaf = IrFunction::new(FuncId::new(2), "leaf", FuncTyId::new(0), BlockId::new(0));
+        {
+            let x = ValueId::new(40);
+            let y = ValueId::new(41);
+            let s = ValueId::new(42);
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((x, Ty::I32));
+            b0.params.push((y, Ty::I32));
+            b0.body.push(
+                InstrNode::new(Inst::BinOp { op: BinOp::Add, ty: Ty::I32, lhs: x, rhs: y })
+                    .with_result(s),
+            );
+            b0.body.push(InstrNode::new(Inst::Return { values: vec![s] }));
+            leaf.blocks.push(b0);
+        }
+
+        // mid(a,b) = leaf(a,b) & b  (FuncId 1, NON-LEAF).
+        let mut mid = IrFunction::new(FuncId::new(1), "mid", FuncTyId::new(0), BlockId::new(0));
+        {
+            let a = ValueId::new(20);
+            let b = ValueId::new(21);
+            let c = ValueId::new(22);
+            let r = ValueId::new(23);
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((a, Ty::I32));
+            b0.params.push((b, Ty::I32));
+            b0.body.push(
+                InstrNode::new(Inst::Call { callee: FuncId::new(2), args: vec![a, b] })
+                    .with_result(c),
+            );
+            b0.body.push(
+                InstrNode::new(Inst::BinOp { op: BinOp::And, ty: Ty::I32, lhs: c, rhs: b })
+                    .with_result(r),
+            );
+            b0.body.push(InstrNode::new(Inst::Return { values: vec![r] }));
+            mid.blocks.push(b0);
+        }
+
+        // caller(a,b) = mid(a,b)  (FuncId 0).
+        let mut caller =
+            IrFunction::new(FuncId::new(0), "caller", FuncTyId::new(0), BlockId::new(0));
+        {
+            let a = ValueId::new(0);
+            let b = ValueId::new(1);
+            let r = ValueId::new(2);
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((a, Ty::I32));
+            b0.params.push((b, Ty::I32));
+            b0.body.push(
+                InstrNode::new(Inst::Call { callee: FuncId::new(1), args: vec![a, b] })
+                    .with_result(r),
+            );
+            b0.body.push(InstrNode::new(Inst::Return { values: vec![r] }));
+            caller.blocks.push(b0);
+        }
+
+        module.functions.push(caller);
+        module.functions.push(mid);
+        module.functions.push(leaf);
+
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("non-leaf callee flattens recursively and splices");
+        for (id, block) in &lir.blocks {
+            for inst in &block.instructions {
+                assert!(
+                    !matches!(inst.opcode, Opcode::Call { .. } | Opcode::CallIndirect),
+                    "a call opcode survived recursive flattening in {id:?}: {:?}",
+                    inst.opcode
+                );
+            }
+        }
+    }
+
+    /// Mutual recursion (f -> g -> f) must neither hang the flatten nor be
+    /// mis-inlined: the flatten stack breaks the cycle and the converter
+    /// fail-closes on the surviving call.
+    #[test]
+    fn mutual_recursion_fail_closes_without_hanging() {
+        let mut module = Module::new("mutrec");
+        module.func_types.push(FuncTy {
+            params: vec![Ty::I32, Ty::I32],
+            returns: vec![Ty::I32],
+            is_vararg: false,
+        });
+        for (id, other, name) in [(0u32, 1u32, "f"), (1, 0, "g")] {
+            let mut f = IrFunction::new(FuncId::new(id), name, FuncTyId::new(0), BlockId::new(0));
+            let a = ValueId::new(0);
+            let b = ValueId::new(1);
+            let r = ValueId::new(2);
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((a, Ty::I32));
+            b0.params.push((b, Ty::I32));
+            b0.body.push(
+                InstrNode::new(Inst::Call { callee: FuncId::new(other), args: vec![a, b] })
+                    .with_result(r),
+            );
+            b0.body.push(InstrNode::new(Inst::Return { values: vec![r] }));
+            f.blocks.push(b0);
+            module.functions.push(f);
+        }
+        assert!(matches!(
+            lower_module_to_lir(&module, FuncId::new(0)),
+            Err(ModuleLirError::UnsupportedInst { inst: "Call", .. })
+        ));
+    }
+
+    /// A UNIT (`()`) formal occupies NO LIR parameter slot — the captureless
+    /// closure's `bb0(%0: ())` environment formal, measured in trust-ts-strip's
+    /// `lexer::lex::{closure#0}` family. The unit ValueId stays UNBOUND, so a
+    /// body that actually READS the unit value fails closed as undefined.
+    /// `fn requested(p: &S) -> usize` over a struct with a RUSTC-RECORDED
+    /// layout — the measured `EntropyError::requested` shape: a
+    /// WHOLE-AGGREGATE load through an incoming `Ty::Ptr` param (a read-only
+    /// root), then a field extract. Lowers to per-field Ldr at the RECORDED
+    /// `ptr + offset` (repr(Rust) reorders, so a canonical guess would read
+    /// the wrong bytes — the recorded offsets deliberately swap the fields
+    /// here to prove the recorded ones are used); a STORE through the same
+    /// root stays fail-closed, and so is a Tuple-typed incoming load (no
+    /// recorded offsets exist for tuples).
+    #[test]
+    fn incoming_ptr_aggregate_load_decomposes_per_field() {
+        let agg_ty = Ty::Struct(trust_ir::value::StructId::new(0));
+        let build = |store_back: bool| {
+            let mut module = Module::new("t");
+            module.structs.push(trust_ir::StructDef {
+                id: trust_ir::value::StructId::new(0),
+                name: "S".to_string(),
+                fields: vec![
+                    trust_ir::ty::FieldDef {
+                        name: "requested".to_string(),
+                        ty: Ty::Usize,
+                        // rustc put the u32 FIRST: usize lives at offset 8.
+                        offset: Some(8),
+                    },
+                    trust_ir::ty::FieldDef {
+                        name: "kind".to_string(),
+                        ty: Ty::U32,
+                        offset: Some(0),
+                    },
+                ],
+                size: Some(16),
+                align: Some(8),
+                repr: Default::default(),
+            });
+            module.func_types.push(FuncTy {
+                params: vec![Ty::Ptr],
+                returns: vec![Ty::Usize],
+                is_vararg: false,
+            });
+            let mut f = IrFunction::new(FuncId::new(0), "r", FuncTyId::new(0), BlockId::new(0));
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((ValueId::new(0), Ty::Ptr));
+            b0.body.push(
+                InstrNode::new(Inst::Load {
+                    ty: agg_ty.clone(),
+                    ptr: ValueId::new(0),
+                    volatile: false,
+                    align: None,
+                })
+                .with_result(ValueId::new(1)),
+            );
+            if store_back {
+                b0.body.push(InstrNode::new(Inst::Store {
+                    ty: agg_ty.clone(),
+                    ptr: ValueId::new(0),
+                    value: ValueId::new(1),
+                    volatile: false,
+                    align: None,
+                }));
+            }
+            b0.body.push(
+                InstrNode::new(Inst::ExtractField {
+                    ty: Ty::Usize,
+                    aggregate: ValueId::new(1),
+                    field: 0,
+                })
+                .with_result(ValueId::new(2)),
+            );
+            b0.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }));
+            f.blocks.push(b0);
+            module.functions.push(f);
+            module
+        };
+
+        let lir = lower_module_to_lir(&build(false), FuncId::new(0))
+            .expect("incoming-root aggregate load must lower");
+        let block = lir.blocks.get(&Block(0)).expect("entry");
+        let loads = block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i.opcode, Opcode::Load { .. }))
+            .count();
+        assert_eq!(loads, 2, "one Ldr per scalar field");
+        assert!(
+            block.instructions.iter().any(|i| matches!(i.opcode, Opcode::Copy)),
+            "the field extract is a Copy of the loaded field"
+        );
+
+        // The RECORDED offsets are the ones used: the usize field was
+        // recorded at offset 8, so exactly one address computation adds 8.
+        let gep_offsets: Vec<i64> = block
+            .instructions
+            .iter()
+            .filter_map(|i| match i.opcode {
+                Opcode::Iconst { imm, .. } => Some(imm),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            gep_offsets.contains(&8),
+            "the usize field loads at its RECORDED offset 8, got consts {gep_offsets:?}"
+        );
+
+        // Writing the aggregate back through the incoming pointer is refused:
+        // the root is read-only and never a slot.
+        assert!(lower_module_to_lir(&build(true), FuncId::new(0)).is_err());
+    }
+
+    /// The PAIR-ENUM lane end to end, on the measured `Option<u64>` shape:
+    /// `take(o: Option<u64>) -> u64` (pair param, tag switch via extract 0,
+    /// payload extract 1) and `mk(x: u64) -> Option<u64>` (const-seed +
+    /// insertfield construct, pair return). The enum def is the producer's
+    /// exact spelling: `repr(u64) { None = 0, Some(u64) = 1 }` with a
+    /// recorded Direct{0} descriptor.
+    #[test]
+    fn pair_enum_option_shapes_lower_as_register_pairs() {
+        let option_def = || {
+            let mut def = trust_ir::EnumDef::new(
+                trust_ir::EnumId::new(0),
+                "Option",
+                vec![
+                    trust_ir::EnumVariant {
+                        name: "None".to_string(),
+                        fields: vec![],
+                        field_names: vec![],
+                    },
+                    trust_ir::EnumVariant {
+                        name: "Some".to_string(),
+                        fields: vec![Ty::U64],
+                        field_names: vec![],
+                    },
+                ],
+            );
+            def.discriminants = vec![Some(0), Some(1)];
+            def.repr = Some(EnumTagRepr::U64);
+            def.layout = Some(trust_ir::EnumLayoutDescriptor {
+                encoding: trust_ir::EnumTagEncoding::Direct { tag_offset: 0 },
+                size: 16,
+                align: 8,
+                variant_field_offsets: vec![vec![], vec![8]],
+            });
+            def
+        };
+        let ety = Ty::Enum(trust_ir::EnumId::new(0));
+
+        // mk(x) -> Option<u64>: const { 1, 0 }; insertfield 1, x; ret.
+        let mut module = Module::new("t");
+        module.enums.push(option_def());
+        module.func_types.push(FuncTy {
+            params: vec![Ty::U64],
+            returns: vec![ety.clone()],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "mk", FuncTyId::new(0), BlockId::new(0));
+        let mut b0 = Block::new(BlockId::new(0));
+        b0.params.push((ValueId::new(0), Ty::U64));
+        b0.body.push(
+            InstrNode::new(Inst::Const {
+                ty: ety.clone(),
+                value: Constant::Aggregate(vec![Constant::Int(1), Constant::Int(0)]),
+            })
+            .with_result(ValueId::new(1)),
+        );
+        b0.body.push(
+            InstrNode::new(Inst::InsertField {
+                ty: ety.clone(),
+                aggregate: ValueId::new(1),
+                field: 1,
+                value: ValueId::new(0),
+            })
+            .with_result(ValueId::new(2)),
+        );
+        b0.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }));
+        f.blocks.push(b0);
+        module.functions.push(f);
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("the Option construct must lower as a register pair");
+        assert_eq!(
+            lir.signature.returns,
+            vec![LirType::I64, LirType::I64],
+            "the enum returns as (tag, payload)"
+        );
+        let block = lir.blocks.get(&Block(0)).expect("entry");
+        let ret = block.instructions.last().expect("return");
+        assert!(matches!(ret.opcode, Opcode::Return));
+        assert_eq!(ret.args.len(), 2, "both lanes return");
+
+        // take(o) -> u64: extract 0 (tag), switch, extract 1 (payload), join.
+        let mut module = Module::new("t");
+        module.enums.push(option_def());
+        module.func_types.push(FuncTy {
+            params: vec![ety.clone()],
+            returns: vec![Ty::U64],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "take", FuncTyId::new(0), BlockId::new(0));
+        let mut b0 = Block::new(BlockId::new(0));
+        b0.params.push((ValueId::new(0), ety.clone()));
+        b0.body.push(
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::U64,
+                aggregate: ValueId::new(0),
+                field: 0,
+            })
+            .with_result(ValueId::new(2)),
+        );
+        b0.body.push(InstrNode::new(Inst::Switch {
+            value: ValueId::new(2),
+            default: BlockId::new(2),
+            default_args: vec![],
+            cases: vec![trust_ir::inst::SwitchCase {
+                value: Constant::Int(1),
+                target: BlockId::new(1),
+                args: vec![],
+            }],
+            exhaustive_enum_unreachable: false,
+        }));
+        f.blocks.push(b0);
+        let mut b1 = Block::new(BlockId::new(1));
+        b1.body.push(
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::U64,
+                aggregate: ValueId::new(0),
+                field: 1,
+            })
+            .with_result(ValueId::new(3)),
+        );
+        b1.body.push(InstrNode::new(Inst::Br {
+            target: BlockId::new(3),
+            args: vec![ValueId::new(3)],
+        }));
+        f.blocks.push(b1);
+        let mut b2 = Block::new(BlockId::new(2));
+        b2.body.push(
+            InstrNode::new(Inst::Const { ty: Ty::U64, value: Constant::Int(0) })
+                .with_result(ValueId::new(4)),
+        );
+        b2.body.push(InstrNode::new(Inst::Br {
+            target: BlockId::new(3),
+            args: vec![ValueId::new(4)],
+        }));
+        f.blocks.push(b2);
+        let mut b3 = Block::new(BlockId::new(3));
+        b3.params.push((ValueId::new(1), Ty::U64));
+        b3.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(1)] }));
+        f.blocks.push(b3);
+        module.functions.push(f);
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("the Option match must lower from the register pair");
+        assert_eq!(
+            lir.signature.params,
+            vec![LirType::I64, LirType::I64],
+            "the enum formal splits into (tag, payload)"
+        );
+    }
+
+    /// A BY-VALUE 2-scalar-field struct of 16 bytes or fewer rides rustc's
+    /// PassMode::Pair: two register formals in LAYOUT order, with the
+    /// declaration-order mapping absorbing a repr(Rust) reorder — the
+    /// `Range<usize>` argument shape. Extracts are Copies of the mapped
+    /// formal.
+    #[test]
+    fn by_value_pair_struct_param_maps_fields_to_register_formals() {
+        // The recorded offsets REORDER the fields (decl 0 at offset 8): the
+        // signature emits layout order, and extract-by-decl-index must still
+        // reach the right formal.
+        let mut module = Module::new("t");
+        module.structs.push(trust_ir::StructDef {
+            id: trust_ir::value::StructId::new(0),
+            name: "R".to_string(),
+            fields: vec![
+                trust_ir::ty::FieldDef {
+                    name: "start".to_string(),
+                    ty: Ty::Usize,
+                    offset: Some(8),
+                },
+                trust_ir::ty::FieldDef { name: "end".to_string(), ty: Ty::Usize, offset: Some(0) },
+            ],
+            size: Some(16),
+            align: Some(8),
+            repr: Default::default(),
+        });
+        let sty = Ty::Struct(trust_ir::value::StructId::new(0));
+        module.func_types.push(FuncTy {
+            params: vec![sty.clone()],
+            returns: vec![Ty::Usize],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "r", FuncTyId::new(0), BlockId::new(0));
+        let mut b0 = Block::new(BlockId::new(0));
+        b0.params.push((ValueId::new(0), sty));
+        // ret start - end  (uses BOTH fields so both Copies exist)
+        b0.body.push(
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::Usize,
+                aggregate: ValueId::new(0),
+                field: 0,
+            })
+            .with_result(ValueId::new(1)),
+        );
+        b0.body.push(
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::Usize,
+                aggregate: ValueId::new(0),
+                field: 1,
+            })
+            .with_result(ValueId::new(2)),
+        );
+        b0.body.push(
+            InstrNode::new(Inst::BinOp {
+                op: trust_ir::inst::BinOp::Sub,
+                ty: Ty::Usize,
+                lhs: ValueId::new(1),
+                rhs: ValueId::new(2),
+            })
+            .with_result(ValueId::new(3)),
+        );
+        b0.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(3)] }));
+        f.blocks.push(b0);
+        module.functions.push(f);
+
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("a 16-byte two-scalar struct formal must ride the register pair");
+        assert_eq!(
+            lir.signature.params,
+            vec![LirType::I64, LirType::I64],
+            "two register formals"
+        );
+        let block = lir.blocks.get(&Block(0)).expect("entry");
+        let copies: Vec<&Instruction> = block
+            .instructions
+            .iter()
+            .filter(|i| matches!(i.opcode, Opcode::Copy))
+            .collect();
+        assert_eq!(copies.len(), 2, "each field extract is a Copy of a formal");
+        // Layout order put decl-field 1 ("end", offset 0) FIRST: the entry
+        // block's params are [end, start], so decl-field 0's Copy must read
+        // the SECOND formal.
+        let entry_params: Vec<Value> = block.params.iter().map(|(v, _)| *v).collect();
+        assert_eq!(entry_params.len(), 2);
+        assert_eq!(
+            copies[0].args[0], entry_params[1],
+            "decl field 0 (offset 8) maps to the second (layout-later) formal"
+        );
+        assert_eq!(
+            copies[1].args[0], entry_params[0],
+            "decl field 1 (offset 0) maps to the first (layout-first) formal"
+        );
+    }
+
+    /// A BY-VALUE struct larger than 16 bytes arrives INDIRECTLY (rustc's
+    /// hidden pointer in one GPR): the formal binds one I64, and a field
+    /// extract loads through it at the RECORDED offset — the measured
+    /// `transform::is_kw(Token)` shape, minus Token's niche-encoded enum
+    /// field (which stays refused with its own reason). A <=16-byte struct
+    /// (Direct/Pair registers) refuses by name.
+    #[test]
+    fn by_value_indirect_struct_param_reads_fields_through_the_hidden_pointer() {
+        let build = |size: u64| {
+            let mut module = Module::new("t");
+            module.structs.push(trust_ir::StructDef {
+                id: trust_ir::value::StructId::new(0),
+                name: "Token".to_string(),
+                fields: vec![
+                    trust_ir::ty::FieldDef {
+                        name: "start".to_string(),
+                        ty: Ty::Usize,
+                        offset: Some(0),
+                    },
+                    trust_ir::ty::FieldDef {
+                        name: "end".to_string(),
+                        ty: Ty::Usize,
+                        offset: Some(8),
+                    },
+                    trust_ir::ty::FieldDef {
+                        name: "flag".to_string(),
+                        ty: Ty::Bool,
+                        offset: Some(16),
+                    },
+                ],
+                size: Some(size),
+                align: Some(8),
+                repr: Default::default(),
+            });
+            let sty = Ty::Struct(trust_ir::value::StructId::new(0));
+            module.func_types.push(FuncTy {
+                params: vec![sty.clone()],
+                returns: vec![Ty::Usize],
+                is_vararg: false,
+            });
+            let mut f = IrFunction::new(FuncId::new(0), "k", FuncTyId::new(0), BlockId::new(0));
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((ValueId::new(0), sty));
+            b0.body.push(
+                InstrNode::new(Inst::ExtractField {
+                    ty: Ty::Usize,
+                    aggregate: ValueId::new(0),
+                    field: 1,
+                })
+                .with_result(ValueId::new(1)),
+            );
+            b0.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(1)] }));
+            f.blocks.push(b0);
+            module.functions.push(f);
+            module
+        };
+
+        let lir = lower_module_to_lir(&build(24), FuncId::new(0))
+            .expect("a >16-byte recorded struct formal must ride the hidden pointer");
+        assert_eq!(
+            lir.signature.params,
+            vec![LirType::I64],
+            "the formal is ONE hidden pointer"
+        );
+        let block = lir.blocks.get(&Block(0)).expect("entry");
+        assert!(
+            block
+                .instructions
+                .iter()
+                .any(|i| matches!(i.opcode, Opcode::Iconst { imm: 8, .. })),
+            "field 1 loads at its recorded offset 8"
+        );
+        assert!(
+            block.instructions.iter().any(|i| matches!(i.opcode, Opcode::Load { .. })),
+            "the field read is a Load through the pointer"
+        );
+
+        // 16 bytes or fewer rides Direct/Pair registers — refused by name.
+        assert!(matches!(
+            lower_module_to_lir(&build(16), FuncId::new(0)),
+            Err(ModuleLirError::UnsupportedSignature { .. })
+        ));
+    }
+
+    /// A TUPLE-typed incoming aggregate load must refuse: tuples carry no
+    /// recorded offsets and repr(Rust) reorders, so no sound layout exists.
+    #[test]
+    fn incoming_ptr_tuple_load_refuses_without_recorded_layout() {
+        let mut module = Module::new("t");
+        module.func_types.push(FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::Usize],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "r", FuncTyId::new(0), BlockId::new(0));
+        let mut b0 = Block::new(BlockId::new(0));
+        b0.params.push((ValueId::new(0), Ty::Ptr));
+        b0.body.push(
+            InstrNode::new(Inst::Load {
+                ty: Ty::Tuple(vec![Ty::Usize, Ty::U32]),
+                ptr: ValueId::new(0),
+                volatile: false,
+                align: None,
+            })
+            .with_result(ValueId::new(1)),
+        );
+        b0.body.push(
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::Usize,
+                aggregate: ValueId::new(1),
+                field: 0,
+            })
+            .with_result(ValueId::new(2)),
+        );
+        b0.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(2)] }));
+        f.blocks.push(b0);
+        module.functions.push(f);
+        assert!(matches!(
+            lower_module_to_lir(&module, FuncId::new(0)),
+            Err(ModuleLirError::UnsupportedAggregate { .. })
+        ));
+    }
+
+    #[test]
+    fn unit_param_occupies_no_lir_slot() {
+        let build = |read_unit: bool| {
+            let mut module = Module::new("t");
+            module.func_types.push(FuncTy {
+                params: vec![Ty::Unit, Ty::I32],
+                returns: vec![Ty::I32],
+                is_vararg: false,
+            });
+            let mut f = IrFunction::new(FuncId::new(0), "c", FuncTyId::new(0), BlockId::new(0));
+            let mut b0 = Block::new(BlockId::new(0));
+            b0.params.push((ValueId::new(0), Ty::Unit));
+            b0.params.push((ValueId::new(1), Ty::I32));
+            let ret = if read_unit {
+                // A (malformed) read of the unit value: pass it to Return.
+                ValueId::new(0)
+            } else {
+                ValueId::new(1)
+            };
+            b0.body.push(InstrNode::new(Inst::Return { values: vec![ret] }));
+            f.blocks.push(b0);
+            module.functions.push(f);
+            module
+        };
+
+        let lir = lower_module_to_lir(&build(false), FuncId::new(0))
+            .expect("a unit formal must not refuse the function");
+        assert_eq!(
+            lir.signature.params,
+            vec![LirType::I32],
+            "the unit formal contracts away; only the scalar remains"
+        );
+        let entry = lir.blocks.get(&Block(0)).expect("entry block");
+        assert_eq!(entry.params.len(), 1, "entry block params match the signature");
+
+        // Reading the unbound unit value fails closed.
+        assert!(lower_module_to_lir(&build(true), FuncId::new(0)).is_err());
+    }
+
+    /// The `&str` FORMAL lane: at the machine level a `&str` is `&[u8]` —
+    /// the same (data, len) ScalarPair split, with BYTE loads through the
+    /// data pointer. `fn f(s: &str) -> u64 { ptr_metadata }` must lower with
+    /// the split; UTF-8 validity is a producer-side fact this lane never
+    /// consults.
+    #[test]
+    fn str_param_splits_like_a_byte_slice() {
+        use trust_ir::ty::FatPtrKind;
+        let mut module = Module::new("t");
+        module.func_types.push(FuncTy {
+            params: vec![Ty::FatPtr(FatPtrKind::Str)],
+            returns: vec![Ty::U64],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "len", FuncTyId::new(0), BlockId::new(0));
+        let mut b0 = Block::new(BlockId::new(0));
+        b0.params.push((ValueId::new(0), Ty::FatPtr(FatPtrKind::Str)));
+        b0.body.push(
+            InstrNode::new(Inst::PtrMetadata {
+                ptr_ty: Ty::FatPtr(FatPtrKind::Str),
+                metadata_ty: Ty::U64,
+                ptr: ValueId::new(0),
+            })
+            .with_result(ValueId::new(1)),
+        );
+        b0.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(1)] }));
+        f.blocks.push(b0);
+        module.functions.push(f);
+
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("a &str formal must split like &[u8]");
+        assert_eq!(
+            lir.signature.params,
+            vec![LirType::I64, LirType::I64],
+            "&str splits into (data, len)"
+        );
+    }
+
+    /// The `&[T]` FORMAL lane: `fn at(s: &[u8], i: usize) -> u8` as the
+    /// producer emits it — `ptr_metadata` (len), `ptr_data` (base), `gep`,
+    /// `load` — lowers with the fat param SPLIT into (data, len) I64 slots and
+    /// the load riding the incoming read-only root. A STORE through the same
+    /// root stays fail-closed (`&[T]` is shared).
+    #[test]
+    fn fat_slice_param_splits_and_loads() {
+        use trust_ir::inst::CastOp;
+        use trust_ir::ty::FatPtrKind;
+        use trust_ir::value::TyId;
+
+        let mut module = Module::new("t");
+        module.types.push(Ty::U8); // TyId(0) = slice element
+        module.func_types.push(FuncTy {
+            params: vec![Ty::FatPtr(FatPtrKind::Slice(TyId::new(0))), Ty::Usize],
+            returns: vec![Ty::U8],
+            is_vararg: false,
+        });
+        let mut f = IrFunction::new(FuncId::new(0), "at", FuncTyId::new(0), BlockId::new(0));
+        let s = ValueId::new(0);
+        let i = ValueId::new(1);
+        let len = ValueId::new(2);
+        let data = ValueId::new(3);
+        let addr = ValueId::new(4);
+        let byte = ValueId::new(5);
+        let mut b0 = Block::new(BlockId::new(0));
+        b0.params.push((s, Ty::FatPtr(FatPtrKind::Slice(TyId::new(0)))));
+        b0.params.push((i, Ty::Usize));
+        b0.body = vec![
+            InstrNode::new(Inst::PtrMetadata {
+                ptr_ty: Ty::FatPtr(FatPtrKind::Slice(TyId::new(0))),
+                metadata_ty: Ty::U64,
+                ptr: s,
+            })
+            .with_result(len),
+            InstrNode::new(Inst::PtrData {
+                ptr_ty: Ty::FatPtr(FatPtrKind::Slice(TyId::new(0))),
+                ptr: s,
+            })
+            .with_result(data),
+            InstrNode::new(Inst::GEP {
+                pointee_ty: Ty::U8,
+                base: data,
+                indices: vec![i],
+                inbounds: true,
+            })
+            .with_result(addr),
+            InstrNode::new(Inst::Load { ty: Ty::U8, ptr: addr, volatile: false, align: None })
+                .with_result(byte),
+            InstrNode::new(Inst::Return { values: vec![byte] }),
+        ];
+        let _ = len; // metadata result is deliberately unused in this body
+        f.blocks.push(b0);
+        module.functions.push(f);
+
+        let lir = lower_module_to_lir(&module, FuncId::new(0))
+            .expect("fat slice param lane lowers at/gep/load");
+        assert_eq!(
+            lir.signature.params,
+            vec![LirType::I64, LirType::I64, LirType::I64],
+            "the fat param splits into (data, len) plus the index"
+        );
+        let loads = lir
+            .blocks
+            .values()
+            .flat_map(|b| &b.instructions)
+            .filter(|inst| matches!(inst.opcode, Opcode::Load { .. }))
+            .count();
+        assert_eq!(loads, 1, "exactly one element load");
+
+        // Fail-closed twin: a STORE through the slice data pointer refuses.
+        let g = module.function_by_id_mut(FuncId::new(0)).unwrap();
+        let entry = &mut g.blocks[0];
+        entry.body.remove(3); // drop the Load
+        entry.body.insert(
+            3,
+            InstrNode::new(Inst::Store {
+                ty: Ty::U8,
+                ptr: addr,
+                value: i,
+                volatile: false,
+                align: None,
+            }),
+        );
+        // Return something type-correct so only the Store can be the refusal.
+        let last = entry.body.len() - 1;
+        entry.body[last] = InstrNode::new(Inst::Return { values: vec![i] });
+        module.func_types[0].returns = vec![Ty::Usize];
+        assert!(
+            matches!(
+                lower_module_to_lir(&module, FuncId::new(0)),
+                Err(ModuleLirError::NonLocalPointer { .. })
+            ),
+            "a store through the incoming slice root must fail closed"
+        );
+    }
+
+    #[test]
+    fn fixpoint_terminates_and_fail_closes_on_inadmissible_second_call() {
+        // First call admissible (local leaf diamond), second call retargeted to
+        // a FuncId ABSENT from the module. The fixpoint must stop once no pass
+        // makes progress, and the converter must fail-close on the residual
+        // call — this test completing at all is the termination pin.
+        let mut module = two_calls_one_block_module();
+        let caller = &mut module.functions[0];
+        let second = caller.blocks[0]
+            .body
+            .iter_mut()
+            .filter(|n| matches!(n.inst, Inst::Call { .. }))
+            .nth(1)
+            .expect("caller has two calls");
+        let Inst::Call { callee, .. } = &mut second.inst else { unreachable!() };
+        *callee = FuncId::new(9);
+        assert!(matches!(
+            lower_module_to_lir(&module, FuncId::new(0)),
+            Err(ModuleLirError::UnsupportedInst { inst: "Call", .. })
+        ));
+    }
+
     #[test]
     fn fail_closed_on_recursive_call() {
         // A self-recursive call (callee == caller) is NOT admissible -> left in
@@ -6227,9 +8881,14 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_on_non_leaf_callee() {
-        // The callee itself CALLS a third function -> non-leaf -> not inlined ->
-        // converter fail-closes on the surviving Call in the caller.
+    fn fail_closed_on_non_leaf_callee_with_inadmissible_nested_call() {
+        // HISTORY: this pin used to assert that ANY non-leaf callee fail-closes.
+        // The recursive flatten retired that limitation (see
+        // `flattens_local_nonleaf_callee_chain` for the success pin). What
+        // SURVIVES is the boundary this test now pins: a non-leaf callee whose
+        // OWN call cannot be flattened (here: a callee absent from the module)
+        // is declined without mis-inlining, and the converter fail-closes on
+        // the surviving Call in the caller.
         let mut module = Module::new("nonleaf");
         for _ in 0..3 {
             module.func_types.push(FuncTy {
@@ -6238,7 +8897,7 @@ mod tests {
                 is_vararg: false,
             });
         }
-        // FuncId 2: a leaf the middle callee calls.
+        // FuncId 2: a leaf that exists but is NOT what mid calls.
         let mut leaf = IrFunction::new(FuncId::new(2), "leaf", FuncTyId::new(2), BlockId::new(0));
         let mut lb = Block::new(BlockId::new(0));
         lb.params.push((ValueId::new(20), Ty::I32));
@@ -6246,14 +8905,15 @@ mod tests {
         lb.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(20)] }));
         leaf.blocks.push(lb);
 
-        // FuncId 1: the (non-leaf) callee that itself calls FuncId 2.
+        // FuncId 1: the (non-leaf) callee whose nested call targets FuncId 9 —
+        // absent from the module, so the flatten cannot remove it.
         let mut mid = IrFunction::new(FuncId::new(1), "mid", FuncTyId::new(1), BlockId::new(0));
         let mut mb = Block::new(BlockId::new(0));
         mb.params.push((ValueId::new(10), Ty::I32));
         mb.params.push((ValueId::new(11), Ty::I32));
         mb.body.push(
             InstrNode::new(Inst::Call {
-                callee: FuncId::new(2),
+                callee: FuncId::new(9),
                 args: vec![ValueId::new(10), ValueId::new(11)],
             })
             .with_result(ValueId::new(12)),
@@ -7002,6 +9662,63 @@ mod tests {
         }
     }
 
+    /// `fn f(e: E) -> u8 { extractfield u8 %e, 0 }` — the producer's tag read on
+    /// a BY-VALUE fieldless-enum param (the `is_gt_fam`/`gt_cnt` switch-head
+    /// shape, measured in trust-ts-strip). The extract is an identity at the
+    /// machine level, so it lowers to a `Copy` of the carrier value; field
+    /// indices other than 0 and a mistyped tag read stay refused.
+    #[test]
+    fn fieldless_enum_param_tag_extract_lowers_to_copy() {
+        let build = |field: u32, field_ty: Ty| {
+            let mut module = Module::new("t");
+            module.enums.push(three_variant_enum());
+            let ety = Ty::Enum(trust_ir::EnumId::new(0));
+            module.func_types.push(FuncTy {
+                params: vec![ety.clone()],
+                returns: vec![Ty::U8],
+                is_vararg: false,
+            });
+            let mut f = IrFunction::new(FuncId::new(0), "f", FuncTyId::new(0), BlockId::new(0));
+            let mut block = Block::new(BlockId::new(0));
+            block.params = vec![(ValueId::new(0), ety.clone())];
+            block.body = vec![
+                InstrNode::new(Inst::ExtractField {
+                    ty: field_ty,
+                    aggregate: ValueId::new(0),
+                    field,
+                })
+                .with_result(ValueId::new(1)),
+                InstrNode::new(Inst::Return { values: vec![ValueId::new(1)] }),
+            ];
+            f.blocks.push(block);
+            module.functions.push(f);
+            module
+        };
+
+        // The admitted identity read: field 0 typed at the tag repr (u8).
+        let lir = lower_module_to_lir(&build(0, Ty::U8), FuncId::new(0))
+            .expect("fieldless-enum tag extract must lower");
+        assert_eq!(lir.signature.params, vec![LirType::I8], "param is the tag carrier");
+        let block = lir.blocks.get(&Block(0)).expect("entry block");
+        assert!(
+            matches!(block.instructions[0].opcode, Opcode::Copy),
+            "tag extract is an identity Copy, got {:?}",
+            block.instructions[0].opcode
+        );
+        assert!(matches!(block.instructions[1].opcode, Opcode::Return));
+
+        // A non-zero field index has nothing to read on a fieldless enum.
+        assert!(matches!(
+            lower_module_to_lir(&build(1, Ty::U8), FuncId::new(0)),
+            Err(ModuleLirError::UnsupportedAggregate { .. })
+        ));
+        // A tag read typed wider than the admitted carrier is def drift.
+        assert!(matches!(
+            lower_module_to_lir(&build(0, Ty::U32), FuncId::new(0)),
+            Err(ModuleLirError::UnsupportedAggregate { .. })
+        ));
+    }
+
     /// The carrier comes from the DESCRIPTOR, so a def the descriptor does not
     /// pin stays refused — even though its `canonical_tag_repr` alone would
     /// happily name a width.
@@ -7050,12 +9767,22 @@ mod tests {
         // (g) A `#[repr]` hint too narrow for the values has no canonical tag.
         let too_narrow = fieldless_enum(&[0, 300], Some(EnumTagRepr::U8), 2);
 
+        // The payload-carrying row is RETIRED BY CAPABILITY: a Direct-tagged
+        // single-payload enum now lowers through the PAIR-ENUM lane (its
+        // constant becomes a (tag, payload) register pair — see the
+        // pair_enum_* pins), so it is asserted to LOWER here rather than
+        // refuse. Every row that remains has NO admitting lane.
+        let m = enum_const_module(payload, 0);
+        assert!(
+            lower_module_to_lir(&m, FuncId::new(0)).is_ok(),
+            "a Direct-tagged single-payload enum constant rides the pair-enum lane"
+        );
+
         for (why, def) in [
             ("no layout descriptor", def),
             ("size 4 with a 1-byte tag", size_mismatch),
             ("niche encoding", niche),
             ("tag at offset 4", offset_tag),
-            ("a payload-carrying variant", payload),
             ("a single-variant enum", single),
             ("a repr hint narrower than the values", too_narrow),
         ] {

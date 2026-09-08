@@ -370,9 +370,7 @@ fn test_ty_all_variants_roundtrip() {
             // 11598e13fe, leaving `cargo test -p trust-types` uncompilable (E0063)
             // since B3-1 — masked because the suite was not run. `None` = the
             // historical flattened-struct semantics.
-            faithful_enum_repr: None,
-            enum_layout: None,
-        },
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, },
     ];
     for ty in &types {
         let json = serde_json::to_string(ty).expect("serialize");

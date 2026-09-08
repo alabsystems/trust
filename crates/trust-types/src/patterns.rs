@@ -419,11 +419,13 @@ fn operand_ty_hint(body: &VerifiableBody, op: &Operand) -> crate::model::Ty {
         // An opaque `&[…]` table constant: no numeric type, never feeds an
         // arithmetic/bounds VC; neutral `Unit` hint (modeled as an opaque slice).
         Operand::Constant(crate::model::ConstValue::OpaqueConst) => crate::model::Ty::Unit,
-        // A `UnitVariantRef` reference constant: same neutral `Unit` hint as
-        // `OpaqueConst` above (modeled as an opaque fresh-symbolic ref).
-        Operand::Constant(crate::model::ConstValue::UnitVariantRef { .. }) => {
-            crate::model::Ty::Unit
-        }
+        // A `UnitVariantRef` / `StructScalarFieldsRef` reference constant: same
+        // neutral `Unit` hint as `OpaqueConst` above (modeled as an opaque
+        // fresh-symbolic ref; the variant/field payload is syntactic-only).
+        Operand::Constant(
+            crate::model::ConstValue::UnitVariantRef { .. }
+            | crate::model::ConstValue::StructScalarFieldsRef { .. },
+        ) => crate::model::Ty::Unit,
         // A typed opaque integer constant (const-generic `N`, associated const,
         // `size_of::<T>()` in a generic body): carries its declared integer type so
         // sort selection stays correct for the arithmetic/bounds VCs it DOES feed.

@@ -1,9 +1,58 @@
-error[E0433]: cannot find module or crate `trust` in this scope
-  --> $DIR/trust-spec-invariant-not-in-scope.rs:15:3
+
+=== Trust Verification Report (trust_spec_invariant_not_in_scope) ===
+
+note: Trust verification: 0 proved, 0 failed, 2 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/trust-spec-invariant-not-in-scope.rs:40:1
    |
-LL | #[trust::invariant(x > 0)]
-   |   ^^^^^ use of unresolved module or unlinked crate `trust`
+LL | / fn annotated(x: i32) -> i32 {
+LL | |
+LL | |
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate `x > 0` was not lowered into a typed verifier formula
+   = note: [unknown] UNKNOWN (trust-full-verifier): native full verifier evidence status: Unsupported; no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecUnverifiable`: unverifiable source specification (item-position `invariant` names no program point, so it has no exact meaning to lower; a predicate checked in isolation is provable only when it is a tautology. Use the first-class loop clause `while <cond> invariant <predicate> { .. }`, or `requires`/`ensures` for an entry/return condition): x > 0
 
-error: aborting due to 1 previous error
+error: Trust Level 0 safety verification incomplete for `trust_spec_invariant_not_in_scope::annotated`: 2 obligation(s) were not proved
+  --> $DIR/trust-spec-invariant-not-in-scope.rs:40:1
+   |
+LL | / fn annotated(x: i32) -> i32 {
+LL | |
+LL | |
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: strict Trust verification requires every Level 0 obligation to be statically proved; failed, unknown, timed-out, runtime-checked, unsupported, and skipped outcomes are all build errors
+   = note: Level 0 summary: 0 failed, 2 unknown or timed out, 0 runtime-checked, 0 skipped
+   = note: native verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
 
-For more information about this error, try `trustc --explain E0433`.
+error: Trust strict verification failed for `trust_spec_invariant_not_in_scope::annotated`: 2 obligation(s) were not fully verified
+  --> $DIR/trust-spec-invariant-not-in-scope.rs:40:1
+   |
+LL | / fn annotated(x: i32) -> i32 {
+LL | |
+LL | |
+LL | |     x
+LL | | }
+   | |_^
+   |
+   = note: summary: 0 trusted, 0 certified, 0 failed, 2 unknown, 0 runtime-checked, 0 skipped out of 2
+   = note: unknown or timed-out obligations are unproved coverage gaps and are not permitted under strict verification
+   = note: skipped or unsupported verification artifacts are unproved coverage gaps and are not permitted under strict verification
+   = note: the default policy reports rather than fails a gap whose obligations all keep their runtime checks; that did not apply here because at least one non-advisory obligation has no runtime fallback, so accepting it would ship behaviour with nothing checking it
+   = help: this build failed on unproved coverage, not on a refutation: to record these rows as warnings and continue only in non-proof survey mode, build with `-Z trust-policy=advisory`
+   = note: --- native verifier detail (9 line(s) below; engine internals, not required to act on this error) ---
+   = note: native full verifier status: Inconclusive; requested=2, proved=0, failed=0, unknown=0, timed_out=0, unsupported=2, skipped=0, insufficient_strength=0
+   = note: native full verifier diagnostic: typed TrustIr NativeVerificationBundle indexed: schema_version=6 bundle_digest=sha256:4bbec945d48064bc94a4953d30f1dc93eacf08d0774dcd0aed1145ebf488f727 requests=1
+   = note: native full verifier diagnostic: typed TrustIr native request indexed: suite=trust-mc request_id=0 proof_obligations=[0] request_digest=sha256:493c90354274a7b62b90e01eac84115ca28b86aaab2d29c4925a123972d0f239
+   = note: native full verifier diagnostic: full-verification engine batch: engine=trust-mc@0.8.0+native-trust-ir-bundle obligations=1 elapsed_ms=0 worker_threads=unbounded
+   = note: native full verifier evidence `unsupported:trust_spec_invariant_not_in_scope__annotated:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.contract", name: "unsupported" }; obligation: compiler contract predicate `x > 0` was not lowered into a typed verifier formula
+   = note: native full verifier evidence `vc:trust_spec_invariant_not_in_scope__annotated:custom:0`: no full-verification primary owner is defined for obligation kind Custom { namespace: "trust.vc", name: "unsupported_mir" }; obligation: unsupported MIR `SpecUnverifiable`: unverifiable source specification (item-position `invariant` names no program point, so it has no exact meaning to lower; a predicate checked in isolation is provable only when it is a tautology. Use the first-class loop clause `while <cond> invariant <predicate> { .. }`, or `requires`/`ensures` for an entry/return condition): x > 0
+   = note: native full verifier evidence `vc:trust_spec_invariant_not_in_scope__annotated:trust_mc_default_function:0`: direct typed trust_mc CHC/PDR input required as ContractPredicate::MathIr, ContractPredicate::CanonicalJson, or schema-matched ContractPredicate::TrustIr with schema trust-mc.typed-chc-obligation.v1 and native Trust/TrustIr proof metadata
+   = note: native full verifier evidence `vc:trust_spec_invariant_not_in_scope__annotated:trust_mc_default_function:0`: native CHC/PDR candidate required: ChcPdrProofKind::PdrInvariant; expected proof_strength is Pdr/SmtBacked, but a generic solver verdict or serialized candidate is diagnostic-only and Proved additionally requires live opaque native-bundle authority
+   = note: native full verifier evidence `vc:trust_spec_invariant_not_in_scope__annotated:trust_mc_default_function:0`: adapter returns Unsupported with no proof_strength when direct typed trust_mc CHC/PDR input is absent or the native typed solver does not prove the obligation
+
+error: aborting due to 2 previous errors
+

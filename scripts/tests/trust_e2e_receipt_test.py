@@ -1178,6 +1178,57 @@ class LegacyHarnessReleaseBoundaryTests(unittest.TestCase):
             source,
         )
 
+    def test_comprehensive_certified_monitor_uses_native_authority_parent(self) -> None:
+        completed = self.run_shell(
+            "run_trust_comprehensive_harness.sh", "list", "release"
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        rows = [
+            line.split("\t")
+            for line in completed.stdout.splitlines()
+            if line.startswith("release.certified-monitor-e2e\t")
+        ]
+        self.assertEqual(len(rows), 1)
+        gate_id, category, required, last_green, command = rows[0]
+        self.assertEqual(gate_id, "release.certified-monitor-e2e")
+        self.assertEqual(category, "harness")
+        self.assertEqual(required, "true")
+        self.assertRegex(last_green, r"^(never|\d{4}-\d{2}-\d{2})$")
+        self.assertEqual(
+            command,
+            "build/host/stage2/bin/targo-trust trust release validate "
+            "certified-monitors --stage2-sysroot build/host/stage2",
+        )
+        self.assertNotIn("stage2_certified_monitor_e2e.sh", command)
+
+    def test_comprehensive_authenticated_strict_rows_use_stage2_targo(self) -> None:
+        completed = self.run_shell(
+            "run_trust_comprehensive_harness.sh", "list", "release"
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        rows = {
+            fields[0]: fields[1:]
+            for line in completed.stdout.splitlines()
+            if len(fields := line.split("\t")) == 5
+        }
+        for name in ("intbound", "widthconv", "budget", "floatbits"):
+            gate_id = f"release.{name}-strict"
+            self.assertIn(gate_id, rows)
+            category, required, last_green, command = rows[gate_id]
+            self.assertEqual(category, "soundness")
+            self.assertEqual(required, "true")
+            self.assertRegex(last_green, r"^(never|\d{4}-\d{2}-\d{2})$")
+            self.assertEqual(
+                command,
+                'TARGO="$(pwd -P)/build/host/stage2/bin/targo" '
+                f"bash scripts/trust_{name}_strict_gate.sh",
+            )
+        authenticated = "\n".join(
+            rows[f"release.{name}-strict"][3]
+            for name in ("intbound", "widthconv", "budget", "floatbits")
+        )
+        self.assertNotIn("stage1/bin/targo", authenticated)
+
     def test_superset_release_and_status_report_cannot_promote_diagnostics(self) -> None:
         completed = self.run_shell("run_trust_superset_suite.sh", "release")
         self.assertEqual(completed.returncode, 2)

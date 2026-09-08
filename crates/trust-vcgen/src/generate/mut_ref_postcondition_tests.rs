@@ -356,7 +356,7 @@ fn kinded_adt(name: &str, fields: Vec<(String, Ty)>, kind: Option<trust_types::A
             layout,
             enum_layout,
             ..
-        } => Ty::Adt {
+        } => Ty::Adt { arbitrary_precision: None,
             name,
             fields,
             variants,

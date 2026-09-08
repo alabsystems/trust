@@ -8,15 +8,45 @@
 //! unbounded (a vendored `memchr(std)` body hung `trustc` for 4h+ this way).
 //!
 //! This module makes the *existing* budget ambient so every preprocessing choke
-//! point across the verifier crates can consult it with no signature churn — the
+//! point across the verifier crates CAN consult it with no signature churn — the
 //! same RAII + `thread_local!` shape already used for `FAITHFUL_SCALARS` in
-//! `trust-mir-extract`. The compiler installs the budget once, at function entry,
-//! before any preprocessing; the choke points (`convert_ty_inner`, the
+//! `trust-mir-extract`. A trip costs only completeness — an `Unsupported` type,
+//! an `Unknown` obligation, a dropped strengthening — never soundness: an
+//! over-budget result is NEVER `Proved`.
+//!
+//! # What actually polls this — read this before relying on the bound
+//!
+//! This paragraph used to assert that "the choke points (`convert_ty_inner`, the
 //! VC-generation walks, the driver worklists, the widening fixpoint) call
-//! [`budget_exhausted`] once per iteration and fail closed on overrun. A trip
-//! costs only completeness — an `Unsupported` type, an `Unknown` obligation, a
-//! dropped strengthening — never soundness: an over-budget result is NEVER
-//! `Proved`.
+//! [`budget_exhausted`] once per iteration". **That was FALSE, and it was the
+//! stated premise under which an unbounded verifier was believed bounded.**
+//! MEASURED 2026-08-31 by counting call sites: `budget_exhausted()` appeared in
+//! ONE file of `trust-vcgen` (`contracts.rs`) and in NONE of `generate/mod.rs`,
+//! `generate/path_defs.rs`, `generate/safety.rs`, `generate/checked_vcs.rs`,
+//! `generate/overflow_vc.rs` or `termination.rs` — that is, in none of "the
+//! VC-generation walks". On `trust-spec-elab` the verifier spent >=99.7% of its
+//! time in walks that polled nothing, and no timeout could bound it.
+//!
+//! Two independent defects produced that outcome, and BOTH are needed for the
+//! bound to hold:
+//!
+//! 1. **The polls were missing.** Now added at the walk loops whose degradation
+//!    is already proven sound and pinned by tests.
+//! 2. **No budget was INSTALLED over the whole-crate R1 pre-pass.** The only
+//!    production `VerifyBudgetGuard::install` sat inside the PER-BODY pass, so
+//!    the pre-pass ran at `VERIFY_STEPS = u64::MAX` with no deadline and every
+//!    poll reachable from it was DEAD CODE. A poll bounds nothing unless a guard
+//!    is installed above it.
+//!
+//! The honest current statement is therefore: **the bound holds exactly at the
+//! loops enumerated by `grep -rn 'budget_exhausted()' crates/ compiler/`, and
+//! only under a scope that installed a guard.** Two places deliberately do NOT
+//! poll, because for them a truncated result is not fail-closed:
+//! `entry_versions_fixpoint` (a partial version map renders reads BARE, which is
+//! the documented false-ACCEPT direction — it needs a fail-closed carrier that
+//! does not exist yet) and `block_entry_versions`, which discards that
+//! fixpoint's `converged` flag. Do not add a poll to either without first giving
+//! `StmtVersionCtx` a way to report that it is incomplete.
 //!
 //! # Termination guarantee (why this is a *proof*, not just a timeout)
 //!

@@ -23,7 +23,8 @@ pub fn recursive_requires(n: u32)
 }
 
 #[cfg(bad_recursive_call)]
-pub fn recursive_requires(n: u32) //[bad_recursive_call]~ NOTE [precond] FAILED
+pub fn recursive_requires(n: u32) //[bad_recursive_call]~ WARN Trust Level 0 safety verification incomplete
+//[bad_recursive_call]~| NOTE [precond] FAILED
 //[bad_recursive_call]~| NOTE Trust verification: 2 proved, 1 failed
 //[bad_recursive_call]~| ERROR Trust strict verification failed for
     requires n > 0

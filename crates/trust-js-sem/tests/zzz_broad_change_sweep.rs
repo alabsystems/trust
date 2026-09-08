@@ -2,7 +2,7 @@
 // s1d-divergence fixes (heritage private scoping, generator/arrow param
 // [Yield], object/class `*`-prefix, generator-function IsConstructor,
 // Object.prototype.toString on generators). Confirms zero NEW wrong traces
-// across the real corpus. Env-gated on TRUST_JS_NODE. Not for commit.
+// across the real corpus. Env-gated on TRUST_JS_NODE. Committed deliberately despite the name: env-gated on TRUST_JS_NODE, inert by default.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

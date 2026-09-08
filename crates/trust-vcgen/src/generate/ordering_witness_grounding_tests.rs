@@ -25,9 +25,7 @@ fn i64_ty() -> Ty {
 }
 
 fn rat_ty() -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "rational::Rat".into(),
         fields: vec![("id".into(), Ty::Int { width: 32, signed: false })],
         variants: vec![],
@@ -48,9 +46,7 @@ fn ref_rat_ty() -> Ty {
 /// `std::result::Result<ok_payload, i64>` in the flattened lowering shape
 /// (machine tags: Ok = 0, Err = 1).
 fn result_ty(ok_payload: Ty) -> Ty {
-    Ty::Adt {
-        adt_kind: None,
-        layout: None,
+    Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
         name: "std::result::Result".into(),
         fields: vec![
             ("__tag".into(), i64_ty()),

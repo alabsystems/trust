@@ -112,9 +112,7 @@ fn make_checked_div_option() -> VerifiableFunction {
         fields: vec![("tag".to_string(), Ty::i64()), ("value".to_string(), Ty::i32())],
         disc_index_safe: false,
         // Trust (B3-1 field completion): pre-existing E0063 missed by 11598e13fe.
-        faithful_enum_repr: None,
-        enum_layout: None,
-    };
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
 
     VerifiableFunction {
         name: "checked_div".to_string(),
@@ -205,9 +203,7 @@ fn pair_ty() -> Ty {
         fields: vec![("left".to_string(), Ty::i64()), ("right".to_string(), Ty::i32())],
         disc_index_safe: false,
         // Trust (B3-1 field completion): pre-existing E0063 missed by 11598e13fe.
-        faithful_enum_repr: None,
-        enum_layout: None,
-    }
+        faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, }
 }
 
 fn make_pair_helper() -> VerifiableFunction {
@@ -504,6 +500,7 @@ fn emit_module_objects_splits_two_function_module_with_stable_names_and_native_a
         function_count: 2,
         source_functions: None,
         linkage: Vec::new(),
+        statics: Vec::new(),
     };
 
     let objects = backend.emit_module_objects(&module).expect("emit_module_objects should succeed");
@@ -530,6 +527,7 @@ fn emit_module_objects_rejects_empty_module_without_object_output() {
         function_count: 0,
         source_functions: None,
         linkage: Vec::new(),
+        statics: Vec::new(),
     };
 
     let err = backend
@@ -601,7 +599,7 @@ fn emit_object_helper_call_struct_return_regression_emits_native_objects() {
         .instructions
         .iter()
         .find(
-            |instr| matches!(instr.opcode, Opcode::Call { ref name } if name == "make_pair_helper"),
+            |instr| matches!(instr.opcode, Opcode::Call { ref name, .. } if name == "make_pair_helper"),
         )
         .expect("caller should contain helper call");
     let call_result =
@@ -619,6 +617,7 @@ fn emit_object_helper_call_struct_return_regression_emits_native_objects() {
         function_count: 2,
         source_functions: None,
         linkage: Vec::new(),
+        statics: Vec::new(),
     };
     let objects = backend
         .emit_module_objects(&module)
@@ -646,7 +645,7 @@ fn emit_objects_overflow_caller_preserves_external_branch_relocation() {
         .instructions
         .iter()
         .find(|instr| {
-            matches!(instr.opcode, Opcode::Call { ref name } if name == "checked_add_overflowing")
+            matches!(instr.opcode, Opcode::Call { ref name, .. } if name == "checked_add_overflowing")
         })
         .expect("main should contain the checked_add_overflowing call");
     let call_result = call_instr.results.first().copied().expect("call should produce a result");

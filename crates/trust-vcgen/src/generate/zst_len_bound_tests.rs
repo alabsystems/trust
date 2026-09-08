@@ -71,7 +71,7 @@ fn len_isize_bound_requires_bytes_or_a_non_zst_slice_element() {
 
     let string = len_call(
         "alloc::string::String::len",
-        Ty::Adt {
+        Ty::Adt { arbitrary_precision: None,
             name: "alloc::string::String".into(),
             fields: vec![],
             variants: vec![],
@@ -89,7 +89,7 @@ fn len_isize_bound_requires_bytes_or_a_non_zst_slice_element() {
 
     let erased_vec = len_call(
         "alloc::vec::Vec::<u8>::len",
-        Ty::Adt {
+        Ty::Adt { arbitrary_precision: None,
             name: "alloc::vec::Vec".into(),
             fields: vec![],
             variants: vec![],

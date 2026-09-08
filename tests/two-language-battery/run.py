@@ -135,6 +135,7 @@ CANONICAL_FIXTURES = {
     "lane-c-combo/c4_island_in_requires.rs": ("C-combo", "frontier", "trustc"),
     "lane-c-combo/c5_NEG_wrong_citation.rs": ("C-combo", "reject", "trustc"),
     "lane-c-combo/c6_readable_select.rs": ("C-combo", "pass", "trustc"),
+    "lane-c-combo/c7_theorem_about_the_function.rs": ("C-combo", "pass", "trustc"),
     "lane-d-legacy/d1_kani_contracts.rs": ("D-legacy", "tippy-emits-lean", "tippy"),
     "lane-d-legacy/d2_kani_nondet.rs": ("D-legacy", "tippy-emits-lean", "tippy"),
     "lane-e-ir-spine/e1_both_languages_in_ir.rs": (
@@ -429,7 +430,12 @@ def capture_fixture_inventory(files: list[Path], canonical: bool) -> dict[Path, 
         if changed:
             detail.append(f"directive_mismatch={changed}")
         raise RuntimeError(
-            "canonical battery inventory differs from the reviewed 25-fixture "
+            # Count DERIVED, never hardcoded: the literal here said "25" while
+            # CANONICAL_FIXTURES already held 26, so the message misreported the
+            # very manifest it was defending. A hardcoded count in an error about
+            # inventory drift is itself inventory drift.
+            f"canonical battery inventory differs from the reviewed "
+            f"{len(CANONICAL_FIXTURES)}-fixture "
             f"manifest: {'; '.join(detail)}"
         )
     return captured
@@ -740,6 +746,7 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
             rec["battery_ok"] = False
         else:
             recorded_func_id = None
+            recorded_def_index = None
             linked = False
             try:
                 coverage = json.loads(coverage_text) if coverage_text else {}
@@ -748,25 +755,31 @@ def run_one(path: Path, timeout: int, source_path: Path | None = None) -> dict:
                     for row in clean_origin.get("emitted", []):
                         if clean_def and clean_def in str(row.get("def_path", "")):
                             recorded_func_id = row.get("func_id")
+                            recorded_def_index = row.get("def_index")
                             break
-                if recorded_func_id is not None:
+                if type(recorded_func_id) is int and type(recorded_def_index) is int:
                     for row in clean_origin.get("linked", []):
                         if (
                             row.get("target_func_id") == recorded_func_id
+                            and type(row.get("source_def_index")) is int
+                            and row.get("source_def_index") == recorded_def_index
+                            and type(row.get("decl_func_id")) is int
                             and row.get("edges_repointed", 0) >= 1
                         ):
                             linked = True
                             break
             except (ValueError, TypeError):
                 pass
-            call_spelling = (
-                f"call @func.{recorded_func_id}(" if recorded_func_id is not None else None
+            identities_recorded = (
+                type(recorded_func_id) is int and type(recorded_def_index) is int
             )
+            call_spelling = f"call @func.{recorded_func_id}(" if identities_recorded else None
             call_in_text = bool(call_spelling) and call_spelling in blob
             rec["clean_recorded_func_id"] = recorded_func_id
+            rec["clean_recorded_def_index"] = recorded_def_index
             rec["clean_linked"] = linked
             rec["clean_call_in_text"] = call_in_text
-            if recorded_func_id is None:
+            if not identities_recorded:
                 rec["verdict"] = "ir-no-clean-row"
                 rec["battery_ok"] = False
             elif linked and call_in_text:

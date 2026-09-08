@@ -50,6 +50,11 @@ Usage (defaults reproduce the 2026-07-01 baseline):
       --corpus realcode=reports/2026-06-29-honest-real-code-coverage/corpus/realcode.rs \
       --corpus realcode_no_closure_bodies=reports/trust-ir-producer-baseline-2026-07-01/corpus-variant/realcode_no_closure_bodies.rs
 
+Check the conjunctive corpus-local instrumented-row zero-residue gate on an existing artifact:
+
+  python3 scripts/trust_ir_producer_scorecard.py \
+      --check-completion reports/trust-ir-producer-baseline-2026-07-01/wave-b0-subject-0831
+
 Author: Andrew Yates | Copyright 2026 | License: Apache-2.0 OR MIT
 """
 
@@ -163,7 +168,7 @@ def guarded_compile(argv, cwd, env, timeout, poll=2.0):
 
 # Exact-event filter: the two trust-ir-lower events live in module
 # rustc_mir_build::builder (builder/mod.rs); the noisy sub-modules are forced off.
-RUSTC_LOG_FILTER = (
+_RUSTC_LOG_FILTER_DEFAULT = (
     "rustc_mir_build::builder::scope=off,"
     "rustc_mir_build::builder::expr=off,"
     "rustc_mir_build::builder::matches=off,"
@@ -198,6 +203,25 @@ RUSTC_LOG_FILTER = (
     # `crate_module.rs`'s 4, and the whole file's stderr came to 6 lines.
     "trust_thir_lower::differential=debug"
 )
+
+# Trust (2026-08-31): `TRUST_SCORECARD_LOG_FILTER` overrides the filter for ONE run.
+#
+# WHY THIS EXISTS, and why it is an override rather than a change to the default:
+# `crate_module=debug` is what ENABLES the self-validation walk at all — the call site
+# guards it with `tracing::enabled!(DEBUG)` precisely so a normal compile never pays for
+# it. On 2026-08-31 that walk (`trust_ir_build::validate_module`) was found to recurse
+# UNBOUNDEDLY on some modules: 60 corpus files that compile without `-Ztrust-ir-lower`
+# SIGSEGV with it, scoring `flag_induced_fail`, and the corpus lost 192 bodies
+# (7,257 -> 7,065). See `reports/what-100-percent-costs-2026-08-31.md` Addendum 7 for the
+# reproducer and the bisect.
+#
+# Dropping that one target restores the corpus, at the cost of leaving `modules_invalid`
+# UNMEASURED. That is a real loss, so the override is per-run, never the default, and the
+# effective filter is recorded verbatim in the artifact's `provenance.rustc_log_filter` —
+# so an artifact measured this way SAYS SO, and a reader can tell a sweep that measured
+# zero invalid modules from one that did not look. A filter that silently omits an
+# instrument is the same failure as a gate that cannot fail (see the note above).
+RUSTC_LOG_FILTER = os.environ.get("TRUST_SCORECARD_LOG_FILTER", _RUSTC_LOG_FILTER_DEFAULT)
 
 UNSUP_RE = re.compile(
     r"trust-ir-lower: unsupported THIR shapes, "
@@ -272,6 +296,23 @@ ROW1_PROBE_RE = re.compile(
     r'declarations=(?P<declarations>\d+), '
     r'outcome="(?P<outcome>[^"]*)", '
     r'samples=(?P<samples>\d+)'
+    # Trust (absent-callee Stage 0): the two priced unknowns, OPTIONAL so every
+    # pre-instrument stderr still parses. `offender` = which Undef broke the
+    # dead-seed proof (oracle-live-havoc rows); `why` = the differential's own
+    # last note (not-run rows).
+    r'(?:, offender="(?P<offender>[^"]*)")?'
+    r'(?:, why="(?P<why>[^"]*)")?'
+)
+# Trust (absent-callee Stage 1.5): the two-sided UNINTERPRETED-CALLEE probe --
+# instrument only; prices the conversion rate of the design's substitution.
+ROW1_UC_RE = re.compile(
+    r'trust-ir-lower: row1 UC probe, '
+    r'def_index=(?P<def_index>\d+), '
+    r'def_path="(?P<def_path>[^"]*)", '
+    r'declarations=(?P<declarations>\d+), '
+    r'outcome="(?P<outcome>[^"]*)", '
+    r'samples=(?P<samples>\d+), '
+    r'detail="(?P<detail>[^"]*)"'
 )
 # The probe emits a BARE LEAF NAME (`ADD_A`) while a body is keyed by its full crate-qualified
 # path (`const_int_wrapping_rpass[34f5]::ADD_A`). Joining on the leaf is the obvious move and it
@@ -292,6 +333,36 @@ DIFF_RE = re.compile(
     r"trust-ir-lower: differential, "
     r"def=DefId\([^~]*~\s*(?P<path>.+?)\), equal=(?P<equal>true|false), "
     r"samples=(?P<samples>\d+), mode=(?P<mode>\w+), note=\"(?P<note>.*)\"\s*$",
+    re.MULTILINE,
+)
+
+# Trust (2026-09-02): the DERIVED-MIR channel, which this scorecard had never parsed at all
+# (`grep -ci derived` returned 0 before this line). The compiler has been emitting it per body
+# all along and `scripts/trust_ir_flip_frontier.py` already carried this exact regex; the
+# scorecard's event list at the top of this file is channel-1 only, so every artifact it has
+# ever produced records half the evidence.
+#
+# WHY THAT MATTERED, measured on the 2,000-file corpus lock with `build/snap-t24`: 2,819 clean
+# bodies are `DerivedAgreed` and **16 are `DerivedMismatch`** — sixteen standing disagreements
+# between the built MIR and the MIR re-derived from the producer's trust-ir, none of which any
+# baseline artifact records and none of which the per-wave "divergences 0" line has ever
+# covered, because that line is computed from `mode` alone.
+#
+# The 16 do NOT ship wrong code, and the distinction is worth stating precisely because the
+# alarming reading is the natural one. `rustc_mir_build/src/builder/mod.rs:405` calls
+# `flip_registry::record_green` ONLY under
+# `derived_report.verdict == DerivedVerdict::DerivedAgreed`, so a `DerivedMismatch` body is
+# never flipped and its real MIR is never replaced; under `-Ztrust-ir-lower=strict` the same
+# site raises a hard `span_err`. Three of the 16 are additionally `mode=Agreed` on channel 1,
+# which is the combination that WOULD flip if the derived verdict were green — so they are
+# exactly the bodies where the two channels disagree about the same program, and exactly the
+# ones no report could previously name.
+#
+# The instrument was working; the REPORTING was blind. This closes that.
+DERIVED_RE = re.compile(
+    r"trust-ir-lower: derived-MIR differential, "
+    r"def=DefId\([^~]*~\s*(?P<path>.+?)\), verdict=(?P<verdict>\w+), "
+    r'detail="(?P<detail>.*?)",\s*markers_exact',
     re.MULTILINE,
 )
 
@@ -528,6 +599,11 @@ def classify_note(mode: str, note: str, blockers=None) -> str:
         if note.startswith("signature divergence"):
             return "divergence-signature"
         return "divergence-interpretation"
+    # Trust (absent-callee Stage 3): the fenced UC verdict class -- its own bucket, NEVER
+    # folded into "agreed" (the mode string equality above already keeps every Agreed count
+    # clean of it; this rule keeps the note-class histogram honest too).
+    if mode == "AgreedUninterpretedCallee":
+        return "agreed-uninterpreted-callee"
     # mode == NotRun
     # Trust (B3/E6 authority audit): classify exact comparator markers before broad substring
     # rules below (`direct call`, `vararg`, ...). The diagnostic embeds function names, and a
@@ -782,6 +858,17 @@ def parse_bodies(stderr: str):
         if _idx_to_path.setdefault(i, p) != p:
             _idx_ambiguous.add(i)
     _row1, _row1_unjoined = {}, 0
+    _uc = {}
+    for m in ROW1_UC_RE.finditer(stderr):
+        i = m.group("def_index")
+        p2 = _idx_to_path.get(i)
+        if p2 is None or i in _idx_ambiguous:
+            continue
+        _uc[p2] = {
+            "outcome": m.group("outcome"),
+            "samples": int(m.group("samples")),
+            **({"detail": m.group("detail")} if m.group("detail") else {}),
+        }
     for m in ROW1_PROBE_RE.finditer(stderr):
         i = m.group("def_index")
         p = _idx_to_path.get(i)
@@ -792,12 +879,23 @@ def parse_bodies(stderr: str):
             "outcome": m.group("outcome"),
             "samples": int(m.group("samples")),
             "declarations": int(m.group("declarations")),
+            # Trust (absent-callee Stage 0): present only on instrumented rows.
+            **({"offender": m.group("offender")} if m.group("offender") else {}),
+            **({"why": m.group("why")} if m.group("why") else {}),
+            # Trust (absent-callee Stage 1.5): the UC probe's row, when one ran.
+            **({"uc": _uc.get(p)} if _uc.get(p) else {}),
         }
     collect_primary = collections.defaultdict(list)
     collect_cascade = collections.defaultdict(list)
     for m in COLLECT_RE.finditer(stderr):
         dst = collect_primary if m.group("cls") == "primary" else collect_cascade
         dst[m.group("path")].append([m.group("what"), int(m.group("n"))])
+    # Trust (2026-09-02): the derived-MIR verdict per body. Keyed on the same def path as the
+    # channel-1 event, so the two are joinable per body rather than only in aggregate. First
+    # writer wins, matching `DIFF_RE`'s own dedup below.
+    derived = {}
+    for m in DERIVED_RE.finditer(stderr):
+        derived.setdefault(m.group("path"), (m.group("verdict"), m.group("detail")))
     bodies = {}
     dup_diff = 0
     for m in DIFF_RE.finditer(stderr):
@@ -836,6 +934,12 @@ def parse_bodies(stderr: str):
             # None, NOT as False — "not measured" must stay distinguishable from "modelled".
             "symbolic": symbolic.get(p),
             "opaque_collapse": opaque.get(p),
+            # Trust (2026-09-02): the DERIVED-MIR channel. Absent (None) means the producer
+            # emitted no derived event for this body and must stay distinguishable from
+            # `DerivedUnsupported`, which means it emitted one and refused — the same
+            # not-measured-vs-modelled discipline the fields above keep.
+            "derived_verdict": (derived.get(p) or (None, None))[0],
+            "derived_detail": (derived.get(p) or (None, None))[1],
             # Trust (extern-750 attribution): the row-1 probe outcome for this body, when the
             # producer emitted one. Absent means the probe did not run for this body — which
             # must stay distinguishable from "ran and found nothing", because the ONLY reason
@@ -1461,7 +1565,39 @@ def aggregate(results):
             "seam_declaration_blockers": seam_blocker_census(bs),
             "unsupported_count_per_body_histogram": {str(k): v for k, v in sorted(hist.items())},
             "agreed": sum(1 for b in bs if b["mode"] == "Agreed"),
+            # Trust (absent-callee Stage 3): its own column, beside -- never inside -- Agreed.
+            "agreed_uninterpreted_callee": sum(
+                1 for b in bs if b["mode"] == "AgreedUninterpretedCallee"
+            ),
             "divergences": sorted(b["def"] for b in bs if b["mode"] == "MirOracle"),
+            # Trust (2026-09-02): the DERIVED-MIR channel, previously unrecorded entirely.
+            # `divergences` above is channel-1 only, so a per-wave "divergences 0" line has
+            # never covered a derived-channel disagreement. These four keys make it checkable
+            # from the artifact instead of re-measurable only off stderr.
+            #
+            # `derived_mismatches` is the one to read. A body in it is NOT shipping wrong code:
+            # `rustc_mir_build/src/builder/mod.rs:405` calls `flip_registry::record_green` only
+            # under `DerivedVerdict::DerivedAgreed`, so a mismatched body is never flipped, and
+            # `-Ztrust-ir-lower=strict` turns the same verdict into a hard error. It is a
+            # DETECTED disagreement, which is the instrument working — but one nothing counted.
+            #
+            # `derived_mismatch_flip_shaped` is the sharpest subset: bodies channel 1 calls
+            # `Agreed` while the derived channel calls Mismatch. Those are the bodies where the
+            # two independent checks disagree about the same program, and the ones that would
+            # flip if the derived verdict ever turned green for the wrong reason.
+            "derived_agreed": sum(1 for b in bs if b.get("derived_verdict") == "DerivedAgreed"),
+            "derived_unsupported": sum(
+                1 for b in bs if b.get("derived_verdict") == "DerivedUnsupported"
+            ),
+            "derived_unmeasured": sum(1 for b in bs if b.get("derived_verdict") is None),
+            "derived_mismatches": sorted(
+                b["def"] for b in bs if b.get("derived_verdict") == "DerivedMismatch"
+            ),
+            "derived_mismatch_flip_shaped": sorted(
+                b["def"]
+                for b in bs
+                if b.get("derived_verdict") == "DerivedMismatch" and b["mode"] == "Agreed"
+            ),
             "divergence_note_histogram": dict(collections.Counter(
                 b["note"] for b in bs if b["mode"] == "MirOracle")),
         }
@@ -1537,6 +1673,515 @@ def aggregate(results):
     }
 
 
+def evaluate_producer_completion(aggregate):
+    """Pure, fail-closed W0 zero-residue decision for one corpus aggregate.
+
+    This deliberately consumes only the structured aggregate, not prose, percentages, or
+    per-body rows. In particular, ``lowered_clean`` is not consulted: it means only that the
+    producer emitted no unsupported-shape tag, and can still include symbolic placeholders,
+    opaque live-value collapse, or bodies without an affirmative semantic adjudication.
+
+    The returned dictionary is JSON-serializable. Missing, malformed, negative, or
+    type-confused acceptance fields fail their checks instead of inheriting an optimistic
+    default, so pre-instrumentation artifacts remain readable but cannot pass this gate.
+    """
+    missing = object()
+
+    def field(path):
+        value = aggregate
+        for part in path.split("."):
+            if not isinstance(value, dict) or part not in value:
+                return missing
+            value = value[part]
+        return value
+
+    def display(value):
+        return None if value is missing else value
+
+    def count(value):
+        # bool is an int subclass, but accepting True as a count would make malformed JSON pass.
+        return type(value) is int and value >= 0
+
+    checks = []
+
+    def add(check_id, fields, predicate, expected, actual, passed):
+        missing_fields = [path for path in fields if field(path) is missing]
+        check = {
+            "id": check_id,
+            "fields": fields,
+            "predicate": predicate,
+            "expected": expected,
+            "actual": actual,
+            "passed": bool(passed) and not missing_fields,
+        }
+        if missing_fields:
+            check["missing_fields"] = missing_fields
+        checks.append(check)
+
+    total = field("bodies.total")
+    add(
+        "admitted_body_denominator_nonzero",
+        ["bodies.total"],
+        "greater_than",
+        0,
+        display(total),
+        count(total) and total > 0,
+    )
+
+    modelled = field("bodies.lowered_clean_modelled")
+    add(
+        "modelled_equals_total",
+        ["bodies.lowered_clean_modelled", "bodies.total"],
+        "counts_equal",
+        {"modelled": "bodies.total"},
+        {"modelled": display(modelled), "total": display(total)},
+        count(modelled) and count(total) and modelled == total,
+    )
+
+    def add_zero(check_id, path):
+        value = field(path)
+        add(check_id, [path], "equals", 0, display(value), count(value) and value == 0)
+
+    add_zero("symbolic_zero", "bodies.lowered_clean_symbolic")
+    add_zero("opaque_collapse_all_zero", "bodies.opaque_collapse_all")
+    add_zero("opaque_collapse_clean_zero", "bodies.lowered_clean_opaque")
+    add_zero("class_unmeasured_zero", "bodies.lowered_clean_class_unmeasured")
+
+    ok_files = field("file_outcomes.ok")
+    modules_measured = field("validation.modules_measured")
+    add(
+        "validation_measured_equals_ok_files",
+        ["validation.modules_measured", "file_outcomes.ok"],
+        "counts_equal",
+        {"modules_measured": "file_outcomes.ok"},
+        {"modules_measured": display(modules_measured), "ok_files": display(ok_files)},
+        count(modules_measured) and count(ok_files) and modules_measured == ok_files,
+    )
+    add_zero("validation_unmeasured_zero", "validation.modules_unmeasured")
+    add_zero("validation_invalid_zero", "validation.modules_invalid")
+    add_zero("validation_errors_zero", "validation.error_occurrences")
+
+    outcomes = field("file_outcomes")
+    outcomes_well_formed = (
+        isinstance(outcomes, dict)
+        and all(isinstance(k, str) and count(v) for k, v in outcomes.items())
+    )
+    flag_induced = (
+        {k: v for k, v in outcomes.items() if k.startswith("flag_induced_")}
+        if outcomes_well_formed else None
+    )
+    add(
+        "flag_induced_outcomes_zero",
+        ["file_outcomes"],
+        "all_matching_counts_equal_zero",
+        {"key_prefix": "flag_induced_", "count": 0},
+        flag_induced,
+        outcomes_well_formed and all(v == 0 for v in flag_induced.values()),
+    )
+
+    ice_signatures = field("flag_induced_ice_signatures")
+    ice_signatures_well_formed = (
+        isinstance(ice_signatures, dict)
+        and all(isinstance(k, str) and count(v) for k, v in ice_signatures.items())
+    )
+    add(
+        "flag_induced_ice_signatures_zero",
+        ["flag_induced_ice_signatures"],
+        "all_counts_equal_zero",
+        0,
+        display(ice_signatures),
+        ice_signatures_well_formed and all(v == 0 for v in ice_signatures.values()),
+    )
+
+    # A timeout or a future outcome spelling must not silently shrink the admitted denominator.
+    # Standalone compile failures remain the scorecard's documented pre-admission exclusion.
+    unresolved_outcomes = (
+        {
+            k: v for k, v in outcomes.items()
+            if k not in {"ok", "compile_fail"} and not k.startswith("flag_induced_")
+        }
+        if outcomes_well_formed else None
+    )
+    add(
+        "unresolved_file_outcomes_zero",
+        ["file_outcomes"],
+        "all_unrecognized_counts_equal_zero",
+        {"accepted_keys": ["ok", "compile_fail"], "count": 0},
+        unresolved_outcomes,
+        outcomes_well_formed and all(v == 0 for v in unresolved_outcomes.values()),
+    )
+
+    add_zero(
+        "agreed_uninterpreted_callee_zero",
+        "bodies.agreed_uninterpreted_callee",
+    )
+
+    divergences = field("bodies.divergences")
+    add(
+        "divergences_zero",
+        ["bodies.divergences"],
+        "empty_list",
+        [],
+        display(divergences),
+        isinstance(divergences, list) and not divergences,
+    )
+
+    anomalies = field("parse_anomalies")
+    anomalies_well_formed = (
+        isinstance(anomalies, dict)
+        and all(isinstance(k, str) and count(v) for k, v in anomalies.items())
+    )
+    add(
+        "parse_anomalies_zero",
+        ["parse_anomalies"],
+        "all_counts_equal_zero",
+        0,
+        display(anomalies),
+        anomalies_well_formed and all(v == 0 for v in anomalies.values()),
+    )
+
+    add_zero(
+        "partial_bodies_zero",
+        "partial_bodies_from_flag_induced_failures.total",
+    )
+
+    complete = all(check["passed"] for check in checks)
+    return {
+        "schema": "trust.trust-ir.producer-row-gate.v2",
+        "scope": "corpus-local instrumented-row zero-residue",
+        "result": "pass" if complete else "incomplete",
+        "complete": complete,
+        "does_not_establish": [
+            "G1",
+            "an independently complete file/body denominator",
+            "G4",
+            "universal semantic equivalence",
+            "product completion",
+        ],
+        "checks": checks,
+        "non_acceptance_metrics": {
+            "lowered_clean": {
+                "field": "bodies.lowered_clean",
+                "value": display(field("bodies.lowered_clean")),
+                "acceptance_condition": False,
+                "meaning": "diagnostic only: zero unsupported-shape tags",
+            },
+            "sampled_agreement": {
+                "field": "bodies.lowered_clean_modelled_agreed",
+                "value": display(field("bodies.lowered_clean_modelled_agreed")),
+                "acceptance_condition": False,
+                "meaning": (
+                    "falsification health only; applicability must be owner-signed and "
+                    "universal or exhaustive refinement evidence remains authoritative"
+                ),
+            },
+        },
+    }
+
+
+def evaluate_scorecard_completion(data, *, recompute_from_files=False):
+    """Conjoin corpus-local decisions, optionally rebuilding aggregates from raw rows.
+
+    ``recompute_from_files`` is required for an evidence check: a stored aggregate is a cached
+    rendering aid and must not be trusted over the artifact's raw per-file measurements.
+    """
+    corpora = data.get("corpora") if isinstance(data, dict) else None
+    errors = []
+    results = {}
+    if not isinstance(data, dict) or data.get("schema") != "trust.trust-ir.producer-scorecard.v1":
+        errors.append("missing or unsupported producer scorecard schema")
+    provenance_value = data.get("provenance") if isinstance(data, dict) else None
+    provenance_ok = (
+        isinstance(provenance_value, dict)
+        and isinstance(provenance_value.get("repo_head"), str)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", provenance_value["repo_head"])
+        and isinstance(provenance_value.get("trustc_version_verbose"), str)
+        and bool(provenance_value["trustc_version_verbose"])
+        and provenance_value.get("rustc_log_filter") == RUSTC_LOG_FILTER
+        and isinstance(provenance_value.get("compile_flags"), list)
+        and all(isinstance(flag, str) for flag in provenance_value["compile_flags"])
+        and type(provenance_value.get("seed")) is int
+    )
+    if not provenance_ok:
+        errors.append("missing or malformed scorecard provenance identity")
+    if not isinstance(corpora, dict):
+        errors.append("missing or malformed corpora mapping")
+    elif not corpora:
+        errors.append("no corpora to evaluate")
+    else:
+        for name, corpus in corpora.items():
+            aggregate_value = corpus.get("aggregate") if isinstance(corpus, dict) else None
+            if recompute_from_files:
+                files = corpus.get("files") if isinstance(corpus, dict) else None
+                raw_error = None
+                if not isinstance(files, list):
+                    raw_error = "missing or malformed files list"
+                else:
+                    input_census = corpus.get("input_census")
+                    body_census = corpus.get("body_census")
+                    census_rows = (
+                        input_census.get("files") if isinstance(input_census, dict) else None
+                    )
+                    census_ok = (
+                        isinstance(input_census, dict)
+                        and set(input_census)
+                        == {"schema", "source", "files"}
+                        and input_census.get("schema")
+                        == "trust.trust-ir.producer-input-census.v1"
+                        and input_census.get("source") == "precompile-content-manifest/v1"
+                        and isinstance(census_rows, list)
+                    )
+                    if not census_ok:
+                        raw_error = "missing or malformed independent input census"
+                    expected_files = []
+                    if raw_error is None:
+                        for census_index, census_row in enumerate(census_rows):
+                            row_ok = (
+                                isinstance(census_row, dict)
+                                and set(census_row)
+                                == {"file", "sha256", "expected_outcome"}
+                                and isinstance(census_row.get("file"), str)
+                                and bool(census_row["file"])
+                                and isinstance(census_row.get("sha256"), str)
+                                and re.fullmatch(r"[0-9a-f]{64}", census_row["sha256"])
+                                and census_row.get("expected_outcome") in {"ok", "compile_fail"}
+                            )
+                            if not row_ok:
+                                raw_error = (
+                                    f"malformed input_census.files[{census_index}]"
+                                )
+                                break
+                            expected_files.append(
+                                (census_row["file"], census_row["expected_outcome"])
+                            )
+                        if raw_error is None and len(expected_files) != len(set(expected_files)):
+                            raw_error = "duplicate rows in independent input census"
+
+                    body_census_rows = (
+                        body_census.get("bodies") if isinstance(body_census, dict) else None
+                    )
+                    body_census_ok = (
+                        isinstance(body_census, dict)
+                        and set(body_census) == {"schema", "source", "bodies"}
+                        and body_census.get("schema")
+                        == "trust.trust-ir.producer-body-census.v1"
+                        and body_census.get("source")
+                        == "independent-hir-body-owner-census/v1"
+                        and isinstance(body_census_rows, list)
+                    )
+                    if raw_error is None and not body_census_ok:
+                        raw_error = "missing or malformed independent reachable-body census"
+                    expected_bodies = []
+                    if raw_error is None:
+                        for census_index, census_row in enumerate(body_census_rows):
+                            row_ok = (
+                                isinstance(census_row, dict)
+                                and set(census_row) == {"file", "def", "kind"}
+                                and all(
+                                    isinstance(census_row.get(field), str)
+                                    and bool(census_row[field])
+                                    for field in ("file", "def", "kind")
+                                )
+                            )
+                            if not row_ok:
+                                raw_error = (
+                                    f"malformed body_census.bodies[{census_index}]"
+                                )
+                                break
+                            expected_bodies.append(
+                                (census_row["file"], census_row["def"], census_row["kind"])
+                            )
+                        if raw_error is None and len(expected_bodies) != len(
+                            set(expected_bodies)
+                        ):
+                            raw_error = "duplicate rows in independent reachable-body census"
+
+                    observed_files = []
+                    observed_bodies = []
+                    for index, row in enumerate(files):
+                        if (
+                            not isinstance(row, dict)
+                            or not isinstance(row.get("file"), str)
+                            or not row.get("file")
+                            or not isinstance(row.get("outcome"), str)
+                        ):
+                            raw_error = f"malformed files[{index}] result"
+                            break
+                        observed_files.append((row["file"], row["outcome"]))
+                        if not isinstance(row.get("bodies"), list) or not all(
+                            isinstance(body, dict) for body in row["bodies"]
+                        ):
+                            raw_error = f"malformed files[{index}].bodies"
+                            break
+                        # A failed compilation contributes no completed body and no module that
+                        # validation examined.  Letting a non-`ok` row carry optimistic body rows
+                        # permits a forged artifact to satisfy the body denominator while keeping
+                        # `modules_measured == ok_files == 0` -- a validation bypass.
+                        if row["outcome"] != "ok" and row["bodies"]:
+                            raw_error = f"non-ok files[{index}] carries completed bodies"
+                            break
+                        if row["outcome"].startswith("flag_induced_") and (
+                            not isinstance(row.get("partial_bodies"), list)
+                            or not all(isinstance(body, dict) for body in row["partial_bodies"])
+                        ):
+                            raw_error = f"malformed files[{index}].partial_bodies"
+                            break
+                        if row["outcome"] in {"ok", "flag_induced_fail", "flag_induced_ice"} \
+                                and not isinstance(row.get("anomalies"), dict):
+                            raw_error = f"missing or malformed files[{index}].anomalies"
+                            break
+                        for body_kind in ("bodies", "partial_bodies"):
+                            for body_index, body in enumerate(row.get(body_kind, [])):
+                                body_types_ok = (
+                                    isinstance(body.get("def"), str)
+                                    and bool(body.get("def"))
+                                    and type(body.get("unsupported")) is int
+                                    and body["unsupported"] >= 0
+                                    and isinstance(body.get("reasons"), list)
+                                    and all(
+                                        isinstance(reason, str) and bool(reason)
+                                        for reason in body["reasons"]
+                                    )
+                                    and len(body["reasons"]) == len(set(body["reasons"]))
+                                    and body["unsupported"] == len(body["reasons"])
+                                    and isinstance(body.get("kind"), str)
+                                    and bool(body.get("kind"))
+                                    and isinstance(body.get("mode"), str)
+                                    and body["mode"]
+                                    in {
+                                        "Agreed",
+                                        "AgreedUninterpretedCallee",
+                                        "MirOracle",
+                                        "NotRun",
+                                    }
+                                    and type(body.get("equal")) is bool
+                                    and type(body.get("samples")) is int
+                                    and body["samples"] >= 0
+                                    and body["equal"] == (body["mode"] == "Agreed")
+                                    and (
+                                        body["mode"] != "Agreed" or body["samples"] > 0
+                                    )
+                                    and type(body.get("symbolic")) in {bool, type(None)}
+                                    and type(body.get("opaque_collapse")) is bool
+                                    and isinstance(body.get("note_class"), str)
+                                    and isinstance(body.get("note"), str)
+                                )
+                                if not body_types_ok:
+                                    raw_error = (
+                                        f"malformed files[{index}].{body_kind}[{body_index}]"
+                                    )
+                                    break
+                                if body_kind == "bodies":
+                                    observed_bodies.append(
+                                        (row["file"], body["def"], body["kind"])
+                                    )
+                            if raw_error:
+                                break
+                        if raw_error:
+                            break
+                        if row["outcome"] == "ok":
+                            validation = row.get("validation")
+                            if not isinstance(validation, dict):
+                                raw_error = f"missing or malformed files[{index}].validation"
+                                break
+                            total = validation.get("total")
+                            classes = validation.get("classes")
+                            classes_ok = (
+                                isinstance(classes, dict)
+                                and all(
+                                    isinstance(name, str)
+                                    and bool(name)
+                                    and type(count) is int
+                                    and count >= 0
+                                    for name, count in classes.items()
+                                )
+                            )
+                            if (
+                                type(total) is not int
+                                or total < 0
+                                or not classes_ok
+                                or total != sum(classes.values())
+                            ):
+                                raw_error = (
+                                    f"inconsistent or malformed files[{index}].validation"
+                                )
+                                break
+                    if raw_error is None and sorted(observed_files) != sorted(expected_files):
+                        raw_error = "raw file rows do not equal the independent input census"
+                    if raw_error is None and sorted(observed_bodies) != sorted(expected_bodies):
+                        raw_error = (
+                            "differential body rows do not equal the independent "
+                            "reachable-body census"
+                        )
+                if raw_error:
+                    errors.append(f"corpus {name!r}: {raw_error}")
+                    aggregate_value = {}
+                else:
+                    try:
+                        aggregate_value = aggregate(files)
+                    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+                        errors.append(f"corpus {name!r}: malformed raw result: {exc}")
+                        aggregate_value = {}
+            elif not isinstance(aggregate_value, dict):
+                errors.append(f"corpus {name!r} is missing a structured aggregate")
+                aggregate_value = {}
+            results[name] = evaluate_producer_completion(aggregate_value)
+    complete = not errors and bool(results) and all(
+        result["complete"] for result in results.values()
+    )
+    return {
+        "schema": "trust.trust-ir.producer-scorecard-row-gate.v2",
+        "scope": (
+            "listed corpus-local instrumented-row zero-residue gates with explicit "
+            "input/body census equality"
+        ),
+        "result": "pass" if complete else "incomplete",
+        "complete": complete,
+        "does_not_establish": [
+            "G1",
+            "independence of the supplied census",
+            "G4",
+            "universal semantic equivalence",
+            "product completion",
+        ],
+        "aggregate_source": "recomputed_from_files" if recompute_from_files else "stored",
+        "artifact_errors": errors,
+        "corpora": results,
+    }
+
+
+def check_completion_artifact(out_dir):
+    """Print the structured completion decision for an artifact; return a gate exit code."""
+    path = out_dir if out_dir.endswith(".json") else os.path.join(out_dir, "data.json")
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        result = {
+            "schema": "trust.trust-ir.producer-scorecard-row-gate.v2",
+            "scope": (
+                "listed corpus-local instrumented-row zero-residue gates with explicit "
+                "input/body census equality"
+            ),
+            "result": "incomplete",
+            "complete": False,
+            "does_not_establish": [
+                "G1",
+                "independence of the supplied census",
+                "G4",
+                "universal semantic equivalence",
+                "product completion",
+            ],
+            "aggregate_source": "recomputed_from_files",
+            "artifact_errors": [f"cannot read {path}: {exc}"],
+            "corpora": {},
+        }
+    else:
+        result = evaluate_scorecard_completion(data, recompute_from_files=True)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["complete"] else 1
+
+
 def provenance(trustc: str, repo: str, args):
     ver = subprocess.run([trustc, "--version", "--verbose"],
                          capture_output=True, text=True).stdout.strip()
@@ -1572,6 +2217,24 @@ def render_markdown(data):
         agg = corpus["aggregate"]
         b = agg["bodies"]
         out.append(f"\n## corpus: {name}\n")
+        completion = evaluate_producer_completion(agg)
+        failed_completion_checks = [
+            check["id"] for check in completion["checks"] if not check["passed"]
+        ]
+        if completion["complete"]:
+            out.append(
+                "- corpus-local instrumented-row zero-residue gate: **PASS**"
+                " (does not establish G1, census independence, G4, universal semantic"
+                " equivalence, or product completion)"
+            )
+        else:
+            out.append(
+                "- corpus-local instrumented-row zero-residue gate: **INCOMPLETE**"
+                " (does not establish G1, census independence, G4, universal semantic"
+                " equivalence, or product completion);"
+                " failed conjuncts: "
+                + ", ".join(failed_completion_checks)
+            )
         meta = corpus.get("sample_meta") or {}
         if "campaign_pins_excluded_from_pool" in meta:
             # Self-describing: the sampling population is the whole basis of
@@ -1590,8 +2253,10 @@ def render_markdown(data):
             )
         out.append(f"- file outcomes: `{agg['file_outcomes']}`")
         out.append(f"- bodies reached (in files that fully compiled under the flag): **{b['total']}**")
-        out.append(f"- lowered clean (0 unsupported shapes): **{b['lowered_clean']}"
-                   f" ({b['lowered_clean_pct']}%)**")
+        out.append(
+            f"- lowered clean (diagnostic only; **NOT an acceptance metric**;"
+            f" 0 unsupported shapes): **{b['lowered_clean']} ({b['lowered_clean_pct']}%)**"
+        )
         if b.get("bodies_out_of_fragment"):
             out.append(
                 f"- in-fragment rate (excluding {b['bodies_out_of_fragment']} coroutine bodies"
@@ -1650,6 +2315,22 @@ def render_markdown(data):
                 out.append(f"  - by class: {v['class_histogram']}")
         out.append(f"- by kind: {b['by_kind']} (clean: {b['clean_by_kind']})")
         out.append(f"- note-class histogram: {b['note_class_histogram']}")
+        # Trust (absent-callee Stage 2 disclosure): the UNINTERPRETED-CALLEE adjudication
+        # column — probe rows whose two-leg UC comparison agreed under the pairing
+        # conjuncts and fence. DISCLOSED, NEVER Agreed: these rows assert "the two
+        # lowerings are the same program under the assumption the absent callee is a
+        # pure function of nothing" (docs/TCB.md carries the row), and they are counted
+        # here precisely so they can never be confused with the Agreed column above.
+        uc_hist = {}
+        for f2 in corpus.get("files", []):
+            for b2 in f2.get("bodies", []):
+                u2 = (b2.get("row1_probe") or {}).get("uc")
+                if u2:
+                    uc_hist[u2["outcome"]] = uc_hist.get(u2["outcome"], 0) + 1
+        if uc_hist:
+            out.append(
+                f"- uninterpreted-callee adjudication (DISCLOSED, never Agreed): {uc_hist}"
+            )
         sdb = b.get("seam_declaration_blockers") or {}
         if sdb.get("rows_total"):
             out.append(
@@ -1685,7 +2366,15 @@ def render_markdown(data):
         out.append(f"- unsupported-count-per-body: {b['unsupported_count_per_body_histogram']}")
         div = b["divergences"]
         div_shown = div[:10] + ([f"... +{len(div) - 10} more"] if len(div) > 10 else [])
-        out.append(f"- differential Agreed: {b['agreed']}; divergences ({len(div)}): {div_shown}")
+        out.append(
+            f"- sampled differential Agreed (testing evidence, not a proof): {b['agreed']};"
+            f" divergences ({len(div)}): {div_shown}"
+        )
+        if b.get("agreed_uninterpreted_callee"):
+            out.append(
+                f"- agreed-uninterpreted-callee (VERDICT CLASS, disclosed, never Agreed): "
+                f"{b['agreed_uninterpreted_callee']}"
+            )
         if b["divergence_note_histogram"]:
             out.append(f"- divergence notes: {b['divergence_note_histogram']}")
         pb = agg["partial_bodies_from_flag_induced_failures"]
@@ -1791,6 +2480,12 @@ def main():
     ap.add_argument("--selftest-seam-blockers", action="store_true",
                     help="mutation proof that the declaration-blocker split actually splits "
                          "(also runs --check-seam-blockers)")
+    ap.add_argument("--check-completion", metavar="DIR_OR_DATA_JSON",
+                    help="recompute and evaluate each fail-closed corpus-local instrumented-row "
+                         "zero-residue gate from an EXISTING artifact's raw file rows and "
+                         "explicit input/body censuses, print structured JSON, and exit "
+                         "nonzero unless every listed corpus passes; does not establish G1, "
+                         "census independence, G4, or product completion; no --trustc needed")
     ap.add_argument("--rerender", metavar="DIR",
                     help="recompute `aggregate` and rewrite SCORECARD.md from an EXISTING "
                          "postbuild dir's data.json per-body rows. No compiler, no corpus "
@@ -1813,6 +2508,8 @@ def main():
         return check_seam_blockers(os.path.abspath(args.repo))
     if args.selftest_seam_blockers:
         return selftest_seam_blockers(os.path.abspath(args.repo))
+    if args.check_completion:
+        return check_completion_artifact(args.check_completion)
     if args.rerender:
         return rerender(args.rerender, check_only=args.rerender_check)
     if not args.trustc:

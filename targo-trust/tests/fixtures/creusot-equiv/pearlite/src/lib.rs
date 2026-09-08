@@ -7,8 +7,9 @@
 //!
 //! This file contains NO goal text and NO native clause: the mapper proposes
 //! the native clause (see ../proposed/), an independent author writes the
-//! native clause by hand (see ../native/), and goals are rendered only by the
-//! compiler's spec-emit artifact on those two packages.
+//! native clause by hand (see ../native/), and zero-authority canonical
+//! denotations are rendered only by the compiler's spec-emit artifact on those
+//! two packages.
 #![feature(register_tool)]
 #![register_tool(creusot_contracts)]
 

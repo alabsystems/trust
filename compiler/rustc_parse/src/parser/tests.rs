@@ -3176,3 +3176,233 @@ fn trust_predicate_final_by_does_not_steal_following_citation_marker() {
         );
     });
 }
+
+/// Trust (E9): parse the internal clause keyword the `#[trust::ensures]` /
+/// `#[trust::requires]` expanders inject, so these tests exercise the exact
+/// token shape `ExpandTrustEnsures` produces without needing a proc macro.
+fn parse_trust_attribute_contract_fn<'a>(
+    psess: &'a ParseSess,
+    name: &str,
+    source: &str,
+) -> PResult<'a, Box<ast::Item>> {
+    parse_item_from_source_str(filename(psess.source_map(), name), source.to_owned(), psess)
+        .map(|item| item.expect("contract fixture must produce an item"))
+}
+
+fn trust_attribute_contract(function: &ast::Item) -> &ast::FnContract {
+    let ast::ItemKind::Fn(function) = &function.kind else {
+        panic!("contract fixture must parse as a function");
+    };
+    function.contract.as_deref().expect("the contract must be retained")
+}
+
+#[test]
+fn trust_attribute_ensures_citation_joins_the_native_lane() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        // Exactly what `#[trust::ensures(result == x by Clean.Lemmas.bound)]`
+        // expands to.
+        let item = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-citation.rs",
+            "fn cited(x: u32) -> u32 \
+             trust_contract_ensures { result == x by Clean.Lemmas.bound } { x }",
+        )
+        .unwrap();
+        let contract = trust_attribute_contract(&item);
+
+        use ast::ast::{FnContractClauseKind as Kind, FnContractClauseLane as Lane};
+        assert_eq!(
+            contract
+                .clause_order
+                .iter()
+                .map(|marker| (marker.ordinal, marker.kind, marker.lane, marker.lane_index))
+                .collect::<Vec<_>>(),
+            [(0, Kind::Ensures, Lane::Native, 0)],
+            "a cited attribute clause must take the native lane, not the opaque one"
+        );
+        assert!(contract.trust_opaque_ensures.is_empty());
+        assert!(contract.ensures_clauses.is_empty());
+
+        let ensures = contract.trust_native_ensures[0];
+        let citation = ensures.citation.expect("the attribute citation must be retained");
+        assert_eq!(citation.name, Symbol::intern("Clean.Lemmas.bound"));
+        assert_eq!(
+            psess.source_map().span_to_snippet(citation.span).unwrap(),
+            "Clean.Lemmas.bound"
+        );
+        // The predicate span/spelling must EXCLUDE the citation suffix, or the
+        // verifier reads `result == x by Clean.Lemmas.bound` back as the
+        // predicate text and fails to elaborate it.
+        assert_eq!(psess.source_map().span_to_snippet(ensures.predicate).unwrap(), "result == x");
+        assert_eq!(ensures.payload.as_str(), "result == x");
+    });
+}
+
+#[test]
+fn trust_attribute_requires_citation_joins_the_native_lane() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        // A citation on a `requires` is ACCEPTED and handled exactly as the
+        // first-class signature surface handles it (same lane, same downstream
+        // advisory citation flow). Rejecting it here would make the two
+        // surfaces disagree about the same authored clause.
+        let item = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-requires-citation.rs",
+            "fn cited(x: u32) -> u32 trust_contract_requires { x > 0 by Clean.Lemmas.pos } { x }",
+        )
+        .unwrap();
+        let contract = trust_attribute_contract(&item);
+
+        assert!(contract.trust_opaque_requires.is_empty());
+        assert!(contract.requires_clauses.is_empty());
+        let requires = contract.trust_native_requires[0];
+        assert_eq!(
+            requires.citation.expect("the attribute citation must be retained").name,
+            Symbol::intern("Clean.Lemmas.pos")
+        );
+        assert_eq!(psess.source_map().span_to_snippet(requires.predicate).unwrap(), "x > 0");
+        assert_eq!(requires.payload.as_str(), "x > 0");
+    });
+}
+
+#[test]
+fn trust_attribute_clauses_without_a_citation_keep_their_existing_lanes() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        // Regression guard: the citation route is opt-in through `by`; every
+        // uncited attribute payload must reach the pre-existing typed/opaque
+        // decision unchanged.
+        let item = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-uncited.rs",
+            "fn plain(x: u32) -> u32 \
+             trust_contract_requires { x > 0 } \
+             trust_contract_ensures { result == x } { x }",
+        )
+        .unwrap();
+        let contract = trust_attribute_contract(&item);
+
+        assert_eq!(contract.requires_clauses.len(), 1, "a typeable requires stays on the typed lane");
+        assert_eq!(contract.trust_opaque_ensures.len(), 1, "a `result` ensures stays opaque");
+        assert!(contract.trust_native_requires.is_empty());
+        assert!(contract.trust_native_ensures.is_empty());
+    });
+}
+
+#[test]
+fn trust_attribute_final_by_stays_predicate_vocabulary() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        // Identical to the signature surface (see
+        // `trust_by_identifiers_remain_predicate_vocabulary`): a trailing `by`
+        // with no name after it is an ordinary identifier, not a citation, so
+        // `ensures by` over a bool parameter named `by` keeps working. Nothing
+        // is silently "cited": the clause keeps the opaque lane and the
+        // `trust_contracts` query rejects `result == by` as unsupported.
+        let item = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-bare-by.rs",
+            "fn bare(by: u32) -> u32 trust_contract_ensures { result == by } { by }",
+        )
+        .unwrap();
+        let contract = trust_attribute_contract(&item);
+
+        assert!(contract.trust_native_ensures.is_empty(), "a bare `by` must mint no citation");
+        assert_eq!(contract.trust_opaque_ensures.len(), 1);
+    });
+}
+
+#[test]
+fn trust_attribute_citation_with_no_theorem_name_is_rejected() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        // `by` followed by a RESERVED word is a citation attempt with no
+        // usable name. It must be a hard error: dropping it would leave a
+        // clause that looks cited while nothing checks it.
+        let Err(error) = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-citation-reserved.rs",
+            "fn bad(x: u32) -> u32 trust_contract_ensures { result == x by fn } { x }",
+        ) else {
+            panic!("a citation with no theorem name must be rejected");
+        };
+        error.cancel();
+    });
+}
+
+#[test]
+fn trust_attribute_citation_with_a_trailing_dot_is_rejected() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        let Err(error) = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-citation-trailing-dot.rs",
+            "fn bad(x: u32) -> u32 trust_contract_ensures { result == x by Clean. } { x }",
+        ) else {
+            panic!("a citation with a dangling `.` must be rejected");
+        };
+        error.cancel();
+    });
+}
+
+#[test]
+fn trust_attribute_citation_with_an_empty_predicate_is_rejected() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        let Err(error) = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-citation-no-predicate.rs",
+            "fn bad(x: u32) -> u32 trust_contract_ensures { by Clean.Lemmas.bound } { x }",
+        ) else {
+            panic!("a citation with no predicate before it must be rejected");
+        };
+        error.cancel();
+    });
+}
+
+#[test]
+fn trust_attribute_tokens_after_a_citation_are_rejected() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        // The payload group is self-delimiting, so anything left after the
+        // citation is authored text the verifier would never see. Refuse it
+        // rather than discard it.
+        let Err(error) = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-citation-trailing-tokens.rs",
+            "fn bad(x: u32) -> u32 trust_contract_ensures { result == x by Thm ; junk } { x }",
+        ) else {
+            panic!("trailing tokens after a citation must be rejected");
+        };
+        error.cancel();
+    });
+}
+
+#[test]
+fn trust_attribute_citation_reads_a_brace_group_as_predicate() {
+    create_default_session_globals_then(|| {
+        let psess = ParseSess::new();
+        // An attribute payload has no function body, so a depth-zero brace
+        // group belongs to the predicate. The citation is still the suffix.
+        let item = parse_trust_attribute_contract_fn(
+            &psess,
+            "attribute-citation-braces.rs",
+            "fn cited(x: u32) -> u32 \
+             trust_contract_ensures { result == match x { 0 => 0, _ => x } by Clean.Thm } { x }",
+        )
+        .unwrap();
+        let contract = trust_attribute_contract(&item);
+        let ensures = contract.trust_native_ensures[0];
+
+        assert_eq!(
+            ensures.citation.expect("the citation must be retained").name,
+            Symbol::intern("Clean.Thm")
+        );
+        assert_eq!(
+            psess.source_map().span_to_snippet(ensures.predicate).unwrap(),
+            "result == match x { 0 => 0, _ => x }"
+        );
+    });
+}

@@ -415,6 +415,32 @@ pub(crate) fn is_canonical_unit_marker_ty(ty: &Ty) -> bool {
     )
 }
 
+/// Trust: EFHT-P (2026-08-30) — does a [`ConstValue::StructScalarFieldsRef`] constant
+/// inhabit `expected`? Requires `&Adt` with the SAME name, a STRUCT shape (variants
+/// empty), an equal field count, and every recovered leaf inhabiting its declared field
+/// type via [`constant_matches_type`] — never a coercion. The `Datatype` spelling is
+/// deliberately NOT matched (the extractor emits the constant only beside an inline
+/// `Ty::Adt`); an unresolved marker fails closed.
+fn struct_scalar_fields_reference_matches_type(
+    adt_name: &str,
+    leaf_fields: &[ConstValue],
+    expected: &Ty,
+) -> bool {
+    let Ty::Ref { mutable: false, inner } = expected else {
+        return false;
+    };
+    match inner.as_ref() {
+        Ty::Adt { name, fields, variants, .. } if name == adt_name && variants.is_empty() => {
+            leaf_fields.len() == fields.len()
+                && leaf_fields
+                    .iter()
+                    .zip(fields)
+                    .all(|(leaf, (_, field_ty))| constant_matches_type(leaf, field_ty))
+        }
+        _ => false,
+    }
+}
+
 fn constant_matches_type(value: &ConstValue, expected: &Ty) -> bool {
     match value {
         ConstValue::Bool(_) => matches!(expected, Ty::Bool),
@@ -470,6 +496,10 @@ fn constant_matches_type(value: &ConstValue, expected: &Ty) -> bool {
         ConstValue::OpaqueConst => opaque_reference_constant_matches_type(expected),
         ConstValue::UnitVariantRef { enum_name, variant } => {
             unit_variant_reference_matches_type(enum_name, *variant, expected)
+        }
+        // Trust: EFHT-P — the struct sibling of the arm above.
+        ConstValue::StructScalarFieldsRef { adt_name, fields } => {
+            struct_scalar_fields_reference_matches_type(adt_name, fields, expected)
         }
         _ => false,
     }
@@ -1434,19 +1464,13 @@ mod tests {
             fields: vec![("__v0_0".into(), i32_ty.clone())],
             variants: vec![variant.clone()],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
-        let first_class = Ty::Adt {
-            adt_kind: None,
-            layout: None,
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
+        let first_class = Ty::Adt { adt_kind: None, layout: None,
             name: "demo::FirstClass".into(),
             fields: vec![("0".into(), i32_ty.clone())],
             variants: vec![variant],
             disc_index_safe: true,
-            faithful_enum_repr: Some(None),
-            enum_layout: None,
-        };
+            faithful_enum_repr: Some(None), enum_layout: None, arbitrary_precision: None, };
         let datatype = Ty::Datatype {
             name: "demo::Record".into(),
             variants: vec![("mk".into(), vec![("value".into(), i32_ty.clone())])],
@@ -1469,9 +1493,7 @@ mod tests {
             ],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let body = body(vec![legacy_option]);
         assert!(assignment_types_match(
             &body,
@@ -1524,9 +1546,7 @@ mod tests {
             fields,
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let valid = legacy(vec![
             tag(),
             ("__v1_0".into(), Ty::Tuple(vec![Ty::Bool, Ty::Int { width: 32, signed: false }])),
@@ -1583,9 +1603,7 @@ mod tests {
             fields,
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let exact_tag = || vec![("__tag".into(), Ty::Int { width: 64, signed: true })];
         let first_class_error = Ty::adt_enum(
             "Error",
@@ -1721,9 +1739,7 @@ mod tests {
             fields,
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let valid = legacy(vec![
             ("__tag".into(), discr_ty.clone()),
             ("__v0_0".into(), Ty::Unit),
@@ -1784,9 +1800,7 @@ mod tests {
             fields,
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let exact_fields = || vec![("__tag".into(), Ty::Int { width: 64, signed: true })];
         let first_class = Ty::adt_enum(
             "cmp::Ordering",
@@ -1956,9 +1970,7 @@ mod tests {
             fields: vec![("__tag".into(), Ty::Int { width: 64, signed: true })],
             variants: vec![],
             disc_index_safe: false,
-            faithful_enum_repr: None,
-            enum_layout: None,
-        };
+            faithful_enum_repr: None, enum_layout: None, arbitrary_precision: None, };
         let closure = Ty::Closure { name: "demo::call".into(), upvars: vec![], call: None };
         let body = body(vec![
             Ty::Bool,
@@ -2100,7 +2112,7 @@ mod tests {
         // today: the flattened `__tag` / `__v{v}_{f}` view plus first-class
         // variants. Shape taken from the shipped
         // `fixtures/structural-fold-corpus/xor_all.json`, `locals[1].ty`.
-        let tree_definition = Ty::Adt {
+        let tree_definition = Ty::Adt { arbitrary_precision: None, 
             name: "Tree".into(),
             fields: vec![
                 ("__tag".into(), i64_ty()),
@@ -2259,7 +2271,7 @@ mod tests {
             Ty::Datatype { name: "Tree".into(), variants: tree_variants.clone() };
         // The `lower_enum_adt` spelling of the SAME type, taken from the shipped
         // `fixtures/structural-fold-corpus/xor_all.json` `locals[1].ty`.
-        let tree_adt_def = Ty::Adt {
+        let tree_adt_def = Ty::Adt { arbitrary_precision: None, 
             name: "Tree".into(),
             fields: vec![
                 ("__tag".into(), i64_ty()),
@@ -2429,7 +2441,7 @@ mod tests {
             Ty::Adt { name: n, .. } if n == name => {
                 Ty::Datatype { name: name.to_string(), variants: vec![] }
             }
-            Ty::Adt {
+            Ty::Adt { arbitrary_precision: _, 
                 name: n,
                 fields,
                 variants,
@@ -2438,7 +2450,7 @@ mod tests {
                 layout,
                 enum_layout,
                 adt_kind,
-            } => Ty::Adt {
+            } => Ty::Adt { arbitrary_precision: None, 
                 name: n.clone(),
                 fields: fields.iter().map(|(f, t)| (f.clone(), go(t))).collect(),
                 variants: variants

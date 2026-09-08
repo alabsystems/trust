@@ -1,0 +1,797 @@
+{
+  "name": "{closure#0}",
+  "def_path": "P::s2_deadline_clear::{closure#0}",
+  "span": {
+    "file": "lib.rs",
+    "line_start": 20,
+    "col_start": 30,
+    "line_end": 20,
+    "col_end": 45
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": "Unit",
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Closure": {
+            "name": "P::s2_deadline_clear::{closure#0}",
+            "upvars": [],
+            "call": {
+              "kind": "FnOnce",
+              "params": [
+                {
+                  "Ref": {
+                    "mutable": false,
+                    "inner": {
+                      "Adt": {
+                        "name": "core::cell::Cell",
+                        "fields": [
+                          [
+                            "value",
+                            {
+                              "Adt": {
+                                "name": "core::cell::UnsafeCell",
+                                "fields": [
+                                  [
+                                    "value",
+                                    {
+                                      "Adt": {
+                                        "name": "core::option::Option",
+                                        "fields": [
+                                          [
+                                            "__tag",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": true
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "__v1_0",
+                                            {
+                                              "Adt": {
+                                                "name": "std::time::Instant",
+                                                "fields": [
+                                                  [
+                                                    "0",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::sys::time::unix::Instant",
+                                                        "fields": [
+                                                          [
+                                                            "t",
+                                                            {
+                                                              "Adt": {
+                                                                "name": "std::sys::pal::unix::time::Timespec",
+                                                                "fields": [
+                                                                  [
+                                                                    "tv_sec",
+                                                                    {
+                                                                      "Int": {
+                                                                        "width": 64,
+                                                                        "signed": true
+                                                                      }
+                                                                    }
+                                                                  ],
+                                                                  [
+                                                                    "tv_nsec",
+                                                                    {
+                                                                      "Adt": {
+                                                                        "name": "core::num::niche_types::Nanoseconds",
+                                                                        "fields": [
+                                                                          [
+                                                                            "0",
+                                                                            {
+                                                                              "Int": {
+                                                                                "width": 32,
+                                                                                "signed": false
+                                                                              }
+                                                                            }
+                                                                          ]
+                                                                        ],
+                                                                        "variants": [],
+                                                                        "disc_index_safe": false,
+                                                                        "faithful_enum_repr": null,
+                                                                        "layout": null,
+                                                                        "enum_layout": null,
+                                                                        "adt_kind": "Struct"
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                ],
+                                                                "variants": [],
+                                                                "disc_index_safe": false,
+                                                                "faithful_enum_repr": null,
+                                                                "layout": null,
+                                                                "enum_layout": null,
+                                                                "adt_kind": "Struct"
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false,
+                                                        "faithful_enum_repr": null,
+                                                        "layout": null,
+                                                        "enum_layout": null,
+                                                        "adt_kind": "Struct"
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [
+                                          {
+                                            "name": "None",
+                                            "discriminant": 0,
+                                            "fields": []
+                                          },
+                                          {
+                                            "name": "Some",
+                                            "discriminant": 1,
+                                            "fields": [
+                                              [
+                                                "0",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::time::Instant",
+                                                    "fields": [
+                                                      [
+                                                        "0",
+                                                        {
+                                                          "Adt": {
+                                                            "name": "std::sys::time::unix::Instant",
+                                                            "fields": [
+                                                              [
+                                                                "t",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "std::sys::pal::unix::time::Timespec",
+                                                                    "fields": [
+                                                                      [
+                                                                        "tv_sec",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 64,
+                                                                            "signed": true
+                                                                          }
+                                                                        }
+                                                                      ],
+                                                                      [
+                                                                        "tv_nsec",
+                                                                        {
+                                                                          "Adt": {
+                                                                            "name": "core::num::niche_types::Nanoseconds",
+                                                                            "fields": [
+                                                                              [
+                                                                                "0",
+                                                                                {
+                                                                                  "Int": {
+                                                                                    "width": 32,
+                                                                                    "signed": false
+                                                                                  }
+                                                                                }
+                                                                              ]
+                                                                            ],
+                                                                            "variants": [],
+                                                                            "disc_index_safe": false,
+                                                                            "faithful_enum_repr": null,
+                                                                            "layout": null,
+                                                                            "enum_layout": null,
+                                                                            "adt_kind": "Struct"
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    ],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false,
+                                                                    "faithful_enum_repr": null,
+                                                                    "layout": null,
+                                                                    "enum_layout": null,
+                                                                    "adt_kind": "Struct"
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false,
+                                                            "faithful_enum_repr": null,
+                                                            "layout": null,
+                                                            "enum_layout": null,
+                                                            "adt_kind": "Struct"
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false,
+                                                    "faithful_enum_repr": null,
+                                                    "layout": null,
+                                                    "enum_layout": null,
+                                                    "adt_kind": "Struct"
+                                                  }
+                                                }
+                                              ]
+                                            ]
+                                          }
+                                        ],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Enum"
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  }
+                }
+              ],
+              "ret": null
+            }
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 2,
+        "ty": {
+          "Ref": {
+            "mutable": false,
+            "inner": {
+              "Adt": {
+                "name": "core::cell::Cell",
+                "fields": [
+                  [
+                    "value",
+                    {
+                      "Adt": {
+                        "name": "core::cell::UnsafeCell",
+                        "fields": [
+                          [
+                            "value",
+                            {
+                              "Adt": {
+                                "name": "core::option::Option",
+                                "fields": [
+                                  [
+                                    "__tag",
+                                    {
+                                      "Int": {
+                                        "width": 64,
+                                        "signed": true
+                                      }
+                                    }
+                                  ],
+                                  [
+                                    "__v1_0",
+                                    {
+                                      "Adt": {
+                                        "name": "std::time::Instant",
+                                        "fields": [
+                                          [
+                                            "0",
+                                            {
+                                              "Adt": {
+                                                "name": "std::sys::time::unix::Instant",
+                                                "fields": [
+                                                  [
+                                                    "t",
+                                                    {
+                                                      "Adt": {
+                                                        "name": "std::sys::pal::unix::time::Timespec",
+                                                        "fields": [
+                                                          [
+                                                            "tv_sec",
+                                                            {
+                                                              "Int": {
+                                                                "width": 64,
+                                                                "signed": true
+                                                              }
+                                                            }
+                                                          ],
+                                                          [
+                                                            "tv_nsec",
+                                                            {
+                                                              "Adt": {
+                                                                "name": "core::num::niche_types::Nanoseconds",
+                                                                "fields": [
+                                                                  [
+                                                                    "0",
+                                                                    {
+                                                                      "Int": {
+                                                                        "width": 32,
+                                                                        "signed": false
+                                                                      }
+                                                                    }
+                                                                  ]
+                                                                ],
+                                                                "variants": [],
+                                                                "disc_index_safe": false,
+                                                                "faithful_enum_repr": null,
+                                                                "layout": null,
+                                                                "enum_layout": null,
+                                                                "adt_kind": "Struct"
+                                                              }
+                                                            }
+                                                          ]
+                                                        ],
+                                                        "variants": [],
+                                                        "disc_index_safe": false,
+                                                        "faithful_enum_repr": null,
+                                                        "layout": null,
+                                                        "enum_layout": null,
+                                                        "adt_kind": "Struct"
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [
+                                  {
+                                    "name": "None",
+                                    "discriminant": 0,
+                                    "fields": []
+                                  },
+                                  {
+                                    "name": "Some",
+                                    "discriminant": 1,
+                                    "fields": [
+                                      [
+                                        "0",
+                                        {
+                                          "Adt": {
+                                            "name": "std::time::Instant",
+                                            "fields": [
+                                              [
+                                                "0",
+                                                {
+                                                  "Adt": {
+                                                    "name": "std::sys::time::unix::Instant",
+                                                    "fields": [
+                                                      [
+                                                        "t",
+                                                        {
+                                                          "Adt": {
+                                                            "name": "std::sys::pal::unix::time::Timespec",
+                                                            "fields": [
+                                                              [
+                                                                "tv_sec",
+                                                                {
+                                                                  "Int": {
+                                                                    "width": 64,
+                                                                    "signed": true
+                                                                  }
+                                                                }
+                                                              ],
+                                                              [
+                                                                "tv_nsec",
+                                                                {
+                                                                  "Adt": {
+                                                                    "name": "core::num::niche_types::Nanoseconds",
+                                                                    "fields": [
+                                                                      [
+                                                                        "0",
+                                                                        {
+                                                                          "Int": {
+                                                                            "width": 32,
+                                                                            "signed": false
+                                                                          }
+                                                                        }
+                                                                      ]
+                                                                    ],
+                                                                    "variants": [],
+                                                                    "disc_index_safe": false,
+                                                                    "faithful_enum_repr": null,
+                                                                    "layout": null,
+                                                                    "enum_layout": null,
+                                                                    "adt_kind": "Struct"
+                                                                  }
+                                                                }
+                                                              ]
+                                                            ],
+                                                            "variants": [],
+                                                            "disc_index_safe": false,
+                                                            "faithful_enum_repr": null,
+                                                            "layout": null,
+                                                            "enum_layout": null,
+                                                            "adt_kind": "Struct"
+                                                          }
+                                                        }
+                                                      ]
+                                                    ],
+                                                    "variants": [],
+                                                    "disc_index_safe": false,
+                                                    "faithful_enum_repr": null,
+                                                    "layout": null,
+                                                    "enum_layout": null,
+                                                    "adt_kind": "Struct"
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ]
+                                  }
+                                ],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Enum"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ],
+                "variants": [],
+                "disc_index_safe": false,
+                "faithful_enum_repr": null,
+                "layout": null,
+                "enum_layout": null,
+                "adt_kind": "Struct"
+              }
+            }
+          }
+        },
+        "name": "d"
+      },
+      {
+        "index": 3,
+        "ty": {
+          "Adt": {
+            "name": "core::option::Option",
+            "fields": [
+              [
+                "__tag",
+                {
+                  "Int": {
+                    "width": 64,
+                    "signed": true
+                  }
+                }
+              ],
+              [
+                "__v1_0",
+                {
+                  "Adt": {
+                    "name": "std::time::Instant",
+                    "fields": [
+                      [
+                        "0",
+                        {
+                          "Adt": {
+                            "name": "std::sys::time::unix::Instant",
+                            "fields": [
+                              [
+                                "t",
+                                {
+                                  "Adt": {
+                                    "name": "std::sys::pal::unix::time::Timespec",
+                                    "fields": [
+                                      [
+                                        "tv_sec",
+                                        {
+                                          "Int": {
+                                            "width": 64,
+                                            "signed": true
+                                          }
+                                        }
+                                      ],
+                                      [
+                                        "tv_nsec",
+                                        {
+                                          "Adt": {
+                                            "name": "core::num::niche_types::Nanoseconds",
+                                            "fields": [
+                                              [
+                                                "0",
+                                                {
+                                                  "Int": {
+                                                    "width": 32,
+                                                    "signed": false
+                                                  }
+                                                }
+                                              ]
+                                            ],
+                                            "variants": [],
+                                            "disc_index_safe": false,
+                                            "faithful_enum_repr": null,
+                                            "layout": null,
+                                            "enum_layout": null,
+                                            "adt_kind": "Struct"
+                                          }
+                                        }
+                                      ]
+                                    ],
+                                    "variants": [],
+                                    "disc_index_safe": false,
+                                    "faithful_enum_repr": null,
+                                    "layout": null,
+                                    "enum_layout": null,
+                                    "adt_kind": "Struct"
+                                  }
+                                }
+                              ]
+                            ],
+                            "variants": [],
+                            "disc_index_safe": false,
+                            "faithful_enum_repr": null,
+                            "layout": null,
+                            "enum_layout": null,
+                            "adt_kind": "Struct"
+                          }
+                        }
+                      ]
+                    ],
+                    "variants": [],
+                    "disc_index_safe": false,
+                    "faithful_enum_repr": null,
+                    "layout": null,
+                    "enum_layout": null,
+                    "adt_kind": "Struct"
+                  }
+                }
+              ]
+            ],
+            "variants": [
+              {
+                "name": "None",
+                "discriminant": 0,
+                "fields": []
+              },
+              {
+                "name": "Some",
+                "discriminant": 1,
+                "fields": [
+                  [
+                    "0",
+                    {
+                      "Adt": {
+                        "name": "std::time::Instant",
+                        "fields": [
+                          [
+                            "0",
+                            {
+                              "Adt": {
+                                "name": "std::sys::time::unix::Instant",
+                                "fields": [
+                                  [
+                                    "t",
+                                    {
+                                      "Adt": {
+                                        "name": "std::sys::pal::unix::time::Timespec",
+                                        "fields": [
+                                          [
+                                            "tv_sec",
+                                            {
+                                              "Int": {
+                                                "width": 64,
+                                                "signed": true
+                                              }
+                                            }
+                                          ],
+                                          [
+                                            "tv_nsec",
+                                            {
+                                              "Adt": {
+                                                "name": "core::num::niche_types::Nanoseconds",
+                                                "fields": [
+                                                  [
+                                                    "0",
+                                                    {
+                                                      "Int": {
+                                                        "width": 32,
+                                                        "signed": false
+                                                      }
+                                                    }
+                                                  ]
+                                                ],
+                                                "variants": [],
+                                                "disc_index_safe": false,
+                                                "faithful_enum_repr": null,
+                                                "layout": null,
+                                                "enum_layout": null,
+                                                "adt_kind": "Struct"
+                                              }
+                                            }
+                                          ]
+                                        ],
+                                        "variants": [],
+                                        "disc_index_safe": false,
+                                        "faithful_enum_repr": null,
+                                        "layout": null,
+                                        "enum_layout": null,
+                                        "adt_kind": "Struct"
+                                      }
+                                    }
+                                  ]
+                                ],
+                                "variants": [],
+                                "disc_index_safe": false,
+                                "faithful_enum_repr": null,
+                                "layout": null,
+                                "enum_layout": null,
+                                "adt_kind": "Struct"
+                              }
+                            }
+                          ]
+                        ],
+                        "variants": [],
+                        "disc_index_safe": false,
+                        "faithful_enum_repr": null,
+                        "layout": null,
+                        "enum_layout": null,
+                        "adt_kind": "Struct"
+                      }
+                    }
+                  ]
+                ]
+              }
+            ],
+            "disc_index_safe": false,
+            "faithful_enum_repr": null,
+            "layout": null,
+            "enum_layout": null,
+            "adt_kind": "Enum"
+          }
+        },
+        "name": null
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [
+          {
+            "Assign": {
+              "place": {
+                "local": 3,
+                "projections": []
+              },
+              "rvalue": {
+                "Aggregate": [
+                  {
+                    "Adt": {
+                      "name": "core::option::Option",
+                      "variant": 0,
+                      "active_field": null,
+                      "args": "core::option::Option<std::time::Instant>"
+                    }
+                  },
+                  []
+                ]
+              },
+              "span": {
+                "file": "lib.rs",
+                "line_start": 20,
+                "col_start": 40,
+                "line_end": 20,
+                "col_end": 44
+              }
+            }
+          }
+        ],
+        "terminator": {
+          "Call": {
+            "func": "core::cell::Cell::<core::option::Option<std::time::Instant>>::set",
+            "args": [
+              {
+                "Copy": {
+                  "local": 2,
+                  "projections": []
+                }
+              },
+              {
+                "Move": {
+                  "local": 3,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "lib.rs",
+              "line_start": 20,
+              "col_start": 34,
+              "line_end": 20,
+              "col_end": 45
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "unwind": "Continue"
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 2,
+    "return_ty": "Unit"
+  },
+  "contracts": [],
+  "preconditions": [],
+  "postconditions": [],
+  "spec": {
+    "requires": [],
+    "ensures": [],
+    "invariants": []
+  }
+}

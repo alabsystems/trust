@@ -86,6 +86,14 @@ pub(crate) mod ffi_vcgen;
 // Trust: Hardened OS/path/bytes/error/compat obligations for Trust compiler workflows.
 mod guards;
 pub(crate) mod hardened;
+/// The single seam for local definition counting and resolution — see the module
+/// doc. Nothing else in the crate may scan `body.blocks` for a local's definitions.
+///
+/// `pub` so the sibling crates that must ask the SAME question about the same
+/// `VerifiableFunction` — and cannot depend on this crate at build time — can be
+/// measured against it. `crates/trust-ir-bridge/tests/local_defs_parity.rs` is that
+/// measurement.
+pub mod local_defs;
 pub use hardened::profile_enables_hardened;
 // invariants.rs deleted — all items dead code (only used by invariant_inference tests).
 // invariant_inference/ deleted — all items dead code (no production callers).
@@ -617,7 +625,8 @@ pub(crate) fn fixed_width_integer_descriptor(ty: &Ty) -> Option<(u32, bool)> {
         Ty::PtrSizedInt { signed } => (64, *signed),
         _ => return None,
     };
-    matches!(width, 8 | 16 | 32 | 64 | 128).then_some((width, signed))
+    // Trust: third copy of the width set, now the VERIFIED one.
+    (trust_widthconv::width_supported(width) == 1).then_some((width, signed))
 }
 
 fn signed_constant_fits_width(value: i128, width: u32) -> bool {
@@ -839,6 +848,8 @@ fn binary_operand_matches_type(
             | ConstValue::Str { .. }
             | ConstValue::OpaqueConst
             | ConstValue::UnitVariantRef { .. }
+            // Trust: EFHT-P — an opaque-reference carrier, same non-integer verdict.
+            | ConstValue::StructScalarFieldsRef { .. }
             | ConstValue::CallableItem { .. },
         ) => false,
         // A symbolic operand carries a FORMULA sort, not a Rust type. A
@@ -870,7 +881,7 @@ fn binary_operand_self_type(func: &VerifiableFunction, operand: &Operand) -> Opt
         }
         Operand::Constant(ConstValue::Bool(_)) => Some(Ty::Bool),
         Operand::Constant(ConstValue::Uint(value, width))
-            if matches!(*width, 8 | 16 | 32 | 64 | 128)
+            if trust_widthconv::width_supported(*width) == 1
                 && unsigned_constant_fits_width(*value, *width) =>
         {
             Some(Ty::Int { width: *width, signed: false })
@@ -883,7 +894,7 @@ fn binary_operand_self_type(func: &VerifiableFunction, operand: &Operand) -> Opt
         }
         Operand::Constant(ConstValue::ConstParam { width: 1, signed: false, .. }) => Some(Ty::Bool),
         Operand::Constant(ConstValue::ConstParam { width, signed, .. })
-            if matches!(*width, 8 | 16 | 32 | 64 | 128) =>
+            if trust_widthconv::width_supported(*width) == 1 =>
         {
             Some(Ty::Int { width: *width, signed: *signed })
         }
@@ -1773,6 +1784,9 @@ pub use generate::{
     compute_trivial_setter_summaries,
     // Trust (runtime ledger): proven-overflow-check elision origin surface.
     overflow_vc_block_origins,
+    // Trust (W4/spine-derives-unreachable): the arm-1b terminator-VC block
+    // population, taken as an input by the trust-ir spine's terminator walk.
+    terminator_vc_block_set,
 };
 pub use paired_condvar_cert::{
     CertifiedCondvarPair, PairedCondvarCandidate, certify_paired_condvars,
@@ -1786,6 +1800,17 @@ pub use paired_condvar_cert::{
 /// call Trust does NOT already cover — making unsafe-call detection complete (no
 /// unsafe call silently escapes) instead of relying on the name lists alone.
 #[must_use]
+/// True iff `span`'s file is the trusted sysroot `std`/`core`/`alloc` library tree.
+/// Public wrapper over the sep_engine's `is_trusted_std_span` (the same predicate that
+/// discharges std's `vec!`-macro-internal unsafe ops), so the compiler-side
+/// unmodeled-unsafe-CALL generator can decline a false-positive finding for a
+/// std-macro-authored unsafe call (e.g. `thread_local!` → `LazyStorage::get_or_init`).
+/// Std is the trusted TCB the verifier hard-skips; this is NOT a proof, it declines an
+/// audit flag whose obligation belongs to std, not the ny caller.
+pub fn span_is_trusted_std(span: &trust_types::SourceSpan) -> bool {
+    sep_engine::is_trusted_std_span(span)
+}
+
 pub fn call_has_unsafe_model(callee: &str) -> bool {
     let lower = callee.to_lowercase();
     // T5A parity note: "::ffi::" was DELETED from `is_unsafe_fn_call`'s name
@@ -1855,6 +1880,7 @@ pub use generate::generate_bounded_reduction_bmc_refutation_candidates;
 // `-full`-only assert refutation.
 pub use generate::generate_full_assert_refutation_vcs;
 pub use generate::{
+    assert_refutation_target_block_count,
     all_callsites_precondition_dominated, call_dest_fact_token, derive_float_result_range,
     // NOTE: `composed_formula_is_caller_entry_grounded` is deliberately NOT
     // re-exported. It is the CALL-SITE REPLAY lane's own admission gate, and an
@@ -1868,6 +1894,7 @@ pub use generate::{
     generate_callsite_precondition_vcs,
     generate_callsite_precondition_vcs_attributed,
     generate_full_assert_refutation_vcs_with_context, generate_vcs,
+    is_assert_refutation_target_block,
     generate_vcs_capturing_raw_body_with_context, generate_vcs_with_context,
     generate_vcs_with_discharge, generate_vcs_with_discharge_and_summaries,
     generate_vcs_with_discharge_and_summaries_configured,
@@ -2219,6 +2246,8 @@ mod gen_work {
             // A fresh outermost scope is a fresh function: drop any memoized
             // place types/Sorts from the previous one (see `place_memo`).
             super::place_memo::reset();
+            // Same boundary, same reason, for the opaque-deref/havoc-name memo.
+            super::havoc_memo::reset();
         }
         Guard
     }
@@ -2242,7 +2271,62 @@ mod gen_work {
                 // types/Sorts so nothing can leak into a later scope (or into an
                 // unscoped call, where the memo is inert anyway).
                 super::place_memo::reset();
+                super::havoc_memo::reset();
             }
+        }
+    }
+
+    /// Enter a VC-gen scope with the work meter DISABLED for the scope's whole extent.
+    ///
+    /// WHY THIS EXISTS. The four generation memos (`place_memo` name/ty/sort,
+    /// `havoc_memo`'s flags/`version_oracle`/`entry_gen_sets`/`writes_until`) gate on
+    /// `scope_active()` ALONE — they are pure caches and are inert outside a scope. The
+    /// work METER is a separate concern that happens to share the same scope. A replay
+    /// path that needs BYTE-IDENTICAL output (the overflow-elision join table,
+    /// `generate::safety::overflow_vc_block_origins`) must have the memos and must NOT
+    /// have the meter: a trip there substitutes `gen_work_degraded_leaf()` into the
+    /// materialized types, which changes the rendered formula, which changes the
+    /// canonical join key — silently breaking the join instead of reporting.
+    ///
+    /// WHY IT CANNOT CORRUPT THE JOIN. With `BUDGET == usize::MAX` both `record` and
+    /// `charge_local_once` return `false` on every call without touching `WORK`, so
+    /// `is_tripped()` stays false and NO degraded leaf can ever be produced. What
+    /// remains is the memo layer, which is observationally identical to recomputation
+    /// (each memoized value is a pure function of `func` plus the key, and the memo is
+    /// keyed on function identity). So the scope changes only the COST of this path,
+    /// never a byte of its output.
+    ///
+    /// FULLY TRANSPARENT TO AN ENCLOSING METER. The budget/trip/work triple is saved
+    /// and restored around the scope regardless of depth, so a nested use neither
+    /// inherits an enclosing budget (which could truncate this path) nor charges the
+    /// enclosing generation for this replay's walk (which could truncate THAT path).
+    #[must_use]
+    pub(super) fn enter_unmetered() -> UnmeteredGuard {
+        let prev_budget = BUDGET.with(Cell::get);
+        let prev_tripped = TRIPPED.with(Cell::get);
+        let prev_work = WORK.with(Cell::get);
+        let inner = enter();
+        BUDGET.with(|b| b.set(usize::MAX));
+        TRIPPED.with(|t| t.set(false));
+        UnmeteredGuard { inner: Some(inner), prev_budget, prev_tripped, prev_work }
+    }
+
+    /// Guard for [`enter_unmetered`]: drops the ordinary scope guard first (so the
+    /// depth→0 memo reset runs at the right moment), then restores the enclosing meter
+    /// state.
+    pub(super) struct UnmeteredGuard {
+        inner: Option<Guard>,
+        prev_budget: usize,
+        prev_tripped: bool,
+        prev_work: usize,
+    }
+
+    impl Drop for UnmeteredGuard {
+        fn drop(&mut self) {
+            drop(self.inner.take());
+            BUDGET.with(|b| b.set(self.prev_budget));
+            TRIPPED.with(|t| t.set(self.prev_tripped));
+            WORK.with(|w| w.set(self.prev_work));
         }
     }
 
@@ -2425,6 +2509,11 @@ mod place_memo {
         func_name: String,
         tys: HashMap<Key, Ty>,
         sorts: HashMap<Key, Sort>,
+        /// `place_to_var_name` results. Same determinism argument as `tys`/
+        /// `sorts` — the SMT name is a pure function of the function's local
+        /// table and the place's projection path — and the same key, so an
+        /// unencodable projection takes the uncached path here too.
+        names: HashMap<Key, std::rc::Rc<str>>,
     }
 
     impl State {
@@ -2498,6 +2587,41 @@ mod place_memo {
         })
     }
 
+    /// The memoized SMT name for a place, if one was computed for THIS function.
+    pub(super) fn lookup_name(
+        func: &VerifiableFunction,
+        key: &Key,
+    ) -> Option<std::rc::Rc<str>> {
+        MEMO.with(|m| {
+            let memo = m.borrow();
+            let state = memo.as_ref()?;
+            if !state.is_for(func) {
+                return None;
+            }
+            state.names.get(key).cloned()
+        })
+    }
+
+    /// Store a computed SMT name.
+    ///
+    /// verifier-perf: `place_to_var_name` rebuilds an `FxHashSet` over EVERY
+    /// local (the `local_indices_are_unique` screen) and makes two more
+    /// O(locals) passes (the matching decl, the shared-source-name count) on
+    /// every call — and it is called once per place occurrence in every formula
+    /// the generator builds or rewrites, which made it the single hottest leaf
+    /// in a stack sample of the wedged generator (the allocation inside that
+    /// per-call `FxHashSet` alone). The result is a pure function of the
+    /// function's local table and the place, so it memoizes exactly.
+    pub(super) fn store_name(func: &VerifiableFunction, key: Key, name: &std::rc::Rc<str>) {
+        if !super::gen_work::scope_active() {
+            return;
+        }
+        MEMO.with(|m| {
+            let mut memo = m.borrow_mut();
+            bind(&mut memo, func).names.insert(key, std::rc::Rc::clone(name));
+        });
+    }
+
     pub(super) fn lookup_sort(func: &VerifiableFunction, key: &Key) -> Option<Sort> {
         MEMO.with(|m| {
             let memo = m.borrow();
@@ -2550,9 +2674,388 @@ mod place_memo {
                 func_name: func.name.clone(),
                 tys: HashMap::new(),
                 sorts: HashMap::new(),
+                names: HashMap::new(),
             });
         }
         memo.as_mut().expect("state was just bound")
+    }
+}
+
+// ── verifier-perf: per-function opaque-deref / havoc-name memo ──
+//
+// THE DEFECT THIS CLOSES. `generate::path_defs::deref_store_havoc_names` and its
+// prefix sibling `writes_until` are queried once per (read site x name) by
+// `StmtVersionCtx::version_token_at`, and each query re-ran a WHOLE-FUNCTION
+// analysis:
+//
+//   * `deref_pointer_is_opaque(func, local)` -> `resolve_referent` ->
+//     `local_defs::unique_value_def`, which scans every block and every statement — and
+//     it is called once per statement inside `deref_store_havoc_names`' `.any()`
+//     AND again per prefix statement in `deref_store_havoc_names_over`;
+//   * `mutably_borrowed_local_names(func)`, another full block/statement scan,
+//     whose `Vec::contains` dedup is itself quadratic in the name count;
+//   * `mutable_pointer_local_names(func)`, a scan of every local with the same
+//     quadratic `Vec::contains` dedup.
+//
+// The product is cubic in function size (measured: exponent ~2.9 on statement
+// count before this memo, ~1.2 after — `tests/vcgen_havoc_scaling.rs`), which is
+// why `nn-core`, `ny-core` and `clean-kernel` never completed VC GENERATION.
+//
+// WHY IT CANNOT GO STALE. Every memoized value is a pure function of `func`
+// alone (plus a block id / local index / statement index that selects WITHIN
+// that fixed `func`): they read `func.body.blocks`, `func.body.locals` and
+// nothing else, and `func` is borrowed immutably for the whole VC-gen pass — the
+// same premise `place_memo` above already relies on. On top of that this memo
+// takes `place_memo`'s identity discipline VERBATIM rather than inventing a
+// second one:
+//
+//   * entries are bound to a function identity (address + locals buffer address
+//     + locals length + name) that a query for any OTHER function fails, so a
+//     hit can only ever replay a value computed for the very same function;
+//   * the memo is INERT outside a `gen_work` scope (`scope_active()` false =>
+//     never read, never written), so an unscoped call is byte-identical to
+//     baseline;
+//   * it is cleared on every outermost `gen_work` scope ENTRY and EXIT (see
+//     `gen_work::enter` / `Guard::drop`), so an entry cannot outlive the
+//     generation of the function it describes — reusing one across functions
+//     would additionally require an in-scope allocator address reuse AND a name
+//     collision.
+//
+// A hit therefore replays the byte-identical set the first query computed, so
+// every downstream kill, version token and VC is unchanged. This is pure
+// memoization of a deterministic function: it has no fail-closed direction to
+// get wrong, because it does not change any value — only how often it is
+// computed. `tests/vcgen_havoc_memoization.rs` pins that equivalence by running
+// the whole obligation set with the memo forced off and forced on.
+//
+// MEMORY. The havoc list and the per-local/per-block flags are O(locals +
+// blocks). The prefix `writes_until` sets are the only unbounded contributor
+// (O(statements) sets of up to O(names) each), so their total stored name count
+// is capped at `MAX_MEMOIZED_WRITE_NAMES`; past the cap the memo simply stops
+// storing and the caller recomputes, which is the pre-memo behaviour.
+mod havoc_memo {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use trust_types::fx::{FxHashMap, FxHashSet};
+
+    use super::VerifiableFunction;
+
+    /// Total number of stored `writes_until` names this memo will retain for one
+    /// function. Sized so an ordinary function caches its whole prefix ladder
+    /// while a pathological one degrades to recomputation instead of growing
+    /// without bound. Exceeding it costs time, never correctness.
+    const MAX_MEMOIZED_WRITE_NAMES: usize = 400_000;
+
+    struct State {
+        func_ptr: usize,
+        locals_ptr: usize,
+        locals_len: usize,
+        func_name: String,
+        /// `mutably_borrowed_havoc_names(func) ++ mutable_pointer_local_names(func)`
+        /// — the whole-function havoc list, independent of any block.
+        havoc: Option<Rc<Vec<String>>>,
+        /// `deref_pointer_is_opaque(func, local)`, per local.
+        opaque: FxHashMap<usize, bool>,
+        /// Whether a block contains an opaque deref store, per `BlockId.0`.
+        block_has_opaque_store: FxHashMap<usize, bool>,
+        /// `writes_until(func, block, stmt_idx)`, per `(BlockId.0, stmt_idx)`.
+        writes_until: FxHashMap<(usize, usize), Rc<FxHashSet<String>>>,
+        /// Cumulative names retained in `writes_until` (bounds memory).
+        write_names: usize,
+        /// The statement-granular version oracle (`generate::StmtVersionCtx`),
+        /// held type-erased because it is defined in a child module. Exactly one
+        /// concrete type is ever stored here, and `version_oracle` checks the
+        /// downcast rather than assuming it.
+        version_oracle: Option<Rc<dyn std::any::Any>>,
+        /// The predecessor-INDEPENDENT precompute of the reaching-version
+        /// fixpoint (`generate::path_defs::EntryVersionGenSets`), type-erased
+        /// for the same reason as `version_oracle`.
+        entry_gen_sets: Option<Rc<dyn std::any::Any>>,
+    }
+
+    impl State {
+        fn is_for(&self, func: &VerifiableFunction) -> bool {
+            let (func_ptr, locals_ptr, locals_len) = identity(func);
+            self.func_ptr == func_ptr
+                && self.locals_ptr == locals_ptr
+                && self.locals_len == locals_len
+                && self.func_name == func.name
+        }
+    }
+
+    thread_local! {
+        static MEMO: RefCell<Option<State>> = const { RefCell::new(None) };
+    }
+
+    fn identity(func: &VerifiableFunction) -> (usize, usize, usize) {
+        (
+            std::ptr::from_ref(func) as usize,
+            func.body.locals.as_ptr() as usize,
+            func.body.locals.len(),
+        )
+    }
+
+    /// Clear the memo. Called by `gen_work` on every outermost scope entry AND
+    /// exit, exactly like `place_memo::reset`.
+    pub(super) fn reset() {
+        MEMO.with(|m| *m.borrow_mut() = None);
+    }
+
+    /// The per-block cache key: the ADDRESS of the block's statement buffer.
+    ///
+    /// Deliberately NOT `BlockId.0`. Every block-keyed value here is a function
+    /// of `block.stmts`, and two distinct live statement buffers cannot share an
+    /// address — so this key is exact even if a caller ever passes a block that
+    /// is not the `func.body.blocks[id]` its id names. An EMPTY `stmts` has the
+    /// same dangling-but-aligned address for every block, which is harmless: the
+    /// predicates keyed on it are all `false`/empty for a block with no
+    /// statements, so a shared key can only ever replay the identical value.
+    pub(crate) fn block_key(block: &trust_types::BasicBlock) -> usize {
+        block.stmts.as_ptr() as usize
+    }
+
+    /// The memo state bound to `func`, clearing and rebinding first if it was
+    /// bound to a different function (or to nothing).
+    fn bind<'a>(memo: &'a mut Option<State>, func: &VerifiableFunction) -> &'a mut State {
+        let rebind = !memo.as_ref().is_some_and(|state| state.is_for(func));
+        if rebind {
+            let (func_ptr, locals_ptr, locals_len) = identity(func);
+            *memo = Some(State {
+                func_ptr,
+                locals_ptr,
+                locals_len,
+                func_name: func.name.clone(),
+                havoc: None,
+                opaque: FxHashMap::default(),
+                block_has_opaque_store: FxHashMap::default(),
+                writes_until: FxHashMap::default(),
+                write_names: 0,
+                version_oracle: None,
+                entry_gen_sets: None,
+            });
+        }
+        memo.as_mut().expect("state was just bound")
+    }
+
+    /// Memoize a `bool` keyed by `slot`-selected map and `key`.
+    fn cached_flag(
+        func: &VerifiableFunction,
+        key: usize,
+        which: Which,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        if !super::gen_work::scope_active() {
+            return compute();
+        }
+        if let Some(hit) = MEMO.with(|m| {
+            let memo = m.borrow();
+            let state = memo.as_ref()?;
+            if !state.is_for(func) {
+                return None;
+            }
+            which.map(state).get(&key).copied()
+        }) {
+            return hit;
+        }
+        let value = compute();
+        MEMO.with(|m| {
+            let mut memo = m.borrow_mut();
+            which.map_mut(bind(&mut memo, func)).insert(key, value);
+        });
+        value
+    }
+
+    #[derive(Clone, Copy)]
+    enum Which {
+        Opaque,
+        BlockHasOpaqueStore,
+    }
+
+    impl Which {
+        fn map(self, state: &State) -> &FxHashMap<usize, bool> {
+            match self {
+                Which::Opaque => &state.opaque,
+                Which::BlockHasOpaqueStore => &state.block_has_opaque_store,
+            }
+        }
+        fn map_mut(self, state: &mut State) -> &mut FxHashMap<usize, bool> {
+            match self {
+                Which::Opaque => &mut state.opaque,
+                Which::BlockHasOpaqueStore => &mut state.block_has_opaque_store,
+            }
+        }
+    }
+
+    /// `deref_pointer_is_opaque(func, local)`, computed once per local.
+    pub(crate) fn opaque_pointer(
+        func: &VerifiableFunction,
+        local: usize,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        cached_flag(func, local, Which::Opaque, compute)
+    }
+
+    /// "does this block contain an opaque deref store", computed once per block.
+    pub(crate) fn block_has_opaque_store(
+        func: &VerifiableFunction,
+        block_id: usize,
+        compute: impl FnOnce() -> bool,
+    ) -> bool {
+        cached_flag(func, block_id, Which::BlockHasOpaqueStore, compute)
+    }
+
+    /// The whole-function havoc list, computed once per function.
+    pub(crate) fn havoc_list(
+        func: &VerifiableFunction,
+        compute: impl FnOnce() -> Vec<String>,
+    ) -> Rc<Vec<String>> {
+        if !super::gen_work::scope_active() {
+            return Rc::new(compute());
+        }
+        if let Some(hit) = MEMO.with(|m| {
+            let memo = m.borrow();
+            let state = memo.as_ref()?;
+            if !state.is_for(func) {
+                return None;
+            }
+            state.havoc.clone()
+        }) {
+            return hit;
+        }
+        let value = Rc::new(compute());
+        MEMO.with(|m| {
+            let mut memo = m.borrow_mut();
+            bind(&mut memo, func).havoc = Some(Rc::clone(&value));
+        });
+        value
+    }
+
+    /// The statement-granular version oracle, built once per function.
+    ///
+    /// THE DOMINANT COST THIS REMOVES. `StmtVersionCtx::build` runs TWO
+    /// whole-function reaching-version dataflow FIXPOINTS (`block_entry_versions`
+    /// and the unwind-inclusive `block_entry_versions_full_graph`), and it was
+    /// called at ~20 sites — including `generate::overflow_vc` and
+    /// `block_defs::v2_formula_with_block_defs_at_point_recorded`, which run once
+    /// per OBLIGATION. Rebuilding a per-function fixpoint per program point is
+    /// what made VC generation cubic; a stack sample of the wedged generator
+    /// spends essentially all of its time in
+    /// `block_entry_versions_full_graph -> entry_versions_fixpoint ->
+    /// stmt_writes_name -> place_to_var_name`. One call site had already been
+    /// hand-CSE'd ("lane-A CSE: one statement-version oracle for the whole
+    /// function") — this makes that property hold for ALL of them, by
+    /// construction rather than by remembering to thread a parameter.
+    ///
+    /// The oracle is immutable after construction and a pure function of `func`,
+    /// so sharing one `Rc` among every site is observationally identical to each
+    /// building its own.
+    pub(crate) fn version_oracle<T: 'static>(
+        func: &VerifiableFunction,
+        compute: impl FnOnce() -> T,
+    ) -> Rc<T> {
+        if !super::gen_work::scope_active() {
+            return Rc::new(compute());
+        }
+        if let Some(hit) = MEMO.with(|m| {
+            let memo = m.borrow();
+            let state = memo.as_ref()?;
+            if !state.is_for(func) {
+                return None;
+            }
+            // A failed downcast falls through to a fresh build rather than
+            // panicking: the memo must never be able to hand back a value of a
+            // type the caller did not ask for.
+            state.version_oracle.clone()?.downcast::<T>().ok()
+        }) {
+            return hit;
+        }
+        let value = Rc::new(compute());
+        MEMO.with(|m| {
+            let mut memo = m.borrow_mut();
+            bind(&mut memo, func).version_oracle = Some(Rc::clone(&value) as Rc<dyn std::any::Any>);
+        });
+        value
+    }
+
+    /// The predecessor-INDEPENDENT precompute of the reaching-version fixpoint,
+    /// built once per function.
+    ///
+    /// `entry_versions_fixpoint` is called TWICE per function — from
+    /// `block_entry_versions` and from `block_entry_versions_full_graph` — with
+    /// DIFFERENT predecessor relations but the SAME `func`. Its gen-sets, name
+    /// universe and per-block OUT tokens read only `func` (`preds` is consulted
+    /// nowhere in their construction), so they were being built identically
+    /// twice, and each build is the O(blocks x names x statements)
+    /// `stmt_writes_name` scan.
+    ///
+    /// `compute` returns `None` when the ambient verify budget tripped
+    /// mid-build. A TRUNCATED precompute is never stored and never handed back:
+    /// its `gen_out` would be missing entries the fixpoint indexes by name, and
+    /// — far worse than a panic — a short gen-set is an under-approximated kill
+    /// set. The uncached path is taken again on the next query, which trips
+    /// again immediately because an exhausted budget stays exhausted.
+    pub(crate) fn entry_gen_sets<T: 'static>(
+        func: &VerifiableFunction,
+        compute: impl FnOnce() -> Option<T>,
+    ) -> Option<Rc<T>> {
+        if !super::gen_work::scope_active() {
+            return compute().map(Rc::new);
+        }
+        if let Some(hit) = MEMO.with(|m| {
+            let memo = m.borrow();
+            let state = memo.as_ref()?;
+            if !state.is_for(func) {
+                return None;
+            }
+            // A failed downcast falls through to a fresh build rather than
+            // panicking, exactly as `version_oracle` does.
+            state.entry_gen_sets.clone()?.downcast::<T>().ok()
+        }) {
+            return Some(hit);
+        }
+        let value = Rc::new(compute()?);
+        MEMO.with(|m| {
+            let mut memo = m.borrow_mut();
+            bind(&mut memo, func).entry_gen_sets = Some(Rc::clone(&value) as Rc<dyn std::any::Any>);
+        });
+        Some(value)
+    }
+
+    /// `writes_until(func, block, stmt_idx)`, computed once per program point.
+    pub(crate) fn writes_until(
+        func: &VerifiableFunction,
+        block_id: usize,
+        stmt_idx: usize,
+        compute: impl FnOnce() -> FxHashSet<String>,
+    ) -> Rc<FxHashSet<String>> {
+        if !super::gen_work::scope_active() {
+            return Rc::new(compute());
+        }
+        let key = (block_id, stmt_idx);
+        if let Some(hit) = MEMO.with(|m| {
+            let memo = m.borrow();
+            let state = memo.as_ref()?;
+            if !state.is_for(func) {
+                return None;
+            }
+            state.writes_until.get(&key).cloned()
+        }) {
+            return hit;
+        }
+        let value = Rc::new(compute());
+        MEMO.with(|m| {
+            let mut memo = m.borrow_mut();
+            let state = bind(&mut memo, func);
+            // Past the retention cap the memo stops STORING; every caller still
+            // gets the freshly computed value, so this is a time cost only.
+            let next = state.write_names.saturating_add(value.len());
+            if next <= MAX_MEMOIZED_WRITE_NAMES {
+                state.write_names = next;
+                state.writes_until.insert(key, Rc::clone(&value));
+            }
+        });
+        value
     }
 }
 
@@ -2569,6 +3072,17 @@ pub fn gen_work_used() -> usize {
 #[must_use]
 pub(crate) fn gen_work_scope() -> gen_work::Guard {
     gen_work::enter()
+}
+
+/// Enter a VC-gen scope whose MEMOS are live but whose work METER is disabled for the
+/// scope's whole extent (see `gen_work::enter_unmetered`). Reserved for replay paths
+/// whose output must be byte-identical to a production VC — today exactly one, the
+/// overflow-elision join table — where a meter trip would degrade a formula and break a
+/// join instead of reporting an overrun. Such a path must carry its own reportable
+/// bound; this scope removes the meter, it does not remove the obligation to terminate.
+#[must_use]
+pub(crate) fn gen_work_scope_unmetered() -> gen_work::UnmeteredGuard {
+    gen_work::enter_unmetered()
 }
 
 /// Whether the current function's VC-gen tripped the mid-generation work budget (and so
@@ -3244,6 +3758,30 @@ pub(crate) fn is_thin_pointer_identity_cast(from_ty: &Ty, to_ty: &Ty) -> bool {
     is_thin_pointer_ty(from_ty) && is_thin_pointer_ty(to_ty)
 }
 
+/// Trust (verified-sysroot §5 step 3, slice 1): the provenance-EXPOSE cast — a
+/// THIN pointer's address read as the pinned-width unsigned address word
+/// (`p.addr()`'s `*const () -> usize` transmute, `p as usize`,
+/// `NonNull::addr`'s newtype leg). Under the collapsed allocation-identity
+/// model (`trust_types::alloc_model`: a pointer's `Sort::Int` model value IS
+/// `base(A) + offset`), this cast is VALUE-PRESERVING — `dest == source` is a
+/// theorem of the model — which is what makes `*mut T::add::
+/// precondition_check`-shaped address arithmetic STATABLE over the pointer's
+/// own term instead of a fresh unconstrained integer.
+///
+/// FAIL-CLOSED guards, each carried by an audited classifier:
+///   * source: `is_thin_pointer_ty` — fat pointers (slice/str/dyn) have no
+///     single-address model value and REFUSE; so does every non-pointer.
+///   * target: `alloc_model::ptr_expose_target_is_address_word` — exactly
+///     `Ty::Int { width: 64, signed: false }`. Narrowing (`as u32`) and signed
+///     reinterpret (`as i64`) change the mathematical value and REFUSE.
+///   * direction: EXPOSE only. The RECOVER direction (integer -> pointer)
+///     manufactures provenance the integer does not carry and stays refused
+///     everywhere (`unsupported_cast_reason`'s ptr/int arm).
+pub(crate) fn is_thin_pointer_address_expose_cast(from_ty: &Ty, to_ty: &Ty) -> bool {
+    is_thin_pointer_ty(from_ty)
+        && trust_types::alloc_model::ptr_expose_target_is_address_word(to_ty)
+}
+
 pub(crate) fn is_callable_reification_cast(from_ty: &Ty, to_ty: &Ty) -> bool {
     match (from_ty, to_ty) {
         (Ty::Unit, Ty::FnPtr { .. }) => true,
@@ -3354,7 +3892,12 @@ pub(crate) fn is_modeled_identity_cast(from_ty: &Ty, to_ty: &Ty) -> bool {
         // modular/reinterpret modeling is a future completeness item.
         return (*fw == *tw && *fs == *ts) || (*tw > *fw && !(*fs && !*ts));
     }
-    is_thin_pointer_identity_cast(from_ty, to_ty) || is_fn_pointer_identity_cast(from_ty, to_ty)
+    is_thin_pointer_identity_cast(from_ty, to_ty)
+        || is_fn_pointer_identity_cast(from_ty, to_ty)
+        // Trust (verified-sysroot §5 step 3, slice 1): thin-pointer address
+        // EXPOSE is identity over the collapsed allocation model's value —
+        // see `is_thin_pointer_address_expose_cast` for the model and guards.
+        || is_thin_pointer_address_expose_cast(from_ty, to_ty)
 }
 
 /// A numeric `as` cast that crosses the float boundary (`int -> float`,
@@ -3462,7 +4005,41 @@ fn is_single_pointer_newtype_adt(ty: &Ty, fuel: u32) -> bool {
 }
 
 fn is_thin_pointer_pointee(ty: &Ty) -> bool {
-    !matches!(ty, Ty::Slice { .. } | Ty::Str | Ty::Dynamic { .. } | Ty::Unsupported { .. })
+    is_thin_pointer_pointee_fueled(ty, 8)
+}
+
+/// Whether a pointer to `ty` is THIN (no metadata word).
+///
+/// The direct unsized sorts are the easy half. The half the original negative
+/// gate missed — found by an adversarial probe against the expose-cast arm —
+/// is an ADT whose LAST field is unsized (`struct S { len: usize, tail: [u8] }`):
+/// a pointer to it carries the tail's metadata, so it is FAT, but the pointee
+/// spells `Ty::Adt`, which the bare `!matches!` accepted as thin. That made
+/// `*const S -> usize` admissible as an identity expose-cast, silently dropping
+/// the metadata word. Not reachable from valid MIR today (the lowering declines
+/// such ADTs upstream), but this gate must not be the thing that depends on it.
+///
+/// So the tail recurses: an ADT/tuple/datatype pointee is thin only if its last
+/// field is. Fuel bounds pathological nesting; running out fails CLOSED (fat).
+fn is_thin_pointer_pointee_fueled(ty: &Ty, fuel: u8) -> bool {
+    let Some(fuel) = fuel.checked_sub(1) else {
+        return false;
+    };
+    match ty {
+        Ty::Slice { .. } | Ty::Str | Ty::Dynamic { .. } | Ty::Unsupported { .. } => false,
+        Ty::Adt { fields, .. } => fields
+            .last()
+            .is_none_or(|(_, tail)| is_thin_pointer_pointee_fueled(tail, fuel)),
+        Ty::Tuple(fields) => fields
+            .last()
+            .is_none_or(|tail| is_thin_pointer_pointee_fueled(tail, fuel)),
+        Ty::Datatype { variants, .. } => variants.iter().all(|(_, fields)| {
+            fields
+                .last()
+                .is_none_or(|(_, tail)| is_thin_pointer_pointee_fueled(tail, fuel))
+        }),
+        _ => true,
+    }
 }
 
 pub(crate) fn project_ty(ty: Ty, proj: &Projection) -> Option<Ty> {
@@ -3952,7 +4529,9 @@ pub(crate) fn ptr_metadata_model(func: &VerifiableFunction, operand: &Operand) -
             Operand::Constant(
                 ConstValue::Str { .. }
                 | ConstValue::OpaqueConst
-                | ConstValue::UnitVariantRef { .. },
+                | ConstValue::UnitVariantRef { .. }
+                // Trust: EFHT-P — same faithful-but-unmodeled carrier class.
+                | ConstValue::StructScalarFieldsRef { .. },
             ) => PtrMetadataModel::Unsupported,
             _ => PtrMetadataModel::Invalid,
         };
@@ -4417,7 +4996,7 @@ pub(crate) fn local_is_never_written(func: &VerifiableFunction, local: usize) ->
 }
 
 // Resolve a local to a single constant `usize` index, or `None`.
-// Sound only if *every* assignment to the local is the *same* non-negative
+// Sound only if *every* value the local can hold is the *same* non-negative
 // integer constant (and there is at least one): then the local holds that value
 // wherever it is read. Any non-constant assignment, or two differing constants
 // (e.g. a loop induction variable, or a switch-merged index), yields `None`.
@@ -4427,6 +5006,21 @@ pub(crate) fn local_is_never_written(func: &VerifiableFunction, local: usize) ->
 // because this resolver feeds float-lane DISCHARGES (aggregate const-index
 // tracing, place-name rendering) where a stale constant claims the wrong
 // element.
+//
+// THE ENTRY DEFINITION. A PARAMETER's first value is written at ENTRY and no
+// statement in `body.blocks` carries it, so the constants this scan agrees on are
+// the parameter's SECOND..Nth values, never its first. Unlike the counting
+// channel, a wrong answer here cannot be rescued downstream: the constant is
+// INLINED into a place NAME (`constant_array_index_segment` renders `a[_i]` as
+// `[c;min=N]`, the literal's element), so version renaming has nothing left to
+// bind. `p5` — `fn p5(mut i: usize, c: bool) { let a=[9,1,9,9]; let b=[7;4];
+// if c { i=1; } if i>3 { return 0 } b[a[i] as usize] }` — read `a[i]` as `a[1] ==
+// 1` and PROVED `b[1]` in bounds, kernel-certified, while the c=false path indexes
+// `b[9]`. Pinned by `param_reassigned_once_const_index_still_refutes`.
+//
+// The sibling COUNTER `index_local_stable` has had this arm (`usize::from(is_param)`)
+// since before the seam existed; `array_theory_local` gates this resolver behind it,
+// but `constant_array_index_segment` calls it directly, which is the path `p5` took.
 pub(crate) fn index_local_const(func: &VerifiableFunction, local: usize) -> Option<usize> {
     let mut found: Option<u128> = None;
     for block in &func.body.blocks {
@@ -4460,6 +5054,12 @@ pub(crate) fn index_local_const(func: &VerifiableFunction, local: usize) -> Opti
             return None;
         }
     }
+    // The entry definition (see the note above). A parameter with no explicit
+    // definition never reaches here with `found.is_some()`, so this costs nothing
+    // for the entry-stable formal that the aggregate/float lanes actually trace.
+    if found.is_some() && crate::local_defs::is_parameter(func, local) {
+        return None;
+    }
     found.and_then(|v| usize::try_from(v).ok())
 }
 
@@ -4489,16 +5089,13 @@ pub(crate) fn index_local_const(func: &VerifiableFunction, local: usize) -> Opti
 // In every bail case we return `false`, falling back to opaque per-index naming:
 // the whole array reads as free (a sound false-FAIL), never a false-PROVE.
 fn array_local_index_naming_stable(func: &VerifiableFunction, local: usize) -> bool {
-    let mut whole_assigns = 0usize;
     for block in &func.body.blocks {
         for stmt in &block.stmts {
             let Statement::Assign { place, rvalue, .. } = stmt else {
                 continue;
             };
             if place.local == local {
-                if place.projections.is_empty() {
-                    whole_assigns += 1;
-                } else {
+                if !place.projections.is_empty() {
                     // An in-place element/subslice store: stable only for a
                     // compile-time-constant `Index`. Everything else bails (see above).
                     for p in &place.projections {
@@ -4524,7 +5121,12 @@ fn array_local_index_naming_stable(func: &VerifiableFunction, local: usize) -> b
             }
         }
     }
-    whole_assigns == 1
+    // The scan above decides the PROJECTED stores and the borrow kills; whether the
+    // local's WHOLE value is single is `local_defs::has_one_explicit_def`, which also
+    // counts a `Call` destination and charges a PARAMETER for its implicit ENTRY
+    // definition — an array parameter reassigned once has two values, and the
+    // `whole_assigns == 1` this replaces read that as one.
+    crate::local_defs::has_one_explicit_def(func, local)
 }
 
 // =====================================================================
@@ -4947,46 +5549,18 @@ fn array_element_select(
     ))
 }
 
-// follow a reference local back to the place it points to, so a
-// deref `*L` is named by its underlying storage instead of an opaque `L*`.
-// Match guards on references re-borrow the binding
-// (`_4 = &_3; _9 = *_4; if *_9 < K { ... *_3 + 1 ... }`), so the guard reads
-// `*_9` while the arithmetic reads `*_3`; both alias the same payload yet get
-// distinct SMT names, so the guard never constrains the overflow VC — a Goal-1
-// false-fail. Only *unique, whole-local* definitions are followed, so the
-// referent is unambiguous; `&mut` is safe because a write through the alias
-// canonicalizes to the same place name, keeping reads and writes consistent.
-pub(crate) fn unique_whole_local_def(func: &VerifiableFunction, local: usize) -> Option<&Rvalue> {
-    let mut found: Option<&Rvalue> = None;
-    for block in &func.body.blocks {
-        for stmt in &block.stmts {
-            let Statement::Assign { place, rvalue, .. } = stmt else { continue };
-            if place.local != local {
-                continue;
-            }
-            // A write THROUGH this reference (`*L = v` — projection starting with
-            // Deref) changes the POINTEE, not what `L` points to, so it does not
-            // make L's referent ambiguous: skip it. Trust #soundness (round-12):
-            // previously such a store hit the bail below and returned None,
-            // defeating the `*L -> referent` fold, so `place_to_var_name(*L)` was
-            // the opaque `L*` and a store `*L = v` emitted a def about `L*` that
-            // never havoced the referent `x` — a stale `x == 5` survived the
-            // mutation and vacuously discharged a real overflow (a false-PROVE).
-            // Folding restores the intended invariant: a write through the alias
-            // names the same place as a direct read/write of the referent.
-            if place.projections.first() == Some(&Projection::Deref) {
-                continue;
-            }
-            // A field/index store into this local, or a second whole-local def,
-            // makes its value ambiguous.
-            if !place.projections.is_empty() || found.is_some() {
-                return None;
-            }
-            found = Some(rvalue);
-        }
-    }
-    found
-}
+// Follow a reference local back to the place it points to, so a deref `*L` is named
+// by its underlying storage instead of an opaque `L*`. Match guards on references
+// re-borrow the binding (`_4 = &_3; _9 = *_4; if *_9 < K { ... *_3 + 1 ... }`), so the
+// guard reads `*_9` while the arithmetic reads `*_3`; both alias the same payload yet
+// get distinct SMT names, so the guard never constrains the overflow VC — a Goal-1
+// false-fail. Only the local's UNIQUE VALUE is followed, so the referent is
+// unambiguous; `&mut` is safe because a write through the alias canonicalizes to the
+// same place name, keeping reads and writes consistent.
+//
+// The resolver itself is `local_defs::unique_value_def` — the one place that knows a
+// PARAMETER is defined at ENTRY, so a once-reassigned parameter's single `Assign` is
+// never handed back as that parameter's universal value.
 
 // The place a reference *value* read from `source` ultimately points to.
 fn referent_of_source(func: &VerifiableFunction, source: &Place, fuel: u32) -> Option<Place> {
@@ -5028,7 +5602,7 @@ fn referent_of_source(func: &VerifiableFunction, source: &Place, fuel: u32) -> O
         // read `_1*.0*`, so reads straddling any mutation channel mint DIFFERENT
         // version tokens and can never falsely unify. A whole-local reseat of M
         // itself has no name the fabric tracks relative to the old pointee, so it
-        // fail-closes here (`whole_local_def_count != 0` declines to the opaque
+        // fail-closes here (a local with an explicit whole-local def declines to the opaque
         // per-copy name — no merge, the pre-existing conservative behavior).
         [Projection::Deref, rest @ ..]
             if !rest.is_empty() && rest.iter().all(|p| matches!(p, Projection::Field(_))) =>
@@ -5038,7 +5612,7 @@ fn referent_of_source(func: &VerifiableFunction, source: &Place, fuel: u32) -> O
                     slot.projections.extend_from_slice(rest);
                     referent_of_source(func, &slot, fuel - 1)
                 }
-                None if crate::guards::whole_local_def_count(func, source.local) == 0 => {
+                None if crate::local_defs::never_explicitly_reseated(func, source.local) => {
                     Some(deref_of(source))
                 }
                 None => None,
@@ -5054,7 +5628,8 @@ fn referent_of_source(func: &VerifiableFunction, source: &Place, fuel: u32) -> O
         // never merge. For a never-written reference operand the referent is the
         // definitional `*op`, mirroring the `[Deref]` arm.
         [Projection::Field(idx)] => {
-            let Some(Rvalue::Aggregate(_, operands)) = unique_whole_local_def(func, source.local)
+            let Some(Rvalue::Aggregate(_, operands)) =
+                crate::local_defs::unique_value_def(func, source.local)
             else {
                 return None;
             };
@@ -5082,7 +5657,7 @@ fn resolve_referent(func: &VerifiableFunction, local: usize, fuel: u32) -> Optio
     if fuel == 0 {
         return None;
     }
-    match unique_whole_local_def(func, local)? {
+    match crate::local_defs::unique_value_def(func, local)? {
         Rvalue::Ref { place, .. } | Rvalue::AddressOf(_, place) => {
             Some(canonicalize_deref(func, place.clone(), fuel - 1))
         }
@@ -5104,8 +5679,14 @@ fn resolve_referent(func: &VerifiableFunction, local: usize, fuel: u32) -> Optio
 /// that `resolve_referent` cannot fold (its `_ => None` arm). Mirrors the fuel
 /// (16) `place_to_var_name` uses, so the predicate agrees with how the name is
 /// actually minted: opaque-name ⟺ `resolve_referent` is `None`.
+///
+/// verifier-perf: `resolve_referent` walks every block/statement of `func`, and
+/// this predicate is queried once per statement by several gen-set oracles, so
+/// the raw form is quadratic in function size. Memoized per `(func, local)` —
+/// a pure function of exactly those two, see `havoc_memo` for why a hit can
+/// never replay another function's answer.
 pub(crate) fn deref_pointer_is_opaque(func: &VerifiableFunction, local: usize) -> bool {
-    resolve_referent(func, local, 16).is_none()
+    havoc_memo::opaque_pointer(func, local, || resolve_referent(func, local, 16).is_none())
 }
 
 // Rewrite a place by resolving a leading deref-of-reference to its referent,
@@ -5125,37 +5706,40 @@ fn canonicalize_deref(func: &VerifiableFunction, place: Place, fuel: u32) -> Pla
     canonicalize_deref(func, referent, fuel - 1)
 }
 
-// true iff the storage rooted at `local` is fixed for the whole body
-// at most one whole-local store (a single construction, or zero for a parameter)
-// and no other mutation path: no projected store, no `&mut`/`&raw mut`, no
-// set-discriminant, no deinit, and no whole/projected call-destination write.
+// true iff the storage rooted at `local` is fixed for the whole body:
+// AT MOST ONE VALUE (a single construction, or ZERO body stores for a parameter,
+// whose value is defined at entry) and no other mutation path: no projected store,
+// no `&mut`/`&raw mut`, no set-discriminant, no deinit, and no whole/projected
+// call-destination write.
 // Stronger than `local_is_never_written` (which ignores call dests and allows no
 // construction) and complementary to `array_local_index_naming_stable`
 // (which permits const-index element stores so long as their names converge).
 // Under this predicate a place expressed relative to `local` denotes the same
 // value at every read.
+//
+// THE PARAMETER CLAUSE IS `local_defs::value_count`, NOT A BLOCK TALLY. This
+// function said "or zero for a parameter" in prose while counting `whole_assigns
+// <= 1`, which ADMITS a parameter reassigned once — and roughly a dozen of its
+// callers (the witness-grounding alias trace, the immutable-read value tie, the
+// container-length field reborrow, the float hull) have no parameter refinement of
+// their own; the three that do (`unwrap_receiver_local_is_pinned`,
+// `operand_is_stable_bound`, `stable_scalar_arg_formula`) each hand-rolled it.
+// `place_source_is_stable_rejects_a_reassigned_parameter` is the row.
 pub(crate) fn place_source_is_stable(func: &VerifiableFunction, local: usize) -> bool {
-    let mut whole_assigns = 0usize;
     for block in &func.body.blocks {
         if let Terminator::Call { dest, .. } = &block.terminator {
-            if dest.local == local {
-                // Any call-dest store (whole or projected) reseats/mutates the value.
-                if !dest.projections.is_empty() {
-                    return false;
-                }
-                whole_assigns += 1;
+            // Any call-dest store (whole or projected) reseats/mutates the value;
+            // the whole-local form is counted by `value_count` below.
+            if dest.local == local && !dest.projections.is_empty() {
+                return false;
             }
         }
         for stmt in &block.stmts {
             match stmt {
                 Statement::Assign { place, rvalue, .. } => {
-                    if place.local == local {
-                        if place.projections.is_empty() {
-                            whole_assigns += 1;
-                        } else {
-                            // A store through a projection mutates in place.
-                            return false;
-                        }
+                    // A store through a projection mutates in place.
+                    if place.local == local && !place.projections.is_empty() {
+                        return false;
                     }
                     if let Rvalue::Ref { mutable: true, place: borrowed }
                     | Rvalue::AddressOf(true, borrowed) = rvalue
@@ -5174,7 +5758,7 @@ pub(crate) fn place_source_is_stable(func: &VerifiableFunction, local: usize) ->
             }
         }
     }
-    whole_assigns <= 1
+    crate::local_defs::value_count(func, local).is_at_most(1)
 }
 
 // a struct/enum payload bound by a match arm reaches the arithmetic
@@ -5199,7 +5783,7 @@ fn base_value_alias(func: &VerifiableFunction, place: &Place) -> Option<Place> {
         return None;
     }
     let Rvalue::Use(Operand::Copy(src) | Operand::Move(src)) =
-        unique_whole_local_def(func, place.local)?
+        crate::local_defs::unique_value_def(func, place.local)?
     else {
         return None;
     };
@@ -5312,6 +5896,28 @@ pub(crate) fn version_token_is_loop_transition_havoc(name: &str) -> bool {
 // live here). Exporting the one function keeps the two ends unforkable — the
 // same rationale as `trust_types::total_call_summaries`.
 pub fn place_to_var_name(func: &VerifiableFunction, place: &Place) -> String {
+    // verifier-perf: memoized per `(func, place)` on the SAME key and the SAME
+    // identity discipline as the place-type/Sort memo (see `place_memo`). This
+    // function is a pure function of the function's local table and the place —
+    // but it rebuilds an `FxHashSet` over every local and makes two more
+    // O(locals) passes on every call, and the generator calls it once per place
+    // occurrence in every formula it builds or rewrites. `key_for` returns
+    // `None` outside a VC-gen scope and for projection paths it cannot encode
+    // injectively, and those take the uncached path unchanged.
+    let memo_key = place_memo::key_for(place);
+    if let Some(key) = &memo_key
+        && let Some(cached) = place_memo::lookup_name(func, key)
+    {
+        return cached.to_string();
+    }
+    let computed = place_to_var_name_uncached(func, place);
+    if let Some(key) = memo_key {
+        place_memo::store_name(func, key, &std::rc::Rc::from(computed.as_str()));
+    }
+    computed
+}
+
+fn place_to_var_name_uncached(func: &VerifiableFunction, place: &Place) -> String {
     // Public callers can construct Trust IR directly. Every canonicalization
     // helper resolves locals by explicit `LocalDecl.index` or scans Place IDs,
     // so sparse/reordered tables remain well-defined and must not lose useful

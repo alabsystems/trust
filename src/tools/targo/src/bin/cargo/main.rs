@@ -378,16 +378,50 @@ fn authorize_trust_execution(
     // `ship provision` — mint this machine's publishing identity — there is no artifact
     // whose proof status is in question, so the flag answers a question nobody asked.
     //
-    // So: proceed, and SAY the lane instead of demanding it be typed. The awareness the
-    // refusal exists to create is preserved by `ExplicitUnverified`'s own notice ("runs
-    // with the proof pipeline off"), which prints either way. Nothing about what gets
-    // built changes — this is the same lane the flag would have selected, chosen for the
-    // user because it is the only one on offer.
-    if verified_trust_lane_for(cmd).is_none() && !is_manifest_command {
+    // So: proceed, and SAY the lane instead of demanding it be typed. Nothing about what
+    // gets built changes — this is the same lane the flag would have selected, chosen for
+    // the user because it is the only one on offer.
+    //
+    // The awareness the refusal exists to create is preserved by the `UNVERIFIED:` warning
+    // the match arm below prints. It is NOT preserved by the "runs with the proof pipeline
+    // off" wording this comment used to cite: that text lives only in
+    // `unauthorized_lane_message`, whose sole production caller is the `bail!` two lines
+    // down — the line this early return exists to skip. Citing a string on the path you
+    // just bypassed is how a comment ends up defending a guarantee nobody makes.
+    // …but the one-button argument stops where the artifact's audience begins.
+    // "Proceed on a single-lane verb" was argued for `run` and `ship provision`,
+    // where no proof-bearing artifact is in question — and implemented for every
+    // verb without a verified counterpart, which also covered `install`,
+    // `package` and `publish` (output that LEAVES the machine: a binary on a
+    // PATH, a crate at a registry) and `miri` (a pass/fail verdict someone will
+    // read as checked). For those, "does this artifact carry a proof claim" is
+    // exactly the question the flag answers, so the refusal is restored: it
+    // cannot steer to a verified lane, but it can make a human own the choice
+    // the artifact's consumers will inherit. The width-vs-argument gap is
+    // documented in docs/2026-09-01-targo-single-lane-selection-blast-radius.md;
+    // this is that document's disposition 1, and it is what the integration
+    // suite (`cargo_command.rs` — miri exits 101, no UNVERIFIED line) had
+    // pinned all along.
+    if verified_trust_lane_for(cmd).is_none()
+        && !is_manifest_command
+        && !requires_explicit_lane(cmd)
+    {
         return Ok(TrustExecutionAuthorization::ExplicitUnverified);
     }
 
     anyhow::bail!(unauthorized_lane_message(cmd, is_manifest_command))
+}
+
+/// Trust: the single-lane verbs that still demand a typed `--unverified`,
+/// because their output outlives the invocation in someone else's hands.
+/// `install` puts a binary on a PATH; `package`/`publish` ship a crate to a
+/// registry; `miri` mints a pass/fail verdict that reads as "checked". The
+/// local development verbs (`run`, `fix`, `clippy`, `bench`, `doc`, `rustc`,
+/// `rustdoc`, `-Zscript`) proceed on their only lane with the UNVERIFIED
+/// notice — for them the flag answers no question and the daily toll builds
+/// the type-it-without-reading reflex this authorization exists to prevent.
+fn requires_explicit_lane(cmd: &str) -> bool {
+    matches!(cmd, "install" | "package" | "publish" | "miri")
 }
 
 /// Trust: the `targo trust` sub-subcommand that performs the same work as a
@@ -490,8 +524,20 @@ pub(crate) fn configure_trust_execution_policy(
             } else {
                 cmd.to_owned()
             };
+            // Two different things reach this arm, and telling a user their run
+            // "was explicitly authorized" when they typed no flag is a lie in the
+            // one message whose whole job is to be believed. A verb with no
+            // verified counterpart lands here with `explicit_unverified` false —
+            // Targo chose the lane, nobody authorized it — and that is precisely
+            // the case where the reader most needs to know a choice was made for
+            // them.
+            let how = if explicit_unverified {
+                "was explicitly authorized with Trust verification disabled"
+            } else {
+                "has no verified lane, so Trust verification is off; nobody was asked"
+            };
             eprintln!(
-                "warning: UNVERIFIED: `targo {invocation}` was explicitly authorized with Trust verification disabled; this run emits no proof claim"
+                "warning: UNVERIFIED: `targo {invocation}` {how}; this run emits no proof claim"
             );
         }
         TrustExecutionAuthorization::InheritedExplicitUnverified => {
@@ -1627,6 +1673,15 @@ fn execute_external_subcommand(gctx: &GlobalContext, cmd: &str, args: &[&OsStr])
                 // Trust spelling (`trustfmt`).
                 let did_you_mean = if cmd == "rustfmt" || cmd == "trustfmt" {
                     "\n\nhelp: a command with a similar name exists: `fmt`".to_string()
+                } else if cmd == "clippy" || cmd == "cargo-clippy" {
+                    // This toolchain ships the linter as `tippy`, and deletes
+                    // `cargo-clippy`. Without this arm the generic path below
+                    // suggested `search targo-clippy` — a package that cannot
+                    // exist — and `closest_msg` could not rescue it because the
+                    // candidate list only holds commands whose binary RESOLVED,
+                    // so `tippy` is absent precisely when the user needs it.
+                    "\n\nhelp: this toolchain ships the linter as `tippy`: run `targo tippy`"
+                        .to_string()
                 } else {
                     closest_msg(cmd, suggestions.keys(), |c| c, "command")
                 };
@@ -1821,6 +1876,7 @@ fn search_directories(gctx: &GlobalContext) -> Vec<PathBuf> {
 #[cfg(test)]
 mod trust_tests {
     use super::{
+        requires_explicit_lane,
         AuthenticatedProtectedSubcommand, PROTECTED_SUBCOMMAND_AUTHORITY_EXIT,
         TrustExecutionAuthorization, authorize_trust_execution, env_to_bool,
         external_subcommand_prefixes_for_invocation, finish_guarded_protected_subcommand,
@@ -1849,7 +1905,7 @@ mod trust_tests {
     }
 
     #[test]
-    fn every_native_compilation_command_requires_an_explicit_lane() {
+    fn the_native_compilation_set_is_exactly_the_fourteen_transport_verbs() {
         for command in [
             "build", "check", "fix", "clippy", "miri", "test", "run", "bench", "doc", "rustc",
             "rustdoc", "install", "package", "publish",
@@ -1883,8 +1939,13 @@ mod trust_tests {
     /// This pins the DISTINCTION, not either half alone: a change that starts refusing
     /// `run` again, or stops refusing `build`, fails here.
     #[test]
-    fn a_verb_with_no_verified_counterpart_proceeds_instead_of_demanding_the_flag() {
-        for lane_less in ["run", "ship", "install", "publish"] {
+    fn a_local_development_verb_proceeds_and_an_artifact_emitting_one_refuses() {
+        // Local development verbs: the only lane is taken and announced. (`ship`
+        // was in this list once — asserting `ExplicitUnverified` for a verb that
+        // is not a native compilation command at all, so the row could never
+        // pass: `authorize_trust_execution` answers `NotApplicable` for it. The
+        // row now asserts what the code does.)
+        for lane_less in ["run", "fix", "bench", "doc", "rustc", "rustdoc", "clippy"] {
             let got = authorize_trust_execution(true, lane_less, false, false, false, false, false)
                 .unwrap_or_else(|e| panic!("`targo {lane_less}` must not refuse: {e}"));
             assert!(
@@ -1894,6 +1955,27 @@ mod trust_tests {
             assert!(
                 verified_trust_lane_for(lane_less).is_none(),
                 "precondition: `{lane_less}` has no verified counterpart"
+            );
+        }
+        let got = authorize_trust_execution(true, "ship", false, false, false, false, false)
+            .expect("`ship` is not a native compilation command");
+        assert!(
+            matches!(got, TrustExecutionAuthorization::NotApplicable),
+            "`ship` is outside the transport set entirely, got {got:?}"
+        );
+        // Single-lane verbs whose artifact leaves the machine (or mints a
+        // verdict) still demand the typed flag: the refusal cannot steer to a
+        // verified lane, but it makes a human own the choice the artifact's
+        // consumers inherit. This is what the integration suite pinned for
+        // `miri` throughout.
+        for emitting in ["install", "package", "publish", "miri"] {
+            assert!(requires_explicit_lane(emitting), "boundary: `{emitting}`");
+            let error =
+                authorize_trust_execution(true, emitting, false, false, false, false, false)
+                    .expect_err("an artifact-emitting verb must refuse the implicit lane");
+            assert!(
+                error.to_string().contains("implicitly unverified artifact"),
+                "the refusal names the stake: {error}"
             );
         }
         // …and the verbs that DO have a counterpart still refuse, for the same reason.

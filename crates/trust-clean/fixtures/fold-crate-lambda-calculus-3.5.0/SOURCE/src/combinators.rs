@@ -188,7 +188,10 @@ pub fn O() -> Term {
 /// );
 /// ```
 pub fn Y() -> Term {
-    abs(app(abs(app(Var(2), app(Var(1), Var(1)))), abs(app(Var(2), app(Var(1), Var(1))))))
+    abs(app(
+        abs(app(Var(2), app(Var(1), Var(1)))),
+        abs(app(Var(2), app(Var(1), Var(1)))),
+    ))
 }
 
 /// Z - the strict fixed-point combinator.

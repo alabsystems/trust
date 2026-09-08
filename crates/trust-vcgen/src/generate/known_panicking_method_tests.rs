@@ -329,9 +329,7 @@ fn const_diff_range_fn(
         },
         LocalDecl {
             index: 5,
-            ty: Ty::Adt {
-                adt_kind: None,
-                layout: None,
+            ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                 variants: Vec::new(),
                 name: "core::ops::Range".into(),
                 fields: vec![],
@@ -458,9 +456,7 @@ fn off_plus_8_to_off_plus_16_recovers_length_8() {
         },
         LocalDecl {
             index: 5,
-            ty: Ty::Adt {
-                adt_kind: None,
-                layout: None,
+            ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
                 variants: Vec::new(),
                 name: "core::ops::Range".into(),
                 fields: vec![],

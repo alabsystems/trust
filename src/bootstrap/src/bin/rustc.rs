@@ -30,7 +30,7 @@ use shared_helpers::{
     finalize_trust_no_verify, finalize_trust_no_verify_snapshot, maybe_dump, parse_rustc_stage,
     parse_rustc_verbose, parse_value_from_args, retired_trust_bootstrap_shim_target_only_refusal,
     strip_trust_no_verify, trust_bootstrap_no_verify_applies, trust_bootstrap_shim_marker_enabled,
-    trust_bootstrap_verify_unit_requested,
+    trust_bootstrap_verify_unit_argv_refusal, trust_bootstrap_verify_unit_requested,
 };
 
 #[path = "../utils/shared_helpers.rs"]
@@ -69,6 +69,13 @@ fn finalize_trust_verify_control(
     bootstrap_no_verify_applies: bool,
 ) -> TrustVerifyEnvAction {
     if bootstrap_verify_unit_applies {
+        // The lane's separate name, enforced: exactly one verifier control,
+        // `-Ztrust-verify=on`, and no proof-session identity or policy control
+        // beside it. Refused loudly rather than stripped — see
+        // `trust_bootstrap_verify_unit_argv_refusal`.
+        if let Some(message) = trust_bootstrap_verify_unit_argv_refusal(args) {
+            panic!("{message}");
+        }
         canonicalize_trust_verify_on(args);
         TrustVerifyEnvAction::Remove
     } else if targeted_rustc_is_snapshot {

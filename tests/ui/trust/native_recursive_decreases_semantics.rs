@@ -25,7 +25,8 @@ pub fn two_calls(n: u32) //[correct]~ NOTE Trust verification: 4 proved
 }
 
 #[cfg(wrong_decrease)]
-pub fn no_descent(n: u32) //[wrong_decrease]~ NOTE Trust verification: 0 proved, 0 failed, 1 unknown
+pub fn no_descent(n: u32) //[wrong_decrease]~ WARN Trust Level 0 safety verification incomplete
+//[wrong_decrease]~| NOTE Trust verification: 0 proved, 0 failed, 1 unknown
 //[wrong_decrease]~| NOTE [termination] UNKNOWN
 //[wrong_decrease]~| ERROR Trust strict verification failed for
     decreases n

@@ -90,8 +90,14 @@ pub fn one() -> Term {
 /// ```
 pub fn succ() -> Term {
     let z = app!(pair(), zero(), one());
-    let a = abs(app(Var(1), abs!(2, app!(pair(), app(shl0(), Var(2)), app(shl1(), Var(2))))));
-    let b = abs(app(Var(1), abs!(2, app!(pair(), app(shl1(), Var(2)), app(shl0(), Var(1))))));
+    let a = abs(app(
+        Var(1),
+        abs!(2, app!(pair(), app(shl0(), Var(2)), app(shl1(), Var(2)))),
+    ));
+    let b = abs(app(
+        Var(1),
+        abs!(2, app!(pair(), app(shl1(), Var(2)), app(shl0(), Var(1)))),
+    ));
 
     abs(app(snd(), app!(Var(1), z, a, b)))
 }
@@ -121,8 +127,14 @@ pub fn succ() -> Term {
 /// ```
 pub fn pred() -> Term {
     let z = app!(pair(), zero(), zero());
-    let a = abs(app(Var(1), abs!(2, app!(pair(), app(shl0(), Var(2)), app(shl1(), Var(1))))));
-    let b = abs(app(Var(1), abs!(2, app!(pair(), app(shl1(), Var(2)), app(shl0(), Var(2))))));
+    let a = abs(app(
+        Var(1),
+        abs!(2, app!(pair(), app(shl0(), Var(2)), app(shl1(), Var(1)))),
+    ));
+    let b = abs(app(
+        Var(1),
+        abs!(2, app!(pair(), app(shl1(), Var(2)), app(shl0(), Var(2)))),
+    ));
 
     abs(app(snd(), app!(Var(1), z, a, b)))
 }
@@ -205,9 +217,17 @@ pub fn shl1() -> Term {
 /// ```
 pub fn strip() -> Term {
     let z = app!(pair(), zero(), tru());
-    let a =
-        abs(app(Var(1), abs!(2, app!(pair(), app!(Var(1), zero(), app(shl0(), Var(2))), Var(1)))));
-    let b = abs(app(Var(1), abs!(2, app!(pair(), app(shl1(), Var(2)), fls()))));
+    let a = abs(app(
+        Var(1),
+        abs!(
+            2,
+            app!(pair(), app!(Var(1), zero(), app(shl0(), Var(2))), Var(1))
+        ),
+    ));
+    let b = abs(app(
+        Var(1),
+        abs!(2, app!(pair(), app(shl1(), Var(2)), fls())),
+    ));
 
     abs(app(fst(), app!(Var(1), z, a, b)))
 }

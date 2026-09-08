@@ -4033,8 +4033,12 @@ fn machine_unsigned_literal_pattern(value: u128, width: u32, signed: bool) -> Op
     (value <= max).then_some(value as i128)
 }
 
+// Trust: this was a byte-identical second copy of `machine_domain::
+// width_supported`. Both now read the single VERIFIED definition in
+// `trust-widthconv`; the name is kept because seven call sites in this file
+// read better with it.
 fn rust_machine_width_supported(width: u32) -> bool {
-    matches!(width, 8 | 16 | 32 | 64 | 128)
+    trust_widthconv::width_supported(width) == 1
 }
 
 /// Encode the low `width` bits of an integer carrier without imposing the
@@ -4221,6 +4225,61 @@ fn machine_wrapping_ite_operands(
     }
 }
 
+/// Whether a raw integer term has no domain-declaring variable. Explicit BV
+/// nodes and authenticated wrapping encodings keep their declared semantics.
+fn is_closed_int_term(term: &Formula) -> bool {
+    match term {
+        Formula::Int(_) | Formula::UInt(_) => true,
+        Formula::Add(a, b)
+        | Formula::Sub(a, b)
+        | Formula::Mul(a, b)
+        | Formula::Div(a, b)
+        | Formula::Rem(a, b) => is_closed_int_term(a) && is_closed_int_term(b),
+        Formula::Neg(a) => is_closed_int_term(a),
+        _ => false,
+    }
+}
+
+/// Evaluate a closed raw arithmetic term only when every literal, intermediate,
+/// and result fits the domain borrowed from its surrounding machine values.
+/// Otherwise lowering the term to BV could silently change its proposition.
+/// This is fail-closed for compound u128 terms beyond the i128 carrier; bare
+/// UInt literals still use the existing full-width literal translator.
+fn closed_int_value_exact_at(term: &Formula, width: u32, signed: bool) -> Option<i128> {
+    if !rust_machine_width_supported(width) {
+        return None;
+    }
+    let value = match term {
+        Formula::Int(n) => *n,
+        Formula::UInt(n) => i128::try_from(*n).ok()?,
+        Formula::Add(a, b) => closed_int_value_exact_at(a, width, signed)?
+            .checked_add(closed_int_value_exact_at(b, width, signed)?)?,
+        Formula::Sub(a, b) => closed_int_value_exact_at(a, width, signed)?
+            .checked_sub(closed_int_value_exact_at(b, width, signed)?)?,
+        Formula::Mul(a, b) => closed_int_value_exact_at(a, width, signed)?
+            .checked_mul(closed_int_value_exact_at(b, width, signed)?)?,
+        Formula::Div(a, b) | Formula::Rem(a, b) => {
+            let left = closed_int_value_exact_at(a, width, signed)?;
+            let right = closed_int_value_exact_at(b, width, signed)?;
+            // i128::checked_rem alone misses narrower MIN % -1: its zero
+            // result fits, but Rust's operation overflows at the declared width.
+            let width_min = signed.then(|| {
+                if width == 128 { i128::MIN } else { -(1_i128 << (width - 1)) }
+            });
+            if right == -1 && width_min == Some(left) {
+                return None;
+            }
+            match term {
+                Formula::Div(..) => left.checked_div(right)?,
+                _ => left.checked_rem(right)?,
+            }
+        }
+        Formula::Neg(a) => closed_int_value_exact_at(a, width, signed)?.checked_neg()?,
+        _ => return None,
+    };
+    machine_literal_pattern(value, width, signed).map(|_| value)
+}
+
 /// Translate a formula into pure declared-width QF_BV, `None` on any node
 /// outside the machine fragment. Integer variables keep their NAMES (so the
 /// translated goal stays aligned with the row's identity and diagnostics) but
@@ -4235,6 +4294,18 @@ fn machine_faithful_translate(
     allow_div_rem: bool,
     polarity: Polarity,
 ) -> Option<Formula> {
+    // A variable-free compound term has no source domain of its own. Borrowing
+    // this domain is exact only if every intermediate fits: for n:u32,
+    // n >= 4294967295 + 1 must not become the tautology n >= 0.
+    // Check at the recursive raw-value boundary, not by walking through the
+    // implementation of authenticated wrapping Ite nodes or shift-count masks.
+    // This only removes translations; it introduces no widening or admission.
+    if !matches!(formula, Formula::Int(_) | Formula::UInt(_))
+        && is_closed_int_term(formula)
+        && closed_int_value_exact_at(formula, width, signed).is_none()
+    {
+        return None;
+    }
     let value = |f: &Formula| {
         machine_faithful_translate(func, f, width, signed, allow_div_rem, Polarity::Value)
     };
@@ -7014,6 +7085,7 @@ mod tests {
             layout: None,
             enum_layout: None,
             adt_kind: Some(trust_types::AdtKind::Struct),
+            arbitrary_precision: None,
         };
         assert!(matches!(
             struct_or_tuple_field_ty(&packed, 0),
@@ -7040,6 +7112,7 @@ mod tests {
                 layout: None,
                 enum_layout: None,
                 adt_kind: kind,
+                arbitrary_precision: None,
             }
         };
         for kind in [None, Some(trust_types::AdtKind::Union), Some(trust_types::AdtKind::Enum)] {
@@ -7062,6 +7135,7 @@ mod tests {
             layout: None,
             enum_layout: None,
             adt_kind: Some(trust_types::AdtKind::Struct),
+            arbitrary_precision: None,
         };
         assert!(matches!(newtype_carrier_ty(&newtype), Ty::Int { width: 32, signed: false }));
         let inconsistent = {
@@ -7079,6 +7153,7 @@ mod tests {
                 layout: None,
                 enum_layout: None,
                 adt_kind: Some(trust_types::AdtKind::Struct),
+                arbitrary_precision: None,
             }
         };
         assert!(
@@ -11042,6 +11117,163 @@ mod tests {
             None,
             "a closed atom may borrow a domain for LITERALS only — an arithmetic \
              node borrowed into a domain it was not written at is the wrap channel",
+        );
+    }
+
+    #[test]
+    fn closed_arithmetic_subterms_refuse_wrap_in_uniform_and_joined_translation() {
+        let mut func = feedback_loop_function();
+        func.body.locals[1].ty = Ty::u32(); // n
+        func.body.locals[2].ty = Ty::u64(); // i
+        let n = || Box::new(Formula::Var("n".into(), Sort::Int));
+        let int = |value| Box::new(Formula::Int(value));
+        let overflow = || Formula::Add(int(4_294_967_295), int(1));
+        // Both literals fit u32, but their sum does not. Before the guard,
+        // this emitted BvULe(BvAdd(MAX, 1, 32), n, 32), i.e. 0 <= n.
+        let clause = Formula::Ge(n(), Box::new(overflow()));
+        assert_eq!(
+            machine_faithful_translate(&func, &clause, 32, false, true, Polarity::Prop),
+            None,
+            "a false arithmetic bound must not turn into a wrapped tautology",
+        );
+        let mixed = Formula::And(vec![
+            clause,
+            Formula::Le(n(), Box::new(Formula::Var("i".into(), Sort::Int))),
+        ]);
+        assert_eq!(
+            machine_faithful_translate_joined(&func, &mixed, true),
+            None,
+            "the per-operand join must reject the same closed operand at n's width",
+        );
+        // A final result that fits cannot excuse an overflowing intermediate,
+        // including when the closed term is nested inside an open operand.
+        let nested = Formula::Add(
+            n(),
+            Box::new(Formula::Sub(Box::new(overflow()), int(1))),
+        );
+        assert_eq!(
+            machine_faithful_translate(&func, &nested, 32, false, true, Polarity::Value),
+            None,
+        );
+        // The uniform path also used to admit an entirely closed false atom.
+        let closed = Formula::Eq(Box::new(overflow()), int(0));
+        assert_eq!(
+            machine_faithful_translate(&func, &closed, 32, false, true, Polarity::Prop),
+            None,
+        );
+    }
+
+    #[test]
+    fn closed_arithmetic_subterm_guard_preserves_exact_and_explicit_wrapping_controls() {
+        let mut func = feedback_loop_function();
+        func.body.locals[1].ty = Ty::u32(); // n
+        func.body.locals[2].ty = Ty::u64(); // i
+        let int = |value| Box::new(Formula::Int(value));
+        let n = || Box::new(Formula::Var("n".into(), Sort::Int));
+        let bv = |value| Box::new(Formula::BitVec { value, width: 32 });
+        let exact = Formula::Ge(
+            n(),
+            Box::new(Formula::Add(int(4_294_967_294), int(1))),
+        );
+        let expected = Formula::BvULe(
+            Box::new(Formula::BvAdd(bv(4_294_967_294), bv(1), 32)),
+            Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
+            32,
+        );
+        assert_eq!(
+            machine_faithful_translate(&func, &exact, 32, false, true, Polarity::Prop),
+            Some(expected.clone()),
+        );
+        assert_eq!(
+            machine_faithful_translate_joined(&func, &exact, true),
+            Some(expected),
+        );
+        // Open arithmetic remains machine-width arithmetic; never widen it.
+        assert_eq!(
+            machine_faithful_translate(
+                &func,
+                &Formula::Add(n(), int(1)),
+                32,
+                false,
+                true,
+                Polarity::Value,
+            ),
+            Some(Formula::BvAdd(
+                Box::new(Formula::Var("n".into(), Sort::BitVec(32))),
+                bv(1),
+                32,
+            )),
+        );
+        // Explicit BV operations already declare wrapping semantics.
+        let wrapped = Formula::BvAdd(bv(4_294_967_295), bv(1), 32);
+        assert_eq!(
+            machine_faithful_translate(
+                &func, &wrapped, 32, false, true, Polarity::Value,
+            ),
+            Some(wrapped.clone()),
+        );
+        // The authenticated body wrapping constructor stays the same operation,
+        // even when its internal raw arithmetic is closed and overflows.
+        let encoded = crate::generate::wrapping_binop_modular_ite(
+            BinOp::Add,
+            &Formula::Int(4_294_967_295),
+            &Formula::Int(1),
+            32,
+            false,
+        )
+        .expect("supported wrapping addition");
+        assert_eq!(
+            machine_faithful_translate(
+                &func, &encoded, 32, false, true, Polarity::Value,
+            ),
+            Some(wrapped),
+        );
+        // Bare u128 literals do not pass through the conservative i128
+        // evaluator used only for compound raw arithmetic.
+        assert_eq!(
+            machine_faithful_translate(
+                &func,
+                &Formula::UInt(u128::MAX),
+                128,
+                false,
+                true,
+                Polarity::Value,
+            ),
+            Some(Formula::BitVec { value: -1, width: 128 }),
+        );
+    }
+
+    #[test]
+    fn closed_arithmetic_subterms_refuse_undefined_signed_and_zero_divisors() {
+        let func = feedback_loop_function();
+        let int = |value| Box::new(Formula::Int(value));
+        let translate = |formula: Formula| {
+            machine_faithful_translate(&func, &formula, 8, true, true, Polarity::Value)
+        };
+        for undefined in [
+            Formula::Div(int(-128), int(-1)),
+            Formula::Rem(int(-128), int(-1)),
+            Formula::Div(int(1), int(0)),
+            Formula::Rem(int(1), int(0)),
+            Formula::Neg(int(-128)),
+        ] {
+            assert_eq!(translate(undefined.clone()), None, "{undefined:?}");
+        }
+        assert_eq!(
+            translate(Formula::Rem(int(-7), int(-1))),
+            Some(Formula::BvSRem(
+                Box::new(Formula::BitVec { value: 249, width: 8 }),
+                Box::new(Formula::BitVec { value: 255, width: 8 }),
+                8,
+            )),
+        );
+        assert_eq!(
+            translate(Formula::Div(int(-7), int(-1))),
+            Some(Formula::BvSDiv(
+                Box::new(Formula::BitVec { value: 249, width: 8 }),
+                Box::new(Formula::BitVec { value: 255, width: 8 }),
+                8,
+            )),
         );
     }
 

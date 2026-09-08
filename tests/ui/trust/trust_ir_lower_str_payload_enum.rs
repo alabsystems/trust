@@ -115,7 +115,10 @@ pub fn late(l: Late) -> u32 {
 // does not actually reach the arm it claims to test is not a control.
 
 // CONTROL: `&[u8]` maps to `Ty::FatPtr(FatPtrKind::Slice(tid))`, which names the module `types`
-// table and fails requirement (3). Still declines.
+// table and fails requirement (3). REGISTRATION still declines — that is this control's true
+// subject. (wave-EMO: the BODY now lowers via the opaque N-way split, which is reachable ONLY
+// because registration declined, so the control is upheld at its subject; the arms bind
+// nothing, so no fat value is ever extracted or spelled.)
 pub enum SliceE {
     A(u32),
     B(&'static [u8]),
@@ -144,7 +147,8 @@ pub fn dyn_e(e: DynE) -> u32 {
 
 // CONTROL: `*const str` maps to the ANONYMOUS fat pair `Ty::Tuple([Ptr, I64])`, not to
 // `FatPtr(Str)`. Same 16 bytes, different spelling, and the new arm matches on the spelling
-// AND the rustc type — so an aggregate spelling stays out. Still declines.
+// AND the rustc type — so an aggregate spelling stays out. REGISTRATION still declines
+// (wave-EMO lowers the body via the opaque split — see the SliceE note).
 pub enum RawStrE {
     A(u32),
     B(*const str),

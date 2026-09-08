@@ -20,6 +20,15 @@ use super::{AttrArgs, AttrKind, AttrStyle, Attribute, DelimArgs, Expr, FnContrac
 /// vocabulary — never name-resolved or type-checked by rustc. Citation
 /// identity is canonicalized by the parser; its source span is retained
 /// separately for lossless formatting and diagnostics.
+///
+/// TWO SURFACES, ONE REPRESENTATION. This clause is produced by the
+/// first-class signature grammar (`fn f(..) ensures P by T { .. }`) AND by a
+/// `#[trust::requires]` / `#[trust::ensures]` attribute whose payload carries a
+/// `by <thm>` citation. A citation is the author's declaration that the clause
+/// is a verifier-language proof obligation, so both spellings are parsed by the
+/// same `parse_trust_native_clause` and share one discharge path. The attribute
+/// spelling exists because it is `cfg_attr`-gateable: a crate that must also
+/// build under stock rustc cannot use the signature grammar at all.
 #[derive(Clone, Copy, Encodable, Decodable, Debug, Walkable)]
 pub struct TrustNativeClause {
     /// The predicate payload span.

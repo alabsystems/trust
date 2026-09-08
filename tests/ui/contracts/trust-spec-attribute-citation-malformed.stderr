@@ -1,0 +1,8 @@
+error: expected a theorem name after `by` in the contract clause citation
+  --> $DIR/trust-spec-attribute-citation-malformed.rs:20:30
+   |
+LL | #[trust::ensures(result <= x by fn)]
+   |                              ^^
+
+error: aborting due to 1 previous error
+

@@ -1288,31 +1288,18 @@ fn bool_operand_formula_v1(
 // pathological or cyclic IR.
 const V1_RESOLVE_DEPTH: u32 = 16;
 
-/// Trust: Return the rvalue of `local`'s *unique* whole-local assignment across
-/// the entire body, or `None` if it is never assigned (a function input) or
-/// assigned more than once (not SSA-like). The v1 safety bridge uses this to
-/// resolve rustc's SSA-like bounds-check temps into their semantic definitions.
-/// The uniqueness requirement is what makes resolution sound: for the safe-Rust
-/// MIR we verify, a single static assignment that is later read is the reaching
-/// definition at that read, so substituting it cannot change the value seen.
-fn unique_whole_local_def(func: &VerifiableFunction, local: usize) -> Option<&trust_types::Rvalue> {
-    use trust_types::Statement;
-    let mut found = None;
-    for bb in &func.body.blocks {
-        for stmt in &bb.stmts {
-            if let Statement::Assign { place, rvalue, .. } = stmt
-                && place.local == local
-                && place.projections.is_empty()
-            {
-                if found.is_some() {
-                    return None;
-                }
-                found = Some(rvalue);
-            }
-        }
-    }
-    found
-}
+/// Trust: the rvalue of `local`'s ONE value, when a whole-local assignment produces
+/// it. The v1 safety bridge uses this to resolve rustc's SSA-like bounds-check temps
+/// into their semantic definitions; the uniqueness requirement is what makes
+/// resolution sound, since a single static assignment that is later read is the
+/// reaching definition at that read, so substituting it cannot change the value seen.
+///
+/// `trust_vcgen::local_defs` and NOT a local block scan: a PARAMETER is defined at
+/// ENTRY, invisibly to any scan of `body.blocks`, so a once-reassigned parameter's
+/// single assignment is its SECOND value and substituting it at a read on the other
+/// edge changes what the router resolves. That authority is shared with the VC
+/// generator this router feeds, so the two cannot drift.
+use trust_vcgen::local_defs::unique_value_def as unique_whole_local_def;
 
 fn is_ordering_binop(op: trust_types::BinOp) -> bool {
     use trust_types::BinOp;

@@ -112,6 +112,47 @@
 #     as well as printed, because every acquiring caller in this tree redirects
 #     the lock's stderr, so a stderr-only notice is invisible exactly when it
 #     matters. Displacing somebody leaves a record whichever route it took.
+#
+# THE LOCK NAMES A PARENT; THE TREE IS WRITTEN BY ITS CHILD (2026-09-01)
+# ---------------------------------------------------------------------
+# `x.py` acquires with `--pid os.getpid()` and then spawns
+# `build/bootstrap/debug/bootstrap`. The holder and the writer are therefore
+# DIFFERENT PROCESSES, related by fork, and two defects followed from treating
+# them as one. Both are fixed here; both have permanent cases in
+# `scripts/tests/trust_build_lock_test.sh`.
+#
+#   1. A CORRECTLY-LOCKED BUILD WAS REPORTED AS UNLOCKED. Diagnosed at first as
+#      "the scan matches the child, whose pid is in no lock". Measured, that is
+#      not the mechanism: root scoping was a plain SUBSTRING test
+#      (`ps ... | grep -F "$ROOT"`), and sibling checkouts share a prefix, so
+#      Path-normalized: `/workspace/trust` matched every process under `/workspace/trust-t69`.
+#      The refusal named another tree's build. In that normalized `/workspace/trust`
+#      with that tree's own lock FREE, 2026-09-01:
+#        trust-build-lock: FREE, but something is running outside the lock:
+#          a bootstrap BUILD is running outside the lock: pid 1753
+#          /workspace/trust-t69/build/bootstrap/debug/bootstrap build --stage 1 library
+#      Fixed in `pids_scoped_to_root` by matching at a path boundary, which is
+#      what the cwd half already did. The child-vs-holder relation is real too
+#      and is now handled explicitly (`unwrapped_conflict` takes the holder pid
+#      and excuses its descendants) — but it was a latent hole, not this one.
+#      Do not "fix" the cross-tree part by making the lock machine-wide: whether
+#      separate trees should interlock at all is a design question, not an
+#      inference from this bug.
+#
+#   2. KILLING THE HOLDER LEFT A FREE LOCK OVER A LIVE, TREE-MUTATING BUILD.
+#      `kill -TERM` on `x.py` runs its handler, the handler releases, and the
+#      bootstrap child survives and keeps rewriting `build/`. Reproduced
+#      deliberately; the tree then read
+#        trust-build-lock: FREE, but something is running outside the lock:
+#          a bootstrap BUILD is running outside the lock: pid 36141
+#      This is the campaign's own failure class, not untidiness: a half-rewritten
+#      `stage2/bin` makes every push gate fall back to cargo and die at
+#      `-Ztrust-verify` flag-parse — a toolchain that compiles and cannot verify,
+#      with no signal. `release` now HANDS THE LOCK OVER to the surviving writer
+#      rather than dropping it, and `acquire` adopts an unwrapped writer instead
+#      of deleting the lockdir on its way out. See `adopt_lock` for why the two
+#      other candidate fixes (refuse-to-release, reap-the-process-group) do not
+#      work.
 set -u
 
 # --------------------------------------------------------------------------
@@ -159,6 +200,47 @@ pid_cmd() {
 
 pid_elapsed() {
   ps -o etime= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' | tr -d '\n'
+}
+
+pid_ppid() {
+  ps -o ppid= -p "$1" 2>/dev/null | tr -d ' \n'
+}
+
+pid_pgid() {
+  ps -o pgid= -p "$1" 2>/dev/null | tr -d ' \n'
+}
+
+# 0 = $1 is $2, or is reachable from $2 by following ppid links upward.
+#
+# THE PROCESS THAT WRITES THE TREE IS NOT THE PROCESS THAT HOLDS THE LOCK, and
+# no consumer of this file should have to know that. `x.py` acquires with
+# `--pid os.getpid()` and then spawns `build/bootstrap/debug/bootstrap`; the
+# child appears in no lock under its own pid, so a scan that asks only "is this
+# pid recorded anywhere" calls a correctly-locked build unlocked. Ancestry is
+# the relation that answers it, and it cannot be forged: a pid's ppid is set by
+# the kernel at fork.
+#
+# Bounded at 64 hops. A `ps` that answers inconsistently while processes exit
+# under us must not be able to spin this loop — a guard that hangs is a guard
+# that gets deleted.
+pid_is_descendant_of() {
+  _cand=${1:-}
+  _anc=${2:-}
+  case "$_anc" in ''|*[!0-9]*|0|1) return 1 ;; esac
+  case "$_cand" in ''|*[!0-9]*) return 1 ;; esac
+  _hops=0
+  while [ "$_hops" -lt 64 ]; do
+    [ "$_cand" = "$_anc" ] && return 0
+    _cand=$(pid_ppid "$_cand")
+    # Reaching init (1), the kernel (0) or an unreadable answer ends the chain.
+    # Note that a REPARENTED process gets here: once its parent is gone the
+    # chain can no longer prove anything, which is exactly right for the scan
+    # (an orphan is not covered by anybody's lock) and is compensated for
+    # separately in `holder_writers`.
+    case "$_cand" in ''|0|1|*[!0-9]*) return 1 ;; esac
+    _hops=$((_hops + 1))
+  done
+  return 1
 }
 
 # 0 = the process named by (pid, start) is still running.
@@ -286,12 +368,50 @@ reclaim() {
 # SCOPED TO THIS ROOT. There can be several trust clones on one machine, and a
 # guard that fires for somebody else's build is a guard everyone learns to break.
 # A pid counts only if its command line names $ROOT or its cwd is inside it.
+#
+# AND "NAMES $ROOT" MEANS AT A PATH BOUNDARY, NOT ANYWHERE IN THE STRING. This
+# was `grep -F "$ROOT"`, a plain substring test, and sibling checkouts on this
+# machine share a prefix (paths normalized): `/workspace/trust` is a substring of
+# `/workspace/trust-t69`, `/workspace/trust-corpora`, `/workspace/
+# trust-land`. Measured in `/workspace/trust` on 2026-09-01, with that tree's
+# own lock FREE and a legitimate, correctly-locked stage-1 build running in
+# `/workspace/trust-t69`:
+#
+#     trust-build-lock: FREE, but something is running outside the lock:
+#       a bootstrap BUILD is running outside the lock: pid 1753
+#       /workspace/trust-t69/build/bootstrap/debug/bootstrap build --stage 1 library
+#
+# `1753`'s cwd was `/workspace/trust-t69` and its ppid was 98180 — that tree's
+# recorded lock holder. Nothing about it belonged to this root. The lock itself
+# was never confused (LOCKDIR is per-tree); only this scan leaked, and a scan
+# that refuses builds over another tree's work is worse than no scan, because
+# the refusal is indistinguishable from a real one and teaches people to break.
+#
+# The cwd half below was already boundary-correct (`path == root ||
+# index(path, root "/") == 1`); this makes the command-line half match it.
 # --------------------------------------------------------------------------
 pids_scoped_to_root() {
   _cands=$1
   [ -n "$_cands" ] || return 0
   _by_cmd=$(ps -o pid=,command= -p $(printf '%s' "$_cands" | tr '\n' ' ') 2>/dev/null \
-            | grep -F "$ROOT" | awk '{print $1}')
+            | awk -v root="$ROOT" '
+                {
+                  pid = $1
+                  cmd = $0
+                  sub(/^[ \t]*[0-9]+[ \t]+/, "", cmd)
+                  n = length(root)
+                  s = cmd
+                  # Every occurrence of $ROOT is examined, not just the first:
+                  # the root can appear in argv[0] AND in a later `--sysroot`.
+                  # It counts only when the next character ends the path
+                  # component — "/" (something inside the root), end of string,
+                  # or a space (the root named as a bare argument).
+                  while ((i = index(s, root)) > 0) {
+                    nxt = substr(s, i + n, 1)
+                    if (nxt == "" || nxt == "/" || nxt == " ") { print pid; break }
+                    s = substr(s, i + 1)
+                  }
+                }')
   _by_cwd=''
   if command -v lsof >/dev/null 2>&1; then
     _csv=$(printf '%s' "$_cands" | tr '\n' ',' | sed 's/,$//')
@@ -307,38 +427,124 @@ pids_scoped_to_root() {
   printf '%s\n%s\n' "$_by_cmd" "$_by_cwd" | grep -E '^[0-9]+$' | sort -un
 }
 
-# Prints one human line per unwrapped conflicting process, or nothing.
-unwrapped_conflict() {
-  _kind=$1
-
+# EVERY tree-mutating process in $ROOT, whatever its relation to the lock. One
+# row per process, three TAB-separated fields:
+#
+#     <pid> \t <kind> \t <human sentence>
+#
+# The machine-readable prefix is not decoration. Two callers need the pid and
+# not just the sentence: `release` has to ask whether its OWN writer outlived
+# it, and `acquire` has to be able to name a writer in the lock it leaves
+# behind. A `-` in the pid column marks a row that must never be adopted.
+scan_writers() {
   # A build in flight — the process that deletes stage1/bin/rustc.
   _boot=$(pgrep -x bootstrap 2>/dev/null | grep -v "^$$\$")
   for _p in $(pids_scoped_to_root "$_boot"); do
-    printf 'a bootstrap BUILD is running outside the lock: pid %s  %s\n' \
-      "$_p" "$(pid_cmd "$_p")"
+    printf '%s\tbuild\ta bootstrap BUILD is running outside the lock: pid %s  %s\n' \
+      "$_p" "$_p" "$(pid_cmd "$_p")"
   done
 
   # A measurement in flight, run directly instead of through run_measurement_sweep.sh.
   _sc=$(pgrep -f 'trust_ir_producer_scorecar[d]\.py' 2>/dev/null | grep -v "^$$\$")
   for _p in $(pids_scoped_to_root "$_sc"); do
-    printf 'a producer SCORECARD sweep is running outside the lock: pid %s  %s\n' \
-      "$_p" "$(pid_cmd "$_p")"
+    printf '%s\tmeasurement\ta producer SCORECARD sweep is running outside the lock: pid %s  %s\n' \
+      "$_p" "$_p" "$(pid_cmd "$_p")"
+  done
+}
+
+# The rows from scan_writers that NOBODY'S LOCK COVERS. This is the belt-and-
+# braces question, and its answer is a refusal, so it must be exact in both
+# directions.
+#
+# $2 is the pid the lock names, or empty. A writer is COVERED when that holder
+# is alive and the writer descends from it — see `pid_is_descendant_of`: the
+# process rewriting the tree is the holder's CHILD, never the holder itself, so
+# a scan that asks "does this pid appear in a lock" answers no about a perfectly
+# locked build.
+#
+# THE HOLDER MUST BE ALIVE FOR THE EXCUSE TO APPLY, and that asymmetry is the
+# whole safety argument. A dead holder protects nothing; its surviving children
+# are precisely the orphans this scan exists to find, and excusing them by
+# ancestry would convert a fail-closed check into a fail-open one — strictly
+# worse than the false alarm it replaced. Ancestry is also the only relation
+# used: process-GROUP membership would excuse an unrelated peer that merely
+# shares a group with the holder (everything a non-interactive shell script
+# starts shares one), which is the same fail-open direction.
+unwrapped_conflict() {
+  _kind=$1
+  _holder=${2:-}
+  if [ -n "$_holder" ] && ! pid_is_live "$_holder" ""; then
+    _holder=''   # a dead holder excuses nothing
+  fi
+
+  scan_writers | while read -r _wp _wk _wt; do
+    case "$_wp" in
+      ''|*[!0-9]*) printf '%s\t%s\t%s\n' "$_wp" "$_wk" "$_wt"; continue ;;
+    esac
+    if [ -n "$_holder" ] && pid_is_descendant_of "$_wp" "$_holder"; then
+      err "  note: pid $_wp descends from the lock holder (pid $_holder) — it IS the"
+      err "        work the lock is protecting, so it is not a conflict."
+      continue
+    fi
+    printf '%s\t%s\t%s\n' "$_wp" "$_wk" "$_wt"
   done
 
   # The pre-lock advisory sentinel, published by a copy of run_measurement_sweep.sh
   # that predates this lock. A LIVE one is a real conflict. A dead one is reported
   # and stepped over — it is another lane's artifact and `run_measurement_sweep.sh
   # --force` is its documented deleter, so this script does not delete it.
+  #
+  # Its pid column is `-`: the sentinel records a bare pid with no start time, so
+  # it cannot be told apart from a RECYCLED pid, and adopting one would wedge the
+  # tree until an unrelated process happened to exit.
   if [ -e "$LEGACY_SENTINEL" ]; then
     _lp=$(sed -n 's/^pid=//p' "$LEGACY_SENTINEL" 2>/dev/null | head -1)
     if pid_is_live "$_lp" ""; then
-      printf 'a legacy measurement sentinel is LIVE: %s pid %s\n' "$LEGACY_SENTINEL" "$_lp"
+      printf -- '-\tmeasurement\ta legacy measurement sentinel is LIVE: %s pid %s\n' \
+        "$LEGACY_SENTINEL" "$_lp"
     else
       err "  note: a stale $LEGACY_SENTINEL (pid ${_lp:-?}, gone) is present and ignored;"
       err "        scripts/run_measurement_sweep.sh --force removes it."
     fi
   fi
   : "$_kind"
+}
+
+# The exact inverse: the rows that DO belong to the holder named by $1 (whose
+# process group at acquire time was $2). `release` asks this, and its answer
+# decides whether the critical section is really over.
+#
+# The second arm exists because a child can be REPARENTED between the holder's
+# death and this scan, which erases the ppid evidence. The process group is what
+# survives that, and it is safe to use HERE — where the failure direction is
+# reversed. Including a process that is not really ours means the lock stays
+# HELD one build too long; missing one means the tree is left unlocked with a
+# writer in it. The arm is still restricted to a reparented process (ppid 1) so
+# an unrelated peer sharing the group is not swept in.
+holder_writers() {
+  _h=${1:-}
+  _hg=${2:-}
+  [ -n "$_h" ] || return 0
+  scan_writers | while read -r _wp _wk _wt; do
+    case "$_wp" in ''|*[!0-9]*) continue ;; esac
+    if pid_is_descendant_of "$_wp" "$_h"; then
+      printf '%s\t%s\t%s\n' "$_wp" "$_wk" "$_wt"
+      continue
+    fi
+    if [ -n "$_hg" ] && [ "$(pid_ppid "$_wp")" = "1" ] && [ "$(pid_pgid "$_wp")" = "$_hg" ]; then
+      printf '%s\t%s\t%s\n' "$_wp" "$_wk" "$_wt"
+    fi
+  done
+}
+
+# First adoptable row of a scan_writers-shaped list, or nothing.
+first_adoptable() {
+  printf '%s\n' "$1" | awk -F'\t' '$1 ~ /^[0-9]+$/ { print; exit }'
+}
+
+# The human half of a scan_writers-shaped list.
+conflict_text() {
+  printf '%s\n' "$1" | cut -f3-
 }
 
 # --------------------------------------------------------------------------
@@ -408,6 +614,93 @@ loud_takeover() {
     else
       printf '    displaced: (no readable holder info)\n'
     fi
+    printf '\n'
+  } >> "$BREAKS" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
+# ADOPTION — re-point the lock at a process that is writing the tree and never
+# took it.
+#
+# THE STATE THIS EXISTS TO MAKE UNREACHABLE is "the lock is free and something
+# is rewriting `build/` anyway". Two routes produced it, and both are routine:
+#
+#   * `x.py` is signalled. Its SIGTERM handler runs `release`, the lock goes
+#     away with the parent, and `build/bootstrap/debug/bootstrap` — which is a
+#     CHILD, not the holder — survives and keeps rewriting the tree. Reproduced
+#     deliberately with `kill -TERM`; the tree then reported
+#         trust-build-lock: FREE, but something is running outside the lock
+#     which is an accurate description of a state no lock should permit.
+#   * `x.py` is hard-killed. Nothing runs, so the lockdir survives naming a dead
+#     holder — fail-closed so far — until the NEXT acquirer reclaims it as
+#     stale, finds the orphan, refuses, and (before this) DELETED the lockdir on
+#     the way out. A reader turned a safe state into the unsafe one.
+#
+# WHY THIS AND NOT THE OTHER TWO CANDIDATES.
+#   * "Refuse to release while a writer lives" does nothing: the lock would name
+#     a dead holder, and the very next acquirer reclaims it as stale. The record
+#     has to name something ALIVE or the reclaim rule erases it.
+#   * "Reap the holder's process group on release" only narrows the window — a
+#     hard-killed holder runs no cleanup at all, which is the case that matters —
+#     and it makes a guard into a killer of other lanes' work.
+#
+# WHY IT IS SAFE. Adoption never makes the lock weaker: it is taken ONLY on a
+# path that was already going to refuse, and it changes the outcome from
+# "refused, tree unlocked" to "refused, tree locked and the holder named". The
+# adopted holder never receives the token, so nothing can release on its behalf —
+# it never agreed to hold anything. The lock clears the moment that process
+# exits, by the ordinary stale-reclaim rule, so it cannot wedge the tree; and
+# `break --reason` remains for a writer that never exits.
+#
+# WHAT IT BUYS THE CALLER. The refusal used to end with "That process never took
+# the lock, so it cannot be waited on safely." After adoption it can:
+# TRUST_BUILD_LOCK_WAIT blocks on a real recorded holder like any other.
+#
+# REQUIRES $LOCKDIR to already be ours.
+adopt_lock() {
+  _apid=$1
+  _akind=$2
+  _awhy=$3
+  _atmp=$(mktemp "$ROOT/.trust-build-lock.tmp.XXXXXX" 2>/dev/null) || return 1
+  {
+    printf 'token=%s\n' "$(nonce)"
+    printf 'kind=%s\n' "$_akind"
+    printf 'pid=%s\n' "$_apid"
+    printf 'pstart=%s\n' "$(pid_start "$_apid")"
+    printf 'pgid=%s\n' "$(pid_pgid "$_apid")"
+    printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'purpose=%s\n' "ADOPTED (this process never took the lock): $_awhy"
+    printf 'cmd=%s\n' "$(pid_cmd "$_apid")"
+    printf 'host=%s\n' "$(hostname 2>/dev/null)"
+    printf 'adopted=%s\n' "$_awhy"
+    printf 'contract=%s\n' "an unwrapped writer is rewriting this tree; wait for it or break the lock"
+  } > "$_atmp"
+  mv "$_atmp" "$INFO" 2>/dev/null || { rm -f "$_atmp"; return 1; }
+  return 0
+}
+
+# A handover is a DISPLACEMENT of the lock's meaning, so it leaves the same
+# durable trace a break and a stale takeover do — and for the same measured
+# reason: every acquiring caller in this tree redirects this script's stderr
+# (x.py's `release` sends both streams to DEVNULL), so a stderr-only notice is
+# invisible in exactly the runs where it matters.
+loud_handover() {
+  _old=$1
+  _new=$2
+  _what=$3
+  err "  ------------------------------------------------------------------"
+  err "  ORPHAN HANDOVER — the holder is finishing but its WRITER is not."
+  err "    departing   holder pid $_old"
+  err "    surviving   $_what"
+  err "  The lock is NOT being released. It now names the surviving process, so"
+  err "  the tree stays protected and the next lane can WAIT on it instead of"
+  err "  finding a free lock over a live build. It clears when that pid exits."
+  err "    recorded    $BREAKS"
+  err "  ------------------------------------------------------------------"
+  {
+    printf 'when=%s pid=%s user=%s reason=ORPHAN-HANDOVER (holder %s exited, writer %s survives)\n' \
+      "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$(id -un 2>/dev/null)" "$_old" "$_new"
+    printf '    surviving: %s\n' "$_what"
     printf '\n'
   } >> "$BREAKS" 2>/dev/null
 }
@@ -498,6 +791,9 @@ cmd_acquire() {
 
   TOKEN=$(nonce)
   HOLD_START=$(pid_start "$HOLD_PID")
+  # Recorded so `release` can still recognise the holder's own writers after the
+  # holder has died and they have been reparented away from it. See holder_writers.
+  HOLD_PGID=$(pid_pgid "$HOLD_PID")
   _deadline=$(( $(date '+%s') + WAIT ))
   _rounds=0
   _said_waiting=0
@@ -518,6 +814,7 @@ cmd_acquire() {
       printf 'kind=%s\n' "$KIND"
       printf 'pid=%s\n' "$HOLD_PID"
       printf 'pstart=%s\n' "$HOLD_START"
+      printf 'pgid=%s\n' "$HOLD_PGID"
       printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
       printf 'purpose=%s\n' "$(printf '%s' "$PURPOSE" | tr '\n' ' ')"
       printf 'cmd=%s\n' "$(pid_cmd "$HOLD_PID")"
@@ -530,26 +827,54 @@ cmd_acquire() {
       mv "$_tmp" "$INFO" 2>/dev/null || { rm -f "$_tmp"; rmdir "$LOCKDIR" 2>/dev/null; \
         err "trust-build-lock: could not publish holder info"; return 2; }
 
-      _conf=$(unwrapped_conflict "$KIND")
+      # `$HOLD_PID` is passed so the holder's OWN build is not reported as
+      # unlocked. It cannot normally have children yet at this instant, but the
+      # argument is what makes the rule "a writer under the holder is covered"
+      # true of every caller of this scan rather than true by accident of timing.
+      _conf=$(unwrapped_conflict "$KIND" "$HOLD_PID")
       if [ -n "$_conf" ]; then
         if [ -n "$BREAK_REASON" ]; then
           err "trust-build-lock: proceeding past an unwrapped conflict because --reason was given:"
-          printf '%s\n' "$_conf" | sed 's/^/    /' >&2
+          conflict_text "$_conf" | sed 's/^/    /' >&2
           loud_break "$BREAK_REASON" ""
         else
-          rm -f "$INFO"; rmdir "$LOCKDIR" 2>/dev/null
+          # DO NOT hand the tree back unlocked with a writer still in it. That
+          # is the very state this file exists to prevent, and deleting the
+          # lockdir here is how a reader used to create it out of a safe one.
+          # See `adopt_lock`.
+          _adopt=$(first_adoptable "$_conf")
+          _apid=$(printf '%s' "$_adopt" | awk -F'\t' '{print $1}')
+          _akind=$(printf '%s' "$_adopt" | awk -F'\t' '{print $2}')
+          _adopted=0
+          if [ -n "$_apid" ] && adopt_lock "$_apid" "$_akind" \
+                "found rewriting $ROOT while the lock was free"; then
+            _adopted=1
+          else
+            rm -f "$INFO"; rmdir "$LOCKDIR" 2>/dev/null
+          fi
           err ""
           err "  TRUST-BUILD-LOCK: REFUSING to start a $KIND — the tree is busy."
           err ""
-          printf '%s\n' "$_conf" | sed 's/^/    /' >&2
+          conflict_text "$_conf" | sed 's/^/    /' >&2
           err ""
-          err "  That process never took the lock, so it cannot be waited on safely."
-          err "  Options:"
-          err "    watch    scripts/trust_build_lock.sh status"
-          err "    wait     re-run when it exits (pgrep -x bootstrap;"
-          err "             pgrep -f 'trust_ir_producer_scorecar[d]\\.py')"
-          err "    break    re-run with --break --reason \"...\"  (LOUD; logged to"
-          err "             .trust-build-lock.breaks)"
+          if [ "$_adopted" -eq 1 ]; then
+            err "  That process never took the lock. The lock now NAMES it (pid $_apid)"
+            err "  so the tree is not left unprotected and it CAN be waited on; the"
+            err "  lock clears by itself when that pid exits."
+            err "  Options:"
+            err "    wait     TRUST_BUILD_LOCK_WAIT=3600 <your command>   (blocks, then runs)"
+            err "    watch    scripts/trust_build_lock.sh status"
+            err "    break    scripts/trust_build_lock.sh break --reason \"...\"  (LOUD;"
+            err "             logged to .trust-build-lock.breaks)"
+          else
+            err "  That process never took the lock, so it cannot be waited on safely."
+            err "  Options:"
+            err "    watch    scripts/trust_build_lock.sh status"
+            err "    wait     re-run when it exits (pgrep -x bootstrap;"
+            err "             pgrep -f 'trust_ir_producer_scorecar[d]\\.py')"
+            err "    break    re-run with --break --reason \"...\"  (LOUD; logged to"
+            err "             .trust-build-lock.breaks)"
+          fi
           err ""
           return 3
         fi
@@ -630,6 +955,15 @@ cmd_acquire() {
 # --------------------------------------------------------------------------
 # release — only the holder may release. Removing somebody else's lock is the
 # same bug as not having one.
+#
+# AND A HOLDER MAY NOT RELEASE OUT FROM UNDER ITS OWN WRITER. `x.py` takes the
+# lock, spawns `build/bootstrap/debug/bootstrap`, and releases from a SIGTERM
+# handler / `atexit` / `finally` — none of which stop the child. Signalling the
+# parent therefore used to free the lock while the child went on rewriting the
+# tree, which is not untidiness: a half-rewritten `stage2/bin` makes every push
+# gate fall back to cargo and die at `-Ztrust-verify`, i.e. a toolchain that
+# compiles and cannot verify, reported as success. The release becomes a
+# HANDOVER instead — see `adopt_lock` for why the two alternatives do not work.
 # --------------------------------------------------------------------------
 cmd_release() {
   _tok=${1:-}
@@ -642,6 +976,23 @@ cmd_release() {
     describe_holder "$_info"
     return 4
   fi
+
+  _rhp=$(info_field "$_info" pid)
+  _rhg=$(info_field "$_info" pgid)
+  _surv=$(first_adoptable "$(holder_writers "$_rhp" "$_rhg")")
+  if [ -n "$_surv" ]; then
+    _spid=$(printf '%s' "$_surv" | awk -F'\t' '{print $1}')
+    _skind=$(printf '%s' "$_surv" | awk -F'\t' '{print $2}')
+    _stext=$(printf '%s' "$_surv" | cut -f3-)
+    loud_handover "$_rhp" "$_spid" "$_stext" || :
+    if adopt_lock "$_spid" "$_skind" \
+         "orphaned by holder pid $_rhp, which released while this process was still writing"; then
+      return 0
+    fi
+    err "trust-build-lock: could not publish the handover; keeping the lock as-is"
+    return 0
+  fi
+
   reclaim || :
   err "trust-build-lock: released ($(info_field "$_info" kind))"
   return 0
@@ -652,7 +1003,7 @@ cmd_status() {
     _conf=$(unwrapped_conflict any)
     if [ -n "$_conf" ]; then
       err "trust-build-lock: FREE, but something is running outside the lock:"
-      printf '%s\n' "$_conf" | sed 's/^/    /' >&2
+      conflict_text "$_conf" | sed 's/^/    /' >&2
       return 3
     fi
     printf 'trust-build-lock: free\n'
@@ -661,6 +1012,16 @@ cmd_status() {
   _info=$(read_info) || { err "trust-build-lock: held, holder info unreadable (reclaimable)"; return 3; }
   err "trust-build-lock: HELD"
   describe_holder "$_info"
+  # A held lock does not mean everything in the tree is covered by it. The scan
+  # is run here too — excusing the holder's own build, which is the normal and
+  # overwhelmingly common case — so that a writer nobody's lock covers is
+  # visible while the tree is held, not only once it is free.
+  _conf=$(unwrapped_conflict any "$(info_field "$_info" pid)")
+  if [ -n "$_conf" ]; then
+    err ""
+    err "  AND something ELSE is running that this lock does not cover:"
+    conflict_text "$_conf" | sed 's/^/    /' >&2
+  fi
   return 3
 }
 

@@ -4,13 +4,36 @@ Targo is Trust's Cargo-derived package manager and build orchestrator. It
 resolves dependencies and drives the selected Trust toolchain as one coherent
 unit.
 
-Branded Targo compilation never silently chooses an unverified lane. Use
-`targo trust check` (or another authenticated `targo trust ...` workflow) when
-verification and proof artifacts are the intended result. Native compatibility
-work must be explicit—for example, `targo --unverified build`; that lane prints
-an `UNVERIFIED` warning and makes no proof claim. Plain `targo build`, `check`,
-`test`, `install`, `package`, and `publish` commands are refused until a lane is
-selected. `targo tippy` selects its explicit unverified lint transport itself.
+Branded Targo compilation never silently chooses an unverified lane, and for
+the verbs whose artifact outlives the invocation it does not choose one at all.
+Use `targo trust check` (or another authenticated `targo trust ...` workflow)
+when verification and proof artifacts are the intended result. The unverified
+lane prints an `UNVERIFIED` warning and makes no proof claim.
+
+**Which verbs refuse, and which proceed.** `build`, `check` and `test` are
+refused until a lane is named — the verifier driver has a counterpart for each,
+so the refusal steers (`targo trust build` / `targo --unverified build`).
+`install`, `package`, `publish` and `miri` are also refused: they have no
+verified lane, but their output leaves the machine (a binary on a `PATH`, a
+crate at a registry) or mints a verdict someone will read as checked, so the
+typed `--unverified` is a human owning the choice the artifact's consumers
+inherit. The local development verbs — `run`, `fix`, `clippy`, `bench`, `doc`,
+`rustc`, `rustdoc`, and `-Zscript` — proceed on their only lane and announce
+it: for them a refusal could only make the operator retype the identical
+command, a toll that builds the type-`--unverified`-without-reading reflex.
+
+This boundary is the resolution of a drift that stood for a month: between
+2026-08-20 (`4c0c5e9f66`) and 2026-09-01 *every* single-lane verb proceeded —
+`targo publish` included — while this README promised the old refusal and the
+integration suite still pinned `miri` refusing. The width-vs-argument analysis
+is `docs/2026-09-01-targo-single-lane-selection-blast-radius.md`; the code now
+implements its disposition 1, which is what the integration tests asserted all
+along.
+
+`targo tippy` selects its explicit unverified lint transport itself and is not
+a native compilation command, so it neither warns nor starts a broker. Its
+alias `targo clippy` IS one, so `clippy` prints the `UNVERIFIED` warning where
+`tippy` stays silent — interchangeable in what they run, not in what they say.
 
 When code run by an explicitly authorized command recursively invokes the
 `$CARGO` frontend (for example, a compile-test harness), Targo preserves that

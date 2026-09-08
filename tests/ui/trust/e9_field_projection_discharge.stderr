@@ -1,0 +1,69 @@
+note: Clean island kernel-checked: 2 declaration(s) registered (ident_isl, degree_le_self)
+  --> $DIR/e9_field_projection_discharge.rs:35:5
+   |
+LL | /     def ident_isl (x : UInt64) : UInt64 := x
+LL | |
+LL | |     theorem degree_le_self : forall (d : UInt64) (k : UInt64),
+LL | |         Nat.le (UInt64.toNat d) (UInt64.toNat d) :=
+LL | |         fun d k => Nat.le.refl (UInt64.toNat d)
+   | |_______________________________________________^
+
+
+=== Trust Verification Report (e9_field_projection_discharge) ===
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_field_projection_discharge.rs:50:1
+   |
+LL | / pub fn degree_of(c: Cst) -> u64
+LL | |     ensures result == ident_isl(c.degree)
+LL | | {
+LL | |     c.degree
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_field_projection_discharge.rs:58:1
+   |
+LL | / pub fn coeff_of(c: Cst) -> u64
+LL | |     ensures result == ident_isl(c.coeff)
+LL | | {
+LL | |     c.coeff
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_field_projection_discharge.rs:76:1
+   |
+LL | / pub fn degree_bound(c: Cst) -> u64
+LL | |     ensures result <= c.degree by degree_le_self
+LL | | {
+LL | |     c.degree
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: Trust verification: 2 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 2 obligation(s)
+  --> $DIR/e9_field_projection_discharge.rs:87:1
+   |
+LL | / pub fn second_degree(a: Cst, b: Cst) -> u64
+LL | |     ensures result == ident_isl(b.degree)
+LL | | {
+LL | |     b.degree
+LL | | }
+   | |_^
+   |
+   = note: of which 2 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
+
+note: citation `degree_le_self` kernel-discharges this postcondition statement: the cited theorem proves the clause with `result` bound to the imported definition of `degree_bound`, with a clean certification audit
+  --> $DIR/e9_field_projection_discharge.rs:77:35
+   |
+LL |     ensures result <= c.degree by degree_le_self
+   |                                   ^^^^^^^^^^^^^^
+   |
+   = note: E9 citation sweep is diagnostic-only; the exact sealed criterion is independently rechecked in-walk and installs authority only for an exact matching result row
+

@@ -60,7 +60,27 @@ pub(crate) fn convert_basic_block<'tcx>(
         .map(|stmt| convert_statement(tcx, stmt, local_decls, typing_env))
         .collect();
 
-    let terminator = convert_terminator(tcx, bb_data.terminator(), local_decls, typing_env);
+    let terminator = {
+        let mut t = convert_terminator(tcx, bb_data.terminator(), local_decls, typing_env);
+        // DEBUG-FINISHER SENTINEL: rewrite a fixed-arity `debug_*_field*_finish` call to the
+        // total-havoc marker WHEN every field-value arg's erased `&dyn Debug` concrete type
+        // has a PROVABLY panic-free Debug. Needs the block statements + local_decls (the
+        // field types are erased at the terminator), so it lives here, not in
+        // `func_operand_name`. Fails closed → real finisher call → may-panic obligation.
+        if let (Some(ld), Terminator::Call { func, .. }) = (local_decls, &mut t) {
+            if debug_finisher_all_fields_total(tcx, bb_data.terminator(), &bb_data.statements, ld)
+                || debug_nary_finisher_all_fields_total(
+                    tcx,
+                    bb_data.terminator(),
+                    &bb_data.statements,
+                    ld,
+                )
+            {
+                *func = TRUST_TOTAL_CLONE_SENTINEL.to_string();
+            }
+        }
+        t
+    };
 
     BasicBlock { id: BlockId(bb.as_usize()), stmts, terminator }
 }
@@ -164,7 +184,17 @@ const CLONE_TOTALITY_FUEL: u32 = 32;
 /// `trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL`.
 pub(crate) use trust_types::total_call_summaries::TRUST_TOTAL_CLONE_SENTINEL;
 
-/// Return whether `krate` is one of the compiler's actual sysroot crates.
+/// SOUNDNESS (crate-name forgery). `true` iff `krate` is one of the REAL sysroot
+/// `core`/`alloc`/`std` crates, authenticated by its un-forgeable `StableCrateId`
+/// rather than by a printed crate name or `def_path_str` prefix. rustc does NOT
+/// reserve the names `core`/`alloc`/`std`, so a dependency compiled with
+/// `--crate-name alloc` can define an ADT whose `def_path_str` is literally
+/// `alloc::string::String` (with a panicking `Drop`/`Ord`/`Clone`): every
+/// `path.starts_with("alloc::")` / `crate_name == sym::alloc` gate matches it, so a
+/// NAME-ONLY recognizer would DISCHARGE its panic obligation — a FALSE PROOF. Binding
+/// the defining crate's `StableCrateId` — which hashes the real sysroot crate's
+/// metadata and is NOT reproducible by an impostor — closes that hole (the SAME
+/// discipline the bignum/serde_json TCB allowlists already use for external crates).
 ///
 /// Printed crate names and def paths are diagnostics, not identities: a dependency
 /// compiled with `--crate-name core`, `alloc`, or `std` can reproduce those strings.
@@ -478,12 +508,148 @@ fn is_std_deep_clone_container(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId) 
             | "Wrapping"
             | "Reverse"
     ) && (path.starts_with("std::") || path.starts_with("alloc::") || path.starts_with("core::"))
+        // SOUNDNESS (crate-name forgery): the leaf-name/prefix pair above is a fast
+        // pre-filter only; a `--crate-name alloc` dep can spell `alloc::vec::Vec`.
+        // Require the un-forgeable sysroot `StableCrateId` before trusting the deep-
+        // clone dispatch (this fn feeds `tcx_clone_is_total`/`tcx_derived_trait_is_total`).
         && is_real_sysroot_crate(tcx, did.krate)
 }
 
+/// Recover `T` from `Option<T>` via the un-forgeable `Option` diagnostic item.
+fn option_payload_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<ty::Ty<'tcx>> {
+    let ty::TyKind::Adt(def, args) = ty.kind() else { return None };
+    if tcx.get_diagnostic_item(rustc_span::sym::Option) != Some(def.did()) {
+        return None;
+    }
+    args.types().next()
+}
+
+/// Recover `T` from `Vec<T>` via the un-forgeable `Vec` diagnostic item.
+fn vec_elem_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<ty::Ty<'tcx>> {
+    let ty::TyKind::Adt(def, args) = ty.kind() else { return None };
+    if tcx.get_diagnostic_item(rustc_span::sym::Vec) != Some(def.did()) {
+        return None;
+    }
+    args.types().next()
+}
+
+/// `ty`'s `Clone` is TOTAL (panic-free), via the un-spoofable `Clone::clone` LANG-ITEM
+/// METHOD DefId fed to `tcx_clone_is_total` — NOT the trait DefId (the clone-sentinel
+/// base-case-bypass trap: `tcx_clone_is_total` keys its lang-item base case on the
+/// clone METHOD identity).
+fn clone_is_total_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    let Some(clone_trait) = tcx.lang_items().clone_trait() else { return false };
+    let Some(clone_method) = tcx
+        .associated_item_def_ids(clone_trait)
+        .iter()
+        .copied()
+        .find(|d| tcx.item_name(*d) == rustc_span::sym::clone)
+    else {
+        return false;
+    };
+    tcx_clone_is_total(
+        tcx,
+        ty,
+        clone_method,
+        CLONE_TOTALITY_FUEL,
+        &mut std::collections::HashSet::new(),
+    )
+}
+
+/// `p` is a std wrapper whose `Deref` is a TOTAL raw-pointer projection (no user code,
+/// no panic) IRRESPECTIVE of contents: `Box`/`Arc`/`Rc`/`Vec`/`String`, under an
+/// un-forgeable sysroot `StableCrateId`.
+fn is_std_total_deref_wrapper<'tcx>(tcx: TyCtxt<'tcx>, p: ty::Ty<'tcx>) -> bool {
+    let ty::TyKind::Adt(def, _) = p.kind() else { return false };
+    if !is_real_sysroot_crate(tcx, def.did().krate) {
+        return false;
+    }
+    let path = crate::safe_def_path_str(tcx, def.did());
+    let leaf = path.rsplit("::").next().unwrap_or(&path);
+    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    matches!(leaf, "Box" | "Arc" | "Rc" | "Vec" | "String")
+}
+
+/// Batch (abi_total std-adapter lever): is `callee`/`gen_args` a std Option/slice
+/// adapter that is PANIC-FREE-TOTAL for THIS monomorphization? Feeds trust_verify's
+/// `abi_total` interprocedural catch-all so a caller whose only unregistered callee is
+/// one of these gets PROVED. Three arms, each un-spoofably gated (real-sysroot
+/// `StableCrateId` FIRST + a type-driven totality condition); ANY miss → false
+/// (fail-closed → the call keeps its honest may-panic obligation).
+///
+/// SOUNDNESS landmines handled: (cloned) recover the element `T` from the RETURN
+/// `Option<T>` (OWNED), NEVER the `&T` receiver — `tcx_clone_is_total(&T)` is trivially
+/// true (a pointer copy) and would false-prove `Option::<&UserPanickingClone>::cloned`.
+/// (clone gate) bind to the `Clone::clone` METHOD DefId, not the trait. (Deref) restrict
+/// to the 5 wrappers whose `Deref` is a total raw-ptr projection regardless of contents.
+pub fn std_adapter_total_panic_free<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    callee: DefId,
+    gen_args: ty::GenericArgsRef<'tcx>,
+) -> bool {
+    // Un-forgeable provenance FIRST — a `--crate-name alloc` impostor with a panicking
+    // impl is rejected here before any name prefilter is trusted.
+    if !is_real_sysroot_crate(tcx, callee.krate) {
+        return false;
+    }
+    let path = crate::safe_def_path_str(tcx, callee);
+    let sig = tcx.fn_sig(callee).instantiate(tcx, gen_args).skip_binder();
+    // (a) `<[T]>::to_vec` — total iff `T::clone` total. Element from the RETURN `Vec<T>`.
+    if path.contains("slice") && path.ends_with("::to_vec") {
+        return vec_elem_ty(tcx, sig.output()).is_some_and(|t| clone_is_total_ty(tcx, t));
+    }
+    // (b) `Option::<&T>::cloned` — total iff `T::clone` total. Element from the RETURN
+    //     `Option<T>` (OWNED T), never the `&T` receiver (the landmine above).
+    if path.ends_with("::cloned") {
+        return option_payload_ty(tcx, sig.output()).is_some_and(|t| clone_is_total_ty(tcx, t));
+    }
+    // (c) `Option::<P>::as_deref` — total iff `P` is a std total-Deref wrapper. `P` is the
+    //     receiver `Option<P>`'s element = the instance's first type arg.
+    if path.ends_with("::as_deref") {
+        return gen_args.types().next().is_some_and(|p| is_std_total_deref_wrapper(tcx, p));
+    }
+    false
+}
+
 /// Std leaf types whose `Clone` is total irrespective of any type parameter.
-fn is_element_free_total_std_adt(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId) -> bool {
+///
+/// Trust (C2): also reused by `ty_convert::tcx_key_is_std_total` as the
+/// element-free std KEY leaves — every type in this set has a `Hash`/`Eq`/`Ord`
+/// that likewise bottoms out in primitives and runs no user code, so it is a
+/// sound total-map key (see that function's soundness note).
+pub(crate) fn is_element_free_total_std_adt(
+    tcx: TyCtxt<'_>,
+    did: rustc_span::def_id::DefId,
+) -> bool {
     let path = crate::safe_def_path_str(tcx, did);
+    // num-bigint arbitrary-precision integers are NON-generic (limbs are fixed
+    // primitive `u32`/`u64`), so their hand-written `Clone` bottoms out in
+    // primitives and runs NO user code (alloc-abort excluded, as everywhere in
+    // this TCB). Mirrors the bridge's already-trusted `is_element_free_total_std_type`
+    // (trust-ir-bridge/src/lower.rs:14708). DELIBERATELY excludes `num_rational::Ratio`
+    // / `BigRational`: it IS generic, so `Ratio<UserType>` must stay field-aware
+    // (`tcx_clone_is_total`'s derived arm recurses into `numer`/`denom`, which now
+    // bottom out here at `BigInt` — total — while a user element still fails closed).
+    //
+    // Build D (soundness tightening): authenticate the DEFINING crate by its
+    // `StableCrateId` (`is_authenticated_bignum_crate` — the SAME un-spoofable
+    // gate `authenticate_arbitrary_precision` uses) instead of the SPOOFABLE
+    // printed crate-name `path.starts_with("num_bigint")`. A user crate literally
+    // NAMED `num_bigint` with a panicking `BigInt::cmp`/`Clone` has a different
+    // scid, fails here, and stays fail-closed. ZERO behavior change for the real
+    // num_bigint (it authenticates); closes the crate-name spoof for the whole
+    // eq/ord/clone/hash family this oracle serves.
+    if crate::ty_convert::is_authenticated_bignum_crate(tcx, did.krate)
+        && matches!(tcx.item_name(did).as_str(), "BigInt" | "BigUint")
+    {
+        return true;
+    }
+    // Sysroot leaves. The `def_path_str` compares below are a NAME pre-filter only;
+    // rustc does not reserve `core`/`alloc`/`std`, so a `--crate-name alloc` dep can
+    // spell `alloc::string::String` with a panicking `Ord`/`Hash`/`Clone`/`Drop`.
+    // Require the un-forgeable sysroot `StableCrateId` before discharging: this fn is
+    // the element-free-total-std oracle shared by the clone/drop/derived-trait/
+    // total-map-key gates, so the provenance bind closes the forgery across all of them.
     let name_matches = matches!(
         path.as_str(),
         "alloc::string::String"
@@ -551,6 +717,43 @@ fn tcx_clone_is_total<'tcx>(
         TyKind::Pat(base, _) => tcx_clone_is_total(tcx, *base, clone_method, fuel - 1, seen),
         TyKind::Adt(def, args) => {
             let did = def.did();
+            // (a0) [C-bignum] num_bigint / num_rational arbitrary-precision integer /
+            //      rational, RUSTC-AUTHENTICATED by StableCrateId (the SOLE `ArbPrecKind`
+            //      writer). Its `Clone` deep-copies heap limbs through the total `Global`
+            //      allocator — no user code, no panic. Cross-crate, so NOT
+            //      `is_builtin_derived` (needs `as_local()`); REQUIRED because after the
+            //      Edit-C swap a `Vec<Rat>` / `Ratio<BigInt>` element would otherwise fail
+            //      closed. Empty/stale allowlist → None → fail-closed.
+            if crate::ty_convert::authenticate_arbitrary_precision(tcx, did, args).is_some() {
+                return true;
+            }
+            // (a1) [C-zst] phantom / marker ZSTs surfaced by the deep-clone-container arm's
+            //      ALL-type-args recursion below: the allocator (`Global`), hasher
+            //      (`RandomState`), and `PhantomData`. `Vec<T>` is `Vec<T, Global>` and
+            //      `HashMap<K,V>` is `HashMap<K,V,RandomState>`; Clone DOES clone the
+            //      allocator/hasher (unlike eq/hash), so the container arm reaches them
+            //      directly. Their clones run no user code (ZST-trivial / two-u64 copy).
+            //      REQUIRED after Edit C: these are cross-crate std/alloc derives, so
+            //      `is_builtin_derived` (`as_local`) no longer clears them — without this
+            //      the legit `Vec<Rat>` / `BTreeMap<String,Rat>` targets FAIL. Double-anchored
+            //      on leaf name AND std/alloc/core origin (a user type never matches); mirrors
+            //      the audited carve-out in `tcx_derived_trait_is_total`. `PhantomData<T>`'s
+            //      clone never touches T, so returning true without recursing T is sound.
+            {
+                let path = crate::safe_def_path_str(tcx, did);
+                let leaf = path.rsplit("::").next().unwrap_or(&path);
+                let leaf = leaf.split('<').next().unwrap_or(leaf);
+                if matches!(leaf, "Global" | "RandomState" | "PhantomData")
+                    && (path.starts_with("std::")
+                        || path.starts_with("alloc::")
+                        || path.starts_with("core::"))
+                    // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance,
+                    // not the spoofable `std::`/`alloc::`/`core::` prefix.
+                    && is_real_sysroot_crate(tcx, did.krate)
+                {
+                    return true;
+                }
+            }
             // (a) a `#[derive(Clone)]` (`#[automatically_derived]`) impl dispatches Clone
             //     into the fields — total iff every field type is total. Resolve the
             //     concrete `<ty as Clone>::clone` to find and classify the impl.
@@ -565,7 +768,11 @@ fn tcx_clone_is_total<'tcx>(
             .is_some_and(|inst| {
                 let impl_did = tcx.parent(inst.def_id());
                 matches!(tcx.def_kind(impl_did), rustc_hir::def::DefKind::Impl { .. })
-                    && tcx.is_automatically_derived(impl_did)
+                    // `is_builtin_derived` (NOT `is_automatically_derived`) requires
+                    // UN-FORGEABLE `#[rustc_builtin_macro]` derive provenance PLUS
+                    // `as_local()`. A proc-macro-spelled `#[automatically_derived]`
+                    // on a hand-written panicking `clone` is thereby rejected.
+                    && tcx.is_builtin_derived(impl_did)
             });
             if derived {
                 return def.all_fields().all(|f| {
@@ -608,6 +815,7 @@ fn tcx_clone_is_total<'tcx>(
             //       `HashMap<_, TokenBucket{ last_refill: Option<Instant> }>`) fails.
             if (path.starts_with("core::num::niche_types::")
                 || path.starts_with("std::num::niche_types::"))
+                // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
                 && is_real_sysroot_crate(tcx, did.krate)
             {
                 return true;
@@ -615,6 +823,151 @@ fn tcx_clone_is_total<'tcx>(
             // (c) element-free std leaf (`String`/`Ordering`/`Duration`/`NonZero`).
             is_element_free_total_std_adt(tcx, did)
         }
+        _ => false,
+    }
+}
+
+/// Fuel for the structural drop-totality recursion (bounds recursive types); the
+/// drop twin of [`CLONE_TOTALITY_FUEL`].
+const DROP_TOTALITY_FUEL: u32 = 32;
+
+/// Std/alloc/core owning containers whose `Drop` impl is AUDITED panic-free MODULO
+/// its elements: the glue drops each element then deallocates (alloc-abort is out of
+/// the modeled panic set) and runs no other user code. Crate-anchored on the
+/// reserved `std`/`alloc`/`core` root (no user crate can spell these paths) PLUS the
+/// exact container leaf, so a same-named user container never matches. A caller that
+/// admits one MUST recurse its ELEMENT type-args (never its internal
+/// `Unique`/`RawVec`/hashbrown fields) so a user-`Drop` element still fails closed.
+/// DISTINCT from [`is_std_deep_clone_container`]: `Option`/`Result`/`Cow` are OMITTED
+/// (they carry NO `Drop` impl -- the no-`Drop` field-recursion arm handles them), and
+/// `Rc`/`Arc` are OMITTED (shared ownership -- a conservative omission that fails
+/// closed).
+fn is_audited_total_drop_std_container(tcx: TyCtxt<'_>, did: rustc_span::def_id::DefId) -> bool {
+    let path = crate::safe_def_path_str(tcx, did);
+    if !(path.starts_with("alloc::") || path.starts_with("std::") || path.starts_with("core::")) {
+        return false;
+    }
+    // SOUNDNESS (crate-name forgery): the reserved-root prefix above is a pre-filter
+    // only — rustc does not reserve `alloc`/`std`/`core`, so a `--crate-name alloc`
+    // dep can spell `alloc::vec::Vec` with a PANICKING `Drop`. This fn feeds the
+    // `TotalDrop` AdtAuth stamp; require the un-forgeable sysroot `StableCrateId` so a
+    // like-named impostor container never certifies its drop glue total.
+    if !is_real_sysroot_crate(tcx, did.krate) {
+        return false;
+    }
+    let leaf = path.rsplit("::").next().unwrap_or(&path);
+    let leaf = leaf.split('<').next().unwrap_or(leaf);
+    matches!(
+        leaf,
+        "Vec"
+            | "VecDeque"
+            | "BTreeMap"
+            | "BTreeSet"
+            | "BinaryHeap"
+            | "LinkedList"
+            | "String"
+            | "HashMap"
+            | "HashSet"
+            | "Box"
+    )
+}
+
+/// True iff dropping a value of the CONCRETE monomorphized `ty` is PROVABLY
+/// panic-free -- its drop glue runs NO user code -- WITHOUT an axiom. The drop twin
+/// of [`tcx_clone_is_total`] and the extraction half of the `AdtAuth::TotalDrop`
+/// stamp. Running at the tcx level (CONCRETE generic args) it sees a container's real
+/// `K`/`V`, which the element-erased compatibility IR the bridge classifier walks
+/// cannot. True iff EVERY node in the owned tree is a primitive / non-owning
+/// reference / audited std owning container (dealloc only) / authenticated bignum,
+/// and NO ADT in it carries a user `Drop` impl (rustc `has_dtor`) -- a user `Drop`
+/// runs arbitrary, possibly-panicking code and FAILS CLOSED. A non-monomorphic param
+/// also fails closed (its concrete `Drop` is unknown). SOUND: the stamp this feeds is
+/// `#[serde(skip)]`, so a decoded bundle reads `None` (never certified); any user
+/// `Drop`, unaudited container, or fuel-bail declines -- never a false PROVE.
+pub(crate) fn tcx_drop_is_total<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> bool {
+    tcx_drop_is_total_fueled(tcx, ty, DROP_TOTALITY_FUEL, &mut std::collections::HashSet::new())
+}
+
+fn tcx_drop_is_total_fueled<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: ty::Ty<'tcx>,
+    fuel: u32,
+    seen: &mut std::collections::HashSet<ty::Ty<'tcx>>,
+) -> bool {
+    use rustc_middle::ty::TyKind;
+    if fuel == 0 {
+        return false;
+    }
+    // A non-monomorphic type (type/const param) hides its concrete `Drop` -- fail
+    // closed (mirrors `tcx_clone_is_total`; it is verified per monomorphization).
+    if ty.has_non_region_param() {
+        return false;
+    }
+    if !seen.insert(ty) {
+        // A cycle is reached only after this type's enclosing occurrence already
+        // certified it carries no user `Drop` -- total by construction (mirrors
+        // `tcx_clone_is_total`'s cycle short-circuit).
+        return true;
+    }
+    match ty.kind() {
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Str
+        | TyKind::Never => true,
+        // Dropping a reference / raw pointer / fn item drops NO pointee (it does not
+        // OWN one). An owning container reaches its elements through the audited-
+        // container arm below (its type-args), never through a bare pointer.
+        TyKind::Ref(..) | TyKind::RawPtr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
+        TyKind::Tuple(elems) => {
+            elems.iter().all(|e| tcx_drop_is_total_fueled(tcx, e, fuel - 1, seen))
+        }
+        TyKind::Array(elem, _) | TyKind::Slice(elem) => {
+            tcx_drop_is_total_fueled(tcx, *elem, fuel - 1, seen)
+        }
+        TyKind::Pat(base, _) => tcx_drop_is_total_fueled(tcx, *base, fuel - 1, seen),
+        TyKind::Adt(def, args) => {
+            let did = def.did();
+            // (a) authenticated arbitrary-precision leaf: drop bottoms out in a
+            //     fixed-primitive `Vec<u64>`/`Sign` tree -- dealloc only, no user
+            //     code. Same un-spoofable StableCrateId authority as the F6 stamp.
+            if crate::ty_convert::authenticate_arbitrary_precision(tcx, did, args).is_some() {
+                return true;
+            }
+            // (b) an AUDITED std owning container (`Vec`/`BTreeMap`/`Box`/...): its
+            //     glue is dealloc + per-element drop. Checked BEFORE `has_dtor` and
+            //     the field recursion so a TYPE-ERASED owner is reasoned about via
+            //     its real elements (its type-args), never via its internal
+            //     `Unique`/`RawVec`/hashbrown fields -- which would wrongly admit
+            //     `Box<PanickyDrop>` through the non-owning pointer arm, or wrongly
+            //     decline `HashMap` through hashbrown's own `Drop`.
+            if is_audited_total_drop_std_container(tcx, did) {
+                return args.types().all(|t| tcx_drop_is_total_fueled(tcx, t, fuel - 1, seen));
+            }
+            // (c) any OTHER ADT carrying a user `Drop` impl runs arbitrary code.
+            if def.has_dtor(tcx) {
+                return false;
+            }
+            // (d) no user `Drop` impl: the glue is EXACTLY the fields' glue (all
+            //     variants for an enum) -- total iff every field's drop is.
+            def.all_fields().all(|f| {
+                tcx_drop_is_total_fueled(
+                    tcx,
+                    f.ty(tcx, args).skip_normalization(),
+                    fuel - 1,
+                    seen,
+                )
+            })
+        }
+        // A closure type cannot carry a user `Drop` impl (its anonymous type is
+        // unnameable), so its glue is definitionally the upvars' drops.
+        TyKind::Closure(_, args) => args
+            .as_closure()
+            .upvar_tys()
+            .iter()
+            .all(|u| tcx_drop_is_total_fueled(tcx, u, fuel - 1, seen)),
         _ => false,
     }
 }
@@ -671,9 +1024,45 @@ fn tcx_derived_trait_is_total<'tcx>(
         // eq/hash/cmp/default are the base int's -- total iff the base is.
         TyKind::Pat(base, _) => tcx_derived_trait_is_total(tcx, *base, trait_did, fuel - 1, seen),
         TyKind::Adt(def, args) => {
+            // (a0) [C-bignum] arbitrary-precision INTEGER bignum, RUSTC-AUTHENTICATED by
+            // StableCrateId (`authenticate_arbitrary_precision` — the sole `ArbPrec`
+            // writer). `<BigInt|BigUint as Ord>::cmp` is a sign + limb-slice comparison
+            // (num-bigint 0.4.6 `cmp_slice`) and `eq`/`hash` walk the same digit vector:
+            // no division, no user code, TOTAL (alloc-abort is out of the modeled panic
+            // set, matching F6). Cross-crate, so NOT `is_builtin_derived` (needs
+            // `as_local`); mirrors the audited (a0) arm of `tcx_clone_is_total`.
+            // Empty/stale allowlist → `None` → fail-closed.
+            //
+            // P0/P8 — the RATIONAL kinds are REFUSED here, and the previous blanket
+            // `.is_some()` was a LIVE FALSE PROOF. `impl<T: Clone + Integer> Ord for
+            // Ratio<T>` (num-rational 0.4.2 src/lib.rs:341-391) falls through to
+            // `self.numer.div_mod_floor(&self.denom)` whenever the denominators AND the
+            // numerators differ — a DIVISION BY THE DENOMINATOR that panics on a zero
+            // denominator, and `Ratio::new_raw(n, 0)` is a public `const fn` doing no
+            // reduction (src/lib.rs:80). `PartialOrd for Ratio<T>` is
+            // `Some(self.cmp(other))`, so `partial_cmp`/`lt`/`le`/`gt`/`ge` inherit that
+            // panic. Clearing them here made `apply_total_partial_ord_sentinel` rewrite
+            // the call to `TRUST_TOTAL_CLONE_SENTINEL`, which the bridge models as a
+            // TOTAL no-op — so a caller comparing two `Ratio<Big…>` values emitted ZERO
+            // panic obligations and was reported "trivially panic-free" while the program
+            // really panics. The decision now rides
+            // `ArbPrecKind::clears_total_derived_trait_family` (the same RC-C integer/
+            // rational split `is_integer_arbitrary_precision_ty` applies on the bridge
+            // side), so a rational receiver KEEPS its honest obligation.
+            if crate::ty_convert::authenticate_arbitrary_precision(tcx, def.did(), args)
+                .is_some_and(ArbPrecKind::clears_total_derived_trait_family)
+            {
+                return true;
+            }
             let mut derived = false;
             tcx.for_each_relevant_impl(trait_did, ty, |impl_did| {
-                if tcx.is_automatically_derived(impl_did) {
+                // `is_builtin_derived` (NOT `is_automatically_derived`): un-forgeable
+                // `#[rustc_builtin_macro]` provenance + `as_local()`. A proc-macro-spelled
+                // `#[automatically_derived]` over a hand-written panicking `fmt` is rejected
+                // (fails closed → the field Debug stays UNKNOWN). Mirrors the audited
+                // `tcx_clone_is_total` gate. REQUIRED because the Debug-finisher sentinel
+                // makes this fn LIVE via `debug_finisher_all_fields_total`.
+                if tcx.is_builtin_derived(impl_did) {
                     derived = true;
                 }
             });
@@ -723,6 +1112,7 @@ fn tcx_derived_trait_is_total<'tcx>(
                 && (path.starts_with("std::")
                     || path.starts_with("alloc::")
                     || path.starts_with("core::"))
+                // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
                 && is_real_sysroot_crate(tcx, def.did().krate)
             {
                 return true;
@@ -733,6 +1123,7 @@ fn tcx_derived_trait_is_total<'tcx>(
             // this the derived `Duration` impl — and any type holding a `Duration` — fails.)
             if (path.starts_with("core::num::niche_types::")
                 || path.starts_with("std::num::niche_types::"))
+                // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
                 && is_real_sysroot_crate(tcx, def.did().krate)
             {
                 return true;
@@ -877,6 +1268,10 @@ fn is_total_keyed_collect_call<'tcx>(
     if !(keyed_by_ord || keyed_by_hash) {
         return false;
     }
+    // SOUNDNESS (crate-name forgery): bind the destination collection to a REAL
+    // sysroot crate by scid, not by the spoofable printed crate name (`tcx.crate_name`
+    // returns "alloc" for a `--crate-name alloc` dep too). A like-named user collection
+    // with a panicking insert is thereby declined.
     if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
@@ -919,6 +1314,9 @@ fn is_total_keyed_collect_call<'tcx>(
     let ty::Adt(hasher_def, _) = hasher_ty.kind() else {
         return false;
     };
+    // SOUNDNESS (crate-name forgery): the hasher must be a REAL sysroot type, bound by
+    // scid (a `--crate-name std` dep could forge a printed "std" name with a panicking
+    // `write`/`finish`).
     if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
         return false;
     }
@@ -951,7 +1349,9 @@ fn is_total_collection_extend_call<'tcx>(
             tcx.impl_trait_ref(impl_did).instantiate_identity().skip_normalization().def_id
         })
     });
-    // `Extend` is not a diagnostic item, so combine its name with sysroot identity.
+    // `Extend` is a std trait but not a diagnostic item; match by name + un-forgeable
+    // sysroot provenance (SOUNDNESS: crate-name forgery — a `--crate-name std` dep can
+    // print "std", so bind the defining crate's scid, not `tcx.crate_name`).
     match trait_did {
         Some(t) if tcx.item_name(t).as_str() == "Extend" && is_real_sysroot_crate(tcx, t.krate) => {
         }
@@ -968,6 +1368,8 @@ fn is_total_collection_extend_call<'tcx>(
         return false;
     };
     let adt_name = tcx.item_name(def.did());
+    // SOUNDNESS (crate-name forgery): bind the receiver collection to a REAL sysroot
+    // crate by scid, not the spoofable printed crate name.
     if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
@@ -1002,6 +1404,7 @@ fn is_total_collection_extend_call<'tcx>(
         if adt_name.as_str() == "HashMap" { args.types().nth(2) } else { args.types().nth(1) };
     let Some(hasher_ty) = hasher_ty else { return false };
     let ty::Adt(hasher_def, _) = hasher_ty.kind() else { return false };
+    // SOUNDNESS (crate-name forgery): hasher must be a REAL sysroot type, bound by scid.
     if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
         return false;
     }
@@ -1055,6 +1458,7 @@ fn is_total_hash_map_query_call<'tcx>(
     if !(is_map || is_set) {
         return false;
     }
+    // SOUNDNESS (crate-name forgery): bind the receiver map to a REAL sysroot crate by scid.
     if !is_real_sysroot_crate(tcx, def.did().krate) {
         return false;
     }
@@ -1069,6 +1473,7 @@ fn is_total_hash_map_query_call<'tcx>(
     let ty::TyKind::Adt(hasher_def, _) = hasher_ty.kind() else {
         return false;
     };
+    // SOUNDNESS (crate-name forgery): hasher must be a REAL sysroot type, bound by scid.
     if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
         return false;
     }
@@ -1593,6 +1998,69 @@ fn is_panic_diverging_call(callee: &str) -> bool {
         || callee.contains("panic_bounds_check")
         || callee.contains("panic_misaligned_pointer_dereference")
         || callee.contains("panic_cannot_unwind")
+        || is_diverging_panic_or_abort_terminal(callee)
+}
+
+/// R177 — the std DIVERGING TERMINALS beyond `core::panicking::*` that measured
+/// bundles actually contain: the `unwrap`/`expect` panic shims
+/// (`core::option::unwrap_failed` ×18 / `core::result::unwrap_failed` ×3
+/// first_errors in R173c), the RawVec error funnel (`handle_error` ×42 — panics
+/// on capacity overflow, aborts on allocation failure — and the
+/// `capacity_overflow` panic symbol its first arm calls), the global
+/// alloc-error chain (`handle_alloc_error` was 150 dropped member instances,
+/// plus the `__rust_alloc_error_handler`/`__rdl_oom` symbols its body reaches),
+/// and `process::abort`/`intrinsics::abort` (×2).
+///
+/// SOUNDNESS: the same string-gate argument as `is_ub_if_reached_diverging_call`
+/// above. Every consumer of this predicate moves in the STRICT direction only:
+/// * the extractor/bridge route a matching diverging call site to
+///   `assert(false)` under the path condition plus a `PanicFreedom` row, so a
+///   user function that merely shares a tail is held to a STRICTER standard,
+///   never a laxer one; and
+/// * the bundling lane DECLINES to bundle a matching callee's body
+///   (`trust_verify`'s B-lane), returning its call sites to that charged arm —
+///   less bundling, never more credit.
+///
+/// An ABORT terminal (`process::abort`, `handle_alloc_error`) does not unwind,
+/// so charging it as a must-be-unreachable panic point is a conservative
+/// OVER-charge, never an excuse. This is deliberately the OPPOSITE direction
+/// from `is_total_noreturn_call` and `is_alloc_failure_abort_call` below, which
+/// stay unwired pending authenticated std identities because they would ERASE
+/// the continuation — this predicate never erases anything, it only prices the
+/// edge.
+///
+/// Kept in lockstep with the same-named predicate in
+/// `trust-ir-bridge/src/lower.rs` (via `is_panic_call`) for the reason the
+/// `is_panic_diverging_call` doc states: a diverging call routed to `Call` here
+/// must be recognized there too, or it fails closed at the bridge.
+pub fn is_diverging_panic_or_abort_terminal(callee: &str) -> bool {
+    callee.ends_with("::unwrap_failed")
+        || callee.ends_with("::expect_failed")
+        || callee.ends_with("::raw_vec::handle_error")
+        || callee.ends_with("::raw_vec::capacity_overflow")
+        || callee.ends_with("::handle_alloc_error")
+        || callee.ends_with("::__rust_alloc_error_handler")
+        || callee.ends_with("::__rdl_oom")
+        || callee.ends_with("::process::abort")
+        || callee.ends_with("::intrinsics::abort")
+        // R184: the slice-index panic shim (`core::slice::index::slice_index_fail`,
+        // `-> !`) — same class as unwrap_failed, surfaced by the R183 census (×3).
+        || callee.ends_with("::slice_index_fail")
+        // R147: `encode_utf8_raw`'s buffer-too-small panic helper — the
+        // const_eval_select RUNTIME arm (`do_panic::runtime`, `-> !`), surfaced
+        // by the R143B census (×2, char::encode_utf8 inlined into bundled
+        // members). Same class: a diverging direct call with no normal-return
+        // successor whose reachability IS the panic obligation.
+        || callee.ends_with("::do_panic::runtime")
+        // R151: `int_log10::panic_for_nonpositive_argument` (`-> !` cold helper,
+        // module renders as the nonstandard `core::num::imp::int_log10::`) —
+        // ×5 alethe_bridge rows, dropped member i128::checked_pow (R150B census).
+        || callee.ends_with("::int_log10::panic_for_nonpositive_argument")
+        // R151: `std::thread::local::panic_access_error` (`fn(AccessError) -> !`)
+        // — ×2 rows (rational::ARENA init fn, proof_carrying::function_verdicts),
+        // dropped member LocalKey::with::<RandomState>. The bridge's TLS doctrine
+        // already treats this path fail-closed; charging the site is consistent.
+        || callee.ends_with("::thread::local::panic_access_error")
 }
 
 /// A diverging call whose EXECUTION IS UNDEFINED BEHAVIOR: `core::hint::unreachable_unchecked`
@@ -1822,6 +2290,16 @@ fn parse_form_a(
     dest: &Place,
     span: &SourceSpan,
 ) -> Option<AtomicOperation> {
+    // R151 (R147-legA): rustc now renders the ordering as a trailing
+    // const-generic argument (`atomic_xsub::<usize, usize,
+    // core::intrinsics::AtomicOrdering::Release>`, intrinsics/mod.rs:97-262)
+    // instead of the legacy name suffix (`atomic_xsub_release`). A `::<` in the
+    // suffix can never be the legacy form, so route it exclusively; None keeps
+    // the existing Malformed→opaque fail-closed path.
+    if suffix.contains("::<") {
+        return parse_form_a_const_generic(suffix, args, dest, span);
+    }
+
     // Try each operation prefix, longest-first to avoid ambiguity.
     let ops: &[(&str, AtomicOpKind, bool)] = &[
         ("cxchgweak_", AtomicOpKind::CompareExchangeWeak, true),
@@ -1873,6 +2351,106 @@ fn parse_form_a(
         }
     }
 
+    None
+}
+
+/// Parse the const-generic-ordering rendering of Form A (R151 / R147-legA):
+/// `<op>::<[type args, ]ORDERING[, ORDERING]>` where each ORDERING renders as
+/// the full path `core::intrinsics::AtomicOrdering::<Variant>` (the renderer is
+/// `safe_def_path_str_with_args` under `with_no_trimmed_paths`, so the path is
+/// never abbreviated). Orderings are the TRAILING const parameters on every
+/// atomic intrinsic (intrinsics/mod.rs signatures), so they are stripped from
+/// the RIGHT — commas inside type arguments cannot desync the parse. Every
+/// unrecognized shape returns None, which the caller wraps into the same
+/// `Malformed` → opaque-terminator fail-closed path as the legacy form.
+fn parse_form_a_const_generic(
+    suffix: &str,
+    args: &[Operand],
+    dest: &Place,
+    span: &SourceSpan,
+) -> Option<AtomicOperation> {
+    let (op_name, generics) = suffix.split_once("::<")?;
+    let generics = generics.strip_suffix('>')?;
+    let (op_kind, is_cas) = match op_name {
+        "load" => (AtomicOpKind::Load, false),
+        "store" => (AtomicOpKind::Store, false),
+        "xchg" => (AtomicOpKind::Exchange, false),
+        "xadd" => (AtomicOpKind::FetchAdd, false),
+        "xsub" => (AtomicOpKind::FetchSub, false),
+        "and" => (AtomicOpKind::FetchAnd, false),
+        "nand" => (AtomicOpKind::FetchNand, false),
+        "or" => (AtomicOpKind::FetchOr, false),
+        "xor" => (AtomicOpKind::FetchXor, false),
+        "max" | "umax" => (AtomicOpKind::FetchMax, false),
+        "min" | "umin" => (AtomicOpKind::FetchMin, false),
+        "fence" => (AtomicOpKind::Fence, false),
+        "singlethreadfence" => (AtomicOpKind::CompilerFence, false),
+        "cxchg" => (AtomicOpKind::CompareExchange, true),
+        "cxchgweak" => (AtomicOpKind::CompareExchangeWeak, true),
+        // Fail-closed: unrecognized op token.
+        _ => return None,
+    };
+    let (rest, last) = strip_trailing_ordering(generics)?;
+    let place = extract_place_from_args(args, op_kind);
+    let has_dest = !op_kind.is_store() && !op_kind.is_fence();
+    if is_cas {
+        // cxchg/cxchgweak: `<T, const ORD_SUCC, const ORD_FAIL>` — `last` is
+        // the FAILURE ordering, the next-from-right is SUCCESS. A CAS with
+        // fewer than two trailing orderings fails closed via `?`.
+        let (_types, success) = strip_trailing_ordering(rest?)?;
+        Some(AtomicOperation {
+            place,
+            dest: if has_dest { Some(dest.clone()) } else { None },
+            op_kind,
+            ordering: success,
+            failure_ordering: Some(last),
+            span: span.clone(),
+        })
+    } else {
+        Some(AtomicOperation {
+            place,
+            dest: if has_dest { Some(dest.clone()) } else { None },
+            op_kind,
+            ordering: last,
+            failure_ordering: None,
+            span: span.clone(),
+        })
+    }
+}
+
+/// Strip one ORDERING from the right end of a rendered generic-argument list,
+/// returning the remaining prefix (None when the ordering was the whole list,
+/// as in `fence::<...>`). The full `core::intrinsics::AtomicOrdering::` path is
+/// REQUIRED: that is both the forgeability defense (a bare variant name could
+/// be forged by a user type) and the fail-closed handling of an unevaluated
+/// const parameter in a polymorphic body (which renders as `ORD` — no match →
+/// None → Malformed → opaque). Do NOT reuse `parse_ordering`: its tokens are
+/// the legacy lowercase suffixes and it aliases consume→Acquire; the
+/// const-generic enum has exactly these five variants. No variant name is a
+/// suffix of another, so the first `strip_suffix` hit is the only possible one.
+fn strip_trailing_ordering(generics: &str) -> Option<(Option<&str>, AtomicOrdering)> {
+    const VARIANTS: &[(&str, AtomicOrdering)] = &[
+        ("Relaxed", AtomicOrdering::Relaxed),
+        ("Release", AtomicOrdering::Release),
+        ("Acquire", AtomicOrdering::Acquire),
+        ("AcqRel", AtomicOrdering::AcqRel),
+        ("SeqCst", AtomicOrdering::SeqCst),
+    ];
+    for &(name, ord) in VARIANTS {
+        if let Some(rest) = generics.strip_suffix(name) {
+            let rest = rest.strip_suffix("core::intrinsics::AtomicOrdering::")?;
+            return match rest.strip_suffix(", ") {
+                Some(prefix) => Some((Some(prefix), ord)),
+                // fence/singlethreadfence: the ordering is the only argument.
+                None if rest.is_empty() => Some((None, ord)),
+                // Junk between the previous argument and the ordering path —
+                // fail closed rather than guess.
+                None => None,
+            };
+        }
+    }
+    // Unrecognized ordering rendering (future variant, `ORD`, brace-rendered
+    // const) — fail closed.
     None
 }
 
@@ -2144,8 +2722,111 @@ fn convert_rvalue<'tcx>(
                     // SOURCE is a pointer (so a value transmute to an integer stays
                     // fail-closed). The bridge cast-op selector lowers a
                     // pointer-source->integer cast to `PtrToInt`.
-                    let ptr_to_int =
-                        src_ty.as_ref().is_some_and(|t| t.is_any_ptr()) && ty.is_integral();
+                    // R119 — peel `repr(transparent)` wrappers off the SOURCE before the
+                    // `ptr_to_int` test. `NonNull<u8> -> usize` (107 first_errors, the
+                    // dominant residual Transmute once the R107 NonNull leg is on) is a
+                    // pointer-to-integer transmute wearing a newtype: `NonNull<T>` is
+                    // `repr(transparent)` over `*const T`, so the ADDRESS BITS are
+                    // identical and this is exactly the `ptr_to_int` leg — it simply never
+                    // looked through the wrapper.
+                    //
+                    // SOUND UNCONDITIONALLY, for the reason the transparent-UNWRAP leg
+                    // below already states: "the unwrap DIRECTION drops the validity
+                    // invariant (the source's valid range is a subset of the target's) —
+                    // no obligation exists". `NonNull -> usize` DISCARDS non-nullness;
+                    // `usize` admits 0. Nothing is assumed, so nothing is owed. (The WRAP
+                    // direction stays fail-closed; that is what R107's asserted leg is
+                    // for.)
+                    //
+                    // Gates copied from that leg's audited discipline: typing_env present,
+                    // CONCRETENESS (no params/infer/opaques — the E0275 hazard is
+                    // param-bearing input), every hop a `repr(transparent)` STRUCT (unions
+                    // excluded: field overlap voids the chase), exactly one field, bounded
+                    // depth, and the field type NORMALIZED — an unnormalized projection
+                    // alias (`NonZero`'s `<T as ZeroablePrimitive>::NonZeroInner`) never
+                    // matches `TyKind::Adt` and would silently kill the chase.
+                    let peeled_src = (|| -> Option<ty::Ty<'tcx>> {
+                        let src = src_ty?;
+                        let te = typing_env?;
+                        if src.has_non_region_param()
+                            || src.has_non_region_infer()
+                            || src.has_opaque_types()
+                        {
+                            return None;
+                        }
+                        let mut cur = src;
+                        for _ in 0..8u32 {
+                            // PATTERN TYPES. `NonNull<T>`'s field is not `*const T` — it is
+                            // `pattern_type!(*const T is !null)`, rustc's representation of
+                            // the non-null niche. `is_any_ptr()` is FALSE on it
+                            // (`TyKind::Pat`, not `TyKind::RawPtr`), which is exactly why
+                            // R119/R121 measured inert twice: the chase reached the field
+                            // correctly and then failed the pointer test. Three rounds of
+                            // inference missed this; one `[PEEL]` trace line showed it.
+                            //
+                            // A pattern type is a VALIDITY RESTRICTION over an identical
+                            // layout. Unwrapping it DISCARDS the restriction — the same
+                            // unwrap direction this arm already blesses ("the source's
+                            // valid range is a subset of the target's — no obligation
+                            // exists"). Going `!null ptr -> usize` drops non-nullness, and
+                            // `usize` admits 0, so nothing is assumed and nothing is owed.
+                            if let ty::Pat(base, _) = cur.kind() {
+                                cur = *base;
+                                continue;
+                            }
+                            let ty::Adt(def, args) = cur.kind() else { break };
+                            if !def.is_struct() || !def.repr().transparent() {
+                                break;
+                            }
+                            // UNIQUE NON-1-ZST field, exactly as the unwrap leg below
+                            // scans for it. An earlier version of this used
+                            // `fields.len() != 1`, which DECLINED any transparent struct
+                            // carrying a ZST marker beside its payload — measured inert
+                            // on `NonNull<u8> -> usize`, its motivating case. The ZST-skip
+                            // is what makes the chase actually reach the payload.
+                            let mut found = None;
+                            for field in def.non_enum_variant().fields.iter() {
+                                let fty = tcx
+                                    .try_normalize_erasing_regions(te, field.ty(tcx, args))
+                                    .ok()?;
+                                let is_1zst = tcx
+                                    .layout_of(te.as_query_input(fty))
+                                    .is_ok_and(|l| l.is_1zst());
+                                if !is_1zst {
+                                    if found.is_some() {
+                                        return None; // two payload fields — not transparent-shaped
+                                    }
+                                    found = Some(fty);
+                                }
+                            }
+                            match found {
+                                Some(fty) => cur = fty,
+                                None => break, // all-ZST transparent: nothing to peel to
+                            }
+                        }
+                        Some(cur)
+                    })();
+                    let ptr_to_int = ty.is_integral()
+                        && (src_ty.as_ref().is_some_and(|t| t.is_any_ptr())
+                            || peeled_src.is_some_and(|t| t.is_any_ptr()));
+                    // R123 (DIAGNOSTIC ONLY, gated, changes no verdict). R119/R121 measured
+                    // BYTE-IDENTICAL twice — the peel never fires and three rounds of
+                    // inference failed to say why. One line settles all four candidates at
+                    // once: whether `src_ty` is present, whether the peel ADVANCED (peeled
+                    // != src => the transparent chase ran), whether the peeled core is a
+                    // pointer, and whether the target is integral.
+                    if std::env::var_os("TRUST_PEEL_TRACE").is_some() {
+                        eprintln!(
+                            "[PEEL] src={:?} peeled={:?} target={:?} src_is_ptr={} peeled_is_ptr={} tgt_int={} ptr_to_int={}",
+                            src_ty.map(|t| t.kind()),
+                            peeled_src.map(|t| t.kind()),
+                            ty.kind(),
+                            src_ty.as_ref().is_some_and(|t| t.is_any_ptr()),
+                            peeled_src.is_some_and(|t| t.is_any_ptr()),
+                            ty.is_integral(),
+                            ptr_to_int,
+                        );
+                    }
                     // Trust (async plumbing, piece #13): the async-resume shim rustc
                     // itself generates transmutes `&mut Context<'_> -> NonNull<Context>`.
                     // `NonNull<T>` is `#[repr(transparent)]` over `*const T` (a std
@@ -2298,6 +2979,511 @@ fn convert_rvalue<'tcx>(
                             }
                         }
                     }
+                    // R141 — TRANSPARENT-CHAIN-TO-FIELDLESS-ENUM UNWRAP: the
+                    // `std::mem::Alignment` family. MEASURED (R140, not inferred):
+                    // `Alignment` is 126 of the 168 residual Transmute first_errors
+                    // (68 unwrap + 58 wrap), and Transmute overall is 63.8% of all
+                    // bundle-member drops (3268 of 5123) — the single largest lever
+                    // on the survivor pre-filter by a factor of five.
+                    //
+                    // `Alignment` is `#[repr(transparent)]` over
+                    // `#[repr(usize)] enum AlignmentEnum { _Align1Shl0 = 1<<0, .. }`.
+                    // The unwrap leg above chases the transparent struct correctly and
+                    // then dies on `!def.is_struct()` AT the enum, because a fieldless
+                    // enum has no field for its `hops` to project.
+                    //
+                    // SOUNDNESS is the UNWRAP direction — the same story this arm
+                    // already blesses: "the source's valid range is a subset of the
+                    // target's — no obligation exists". A fieldless enum with an
+                    // EXPLICIT integer repr is laid out exactly as that integer and its
+                    // value IS its discriminant, so `Alignment -> usize` DROPS the
+                    // power-of-two validity restriction while `usize` admits every bit
+                    // pattern. Nothing is assumed, so nothing is owed. The WRAP
+                    // direction (`usize -> Alignment`) stays fail-closed below, where it
+                    // belongs: that one IS a real obligation.
+                    //
+                    // WHY A FRESH SYMBOL AND NOT THE TAG — this is measured, not
+                    // assumed, and the measurement REFUTED the obvious design. Modelling
+                    // the transmute as a read of the flattened enum's `__tag` field
+                    // looks precise, but `canaries/enum_tag_unconstrained.rs` asserts
+                    // `(e as usize) >= 1` on a `#[repr(usize)] enum E { A = 1, B = 2,
+                    // C = 4 }` and the verifier REFUTES it (`[assert] FAILED
+                    // (trust-assert-refute)`) while its `>= 0` control PROVES and its
+                    // `>= 4` anti-control stays `unknown`. So `__tag` carries no
+                    // holds-a-declared-discriminant fact, and a tag read would be a
+                    // value-INACCURATE model wearing the costume of a precise one.
+                    // `OpaqueScalar` states exactly what is known — an unconstrained
+                    // integer of the right sort. That is STRICTLY WEAKER than the truth:
+                    // every value/arith/index/equality obligation over the result stays
+                    // `unknown`, each occurrence is an independent fresh symbol so two
+                    // reads are never asserted equal, and nothing can be falsely proved
+                    // from it. What it buys is not precision but LOWERING — the body
+                    // stops failing, so the bundle keeps its members.
+                    //
+                    // Gates mirror the unwrap leg's audited discipline plus the enum's
+                    // own:
+                    //   1. target integral; src/typing_env present; CONCRETENESS (the
+                    //      E0275 hazard is param-bearing input);
+                    //   2. every hop BEFORE the enum a `#[repr(transparent)]` STRUCT
+                    //      with a UNIQUE non-1-ZST field (unions excluded: field
+                    //      overlap voids the chase), field types NORMALIZED;
+                    //   3. at the enum: EVERY variant fieldless AND `repr().int`
+                    //      EXPLICITLY set. NEVER `repr().discr_type()`, whose default is
+                    //      `isize` — that would admit a plain `enum E { A, B }` whose
+                    //      layout is an `i8`;
+                    //   4. layout cross-check: both ends `BackendRepr::Scalar` with the
+                    //      SAME `Primitive`. This independently verifies size and kind
+                    //      agreement, so an error in the repr reasoning above cannot
+                    //      widen the leg — it can only close it.
+                    let transparent_enum_unwrap = (|| -> Option<(u32, bool)> {
+                        use rustc_abi::BackendRepr;
+                        if !ty.is_integral() {
+                            return None;
+                        }
+                        let src = src_ty?;
+                        let te = typing_env?;
+                        if src.has_non_region_param()
+                            || src.has_non_region_infer()
+                            || src.has_opaque_types()
+                        {
+                            return None;
+                        }
+                        let mut cur = src;
+                        let mut reached_fieldless_repr_int_enum = false;
+                        for _ in 0..8usize {
+                            if let ty::TyKind::Pat(base, _) = cur.kind() {
+                                cur = *base;
+                            }
+                            let ty::TyKind::Adt(def, args) = cur.kind() else {
+                                return None;
+                            };
+                            if def.is_enum() {
+                                if def.repr().int.is_none()
+                                    || !def
+                                        .variants()
+                                        .iter()
+                                        .all(|v| v.fields.is_empty())
+                                {
+                                    return None;
+                                }
+                                reached_fieldless_repr_int_enum = true;
+                                break;
+                            }
+                            if !def.is_struct() || !def.repr().transparent() {
+                                return None;
+                            }
+                            let mut found = None;
+                            for f in def.non_enum_variant().fields.iter() {
+                                let fty = tcx
+                                    .try_normalize_erasing_regions(te, f.ty(tcx, args))
+                                    .ok()?;
+                                let is_1zst = tcx
+                                    .layout_of(te.as_query_input(fty))
+                                    .is_ok_and(|l| l.is_1zst());
+                                if !is_1zst {
+                                    if found.is_some() {
+                                        return None; // two payload fields — not transparent-shaped.
+                                    }
+                                    found = Some(fty);
+                                }
+                            }
+                            cur = found?;
+                        }
+                        if !reached_fieldless_repr_int_enum {
+                            return None;
+                        }
+                        let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
+                        let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                        match (ls.backend_repr, lt.backend_repr) {
+                            (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
+                                if a.primitive() == b.primitive() => {}
+                            _ => return None,
+                        }
+                        match convert_ty_with_env(tcx, typing_env, *ty) {
+                            Ty::Int { width, signed } => Some((width, signed)),
+                            _ => None,
+                        }
+                    })();
+                    if let Some((width, signed)) = transparent_enum_unwrap {
+                        return Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
+                            width,
+                            signed,
+                        }));
+                    }
+
+                    // R181 leg 1 — BYTE-ARRAY PACK: `[u8; N]` → the unsigned int of
+                    // exactly N×8 bits (`[u8; 2] → u16` is the measured instance,
+                    // ×31 first_errors in R180). Every bit pattern is a valid value
+                    // of the TARGET, so the source's valid range is a subset of the
+                    // target's — the same "nothing is assumed, so nothing is owed"
+                    // blessing as the R141 unwrap leg, hence default-ON like it.
+                    // The VALUE is OpaqueScalar (fresh unconstrained int): strictly
+                    // weaker than the true byte concatenation (endianness never
+                    // enters), nothing falsely provable, and it buys LOWERING.
+                    let byte_array_pack = (|| -> Option<(u32, bool)> {
+                        let src = src_ty?;
+                        let ty::TyKind::Array(elem, len) = src.kind() else {
+                            return None;
+                        };
+                        if !matches!(elem.kind(), ty::TyKind::Uint(ty::UintTy::U8)) {
+                            return None;
+                        }
+                        let n = len.try_to_target_usize(tcx)?;
+                        match convert_ty_with_env(tcx, typing_env, *ty) {
+                            Ty::Int { width, signed: false }
+                                if n.checked_mul(8) == Some(u64::from(width)) =>
+                            {
+                                Some((width, false))
+                            }
+                            _ => None,
+                        }
+                    })();
+                    if let Some((width, signed)) = byte_array_pack {
+                        return Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
+                            width,
+                            signed,
+                        }));
+                    }
+                    // R181 leg 2 — FLOAT-TO-BITS: `f32 → u32` / `f64 → u64` (×6/×9
+                    // in R180). Every 32/64-bit pattern is a valid value of the
+                    // unsigned target; the reinterpretation is total by definition
+                    // (`to_bits`). OpaqueScalar result — sound havoc today;
+                    // precision can later upgrade to the FloatBits identity model
+                    // without changing the admission.
+                    let float_to_bits = matches!(
+                        (src_ty.map(|t| *t.kind()), ty.kind()),
+                        (
+                            Some(ty::TyKind::Float(ty::FloatTy::F32)),
+                            ty::TyKind::Uint(ty::UintTy::U32)
+                        ) | (
+                            Some(ty::TyKind::Float(ty::FloatTy::F64)),
+                            ty::TyKind::Uint(ty::UintTy::U64)
+                        )
+                    );
+                    if float_to_bits {
+                        if let Ty::Int { width, signed } = convert_ty_with_env(tcx, typing_env, *ty)
+                        {
+                            return Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
+                                width,
+                                signed,
+                            }));
+                        }
+                    }
+                    // R140 — MAYBEUNINIT-TO-INT: `MaybeUninit<uN/iN> -> uN/iN` (×21
+                    // in-gate; every src measured by TRUST_PEEL_TRACE was
+                    // `MaybeUninit<u16>` — the `assume_init` shape inside the
+                    // core::char encode machinery seeding the Lines/cite_check
+                    // bundle drops). EVERY bit pattern is a valid value of a
+                    // full-range integer target, so no validity charge is owed;
+                    // the initialization question is over-approximated by
+                    // `OpaqueScalar` (the fresh unconstrained value includes every
+                    // actually-initialized value — the byte-pack leg's own havoc
+                    // argument, two legs above). STRUCTURAL and unforgeable: the
+                    // source ADT is pinned by the `maybe_uninit` LANG ITEM (not a
+                    // printed path, FP#14), its single type argument must be
+                    // EXACTLY the target type, and the target must be integral —
+                    // `MaybeUninit<char> -> char` or any invariant-carrying target
+                    // stays fail-closed below.
+                    let maybe_uninit_to_int = (|| -> Option<(u32, bool)> {
+                        let src = src_ty?;
+                        let ty::TyKind::Adt(def, args) = src.kind() else {
+                            return None;
+                        };
+                        if tcx.lang_items().maybe_uninit() != Some(def.did()) {
+                            return None;
+                        }
+                        let inner = args.types().next()?;
+                        if inner != *ty || !ty.is_integral() {
+                            return None;
+                        }
+                        match convert_ty_with_env(tcx, typing_env, *ty) {
+                            Ty::Int { width, signed } => Some((width, signed)),
+                            _ => None,
+                        }
+                    })();
+                    if let Some((width, signed)) = maybe_uninit_to_int {
+                        return Rvalue::Use(Operand::Constant(ConstValue::OpaqueScalar {
+                            width,
+                            signed,
+                        }));
+                    }
+                    // R146 — TOTAL NICHE-OPTION transmute (×5 in R143B: u128 ->
+                    // Option<NonZero<u128>> inside checked_pow via NonZero::new,
+                    // seeding 14 member-drops across 5 alethe roots). The
+                    // admission premise is LAYOUT-DERIVED TOTALITY, the exact
+                    // lemma the legs above bless — "the source's valid range is
+                    // a subset of the target's; nothing is assumed, so nothing
+                    // is owed" — read off the TARGET layout: BackendRepr::Scalar
+                    // with the SAME primitive as the integral source and a FULL
+                    // valid range (the niche makes 0 = None, n = Some(n): every
+                    // source bit pattern is a valid target value). No printed
+                    // path gates the admission (FP#14): a forged Option-lookalike
+                    // without the genuine full-range scalar layout stays refused.
+                    // NOTE THE POLARITY vs R107b/R128/R139: those targets' valid
+                    // sets are PROPER SUBSETS of the source range, so admission
+                    // is coupled to a charged assert; charging `src != 0` HERE
+                    // would invent an obligation on a total std function
+                    // (`NonZero::new(0)` is a legal call returning None). The
+                    // bridge lowers the admitted cast as an obligation-free
+                    // havoc of the Option type (the R145 shape).
+                    let total_niche_scalar = (|| -> Option<bool> {
+                        use rustc_abi::BackendRepr;
+                        let src = src_ty?;
+                        let te = typing_env?;
+                        if !src.is_integral() {
+                            return Some(false);
+                        }
+                        if ty.ty_adt_def().is_none()
+                            || ty.has_non_region_param()
+                            || ty.has_non_region_infer()
+                            || ty.has_opaque_types()
+                        {
+                            return Some(false);
+                        }
+                        let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
+                        let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                        match (ls.backend_repr, lt.backend_repr) {
+                            (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
+                                if a.primitive() == b.primitive() && {
+                                    // `WrappingRange::is_full_for` is private;
+                                    // replicate via the public fields: the range
+                                    // covers every value iff end+1 wraps to start
+                                    // under the size mask (0..=MAX included).
+                                    let wr = b.valid_range(&tcx);
+                                    let mask = b.size(&tcx).unsigned_int_max();
+                                    (wr.end.wrapping_add(1) & mask) == wr.start
+                                } =>
+                            {
+                                Some(true)
+                            }
+                            _ => Some(false),
+                        }
+                    })()
+                    .unwrap_or(false);
+                    if total_niche_scalar {
+                        return Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty));
+                    }
+                    // R107b — EXTRACTOR HALF of the asserted wrap leg (R184: PROMOTED to
+                    // unconditional after R176–R181 measured it engaged, sound, and
+                    // verdict-safe on five gates; the R107 "until deliberately
+                    // measured" default-OFF rationale is satisfied).
+                    //
+                    // The WRAP direction (a VALUE-source transmute into `NonNull`) is
+                    // fail-closed above for a stated and CORRECT reason: "its validity
+                    // invariant is a real obligation". This admits it ONLY in the world
+                    // where that obligation is actually CHARGED — the bridge's R107 leg
+                    // emits `src != 0` and asserts it (lower.rs, `Rvalue::Cast` arm).
+                    //
+                    // GATED ON THE SAME ENV VAR AS THE BRIDGE HALF, deliberately: were
+                    // this widening ever live while the assert was not, the transmute
+                    // would be admitted with NOTHING charged — the exact false proof this
+                    // leg exists to avoid. One switch, both halves, always; that makes
+                    // the unsafe combination UNREPRESENTABLE rather than merely ordered.
+                    //
+                    // `repr(transparent)` is checked on the ADT DEFINITION (the std
+                    // layout GUARANTEE that makes the cast address-preserving), and the
+                    // target is pinned by DIAGNOSTIC ITEM, never a printed path — a
+                    // forgeable spelling must not gate an ADMISSION (false proof #14).
+                    // Note the asymmetry with the bridge half, where a forgeable name IS
+                    // acceptable because it only ever ADDS an obligation.
+                    let asserted_wrap = ty.ty_adt_def().is_some_and(|def| {
+                            def.repr().transparent()
+                                && tcx.is_diagnostic_item(rustc_span::sym::NonNull, def.did())
+                        });
+                    // R181 leg 3 — u32 → char wrap (×7 in R180): a REAL validity
+                    // obligation (char's valid set is 0..=0xD7FF ∪ 0xE000..=0x10FFFF),
+                    // charged by the bridge's char-wrap arm under the SAME flag
+                    // (coupled halves, the R107 discipline). The target here is the
+                    // STRUCTURAL PRIMITIVE `char` — no printed path, no forgeable
+                    // name anywhere in the chain.
+                    let asserted_char_wrap = matches!(
+                            src_ty.map(|t| *t.kind()),
+                            Some(ty::TyKind::Uint(ty::UintTy::U32))
+                        )
+                        && matches!(ty.kind(), ty::TyKind::Char);
+                    // R139 — EXTRACTOR HALF of the asserted NICHE-WRAP leg. The
+                    // WRAP direction into a `define_valid_range_type!` wrapper
+                    // (`usize -> core::num::niche_types::UsizeNoHighBit`, the ×66
+                    // measured instance gating the whole Rat-family bundle drops):
+                    // a VALUE-source transmute whose TARGET's transparent chain
+                    // terminates at the PATTERN-TYPE refinement `TyKind::Pat(src, _)`
+                    // of the SOURCE scalar. Admitted ONLY in the world where the
+                    // validity range is CHARGED: the bridge's niche-wrap arm —
+                    // landed FIRST, pinned by
+                    // `usize_to_no_high_bit_wrap_cast_charges_the_range_assert` —
+                    // asserts `src <= isize::MAX as usize` on exactly this cast.
+                    // ADMISSION ⟺ CHARGE is made exact by FOUR conjuncts:
+                    //  1. STRUCTURAL walk (FP#14): repr(transparent) hops, unique
+                    //     non-1ZST field, Pat terminal over the source scalar,
+                    //     Scalar-primitive layout equality (the unwrap walk's own
+                    //     gates, direction reversed);
+                    //  2. the TARGET layout's scalar VALID RANGE is exactly
+                    //     0..=isize::MAX — the layout-derived fact the bridge
+                    //     charges, so a different niche wrapper stays refused
+                    //     (fail-closed) until its own coupled leg lands;
+                    //  3. the def-path equals the bridge arm's key — a NECESSARY
+                    //     narrowing, never sufficient (conjuncts 1-2 are the
+                    //     sufficiency, so a forged spelling without the genuine
+                    //     niche layout still refuses; with the genuine layout the
+                    //     charge is correct anyway);
+                    //  4. src is the u64-primitive uint (usize here).
+                    let asserted_niche_wrap = (|| -> Option<bool> {
+                        use rustc_abi::{BackendRepr, WrappingRange};
+                        let src = src_ty?;
+                        let te = typing_env?;
+                        if !matches!(src.kind(), ty::TyKind::Uint(_)) {
+                            return Some(false);
+                        }
+                        if ty.has_non_region_param()
+                            || ty.has_non_region_infer()
+                            || ty.has_opaque_types()
+                        {
+                            return Some(false);
+                        }
+                        if !tcx
+                            .def_path_str(ty.ty_adt_def()?.did())
+                            .ends_with("num::niche_types::UsizeNoHighBit")
+                        {
+                            return Some(false);
+                        }
+                        let mut cur = *ty;
+                        for _ in 0..8usize {
+                            let ty::TyKind::Adt(def, args) = cur.kind() else {
+                                return Some(false);
+                            };
+                            if !def.is_struct() || !def.repr().transparent() {
+                                return Some(false);
+                            }
+                            let mut found = None;
+                            for f in def.non_enum_variant().fields.iter() {
+                                let fty = tcx
+                                    .try_normalize_erasing_regions(te, f.ty(tcx, args))
+                                    .ok()?;
+                                let is_1zst = tcx
+                                    .layout_of(te.as_query_input(fty))
+                                    .is_ok_and(|l| l.is_1zst());
+                                if !is_1zst {
+                                    if found.is_some() {
+                                        return Some(false);
+                                    }
+                                    found = Some(fty);
+                                }
+                            }
+                            let fty = found?;
+                            if let ty::TyKind::Pat(base, _) = fty.kind() {
+                                if *base != src {
+                                    return Some(false);
+                                }
+                                let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
+                                let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                                return match (ls.backend_repr, lt.backend_repr) {
+                                    (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
+                                        if a.primitive() == b.primitive()
+                                            && b.valid_range(&tcx)
+                                                == (WrappingRange {
+                                                    start: 0,
+                                                    end: i64::MAX as u128,
+                                                }) =>
+                                    {
+                                        Some(true)
+                                    }
+                                    _ => Some(false),
+                                };
+                            }
+                            cur = fty;
+                        }
+                        Some(false)
+                    })()
+                    .unwrap_or(false);
+                    // R128 — EXTRACTOR HALF of the asserted ENUM-WRAP leg (default
+                    // OFF, SAME FLAG, same coupling rationale as R107b above: were
+                    // this admission live while the bridge's membership assert was
+                    // not, the transmute would be admitted with NOTHING charged).
+                    //
+                    // The INT-source transmute into a transparent chain over a
+                    // FIELDLESS explicit-repr(int) enum (`usize -> mem::Alignment`
+                    // is the measured instance: 135 first_errors in R177b, the last
+                    // large lock on the alloc-family bundle drops) OWES a
+                    // set-membership obligation: the enum's validity invariant is
+                    // "the value IS one of the declared discriminants". The bridge
+                    // half (`fieldless_enum_wrap_discriminants` in lower.rs) asserts
+                    // exactly that, deriving the set from the TARGET'S OWN extracted
+                    // `VariantDef.discriminant`s — no printed path gates anything on
+                    // either side: this admission is STRUCTURAL (the R141 unwrap
+                    // walk run on the TARGET, same hop gates, same
+                    // `BackendRepr::Scalar` same-`Primitive` cross-check), and a
+                    // user enum that satisfies it is charged ITS OWN valid set, so
+                    // there is no under-charge to forge (the hole a name-keyed
+                    // power-of-two formula would have opened).
+                    let asserted_enum_wrap = (|| -> Option<()> {
+                            use rustc_abi::BackendRepr;
+                            let src = src_ty?;
+                            if !src.is_integral() {
+                                return None;
+                            }
+                            let te = typing_env?;
+                            if ty.has_non_region_param()
+                                || ty.has_non_region_infer()
+                                || ty.has_opaque_types()
+                            {
+                                return None;
+                            }
+                            let mut cur = *ty;
+                            let mut reached_fieldless_repr_int_enum = false;
+                            for _ in 0..8usize {
+                                if let ty::TyKind::Pat(base, _) = cur.kind() {
+                                    cur = *base;
+                                }
+                                let ty::TyKind::Adt(def, args) = cur.kind() else {
+                                    return None;
+                                };
+                                if def.is_enum() {
+                                    if def.repr().int.is_none()
+                                        || !def
+                                            .variants()
+                                            .iter()
+                                            .all(|v| v.fields.is_empty())
+                                    {
+                                        return None;
+                                    }
+                                    reached_fieldless_repr_int_enum = true;
+                                    break;
+                                }
+                                if !def.is_struct() || !def.repr().transparent() {
+                                    return None;
+                                }
+                                let mut found = None;
+                                for f in def.non_enum_variant().fields.iter() {
+                                    let fty = tcx
+                                        .try_normalize_erasing_regions(te, f.ty(tcx, args))
+                                        .ok()?;
+                                    let is_1zst = tcx
+                                        .layout_of(te.as_query_input(fty))
+                                        .is_ok_and(|l| l.is_1zst());
+                                    if !is_1zst {
+                                        if found.is_some() {
+                                            return None;
+                                        }
+                                        found = Some(fty);
+                                    }
+                                }
+                                cur = found?;
+                            }
+                            if !reached_fieldless_repr_int_enum {
+                                return None;
+                            }
+                            let ls = tcx.layout_of(te.as_query_input(src)).ok()?;
+                            let lt = tcx.layout_of(te.as_query_input(*ty)).ok()?;
+                            match (ls.backend_repr, lt.backend_repr) {
+                                (BackendRepr::Scalar(a), BackendRepr::Scalar(b))
+                                    if a.primitive() == b.primitive() =>
+                                {
+                                    Some(())
+                                }
+                                _ => None,
+                            }
+                        })()
+                        .is_some();
                     // Trust (close-gap): the `fmt::Arguments` bit-packing
                     // (`from_str` packs `len << 1 | 1` into `NonNull<rt::Argument>`;
                     // `as_str` unpacks it) transmutes `usize <-> NonNull<T>`. At the
@@ -2328,19 +3514,39 @@ fn convert_rvalue<'tcx>(
                         && nonnull_thin(*ty);
                     let nonnull_to_usize = src_ty.as_ref().is_some_and(|t| nonnull_thin(*t))
                         && matches!(ty.kind(), ty::TyKind::Uint(ty::UintTy::Usize));
-                    if ty.is_any_ptr()
-                        || ty.is_box()
-                        || ptr_to_int
-                        || ptr_to_nonnull
-                        || usize_to_nonnull
-                        || nonnull_to_usize
+                    if ty.is_any_ptr() || ty.is_box() || ptr_to_int || ptr_to_nonnull
+                        || asserted_wrap || asserted_enum_wrap || asserted_char_wrap
+                        || asserted_niche_wrap
+                        || usize_to_nonnull || nonnull_to_usize
                     {
                         Rvalue::Cast(operand, convert_ty_with_env(tcx, typing_env, *ty))
                     } else {
+                        // R135 (DIAGNOSTIC ONLY, gated, changes no verdict). This refusal
+                        // prints only the TARGET, so the SOURCE of every refused transmute
+                        // has never been observable — which is why the residual 68
+                        // `transmute to usize` rows are still unattributed after R124, and
+                        // why a scoping pass could only INFER (plausibly, via
+                        // `Alignment` -> `#[repr(usize)] AlignmentEnum`) rather than
+                        // measure. The `[PEEL]` line cannot answer it either: it is emitted
+                        // BEFORE `transparent_unwrap_hops` runs, so its `ptr_to_int=false`
+                        // includes sites the unwrap leg subsequently ADMITS, and it carries
+                        // no root attribution.
+                        //
+                        // Append the source ONLY under the env var, so the DEFAULT message
+                        // stays byte-identical and nothing matching on it can break.
+                        let src_suffix = if std::env::var_os("TRUST_PEEL_TRACE").is_some() {
+                            format!(
+                                " [src={:?} peeled={:?}]",
+                                src_ty.map(|t| t.kind()),
+                                peeled_src.map(|t| t.kind()),
+                            )
+                        } else {
+                            String::new()
+                        };
                         unsupported_rvalue(
                             "CastKind::Transmute",
                             format!(
-                                "transmute to {ty:?} requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast"
+                                "transmute to {ty:?} requires layout compatibility and validity-invariant proof; refusing to model it as a value-preserving cast{src_suffix}"
                             ),
                             vec![operand],
                         )
@@ -3031,6 +4237,29 @@ fn callable_def_path_hash(
     CallableDefPathHash::new(hash.stable_crate_id().as_u64(), hash.local_hash().as_u64())
 }
 
+/// Trust: EFHT-P §0.1 — a TRACE, never a verdict switch: with `TRUST_CONST_TRACE=1`,
+/// print which arm a REFERENCE constant took (`mir::Const` kind, promoted flag, type,
+/// span), so "does the promoted `&Struct(N)` reach the valtree path or stay a
+/// `Const::Val` pointer" is a measurement instead of a guess. No env var changes any
+/// verdict; unset, this is a single `env::var_os` miss.
+fn trust_const_trace(arm: &str, const_op: &mir::ConstOperand<'_>) {
+    if std::env::var_os("TRUST_CONST_TRACE").is_none() {
+        return;
+    }
+    let kind = match const_op.const_ {
+        mir::Const::Ty(..) => "Ty".to_string(),
+        mir::Const::Unevaluated(u, _) => {
+            format!("Unevaluated{{promoted:{}}}", u.promoted.is_some())
+        }
+        mir::Const::Val(..) => "Val".to_string(),
+    };
+    eprintln!(
+        "TRUST-CONST-TRACE\tarm={arm}\tkind={kind}\tty={:?}\tspan={:?}",
+        const_op.const_.ty(),
+        const_op.span
+    );
+}
+
 fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'tcx>) -> Operand {
     use rustc_middle::ty::TyKind;
 
@@ -3251,12 +4480,19 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
         if let Some(bytes) = str_ref_bytes_from_value(tcx, value) {
             return Operand::Constant(ConstValue::Str { bytes });
         }
-        // Trust (eq-guard channel): a promoted `&Option<T>::None`-style const —
+        // Trust (eq-guard channel): a promoted `&Enum::UnitVariant` const —
         // the `_4 = const f::promoted[0]` that `o == None` produces — recovers
         // its variant identity instead of degrading to the fresh-symbolic
         // `OpaqueConst` below, which hides the None-ness from the equality
         // guard models. A payload-carrying pointee (`&Some(5)`) falls through.
         if let Some(cv) = std_enum_unit_variant_ref_const(tcx, value) {
+            trust_const_trace("valtree-unit-variant-ref", const_op);
+            return Operand::Constant(cv);
+        }
+        // Trust: EFHT-P — a promoted `&Struct(scalars…)` const recovers its field
+        // values (valtree path only; see `struct_scalar_fields_ref_const`).
+        if let Some(cv) = struct_scalar_fields_ref_const(tcx, value) {
+            trust_const_trace("valtree-struct-scalar-fields-ref", const_op);
             return Operand::Constant(cv);
         }
         let ty_const = ty::Const::new_value(tcx, value.valtree, value.ty);
@@ -3282,9 +4518,31 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
     // satisfiable-as-negation (Unknown/Failed), never falsely Proved; obligations
     // that do NOT depend on it (the common case for collection constructors) are
     // now reachable and discharge normally instead of being wedged at Unknown.
+    // R148: also admit `Const::Unevaluated` consts of CONCRETE monomorphic
+    // ADTs (hashbrown::RawTableInner::NEW, const io::Error values — ×5 in
+    // R143B) whose const-eval-to-valtree fails on embedded pointer
+    // provenance. The type is fully concrete with a registered struct sort,
+    // so neither documented refusal rationale applies (the Alias refusal is
+    // about an unresolvable SORT pre-monomorphization; the terminal refusal
+    // about shapes with no consumer type). OpaqueConst's own soundness
+    // argument covers it verbatim: the value is unconstrained, so it "can
+    // only ENLARGE the error set" — never falsely Proved.
     if const_operand_value(tcx, const_op).is_some()
         || matches!(const_op.const_, mir::Const::Val(..))
+        || (matches!(const_op.const_, mir::Const::Unevaluated(..))
+            && matches!(const_op.const_.ty().kind(), ty::TyKind::Adt(..))
+            && !const_op.const_.ty().has_non_region_param())
     {
+        // Trust: EFHT-P §0.1 trace — WHICH arm an opaque reference constant took: a
+        // `Const::Val` scalar pointer never reaches the valtree lanes above; a valtree
+        // that reached them and still fell through is `valtree-unlowered`.
+        if matches!(ty.kind(), rustc_middle::ty::TyKind::Ref(..)) {
+            if matches!(const_op.const_, mir::Const::Val(..)) {
+                trust_const_trace("opaque-const-val", const_op);
+            } else {
+                trust_const_trace("opaque-valtree-unlowered", const_op);
+            }
+        }
         return Operand::Constant(ConstValue::OpaqueConst);
     }
 
@@ -3297,6 +4555,7 @@ fn convert_const_operand<'tcx>(tcx: TyCtxt<'tcx>, const_op: &mir::ConstOperand<'
     // `unknown` and is never falsely proved. Mirrors the `&[&str]`/slice-table and
     // `&dyn Trait` opaque arms above.
     if matches!(ty.kind(), TyKind::Ref(..)) {
+        trust_const_trace("opaque-ref-no-value", const_op);
         return Operand::Constant(ConstValue::OpaqueConst);
     }
 
@@ -3492,13 +4751,13 @@ fn str_ref_bytes_from_value<'tcx>(tcx: TyCtxt<'tcx>, value: ty::Value<'tcx>) -> 
     None
 }
 
-/// Trust (eq-guard channel): recover a promoted/const `&E` whose std-enum
-/// pointee is a PAYLOAD-LESS variant (`&Option<T>::None`, a unit `&Result`
-/// variant) as [`ConstValue::UnitVariantRef`]. Valtrees are transparent across
+/// Trust (eq-guard channel): recover a promoted/const `&E` whose enum pointee is a
+/// PAYLOAD-LESS variant (`&Option<T>::None`, `&ReadRecordResult::Record`, any unit
+/// `&Enum::Variant`) as [`ConstValue::UnitVariantRef`]. Valtrees are transparent across
 /// `&` (see [`str_ref_bytes_from_value`]), so the same valtree re-typed at the
 /// pointee destructures directly. Fail-closed (`None`) for: a generic pointee,
-/// a non-std enum, a payload-carrying value (`&Some(5)` — non-empty fields), or
-/// a mutable reference.
+/// a payload-carrying value (`&Some(5)` — non-empty fields), or a mutable reference.
+/// (Trust: EFHT-P — the std-only name gate is gone; see the note at its former site.)
 fn std_enum_unit_variant_ref_const<'tcx>(
     tcx: TyCtxt<'tcx>,
     value: ty::Value<'tcx>,
@@ -3516,15 +4775,16 @@ fn std_enum_unit_variant_ref_const<'tcx>(
         return None;
     }
     let enum_name = crate::safe_def_path_str(tcx, adt_def.did());
-    if !matches!(
-        enum_name.as_str(),
-        "core::option::Option"
-            | "std::option::Option"
-            | "core::result::Result"
-            | "std::result::Result"
-    ) {
-        return None;
-    }
+    // Trust: EFHT-P (2026-08-30) — the Option/Result NAME allow-list is DELETED: every
+    // fieldless-variant `&Enum::Variant` promoted constant now recovers its identity,
+    // not only the std pair. The carrier still holds the variant INDEX exactly as it
+    // always has (the carrier's meaning does not change); the EFHT-P transport lane
+    // decodes that index to the DECODED DISCRIMINANT VALUE off the CALLER's own
+    // `Ty::Adt.variants[variant].discriminant` — never here, and never as the index
+    // (refuter-proven false verify: `regex_syntax::hir::Look::Start` is index 0,
+    // value 1). Every consumer of this carrier is name-agnostic (audited 2026-08-30;
+    // the eq-guard channels compare by (name, variant), the value lanes treat it as
+    // an opaque fresh-symbolic reference).
     let pointee = ty::Value { ty: *inner, valtree: value.valtree };
     let destructured = pointee.destructure_adt_const();
     if !destructured.fields.is_empty() {
@@ -3535,6 +4795,63 @@ fn std_enum_unit_variant_ref_const<'tcx>(
         return None;
     }
     Some(ConstValue::UnitVariantRef { enum_name, variant })
+}
+
+/// Trust: EFHT-P (2026-08-30) — recover a promoted/const `&S` whose pointee is an
+/// ALL-SCALAR STRUCT (every field an `Int`/`Uint` leaf) as
+/// [`ConstValue::StructScalarFieldsRef`], carrying the field values in declaration
+/// order. The dominant instance is the promoted newtype constant a derived `eq` against
+/// a constant produces (`&BidiClass(N)` in `idna_adapter::BidiClass::is_*`).
+///
+/// Reachable ONLY through `const_operand_value` (a `mir::Const::Unevaluated`/`Const::Ty`
+/// valtree; valtree construction itself refuses statics, `UnsafeCell` and raw
+/// pointers) — a `Const::Val` scalar pointer (a GVN-materialised promoted, `&STATIC`)
+/// never enters and stays `OpaqueConst`. Fail-closed (`None`) for: a generic pointee, a
+/// non-struct ADT (an enum is [`std_enum_unit_variant_ref_const`]'s business; a union
+/// never), a field-count mismatch, and any field that is not a plain integer leaf
+/// (`bool`, `char`, float, nested ADT, reference, `NonZero`, `Cell` — every one makes
+/// `scalar_valtree_to_const_value` return `None`; in particular the reach for
+/// bool-field structs is ZERO by construction).
+fn struct_scalar_fields_ref_const<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    value: ty::Value<'tcx>,
+) -> Option<ConstValue> {
+    let ty::TyKind::Ref(_, inner, mutbl) = value.ty.kind() else {
+        return None;
+    };
+    if mutbl.is_mut() || inner.has_non_region_param() {
+        return None;
+    }
+    let ty::TyKind::Adt(adt_def, args) = inner.kind() else {
+        return None;
+    };
+    if !adt_def.is_struct() {
+        return None;
+    }
+    let pointee = ty::Value { ty: *inner, valtree: value.valtree };
+    let destructured = pointee.destructure_adt_const();
+    let variant_def = adt_def.non_enum_variant();
+    if destructured.fields.len() != variant_def.fields.len() {
+        return None;
+    }
+    let mut fields = Vec::with_capacity(destructured.fields.len());
+    for (field_const, field_def) in destructured.fields.iter().zip(variant_def.fields.iter()) {
+        // Trust: EFHT-P — `FieldDef::ty` yields an `Unnormalized`; skipping
+        // normalization here is FAIL-CLOSED, not a shortcut. An unnormalized alias
+        // reaches `scalar_valtree_to_const_value`, which admits only `Int`/`Uint`
+        // scalar leaves and returns `None` for every other `TyKind` — so the
+        // un-normalized spelling can only make this recovery REFUSE (the constant
+        // stays `OpaqueConst`), never admit a leaf it should not. Normalizing would
+        // ADMIT strictly more (aliases that resolve to scalars), which is a
+        // capability increase this lane has neither measured nor fenced, and it
+        // would need a `typing_env` this function does not take.
+        let field_ty = field_def.ty(tcx, *args).skip_normalization();
+        fields.push(scalar_valtree_to_const_value(*field_const, field_ty, tcx)?);
+    }
+    Some(ConstValue::StructScalarFieldsRef {
+        adt_name: crate::safe_def_path_str(tcx, adt_def.did()),
+        fields,
+    })
 }
 
 /// Read a `&[&str; N]` / `&[&str]` format-template PIECES array and concatenate its literal
@@ -3856,10 +5173,20 @@ fn range_const_bounds<'tcx>(
 
 /// The UNIQUE whole-local definition of `local`, or None if it has zero or multiple
 /// assignments (ambiguous — fail-closed, never a guessed value).
+///
+/// A PARAMETER (`_1..=_arg_count`) is defined at ENTRY and rustc's MIR carries no
+/// statement for it, so ONE assignment to a parameter is its SECOND value and is not
+/// what its name means on an edge that skipped the store — the same class
+/// `trust_vcgen::local_defs` owns on the lowered side. Declined outright: this
+/// resolver's callers INLINE the rvalue (a const range, a copied operand), which
+/// nothing downstream can undo.
 fn unique_whole_local_def<'a, 'tcx>(
     mir_body: &'a mir::Body<'tcx>,
     local: mir::Local,
 ) -> Option<&'a mir::Rvalue<'tcx>> {
+    if is_mir_parameter(mir_body, local) {
+        return None;
+    }
     let mut found = None;
     for bb_data in mir_body.basic_blocks.iter() {
         for stmt in &bb_data.statements {
@@ -4060,21 +5387,34 @@ struct BoxAllocFacts {
     align: Option<u64>,
 }
 
-/// Is `name` a call to an INFALLIBLE box allocator — one that aborts (never returns)
-/// on OOM and yields a non-null, `align_of::<pointee>()`-aligned pointer? These are
-/// `Box::<T>::new` / `::new_uninit` / `::new_zeroed` and the `box_new_uninit` /
-/// `exchange_malloc` lang items. CRITICALLY EXCLUDES `alloc::alloc` and friends,
-/// which are FALLIBLE (may return null) — discharging a null/misalign check on a
-/// fallible allocation would be a false PROVE.
+/// Is the RESOLVED callee `did` (printed `name`) a call to an INFALLIBLE box allocator —
+/// one that aborts (never returns) on OOM and yields a non-null,
+/// `align_of::<pointee>()`-aligned pointer? These are `Box::<T>::new` / `::new_uninit` /
+/// `::new_zeroed` and the `box_new_uninit` / (legacy) `exchange_malloc` free functions.
+/// CRITICALLY EXCLUDES `alloc::alloc` and friends, which are FALLIBLE (may return null) —
+/// discharging a null/misalign check on a fallible allocation would be a false PROVE.
+///
+/// SOUNDNESS (crate-name forgery — the LAST name-only memory-safety discharge, now closed):
+/// rustc does NOT reserve the names `std`/`alloc`/`core`, so a dependency compiled
+/// `--crate-name alloc` (or one nesting `boxed::Box` modules) can print a callee path
+/// LITERALLY `alloc::boxed::Box::new` over a body that does NOT satisfy the non-null/aligned
+/// guarantee — a NAME-only gate would then FALSELY discharge a genuinely-unsafe deref. So
+/// the identity is authenticated by the resolved `DefId`, NEVER the printed path:
+///   * the `Box::new*` inherent methods are authenticated by the `owned_box` LANG ITEM — the
+///     callee's inherent-impl Self type MUST be the canonical `Box` ADT (a user/impostor
+///     `mycrate::boxed::Box::new` has a DIFFERENT ADT DefId and is declined) — EXACTLY the
+///     un-forgeable discipline `synth_box_pointee` (below) uses for the box-deref source;
+///   * `box_new_uninit` / `exchange_malloc` are free functions with NO lang item to anchor,
+///     so their DEFINING crate is bound to the real sysroot via the un-forgeable
+///     `StableCrateId` (`is_real_sysroot_crate`, convert.rs:186) — the fallback where no
+///     lang item fits.
+/// The `std_origin` name prefix is retained ONLY as a cheap pre-filter, never the authority.
+/// Fail-closed if a required DefId is absent (an anchor-less build declines, never a false
+/// PROVE).
 fn is_infallible_box_allocator<'tcx>(tcx: TyCtxt<'tcx>, did: DefId, name: &str) -> bool {
-    // STD-ORIGIN GATE (defense-in-depth, mirrors the validated
-    // `sep_engine::is_known_good_box_alloc`): the real `Box` is defined in `alloc`
-    // (re-exported in `std`); its monomorphized callee path renders with one of
-    // these crate prefixes. Requiring it means a USER type `mycrate::boxed::Box`
-    // with a `::new` method CANNOT masquerade as the infallible std box allocator —
-    // closing the "loose substring gate" hazard the soundness review flagged
-    // (fixture N1). Without this, N1 is sound only by the value-preserving trace's
-    // fail-closed shape; with it, the recogniser itself rejects the impostor.
+    // Cheap pre-filter: the real `Box`/allocators render with one of these crate prefixes.
+    // This is NOT the authority (a `--crate-name alloc` dep forges it); the DefId anchors
+    // below are — it only cuts the common non-allocator calls fast.
     let std_origin =
         name.starts_with("std::") || name.starts_with("alloc::") || name.starts_with("core::");
     if !std_origin {
@@ -4087,6 +5427,11 @@ fn is_infallible_box_allocator<'tcx>(tcx: TyCtxt<'tcx>, did: DefId, name: &str) 
             || name.ends_with("::new_uninit")
             || name.ends_with("::new_zeroed"));
     if boxed_method {
+        // UN-FORGEABLE ANCHOR: the callee must be an inherent method on the canonical `Box`
+        // ADT, identified by the `owned_box` LANG ITEM — which `--crate-name` cannot forge.
+        // Resolve the callee's inherent impl and require its Self type's ADT DefId to equal
+        // the `owned_box` DefId. `owned_box.is_some()` rules out a spurious `None == None`
+        // match on an anchor-less build; any absent/mismatched DefId fails closed.
         let owned_box = tcx.lang_items().owned_box();
         let self_adt = tcx
             .impl_of_assoc(did)
@@ -4096,6 +5441,8 @@ fn is_infallible_box_allocator<'tcx>(tcx: TyCtxt<'tcx>, did: DefId, name: &str) 
             .map(|adt| adt.did());
         return owned_box.is_some() && self_adt == owned_box;
     }
+    // Free-function / intrinsic allocators have NO lang item to anchor; bind the DEFINING
+    // crate's un-forgeable sysroot `StableCrateId` (the fallback where no lang item fits).
     (name.ends_with("box_new_uninit") || name.ends_with("exchange_malloc"))
         && is_real_sysroot_crate(tcx, did.krate)
 }
@@ -4196,6 +5543,11 @@ fn alloc_call_box_facts<'tcx>(
             unique_call_def_for_local(mir_body, local)
         {
             let name = func_operand_name(tcx, func);
+            // SOUNDNESS (crate-name forgery): authenticate the allocator by its RESOLVED
+            // callee DefId (un-forgeable `owned_box` lang item / sysroot `StableCrateId`),
+            // NEVER the printed `alloc::boxed::Box::new` path a `--crate-name alloc` dep can
+            // forge — see `is_infallible_box_allocator`. Fail-closed if the callee does not
+            // resolve to a concrete `FnDef` (`const_fn_def() == None`): the assert is KEPT.
             if let Some((did, _)) = func.const_fn_def() {
                 if is_infallible_box_allocator(tcx, did, &name) {
                     return Some(BoxAllocFacts {
@@ -4492,6 +5844,126 @@ fn type_is_validity_nonnull(ty: ty::Ty<'_>) -> bool {
     ty.is_ref() || ty.is_box()
 }
 
+/// Is `mir_body` BORROW-PROVENANCE-CLEAN — does it fabricate NO `&T`/`&mut T`
+/// reference from an UNSAFE source?
+///
+/// SOUNDNESS-CRITICAL memory-safety filter. The trust-ir bridge stamps a
+/// `ProofAnnotation::ValidBorrow` on every deref through a statically
+/// reference-typed pointer, which suppresses the load/store
+/// `MemoryAccessWithoutPreciseModel` fail-closed marker in the CHC translator.
+/// That suppression is sound ONLY for a genuinely-valid borrow-checker-validated
+/// reference and UNSOUND for an unsafe-fabricated one (`&*raw`, a `transmute` to
+/// `&T`, a union-field read). Ref-vs-raw and union-ness are ERASED before the
+/// bridge (both collapse to a plain pointer / a struct-shaped `Ty::Adt`), so the
+/// discrimination must be made HERE, on rustc MIR, where the reference/raw/box
+/// distinction, `is_union`, and the real `CastKind` are all still available.
+///
+/// A function is clean iff it contains NONE of the following unsafe
+/// reference-fabrication sources (any one → fail closed, unclean):
+///   - a place that DEREFERENCES a raw pointer (`&*raw` / `*raw`): the deref'd
+///     base is neither a reference nor a `Box`;
+///   - a place that reads THROUGH a UNION field: its bytes carry no validity
+///     guarantee (a punned read can synthesize an arbitrary/invalid reference);
+///   - an `UnwrapUnsafeBinder` (or any unrecognized future) projection;
+///   - an `Rvalue::Cast` whose TARGET type is a reference and whose kind is NOT a
+///     safe ref-to-ref pointer coercion (i.e. a `transmute`/raw-to-ref cast).
+///
+/// COMPLETENESS: in well-typed MIR a reference VALUE comes to exist only via
+///   (a) an INCOMING reference — a `&T`/`&mut T` parameter, a call return, or a
+///       reference LOADED from memory. Each is trusted valid by the language type
+///       system — the SAME residual TCB the GEP arm / `valid_ref_ptrs` seeding
+///       already assume for `&T` parameters (`native.rs`). Never a fabrication.
+///   (b) an `Rvalue::Ref(_, _, place)` — a borrow of a PLACE. This is caught by
+///       the per-place raw-deref / union check applied to EVERY place the visitor
+///       reaches (an `Rvalue::Ref`'s place is one of them).
+///   (c) an `Rvalue::Cast` producing a reference — caught by the cast check.
+/// Every other `Rvalue` only PROPAGATES an already-existing reference value
+/// (`Use`/`CopyForDeref`/`Aggregate`/`Repeat`) or produces a non-reference
+/// (`AddressOf` yields a RAW pointer, `Len`/`Discriminant`/arith yield scalars),
+/// so it introduces no new reference provenance. Any uncertain projection or a
+/// cast-to-ref that is not a recognized-safe coercion fails CLOSED.
+///
+/// This is a whole-function (coarse) attestation: for a clean function EVERY
+/// reference deref is a genuine borrow, so its `ValidBorrow` is sound; an unclean
+/// function is denied `ValidBorrow` entirely (its derefs fail closed). ny-cert
+/// functions carry zero `unsafe` and are therefore all clean.
+pub fn function_is_borrow_provenance_clean<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &mir::Body<'tcx>,
+) -> bool {
+    use rustc_middle::mir::visit::Visitor;
+    struct BorrowProvenanceCleanCheck<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        body: &'a mir::Body<'tcx>,
+        clean: bool,
+    }
+    impl<'a, 'tcx> Visitor<'tcx> for BorrowProvenanceCleanCheck<'a, 'tcx> {
+        fn visit_place(
+            &mut self,
+            place: &mir::Place<'tcx>,
+            _context: mir::visit::PlaceContext,
+            _location: mir::Location,
+        ) {
+            for (i, elem) in place.projection.iter().enumerate() {
+                let base_ty = mir::Place::ty_from(
+                    place.local,
+                    &place.projection[..i],
+                    &self.body.local_decls,
+                    self.tcx,
+                )
+                .ty;
+                match elem {
+                    // `&*p` / `*p`: dereferencing a REFERENCE or a `Box` is a
+                    // validity-guaranteed access; dereferencing a RAW pointer (or
+                    // anything else) carries no such guarantee → fail closed.
+                    mir::PlaceElem::Deref => {
+                        if !(base_ty.is_ref() || base_ty.is_box()) {
+                            self.clean = false;
+                        }
+                    }
+                    // Reading THROUGH a union field is type-punning: the bytes
+                    // carry no validity guarantee → fail closed.
+                    mir::PlaceElem::Field(..) => {
+                        if base_ty.is_union() {
+                            self.clean = false;
+                        }
+                    }
+                    // Array/slice indexing and enum downcasts / type-only casts
+                    // never fabricate a reference from an unsafe source.
+                    mir::PlaceElem::Index(_)
+                    | mir::PlaceElem::ConstantIndex { .. }
+                    | mir::PlaceElem::Subslice { .. }
+                    | mir::PlaceElem::Downcast(..)
+                    | mir::PlaceElem::OpaqueCast(_) => {}
+                    // `UnwrapUnsafeBinder` opens an unsafe binder; treat it and any
+                    // future projection kind as fail-closed.
+                    _ => {
+                        self.clean = false;
+                    }
+                }
+            }
+        }
+        fn visit_rvalue(&mut self, rvalue: &mir::Rvalue<'tcx>, location: mir::Location) {
+            if let mir::Rvalue::Cast(kind, _operand, ty) = rvalue {
+                // A cast that PRODUCES a reference is safe only when it is a
+                // ref-to-ref pointer coercion (unsize `&[T; N]`→`&[T]`,
+                // `&T`→`&dyn Trait`); a `transmute`/raw-to-ref cast to a reference
+                // fabricates provenance → fail closed. (No `PointerCoercion`
+                // variant turns a raw pointer or integer into a `&T`.)
+                if ty.is_ref() && !matches!(kind, mir::CastKind::PointerCoercion(..)) {
+                    self.clean = false;
+                }
+            }
+            // Continue into the rvalue's operands/places so their projections are
+            // checked by `visit_place` above.
+            self.super_rvalue(rvalue, location);
+        }
+    }
+    let mut check = BorrowProvenanceCleanCheck { tcx, body: mir_body, clean: true };
+    check.visit_body(mir_body);
+    check.clean
+}
+
 /// Is `local` a function PARAMETER (`_1..=_arg_count`)?
 fn is_mir_parameter(mir_body: &mir::Body<'_>, local: mir::Local) -> bool {
     let i = local.as_usize();
@@ -4740,6 +6212,197 @@ pub(crate) fn discharge_provably_safe_pointer_asserts<'tcx>(
             if let Some(block) = vbody.blocks.get_mut(bb.as_usize()) {
                 block.terminator = Terminator::Goto(BlockId(target.as_usize()));
             }
+        }
+    }
+}
+
+/// SOUND, PER-CALL-SITE local devirtualization of the transparent-thiserror
+/// `<dyn core::error::Error>::source` call (`self.0.as_dyn_error().source()`). Runs in
+/// the EXTRACTOR post-pass (full `mir::Body` in scope, unlike `func_operand_name`), so
+/// it can trace the reborrow chain and rewrite the SPECIFIC lowered `Terminator::Call`
+/// callee to `TRUST_TOTAL_CLONE_SENTINEL` — which the bridge's
+/// `total_no_panic_call_summary` (lower.rs) models as a fresh `Undef`-at-dest,
+/// panic-free call ⇒ the obligation is PROVED under STRICT. (Ports
+/// `rustc_mir_transform::trust_verify::native_trust_ir_errsource_devirt_demotable_calls`;
+/// that native path fed the STRICT-INERT `expected_absent_callees` set — lame-only — and
+/// never proved. This one keys on the MIR BLOCK INDEX, so each site is decided
+/// independently: no occurrence-erasing key, hence no per-key AND is needed.)
+///
+/// FAIL-CLOSED BY CONSTRUCTION: any weaker shape leaves the call untouched (keeping its
+/// obligation). A sibling `<dyn Error>::source` whose receiver dispatches to a panicking
+/// OVERRIDE is simply not in the rewrite set. Gated on `TRUST_ERRSOURCE_DEVIRT` for an
+/// A/B (flag-off byte-identical to baseline).
+pub(crate) fn stamp_errsource_devirt_total_calls<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    mir_body: &mir::Body<'tcx>,
+    vbody: &mut VerifiableBody,
+) {
+    use rustc_data_structures::fx::FxHashMap;
+
+    if std::env::var_os("TRUST_ERRSOURCE_DEVIRT").is_none() {
+        return;
+    }
+    let typing_env = ty::TypingEnv::post_analysis(tcx, mir_body.source.def_id());
+    let trace = std::env::var_os("TRUST_ERRSOURCE_DEVIRT_TRACE").is_some();
+
+    // thiserror `AsDynError` StableCrateId (captured 2026-08-03; un-spoofable, mirrors
+    // BIGNUM_TCB_ALLOWLIST). A thiserror bump changes it ⇒ fail-closes, never false-proves.
+    const THISERROR_TCB_SCIDS: &[u64] = &[8032019009297296000];
+
+    #[derive(Clone, Copy)]
+    enum RecvSrc<'tcx> {
+        // The recovered `&C` source type — from an `Unsize` cast operand or an
+        // authenticated `as_dyn_error(&C)` arg. Precomputed at def-map build time
+        // (avoids naming the private `Spanned` and drops a lifetime param).
+        Ty(ty::Ty<'tcx>),
+        // `dest = &(*base)` — a fat-pointer (incl. vtable) verbatim reborrow ⇒ same
+        // concrete runtime type as `base`. Followed transitively in Phase 1.
+        Reborrow(mir::Local),
+    }
+
+    let is_as_dyn_error_call = |func: &mir::Operand<'tcx>| -> bool {
+        let Some((did, _)) = func.const_fn_def() else {
+            return false;
+        };
+        if tcx.item_name(did).as_str() != "as_dyn_error" {
+            return false;
+        }
+        let Some(trait_def_id) = tcx.trait_of_assoc(did) else {
+            return false;
+        };
+        if !tcx.def_path_str(trait_def_id).ends_with("AsDynError") {
+            return false;
+        }
+        THISERROR_TCB_SCIDS.contains(&tcx.stable_crate_id(trait_def_id.krate).as_u64())
+    };
+
+    // Phase 0: whole-body def map with UNIQUENESS + address-taking poison; single-Deref
+    // reborrows are vtable-preserving aliases (do NOT poison the base).
+    let mut defs: FxHashMap<mir::Local, Option<RecvSrc<'tcx>>> = FxHashMap::default();
+    for bbdata in mir_body.basic_blocks.iter() {
+        for stmt in &bbdata.statements {
+            if let mir::StatementKind::Assign(assign) = &stmt.kind {
+                let (dest, rvalue) = &**assign;
+                if dest.projection.is_empty() {
+                    let src = match rvalue {
+                        mir::Rvalue::Cast(
+                            mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                            src_op,
+                            _,
+                        ) => Some(RecvSrc::Ty(src_op.ty(&mir_body.local_decls, tcx))),
+                        mir::Rvalue::Ref(_, _, place) | mir::Rvalue::RawPtr(_, place)
+                            if place.projection.len() == 1
+                                && matches!(place.projection[0], mir::ProjectionElem::Deref) =>
+                        {
+                            Some(RecvSrc::Reborrow(place.local))
+                        }
+                        _ => None,
+                    };
+                    defs.entry(dest.local).and_modify(|s| *s = None).or_insert(src);
+                }
+                if let mir::Rvalue::Ref(_, _, place) | mir::Rvalue::RawPtr(_, place) = rvalue {
+                    if place.projection.is_empty() {
+                        defs.insert(place.local, None);
+                    }
+                }
+            }
+        }
+        if let mir::TerminatorKind::Call { func, args, destination, .. } =
+            &bbdata.terminator().kind
+        {
+            if destination.projection.is_empty() {
+                // An authenticated `as_dyn_error(&C)` pins the dest's runtime type to
+                // its arg's concrete `&C`. No args (malformed) → None (fail closed).
+                let src = if is_as_dyn_error_call(func) {
+                    args.get(0).map(|a0| RecvSrc::Ty(a0.node.ty(&mir_body.local_decls, tcx)))
+                } else {
+                    None
+                };
+                defs.entry(destination.local).and_modify(|s| *s = None).or_insert(src);
+            }
+        }
+    }
+
+    // Phase 1: rewrite each demotable virtual `<dyn Error>::source` call, per block index.
+    for (bb, bbdata) in mir_body.basic_blocks.iter_enumerated() {
+        let (func, args) = match &bbdata.terminator().kind {
+            mir::TerminatorKind::Call { func, args, .. }
+            | mir::TerminatorKind::TailCall { func, args, .. } => (func, args),
+            _ => continue,
+        };
+        let Some((callee_def_id, gen_args)) = func.const_fn_def() else {
+            continue;
+        };
+        let Ok(Some(instance)) =
+            ty::Instance::try_resolve(tcx, typing_env, callee_def_id, gen_args)
+        else {
+            continue;
+        };
+        let ty::InstanceKind::Virtual(method_def_id, _) = instance.def else {
+            continue;
+        };
+        let Some(trait_def_id) = tcx.trait_of_assoc(method_def_id) else {
+            continue;
+        };
+        if !matches!(
+            tcx.def_path_str(trait_def_id).as_str(),
+            "core::error::Error" | "std::error::Error"
+        ) {
+            continue;
+        }
+        if tcx.item_name(method_def_id).as_str() != "source" {
+            continue;
+        }
+        let demotable = 'demote: {
+            let Some(arg0) = args.get(0) else {
+                break 'demote false;
+            };
+            let (mir::Operand::Copy(rp) | mir::Operand::Move(rp)) = &arg0.node else {
+                break 'demote false;
+            };
+            if !rp.projection.is_empty() {
+                break 'demote false;
+            }
+            let mut cur = rp.local;
+            let mut fuel = 16u32;
+            let src_ty = loop {
+                let Some(next_fuel) = fuel.checked_sub(1) else {
+                    break 'demote false;
+                };
+                fuel = next_fuel;
+                match defs.get(&cur).copied().flatten() {
+                    Some(RecvSrc::Reborrow(next)) => cur = next,
+                    Some(RecvSrc::Ty(t)) => break t,
+                    None => break 'demote false,
+                }
+            };
+            let Some(concrete) = src_ty.builtin_deref(true) else {
+                break 'demote false;
+            };
+            if concrete.ty_adt_def().is_none() {
+                break 'demote false;
+            }
+            let c_args = tcx.mk_args(&[concrete.into()]);
+            let Ok(Some(inst2)) =
+                ty::Instance::try_resolve(tcx, typing_env, method_def_id, c_args)
+            else {
+                break 'demote false;
+            };
+            inst2.def_id() == method_def_id
+        };
+        if trace {
+            eprintln!(
+                "[ERRSOURCE_DEVIRT] fn={} bb={} demotable={}",
+                tcx.def_path_str(mir_body.source.def_id()),
+                bb.as_usize(),
+                demotable
+            );
+        }
+        if !demotable {
+            continue;
+        }
+        if let Terminator::Call { func, .. } = &mut vbody.blocks[bb.as_usize()].terminator {
+            *func = TRUST_TOTAL_CLONE_SENTINEL.to_string();
         }
     }
 }
@@ -6279,6 +7942,9 @@ pub(crate) fn discharge_os_provenance_error_drops<'tcx>(
         let drop_ty = place.ty(&mir_body.local_decls, tcx).ty;
         let drop_ty = tcx.normalize_erasing_regions(typing_env, ty::Unnormalized::new_wip(drop_ty));
         let ty::Adt(adt_def, _) = drop_ty.kind() else { continue };
+        // SOUNDNESS (crate-name forgery): `is_io_error_ty_name` matches a `std::…::io::…::Error`
+        // NAME; bind the type's defining crate scid to the real sysroot so a forged
+        // `std::io::Error` (with an arbitrary panicking `Drop`) is not a discharge candidate.
         if !is_io_error_ty_name(&crate::safe_def_path_str(tcx, adt_def.did()))
             || !is_real_sysroot_crate(tcx, adt_def.did().krate)
         {
@@ -6541,6 +8207,11 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                     {
                         return marked;
                     }
+                    if let Some(marked) =
+                        tcx_marked_signed_checked_primitive_path(tcx, *def_id, &generic)
+                    {
+                        return marked;
+                    }
                     // Trust (#84): the `?` operator desugars to a `Try::branch` call and
                     // (on the early-return arm) a `FromResidual::from_residual` call. For
                     // the std `Result`/`Option`/`ControlFlow` carriers — when no error
@@ -6552,8 +8223,10 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                     // cannot, because the unit-error residual is extracted as an opaque
                     // constant that erases its type. Append a recognizable marker so the
                     // bridge models the result as a fresh unconstrained value. A CONVERTING
-                    // `?` (whose `from_residual` runs a possibly-panicking user `From::from`)
-                    // is NOT marked and stays fail-closed. See `trust_try_total_marker`.
+                    // `?` (whose `from_residual` runs a user `From::from`) is marked ONLY
+                    // when that From impl's CONCRETE MIR is proven structurally panic-free
+                    // (`converting_from_is_structurally_total`); otherwise it stays
+                    // fail-closed. See `trust_try_total_marker`.
                     if trust_try_total_marker(tcx, *def_id, generic_args) {
                         return format!("{generic}::<__trust_try_total>");
                     }
@@ -6608,6 +8281,30 @@ pub fn func_operand_name<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> 
                     let sentineled = apply_total_clone_sentinel(tcx, func, name.clone());
                     if sentineled != name {
                         return sentineled;
+                    }
+                    // FIX 2: the analogous rewrite for a provably-total DERIVED
+                    // `PartialEq::eq` — same sentinel, same fail-closed discipline,
+                    // same placement BEFORE devirtualization (a derived impl call
+                    // belongs to the sentinel lane, not the devirt rename, which
+                    // itself excludes `#[automatically_derived]` impls).
+                    let eq_sentineled = apply_total_partial_eq_sentinel(tcx, func, name.clone());
+                    if eq_sentineled != name {
+                        return eq_sentineled;
+                    }
+                    // Build D: the analogous rewrite for a provably-total DERIVED
+                    // `PartialOrd`/`Ord` comparison — same sentinel, same fail-closed
+                    // discipline, same placement BEFORE devirtualization.
+                    let ord_sentineled = apply_total_partial_ord_sentinel(tcx, func, name.clone());
+                    if ord_sentineled != name {
+                        return ord_sentineled;
+                    }
+                    // Batch-1 L3: a primitive `<P as Hash>::hash::<H>` fed by a real-
+                    // sysroot hasher is panic-free — same sentinel, same fail-closed
+                    // discipline, same placement BEFORE devirtualization.
+                    let hash_sentineled =
+                        apply_total_primitive_hash_sentinel(tcx, func, name.clone());
+                    if hash_sentineled != name {
+                        return hash_sentineled;
                     }
                     // Devirtualization rename (see `devirtualized_callee_name`): a call
                     // that resolves to a LOCAL impl with available MIR takes the IMPL's
@@ -6747,6 +8444,68 @@ fn tcx_marked_unsigned_wrapping_primitive_path(
     trust_types::RustcTotalPrimitiveMethod::classify(&marked).map(|_| marked)
 }
 
+/// Mark the exact inherent SIGNED-primitive overflow-checked methods modeled
+/// by the E6 checked-arithmetic lane (`iN::checked_add`/`checked_sub`/
+/// `checked_mul`, `Option<iN>`-returning).
+///
+/// Identity discipline as [`tcx_marked_unsigned_wrapping_primitive_path`]:
+/// these are `core` library methods, not intrinsics, and diagnostic path text
+/// is source-spellable — so the item and its inherent impl must live in the
+/// exact crate that supplies the `Sized` lang item, on a PRIMITIVE SIGNED
+/// integer self type, with the exact safe Rust `(I, I) -> Option<I>`
+/// signature (the `Option` checked through its diagnostic-item identity, not
+/// a name). SIGNED only — unsigned checked methods have different underflow
+/// semantics and a different kernel model, so they stay unmarked (checked-
+/// arith spec §5.5) and fail closed downstream.
+fn tcx_marked_signed_checked_primitive_path(
+    tcx: TyCtxt<'_>,
+    def_id: DefId,
+    path: &str,
+) -> Option<String> {
+    if tcx.trait_impl_of_assoc(def_id).is_some() {
+        return None;
+    }
+    let impl_did = tcx.impl_of_assoc(def_id)?;
+    let core_lang_item_crate = tcx.lang_items().sized_trait()?.krate;
+    if def_id.is_local()
+        || def_id.krate != core_lang_item_crate
+        || impl_did.krate != core_lang_item_crate
+    {
+        return None;
+    }
+    let self_ty = tcx.type_of(impl_did).skip_binder();
+    if !matches!(self_ty.kind(), rustc_middle::ty::TyKind::Int(_)) {
+        return None;
+    }
+    if !matches!(tcx.item_name(def_id).as_str(), "checked_add" | "checked_sub" | "checked_mul") {
+        return None;
+    }
+    let sig = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+    if sig.safety() != rustc_hir::Safety::Safe
+        || sig.abi() != rustc_abi::ExternAbi::Rust
+        || sig.c_variadic()
+        || sig.inputs().len() != 2
+        || sig.inputs()[0] != self_ty
+        || sig.inputs()[1] != self_ty
+    {
+        return None;
+    }
+    // The return type must be the std `Option` (by diagnostic-item identity)
+    // instantiated at exactly the self type.
+    let rustc_middle::ty::TyKind::Adt(adt, args) = sig.output().kind() else {
+        return None;
+    };
+    if !tcx.is_diagnostic_item(rustc_span::sym::Option, adt.did())
+        || args.types().next() != Some(self_ty)
+    {
+        return None;
+    }
+    let marked =
+        format!("{}{}", trust_types::TRUST_RUSTC_CHECKED_PRIMITIVE_METHOD_PATH_PREFIX, path);
+    trust_types::RustcCheckedPrimitiveMethod::classify(&marked).map(|_| marked)
+}
+
+
 /// Mark an exact inherent `core` integer wrapping add/sub/mul method for the
 /// refutation-only modular call model.
 ///
@@ -6791,6 +8550,18 @@ fn tcx_marked_wrapping_refutation_path(
 }
 
 fn pure_total_intrinsic_marker_allowed(name: &str, must_be_overridden: bool) -> bool {
+    // `cold_path` is the one modeled intrinsic WITH a fallback body (an empty
+    // `{}` — it is a pure codegen HINT with no value and no effect), so it is
+    // never `must_be_overridden`. It is admitted by exact intrinsic name:
+    // `TyCtxt::intrinsic` authenticated the definition as a genuine
+    // `#[rustc_intrinsic]` item, and rustc keys intrinsic SEMANTICS on that
+    // name, so any authenticated `cold_path` is the no-op hint. Marking it is
+    // what lets the E6 facet gate admit the `-O` lowering of
+    // `iN::checked_*` (which places one `cold_path()` call on its overflow
+    // edge) without loosening the unmarked-callee discipline.
+    if name == "cold_path" {
+        return true;
+    }
     must_be_overridden
         && matches!(
             name,
@@ -7311,6 +9082,23 @@ fn devirtualized_callee_name<'tcx>(
     if resolved == def_id || !resolved.is_local() || !tcx.is_mir_available(resolved) {
         return None;
     }
+    // A `Fn`/`FnMut`/`FnOnce::call*` invocation resolves to the CLOSURE BODY. Do NOT
+    // rename the call to the body's def_path: that discards the rust-call ABI signal
+    // (`is_rust_callable_trait_call`) the bridge needs to FLATTEN the `(receiver_env,
+    // args_tuple)` call form into the body's untupled `[env, arg0, …]` params. Renaming
+    // routes it to the bridge's plain `known_functions` bind (AsWritten), emitting a
+    // 2-arg call against an (N+1)-param body — malformed IR the SSA/type validator
+    // rejects. Keeping the trait spelling routes it through the bridge's proven
+    // closure-receiver flatten path (which flattens, or fails closed, correctly).
+    if matches!(tcx.def_kind(resolved), rustc_hir::def::DefKind::Closure) {
+        return None;
+    }
+    // Derived impls belong to the sentinel lane (see the doc above).
+    if let Some(impl_did) = tcx.impl_of_assoc(resolved) {
+        if tcx.is_automatically_derived(impl_did) {
+            return None;
+        }
+    }
     Some(crate::safe_def_path_str(tcx, resolved))
 }
 
@@ -7325,6 +9113,42 @@ fn devirtualized_callee_name<'tcx>(
 /// def-path-PINNED primitive-comparison table, whose authority is the resolved
 /// callee's defining crate + a compiler-registered diagnostic trait + a builtin
 /// primitive Self type — none of which is forgeable from source.
+///
+/// MEASURED 2026-08-16 (FRONT B, item 2) — FOUR of the `name`-gated arms below are
+/// DEAD: they decline every call by construction, because their prefilters predate the
+/// switch to rustc's fully-qualified `<SelfTy as Trait>::method` rendering (and, for two
+/// of them, a std module-path move). Each row is the callee string this toolchain's own
+/// `-Z trust-dump=mir` prints, next to the spelling the arm demands:
+///
+///   arm                 | demanded (never matches)          | ACTUAL live spelling
+///   --------------------+-----------------------------------+---------------------------
+///   Option::as_deref    | `…::Option::<T>::as_deref` /      | `core::option::Option::
+///                       | `…::Option::as_deref`             |   <alloc::string::String>::as_deref`
+///   Default::default    | `core::default::Default::default` | `<core::option::Option<u32>
+///                       |                                   |   as core::default::Default>::default`
+///   AsRawFd::as_raw_fd  | `std::os::fd::AsRawFd::as_raw_fd` | `<std::fs::File as
+///                       |                                   |   std::os::fd::raw::AsRawFd>::as_raw_fd`
+///   Deref/DerefMut      | `core::ops::Deref::deref` (etc.)  | `<alloc::boxed::Box<u32> as
+///                       |                                   |   core::ops::deref::Deref>::deref`
+///
+/// This is the SAME staleness class the `Clone` arm already documents below (its old
+/// gate matched only `…::Clone::clone`, never the qualified `Clone>::clone`).
+///
+/// DO NOT "repair" these by widening the prefilters without re-measuring first — the
+/// measurement says repair is not currently worth the TCB it would add:
+///   * `Option::as_deref` is ALREADY covered, with strictly BETTER authority, by
+///     `std_adapter_total_panic_free` arm (c) in this file (real-sysroot `StableCrateId`
+///     first, then a payload-type totality gate). Reviving this arm would add a SECOND,
+///     weaker path to the same conclusion. The campaign memory calling `Option::as_deref`
+///     a certify-family blocker is STALE: a probe of `Option::<String>::as_deref` /
+///     `Option::<Box<u32>>::as_deref` PROVES today under the strict default.
+///   * `<Box<T> as Deref>::deref` / `deref_mut` likewise prove today with no obligation
+///     and no absent-callee census row. Rewriting them to the sentinel would REPLACE a
+///     real discharge with a trusted havoc — a TCB regression for zero count movement.
+///   * `<Option<T> as Default>::default` and `<File as AsRawFd>::as_raw_fd` DO still
+///     produce honest absent-callee obligations, so repairing those two would be a real
+///     (if small) improvement — but BOTH occur ZERO times in the ny-cert gate log
+///     (`.gatelogs/gateR8-noenv.log`), so it is count-inert for that campaign.
 fn apply_total_clone_sentinel<'tcx>(
     tcx: TyCtxt<'tcx>,
     func: &mir::Operand<'tcx>,
@@ -7333,6 +9157,193 @@ fn apply_total_clone_sentinel<'tcx>(
     if let Some((method_def_id, gen_args)) = func.const_fn_def() {
         if is_pinned_total_std_primitive_cmp_call(tcx, method_def_id, gen_args) {
             return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+        }
+        if is_total_keyed_collect_call(tcx, method_def_id, gen_args) {
+            return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+        }
+        if is_total_collection_extend_call(tcx, method_def_id, gen_args) {
+            return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+        }
+        if is_total_hash_map_query_call(tcx, method_def_id, gen_args) {
+            return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+        }
+    }
+    // Std LOCK-GUARD deref: `<std::sync::{MutexGuard, RwLockReadGuard,
+    // RwLockWriteGuard} as Deref/DerefMut>::deref{,_mut}` is a raw-pointer
+    // projection with NO panic path and NO user code — total for any `T`.
+    // TWO anchors, both required, both fail-closed:
+    //   (1) the callee name must be the CANONICAL std/core trait-method path
+    //       (a user-defined trait merely NAMED `Deref` — legal to impl for a
+    //       foreign guard type under the orphan rule — never matches);
+    //   (2) the resolved SELF type must be one of the three std guard ADTs,
+    //       std::/alloc::/core::-anchored — so a USER `Deref` impl with a
+    //       panic path (e.g. aterm's own `MutexGuard`, whose deref carries a
+    //       "inner was taken" contract panic) NEVER matches.
+    // `<Option<T> as Default>::default` — returns `None`: NO `T` code runs,
+    // no allocation, no panic path, total for EVERY `T`. A MANUAL std impl,
+    // so the derived-trait totality gate never fires for it; anchored on the
+    // canonical trait path AND the std `Option` self-ADT (a user `Default`
+    // impl never matches).
+    if matches!(
+        name.as_str(),
+        "std::default::Default::default" | "core::default::Default::default"
+    ) {
+        if let Some((_, gen_args)) = func.const_fn_def() {
+            if let Some(self_ty) = gen_args.types().next() {
+                if let Some(adt) = self_ty.ty_adt_def() {
+                    let path = crate::safe_def_path_str(tcx, adt.did());
+                    let leaf = path.rsplit("::").next().unwrap_or(&path);
+                    let leaf = leaf.split('<').next().unwrap_or(leaf);
+                    if leaf == "Option"
+                        && (path.starts_with("core::") || path.starts_with("std::"))
+                        // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
+                        && is_real_sysroot_crate(tcx, adt.did().krate)
+                    {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // `Option::<T>::as_deref` — a structural match plus ONE `Deref::deref` on
+    // the payload: total exactly when the payload's `Deref` impl is a std
+    // raw-pointer projection. Gated on the payload leaf being a std owning
+    // wrapper (`Box`/`Arc`/`Rc`/`String`/`Vec`), std/alloc/core-anchored — a
+    // payload with a USER `Deref` impl (which may panic) never matches.
+    if name.ends_with("::Option::<T>::as_deref") || name.ends_with("::Option::as_deref") {
+        if let Some((_, gen_args)) = func.const_fn_def() {
+            if let Some(payload_ty) = gen_args.types().next() {
+                if let Some(adt) = payload_ty.ty_adt_def() {
+                    let path = crate::safe_def_path_str(tcx, adt.did());
+                    let leaf = path.rsplit("::").next().unwrap_or(&path);
+                    let leaf = leaf.split('<').next().unwrap_or(leaf);
+                    let std_deref_wrapper =
+                        matches!(leaf, "Box" | "Arc" | "Rc" | "String" | "Vec")
+                            && (path.starts_with("std::")
+                                || path.starts_with("alloc::")
+                                || path.starts_with("core::"))
+                            // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
+                            && is_real_sysroot_crate(tcx, adt.did().krate);
+                    if std_deref_wrapper {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // Std FD-accessor: `<OwnedFd/BorrowedFd/File as AsRawFd>::as_raw_fd` is a
+    // plain field read (through the File→FileDesc→OwnedFd chain) — no panic
+    // path, no user code. Same double-anchor discipline as the guard-deref
+    // arm below: canonical trait path AND a std self-ADT, so a user `AsRawFd`
+    // impl never matches.
+    if name.as_str() == "std::os::fd::AsRawFd::as_raw_fd" {
+        if let Some((_, gen_args)) = func.const_fn_def() {
+            if let Some(self_ty) = gen_args.types().next() {
+                if let Some(adt) = self_ty.ty_adt_def() {
+                    let path = crate::safe_def_path_str(tcx, adt.did());
+                    if path.starts_with("std::")
+                        && (path.ends_with("::OwnedFd")
+                            || path.ends_with("::BorrowedFd")
+                            || path.ends_with("::File"))
+                        // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
+                        && is_real_sysroot_crate(tcx, adt.did().krate)
+                    {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+                    }
+                }
+            }
+        }
+    }
+    if matches!(
+        name.as_str(),
+        "std::ops::Deref::deref"
+            | "core::ops::Deref::deref"
+            | "std::ops::DerefMut::deref_mut"
+            | "core::ops::DerefMut::deref_mut"
+    ) {
+        if let Some((_, gen_args)) = func.const_fn_def() {
+            if let Some(self_ty) = gen_args.types().next() {
+                if let Some(adt) = self_ty.ty_adt_def() {
+                    let path = crate::safe_def_path_str(tcx, adt.did());
+                    let leaf = path.rsplit("::").next().unwrap_or(&path);
+                    let leaf = leaf.split('<').next().unwrap_or(leaf);
+                    // `Box` joins the guard set for PANIC-freedom only: its
+                    // deref is an unchecked raw-pointer projection — no code
+                    // path can panic regardless of how the Box was produced
+                    // (a forged label is the UNSAFE lane's alignment/validity
+                    // problem, tracked by its own obligations, never a panic).
+                    let is_std_guard = matches!(
+                        leaf,
+                        "MutexGuard" | "RwLockReadGuard" | "RwLockWriteGuard" | "Box"
+                    ) && (path.starts_with("std::")
+                        || path.starts_with("alloc::")
+                        || path.starts_with("core::"))
+                        // SOUNDNESS (crate-name forgery): un-forgeable sysroot provenance.
+                        && is_real_sysroot_crate(tcx, adt.did().krate);
+                    if is_std_guard {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // Chain to the audited Clone-arm sentinel (lang-item + tcx_clone_is_total
+    // gated); it returns `name` unchanged when the callee is not a provably-total
+    // `Clone::clone` (fail-closed, byte-identical for every other callee).
+    apply_total_clone_sentinel_clone_arm(tcx, func, name)
+}
+
+/// Rewrite a provably-total `Clone::clone` callee to `TRUST_TOTAL_CLONE_SENTINEL`
+/// (the bridge models the sentinel as a total havoc call). THREE independent
+/// anchors, each closing a proven false-proof vector; ALL must hold:
+///   (1) the rendered callee tail is `::Clone::clone`;
+///   (2) the resolved trait is the REAL `Clone` LANG ITEM — not a user trait merely
+///       NAMED `Clone` (`m::Clone::clone`), whose `clone` on a base-case receiver
+///       (`u32`) would otherwise short-circuit `tcx_clone_is_total` to `true` on the
+///       primitive alone (never reaching the ADT gate);
+///   (3) `tcx_clone_is_total` proves the CONCRETE receiver clone panic-free (a
+///       hand-written / foreign / non-builtin-derived element fails closed).
+/// Fails CLOSED on every miss (the call keeps its real name → may-panic obligation).
+/// ONLY the Clone arm is live; the derived-trait / keyed-collect / extend / hashmap
+/// arms stay quarantined in the `#[cfg(any())]` twin.
+fn apply_total_clone_sentinel_clone_arm<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+    name: String,
+) -> String {
+    // Accept BOTH renderings of the clone callee: the generic-path form
+    // `...::Clone::clone` AND the fully-qualified form `<T as core::clone::Clone>::clone`
+    // (which ends in `Clone>::clone` — the `>` before `::clone`). The old gate only
+    // matched the former, so it NEVER fired for the real qualified spelling and the
+    // whole clone sentinel was dead. This is only a cheap prefilter; the un-spoofable
+    // soundness boundary is the `clone_trait()` lang-item gate + `tcx_clone_is_total`
+    // below (a user trait named `*Clone` with a `clone` method passes this string test
+    // but is rejected by the lang-item check).
+    let clone_call_path = call_path_without_trailing_turbofish(&name);
+    if clone_call_path.ends_with("::Clone::clone") || clone_call_path.ends_with("Clone>::clone") {
+        if let Some((clone_method, gen_args)) = func.const_fn_def() {
+            if let Some(self_ty) = gen_args.types().next() {
+                let clone_method = tcx
+                    .associated_item(clone_method)
+                    .trait_item_def_id()
+                    .unwrap_or(clone_method);
+                // LANG-ITEM GATE (vector #2): the resolved method's trait must be the
+                // un-spoofable `Clone` lang item. Binding `Some(clone_trait)` also rules
+                // out a `None == None` match if no Clone lang item existed.
+                if let Some(clone_trait) = tcx.lang_items().clone_trait() {
+                    if tcx.trait_of_assoc(clone_method) == Some(clone_trait)
+                        && tcx_clone_is_total(
+                            tcx,
+                            self_ty,
+                            clone_method,
+                            CLONE_TOTALITY_FUEL,
+                            &mut std::collections::HashSet::new(),
+                        )
+                    {
+                        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+                    }
+                }
+            }
         }
     }
     name
@@ -7450,6 +9461,613 @@ fn is_pinned_total_std_primitive_cmp_call<'tcx>(
     matches!(self_ty.kind(), ty::Int(_) | ty::Uint(_) | ty::Bool | ty::Char)
 }
 
+/// Rewrite a provably-total DERIVED `PartialEq::eq` callee to
+/// `TRUST_TOTAL_CLONE_SENTINEL` (the bridge models the sentinel as a fresh TOTAL
+/// havoc → a fresh `Bool` for this `-> bool` callee). Mirrors
+/// `apply_total_clone_sentinel`'s three-anchor discipline; ALL must hold:
+///   (1) the rendered callee tail is `::PartialEq::eq`/`::PartialEq::ne`
+///       (generic-path form) OR `PartialEq>::eq`/`PartialEq>::ne` (the
+///       fully-qualified `<T as core::cmp::PartialEq>::{eq,ne}` spelling — the `>`
+///       before `::eq`/`::ne`). `ne` is included because `#[derive(PartialEq)]`
+///       emits NO per-type `ne` — a `x != y` call resolves to the PROVIDED default
+///       `PartialEq::ne` = `!self.eq(other)`, whose ONLY effect is the derived `eq`
+///       gated at (3) plus a total `bool` negation. So a derived-total `eq`
+///       certifies a total `ne` by the SAME `tcx_derived_trait_is_total(PartialEq)`
+///       proof — no new soundness surface. (census: `<ThreshDir as PartialEq>::ne`
+///       @ alethe_emit.rs:675 `branch_tree_to_alethe`.)
+///   (2) the resolved trait is the REAL `core::cmp::PartialEq` — gated on the
+///       un-spoofable `PartialEq` DIAGNOSTIC ITEM, with an exact-def-path fallback
+///       (`core::cmp::PartialEq`), so a user trait merely NAMED `PartialEq` is
+///       rejected (the analogue of the `Clone` lang-item gate above; `PartialEq`
+///       has no lang item);
+///   (3) `tcx_derived_trait_is_total` proves the CONCRETE receiver's `eq` panic-free
+///       — its `is_builtin_derived` gate rejects a hand-written / foreign /
+///       proc-macro-spoofed `#[automatically_derived]` impl, and a field with a
+///       genuinely-panicking derived `eq` recurses and FAILS CLOSED.
+/// Fails CLOSED on every miss (the call keeps its real name → may-panic obligation).
+///
+/// A `PartialEq::eq` on a std `Option`/`Result` receiver is DELIBERATELY EXCLUDED
+/// (kept as its real callee name): the eq-guard verify channel models `o == None` as
+/// a pure discriminant test, and the opaque total sentinel would ERASE that (a
+/// precision loss, not a soundness gap — the bridge's trusted-total allowlist still
+/// models these calls total). Mirrors the same carve-out in the quarantined
+/// `is_total_derived_trait_call`.
+fn apply_total_partial_eq_sentinel<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+    name: String,
+) -> String {
+    let eq_call_path = call_path_without_trailing_turbofish(&name);
+    if !(eq_call_path.ends_with("::PartialEq::eq")
+        || eq_call_path.ends_with("PartialEq>::eq")
+        || eq_call_path.ends_with("::PartialEq::ne")
+        || eq_call_path.ends_with("PartialEq>::ne"))
+    {
+        return name;
+    }
+    let Some((eq_method, gen_args)) = func.const_fn_def() else {
+        return name;
+    };
+    let Some(self_ty) = gen_args.types().next() else {
+        return name;
+    };
+    let eq_method = tcx.associated_item(eq_method).trait_item_def_id().unwrap_or(eq_method);
+    let Some(eq_trait) = tcx.trait_of_assoc(eq_method) else {
+        return name;
+    };
+    // TRAIT GATE (vector #2): the resolved trait must be the REAL
+    // `core::cmp::PartialEq`. `PartialEq` has no lang item, so anchor on its
+    // un-spoofable diagnostic item, with an exact-def-path fallback in case the
+    // diagnostic item is unavailable. A user trait named `PartialEq` (whose
+    // def-path is NOT `core::cmp::PartialEq`) is rejected here.
+    let is_core_partial_eq = tcx.get_diagnostic_item(rustc_span::sym::PartialEq) == Some(eq_trait)
+        || crate::safe_def_path_str(tcx, eq_trait) == "core::cmp::PartialEq";
+    if !is_core_partial_eq {
+        return name;
+    }
+    // Precision carve-out (see doc): a std `Option`/`Result` `eq` keeps its real
+    // name so the eq-guard channel can still recover the discriminant test.
+    {
+        let mut st = self_ty;
+        while let ty::TyKind::Ref(_, inner, _) = st.kind() {
+            st = *inner;
+        }
+        if let ty::TyKind::Adt(adt, _) = st.kind() {
+            if matches!(
+                crate::safe_def_path_str(tcx, adt.did()).as_str(),
+                "core::option::Option"
+                    | "std::option::Option"
+                    | "core::result::Result"
+                    | "std::result::Result"
+            ) {
+                return name;
+            }
+        }
+    }
+    if tcx_derived_trait_is_total(
+        tcx,
+        self_ty,
+        eq_trait,
+        CLONE_TOTALITY_FUEL,
+        &mut std::collections::HashSet::new(),
+    ) {
+        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+    }
+    name
+}
+
+/// Build D: rewrite a provably-total DERIVED `PartialOrd`/`Ord` comparison callee to
+/// `TRUST_TOTAL_CLONE_SENTINEL`. Mirrors `apply_total_partial_eq_sentinel`'s three
+/// anchors, ALL of which must hold (fail-closed on every miss):
+///   (1) the tail is `::PartialOrd::{lt,le,gt,ge,partial_cmp}` /
+///       `PartialOrd>::…` (the fully-qualified `<T as core::cmp::PartialOrd>::…`
+///       spelling — the `>` before `::method`) OR `::Ord::cmp` / `Ord>::cmp`. The
+///       derived `lt/le/gt/ge` are the PROVIDED defaults over the derived
+///       `partial_cmp`/`cmp` — total iff the underlying field comparison is total.
+///   (2) the resolved trait is the REAL `core::cmp::PartialOrd` — gated on the
+///       UN-SPOOFABLE `partial_ord_trait()` LANG ITEM (the analogue of the Clone
+///       lang-item gate; `PartialOrd`, unlike `PartialEq`, HAS a lang item) with a
+///       `core::cmp::PartialOrd` def-path fallback — OR the REAL `core::cmp::Ord`,
+///       gated on the `sym::Ord` DIAGNOSTIC ITEM (Ord has no lang item) with a
+///       `core::cmp::Ord` def-path fallback. A user trait merely NAMED
+///       `PartialOrd`/`Ord` has a different def-path and is rejected. The
+///       tail↔trait AGREEMENT check (a PartialOrd tail must resolve to the
+///       PartialOrd trait, an Ord tail to Ord) blocks a cross-tier spoof.
+///   (3) `tcx_derived_trait_is_total` proves the CONCRETE receiver panic-free — its
+///       `is_builtin_derived` gate rejects a hand-written / foreign / proc-macro-
+///       spoofed impl, and a field with a panicking derived `cmp` recurses and FAILS
+///       CLOSED; the (a0) `ArbPrec` arm additionally clears authenticated
+///       BigUint/BigInt/Ratio<Big>.
+/// No `Option`/`Result` carve-out (comparison has no discriminant-test channel to
+/// preserve, unlike eq); `min`/`max`/`clamp` are DELIBERATELY EXCLUDED (own inline
+/// Ord model; non-comparison return type).
+fn apply_total_partial_ord_sentinel<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+    name: String,
+) -> String {
+    use rustc_span::sym;
+    let p = call_path_without_trailing_turbofish(&name);
+    let is_partial_ord_tail = ["lt", "le", "gt", "ge", "partial_cmp"].iter().any(|m| {
+        p.ends_with(&format!("::PartialOrd::{m}")) || p.ends_with(&format!("PartialOrd>::{m}"))
+    });
+    let is_ord_tail = p.ends_with("::Ord::cmp") || p.ends_with("Ord>::cmp");
+    if !(is_partial_ord_tail || is_ord_tail) {
+        return name;
+    }
+    let Some((method, gen_args)) = func.const_fn_def() else {
+        return name;
+    };
+    let Some(self_ty) = gen_args.types().next() else {
+        return name;
+    };
+    let method = tcx.associated_item(method).trait_item_def_id().unwrap_or(method);
+    let Some(cmp_trait) = tcx.trait_of_assoc(method) else {
+        return name;
+    };
+    let is_core_partial_ord = tcx.lang_items().partial_ord_trait() == Some(cmp_trait)
+        || crate::safe_def_path_str(tcx, cmp_trait) == "core::cmp::PartialOrd";
+    let is_core_ord = tcx.get_diagnostic_item(sym::Ord) == Some(cmp_trait)
+        || crate::safe_def_path_str(tcx, cmp_trait) == "core::cmp::Ord";
+    // Trait identity must AGREE with the method tail (a PartialOrd tail must resolve
+    // to the PartialOrd trait, an Ord tail to Ord) so a spoofed spelling cannot cross
+    // tiers.
+    if !((is_partial_ord_tail && is_core_partial_ord) || (is_ord_tail && is_core_ord)) {
+        return name;
+    }
+    if tcx_derived_trait_is_total(
+        tcx,
+        self_ty,
+        cmp_trait,
+        CLONE_TOTALITY_FUEL,
+        &mut std::collections::HashSet::new(),
+    ) {
+        return TRUST_TOTAL_CLONE_SENTINEL.to_string();
+    }
+    name
+}
+
+/// Fixed-arity derived-`Debug` finishers on `core::fmt::Formatter`, whose value args are
+/// INDIVIDUAL `&dyn Debug` operands. The N-ary `debug_{struct,tuple}_fields_finish`
+/// variants are DELIBERATELY EXCLUDED — they take a `&[&dyn Debug]` slice whose elements
+/// are not individual args, so a >5-field derived Debug stays UNKNOWN (sound, less
+/// complete) rather than being under-checked.
+const DEBUG_FIXED_FINISHERS: &[&str] = &[
+    "debug_struct_field1_finish",
+    "debug_struct_field2_finish",
+    "debug_struct_field3_finish",
+    "debug_struct_field4_finish",
+    "debug_struct_field5_finish",
+    "debug_tuple_field1_finish",
+    "debug_tuple_field2_finish",
+    "debug_tuple_field3_finish",
+    "debug_tuple_field4_finish",
+    "debug_tuple_field5_finish",
+];
+
+/// Batch-1 L3: rewrite a `<P as core::hash::Hash>::hash::<H>` call — for a language
+/// PRIMITIVE integer/bool/char `P` fed by a real-sysroot hasher `H` — to
+/// `TRUST_TOTAL_CLONE_SENTINEL`, which the bridge (`total_no_panic_call_summary`,
+/// lower.rs) models as a panic-free `()` no-op. Discharges the sole absent callee
+/// inside a derived `<Rat as Hash>::hash` (rational.rs) — `<u32 as Hash>::hash::<H>`.
+///
+/// SOUND (three un-spoofable anchors, ALL must hold; a miss returns `name` unchanged →
+/// the call keeps its panic obligation and fails closed):
+///   (1) the resolved method's trait is the `Hash` DIAGNOSTIC ITEM (there is no `Hash`
+///       lang item), so a user trait merely NAMED `Hash` with a `hash` method is rejected;
+///   (2) `Self` is a language primitive (`Int`/`Uint`/`Bool`/`Char`) — the orphan rule
+///       forbids a user crate writing `impl Hash for u32`, so a primitive `Self` provably
+///       resolves to the std impl (whose `hash` writes a fixed byte count, runs NO user
+///       comparison, cannot panic);
+///   (3) the hasher `H` is a REAL-sysroot, fully-monomorphized ADT — a user `impl Hasher`
+///       whose `write_*` runs panicking user code is rejected, and a still-generic `H`
+///       (an unmonomorphized derived body) fails closed via `has_non_region_param`.
+/// The `()` return means modeling the call total introduces no value axiom — only the
+/// (correct) fact that the primitive hash cannot panic. NOT reused for the ARENA
+/// `thread_local` closures (they are not `Hash` impls).
+fn apply_total_primitive_hash_sentinel<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    func: &mir::Operand<'tcx>,
+    name: String,
+) -> String {
+    // Cheap prefilter on BOTH renderings: the generic-path `...::Hash::hash` and the
+    // fully-qualified `<T as core::hash::Hash>::hash` (ends in `Hash>::hash`). Only a
+    // prefilter — the soundness boundary is the diagnostic-item + primitive-Self +
+    // sysroot-hasher gates below.
+    let hash_call_path = call_path_without_trailing_turbofish(&name);
+    if !(hash_call_path.ends_with("::Hash::hash") || hash_call_path.ends_with("Hash>::hash")) {
+        return name;
+    }
+    let Some((method_def_id, gen_args)) = func.const_fn_def() else {
+        return name;
+    };
+    if tcx.item_name(method_def_id).as_str() != "hash" {
+        return name;
+    }
+    // Map a resolved impl method to its trait method, then gate on the un-spoofable
+    // `Hash` diagnostic item (mirrors the `clone_trait()` lang-item gate in
+    // `apply_total_clone_sentinel`; `Hash` has no lang item, so use the diagnostic item).
+    let method_def_id =
+        tcx.associated_item(method_def_id).trait_item_def_id().unwrap_or(method_def_id);
+    let Some(trait_def_id) = tcx.trait_of_assoc(method_def_id) else {
+        return name;
+    };
+    if tcx.get_diagnostic_item(rustc_span::sym::Hash) != Some(trait_def_id) {
+        return name;
+    }
+    // `<Self as Hash>::hash::<H>` monomorph args are `[Self, H]` (type args only).
+    let mut type_args = gen_args.types();
+    let Some(self_ty) = type_args.next() else {
+        return name;
+    };
+    if !matches!(
+        self_ty.kind(),
+        ty::TyKind::Int(_) | ty::TyKind::Uint(_) | ty::TyKind::Bool | ty::TyKind::Char
+    ) {
+        return name;
+    }
+    let Some(hasher_ty) = type_args.next() else {
+        return name;
+    };
+    // A still-generic hasher (unmonomorphized) or any type/const param → fail closed.
+    if hasher_ty.has_non_region_param() {
+        return name;
+    }
+    let ty::TyKind::Adt(hasher_def, _) = hasher_ty.kind() else {
+        return name;
+    };
+    if !is_real_sysroot_crate(tcx, hasher_def.did().krate) {
+        return name;
+    }
+    TRUST_TOTAL_CLONE_SENTINEL.to_string()
+}
+
+/// Un-spoofable: an inherent method on the foreign `Formatter` type can be defined ONLY in
+/// Formatter's home crate (core) — coherence forbids a user crate adding an inherent
+/// `debug_*_finish` to `core::fmt::Formatter`, and a user crate cannot be named `core`/`std`.
+fn is_std_debug_fixed_finisher<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> bool {
+    let Some((def_id, _)) = func.const_fn_def() else { return false };
+    if def_id.is_local() {
+        return false;
+    }
+    let name = tcx.item_name(def_id);
+    if !DEBUG_FIXED_FINISHERS.iter().any(|n| name.as_str() == *n) {
+        return false;
+    }
+    let path = crate::safe_def_path_str(tcx, def_id);
+    path.starts_with("core::fmt::Formatter") || path.starts_with("std::fmt::Formatter")
+}
+
+/// Follow `arg` (a `move/copy _L`) back to the `_L = <src> as &dyn Debug (Unsize)` cast in
+/// this block and return the ERASED concrete type = pointee of `<src>`'s reference type.
+/// Bounded copy-follow; None (→ caller fails closed) on any deviation.
+fn unsize_cast_source_pointee<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    arg: &mir::Operand<'tcx>,
+    stmts: &[mir::Statement<'tcx>],
+    local_decls: &mir::LocalDecls<'tcx>,
+) -> Option<ty::Ty<'tcx>> {
+    let mut local = operand_whole_local(arg)?;
+    for _ in 0..8 {
+        // bounded
+        let def = stmts.iter().rev().find_map(|s| match &s.kind {
+            mir::StatementKind::Assign(box (lhs, rv))
+                if lhs.projection.is_empty() && lhs.local == local =>
+            {
+                Some(rv)
+            }
+            _ => None,
+        })?;
+        match def {
+            mir::Rvalue::Cast(
+                mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                src,
+                _,
+            ) => {
+                let src_ty = src.ty(local_decls, tcx);
+                return match src_ty.kind() {
+                    ty::TyKind::Ref(_, pointee, _) | ty::TyKind::RawPtr(pointee, _) => {
+                        Some(*pointee)
+                    }
+                    _ => None,
+                };
+            }
+            // reborrow/copy hop: `_L = _M` or `_L = &(*_M)` → follow _M
+            mir::Rvalue::Use(op, _) => local = operand_whole_local(op)?,
+            mir::Rvalue::Ref(_, _, place)
+                if place.projection.len() == 1
+                    && matches!(place.projection[0], mir::ProjectionElem::Deref) =>
+            {
+                local = place.local
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// True iff `term` is a fixed-arity derived-`Debug` finisher call EVERY of whose `&dyn Debug`
+/// field-value args has a PROVABLY panic-free Debug (`tcx_derived_trait_is_total`,
+/// `is_builtin_derived`-gated). Fails CLOSED on any arg it cannot recover or prove — so the
+/// real finisher call (and its may-panic obligation) survives.
+fn debug_finisher_all_fields_total<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    term: &mir::Terminator<'tcx>,
+    stmts: &[mir::Statement<'tcx>],
+    local_decls: &mir::LocalDecls<'tcx>,
+) -> bool {
+    let mir::TerminatorKind::Call { func, args, .. } = &term.kind else { return false };
+    if !is_std_debug_fixed_finisher(tcx, func) {
+        return false;
+    }
+    let Some(debug_trait) = tcx.get_diagnostic_item(rustc_span::sym::Debug) else {
+        return false;
+    };
+
+    let mut proved_a_field = false;
+    for a in args.iter() {
+        let arg_ty = a.node.ty(local_decls, tcx);
+        let pointee = match arg_ty.kind() {
+            ty::TyKind::Ref(_, inner, _) | ty::TyKind::RawPtr(inner, _) => *inner,
+            _ => continue, // by-value arg (none exist in these sigs)
+        };
+        match pointee.kind() {
+            // `&dyn Debug` field-value arg: recover the erased type and prove it total.
+            ty::TyKind::Dynamic(preds, _)
+                if preds.principal_def_id() == Some(debug_trait) =>
+            {
+                proved_a_field = true;
+                let Some(concrete) =
+                    unsize_cast_source_pointee(tcx, &a.node, stmts, local_decls)
+                else {
+                    return false;
+                };
+                if !tcx_derived_trait_is_total(
+                    tcx,
+                    concrete,
+                    debug_trait,
+                    CLONE_TOTALITY_FUEL,
+                    &mut std::collections::HashSet::new(),
+                ) {
+                    return false;
+                }
+            }
+            // DEFENSE: any OTHER trait object, or a container transitively carrying a
+            // `dyn` (e.g. a future `&[&dyn Debug]` value slice) is NOT an individually
+            // recoverable field → fail closed rather than skip-as-trusted.
+            ty::TyKind::Dynamic(..) => return false,
+            ty::TyKind::Slice(_) | ty::TyKind::Array(..) => return false,
+            // `&str` name / `&mut Formatter` receiver: trusted std, no field dispatch.
+            _ => {}
+        }
+    }
+    proved_a_field
+}
+
+/// N-ary derived-`Debug` finishers on `core::fmt::Formatter`: `debug_struct_fields_finish`
+/// (`name: &str, names: &[&str], values: &[&dyn Debug]`) and `debug_tuple_fields_finish`
+/// (`name: &str, values: &[&dyn Debug]`) — emitted by `#[derive(Debug)]` for a struct/tuple/
+/// enum-variant with MORE than 5 fields (≤5 uses the fixed-arity `debug_*_fieldN_finish`).
+/// The per-field `&dyn Debug` values are elements of a FIXED array aggregate, not individual
+/// args, so they need aggregate recovery. Same un-spoofable inherent-`Formatter` basis as
+/// `is_std_debug_fixed_finisher`.
+const DEBUG_NARY_FINISHERS: &[&str] =
+    &["debug_struct_fields_finish", "debug_tuple_fields_finish"];
+
+fn is_std_debug_nary_finisher<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>) -> bool {
+    let Some((def_id, _)) = func.const_fn_def() else { return false };
+    if def_id.is_local() {
+        return false;
+    }
+    let name = tcx.item_name(def_id);
+    if !DEBUG_NARY_FINISHERS.iter().any(|n| name.as_str() == *n) {
+        return false;
+    }
+    let path = crate::safe_def_path_str(tcx, def_id);
+    path.starts_with("core::fmt::Formatter") || path.starts_with("std::fmt::Formatter")
+}
+
+/// Recover the FIXED array-aggregate element operands behind an N-ary Debug finisher's
+/// `values: &[&dyn Debug]` slice: follow `values` back through the `&[T; N] -> &[T]` Unsize
+/// cast / reborrows to `_arr = [e0, e1, ...]` and return its element operands. None (→ caller
+/// fails closed) if the slice is not a statically-fixed array aggregate (runtime-built slice,
+/// `[x; N]` repeat, or a promoted/const array whose pre-erasure operands are unavailable).
+fn debug_values_slice_elements<'tcx>(
+    values: &mir::Operand<'tcx>,
+    stmts: &[mir::Statement<'tcx>],
+) -> Option<Vec<mir::Operand<'tcx>>> {
+    let mut local = operand_whole_local(values)?;
+    let mut arr_local: Option<mir::Local> = None;
+    for _ in 0..8 {
+        // bounded
+        let def = stmts.iter().rev().find_map(|s| match &s.kind {
+            mir::StatementKind::Assign(box (lhs, rv))
+                if lhs.projection.is_empty() && lhs.local == local =>
+            {
+                Some(rv)
+            }
+            _ => None,
+        })?;
+        match def {
+            // `&[T; N] -> &[T]` unsize: continue from the ref-to-array source operand.
+            mir::Rvalue::Cast(
+                mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                src,
+                _,
+            ) => local = operand_whole_local(src)?,
+            // copy/move hop: `_L = _M`
+            mir::Rvalue::Use(op, _) => local = operand_whole_local(op)?,
+            // `_L = &_ARR` (ref to the WHOLE array local) → resolve the aggregate on `_ARR`.
+            mir::Rvalue::Ref(_, _, place) if place.projection.is_empty() => {
+                arr_local = Some(place.local);
+                break;
+            }
+            // `_L = &(*_M)` reborrow hop
+            mir::Rvalue::Ref(_, _, place)
+                if place.projection.len() == 1
+                    && matches!(place.projection[0], mir::ProjectionElem::Deref) =>
+            {
+                local = place.local
+            }
+            _ => return None,
+        }
+    }
+    let arr_local = arr_local?;
+    let agg = stmts.iter().rev().find_map(|s| match &s.kind {
+        mir::StatementKind::Assign(box (lhs, rv))
+            if lhs.projection.is_empty() && lhs.local == arr_local =>
+        {
+            Some(rv)
+        }
+        _ => None,
+    })?;
+    match agg {
+        mir::Rvalue::Aggregate(box mir::AggregateKind::Array(_), operands) => {
+            Some(operands.iter().cloned().collect())
+        }
+        _ => None,
+    }
+}
+
+/// Read the compile-time length `N` of the `[T; N]` array behind a `&[T]` slice operand
+/// produced by an `&[T; N] -> &[T]` Unsize cast (the `names`/`values` slice of an N-ary Debug
+/// finisher). None (→ caller fails closed) if the slice is not a fixed-size-array unsize (so a
+/// runtime `&[T]` cannot masquerade as a length-checked one).
+fn slice_unsize_source_array_len<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    slice: &mir::Operand<'tcx>,
+    stmts: &[mir::Statement<'tcx>],
+    local_decls: &mir::LocalDecls<'tcx>,
+) -> Option<u64> {
+    let mut local = operand_whole_local(slice)?;
+    for _ in 0..8 {
+        let def = stmts.iter().rev().find_map(|s| match &s.kind {
+            mir::StatementKind::Assign(box (lhs, rv))
+                if lhs.projection.is_empty() && lhs.local == local =>
+            {
+                Some(rv)
+            }
+            _ => None,
+        })?;
+        match def {
+            mir::Rvalue::Cast(
+                mir::CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                src,
+                _,
+            ) => {
+                let src_ty = src.ty(local_decls, tcx);
+                let pointee = match src_ty.kind() {
+                    ty::TyKind::Ref(_, p, _) | ty::TyKind::RawPtr(p, _) => *p,
+                    _ => return None,
+                };
+                return match pointee.kind() {
+                    ty::TyKind::Array(_, len) => len.try_to_target_usize(tcx),
+                    _ => None,
+                };
+            }
+            mir::Rvalue::Use(op, _) => local = operand_whole_local(op)?,
+            mir::Rvalue::Ref(_, _, place)
+                if place.projection.len() == 1
+                    && matches!(place.projection[0], mir::ProjectionElem::Deref) =>
+            {
+                local = place.local
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// True iff `term` is an N-ary derived-`Debug` finisher call whose `values: &[&dyn Debug]`
+/// slice is a FIXED array aggregate EVERY of whose erased element types has a PROVABLY
+/// panic-free Debug (`tcx_derived_trait_is_total`, `is_builtin_derived`-gated — the SAME
+/// classifier the fixed-arity sentinel uses). For the `debug_struct_fields_finish` variant it
+/// ALSO discharges the std-internal `assert_eq!(names.len(), values.len())` by requiring the
+/// recovered `names` and `values` array lengths to be equal. Fails CLOSED on any slice it
+/// cannot resolve to a fixed element set, any element it cannot recover/prove, or a length it
+/// cannot equate — so the real finisher call (and its may-panic obligation) survives.
+fn debug_nary_finisher_all_fields_total<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    term: &mir::Terminator<'tcx>,
+    stmts: &[mir::Statement<'tcx>],
+    local_decls: &mir::LocalDecls<'tcx>,
+) -> bool {
+    let mir::TerminatorKind::Call { func, args, .. } = &term.kind else { return false };
+    if !is_std_debug_nary_finisher(tcx, func) {
+        return false;
+    }
+    let Some(debug_trait) = tcx.get_diagnostic_item(rustc_span::sym::Debug) else {
+        return false;
+    };
+
+    let mut names_len: Option<u64> = None;
+    let mut values_len: Option<u64> = None;
+    let mut proved_values = false;
+    for a in args.iter() {
+        let arg_ty = a.node.ty(local_decls, tcx);
+        // Only the two slice args matter; `&mut Formatter` receiver and `&str` name have a
+        // non-`Slice` pointee and are skipped.
+        let pointee = match arg_ty.kind() {
+            ty::TyKind::Ref(_, inner, _) | ty::TyKind::RawPtr(inner, _) => *inner,
+            _ => continue,
+        };
+        let ty::TyKind::Slice(elem) = pointee.kind() else { continue };
+        // The slice element is itself a reference: `&dyn Debug` (values) or `&str` (names).
+        let elem_pointee = match elem.kind() {
+            ty::TyKind::Ref(_, inner, _) | ty::TyKind::RawPtr(inner, _) => *inner,
+            // A non-reference slice element is neither `names` nor `values`; no finisher sig has
+            // one — fail closed rather than skip-as-trusted.
+            _ => return false,
+        };
+        match elem_pointee.kind() {
+            // `values: &[&dyn Debug]` — recover the field operands and prove each total.
+            ty::TyKind::Dynamic(preds, _) if preds.principal_def_id() == Some(debug_trait) => {
+                proved_values = true;
+                let Some(elems) = debug_values_slice_elements(&a.node, stmts) else {
+                    return false;
+                };
+                values_len = Some(elems.len() as u64);
+                for e in &elems {
+                    let Some(concrete) = unsize_cast_source_pointee(tcx, e, stmts, local_decls)
+                    else {
+                        return false;
+                    };
+                    if !tcx_derived_trait_is_total(
+                        tcx,
+                        concrete,
+                        debug_trait,
+                        CLONE_TOTALITY_FUEL,
+                        &mut std::collections::HashSet::new(),
+                    ) {
+                        return false;
+                    }
+                }
+            }
+            // `names: &[&str]` — recover its fixed length to discharge the length assert.
+            ty::TyKind::Str => {
+                let Some(n) = slice_unsize_source_array_len(tcx, &a.node, stmts, local_decls)
+                else {
+                    return false;
+                };
+                names_len = Some(n);
+            }
+            // Any OTHER `&dyn Trait` value slice, or an unexpected ref-slice arg, is not a
+            // recognizable finisher slice → fail closed.
+            _ => return false,
+        }
+    }
+    // SOUNDNESS: `debug_struct_fields_finish` runs `assert_eq!(names.len(), values.len())`.
+    // Require the recovered lengths to match so a (hand-written) mismatched-length call is NOT
+    // falsely proved. `debug_tuple_fields_finish` carries no `names` arg and no such assert, so
+    // `names_len` stays None there and no equality is imposed.
+    if let Some(n) = names_len {
+        if Some(n) != values_len {
+            return false;
+        }
+    }
+    proved_values
+}
+
 /// Trust (str char-boundary SOUNDNESS): a `str` range-index — `<str as
 /// Index<RangeFrom<usize>>>::index(&s, a..)` and friends — renders through
 /// `safe_def_path_str` as the GENERIC trait path `core::ops::index::Index::index`
@@ -7542,17 +10160,144 @@ pub fn trust_try_total_marker<'tcx>(
         return std_try_carrier_kind(tcx, input0).is_some();
     }
     // from_residual: total iff the target is `Option`, or a `Result` whose error
-    // type equals the residual's error type.
+    // type either EQUALS the residual's error type (the identity re-wrap `Err(e) ->
+    // Err(e)`, no user code) or, when it DIFFERS (a CONVERTING `?`), whose
+    // `<target_err as From<residual_err>>::from` impl body is PROVABLY structurally
+    // panic-free — verified against the CONCRETE From impl's real MIR, never a name.
     match std_try_carrier_kind(tcx, output) {
         Some(StdCarrier::Option) => true,
         Some(StdCarrier::Result) => {
             match (result_err_ty(tcx, output), result_err_ty(tcx, input0)) {
-                (Some(target_err), Some(residual_err)) => target_err == residual_err,
+                (Some(target_err), Some(residual_err)) => {
+                    target_err == residual_err
+                        || converting_from_is_structurally_total(tcx, target_err, residual_err)
+                }
                 _ => false,
             }
         }
         _ => false,
     }
+}
+
+/// SOUNDNESS-CRITICAL. A CONVERTING `?` (`target_err != residual_err`) desugars its
+/// early-return arm to `FromResidual::from_residual(Err(e))`, whose std body is
+/// `Err(<target_err as From<residual_err>>::from(e))` — its ONLY internal effect is
+/// the `From::from` call. This returns `true` (marking the whole converting
+/// `from_residual` TOTAL) IFF that `From` impl's REAL, CONCRETE MIR body is
+/// structurally panic-free. For every ny-cert error type the conversion is a
+/// thiserror `#[from]` variant-wrap (`DeepCrownError::Rat(e)`) — a pure single-
+/// variant aggregate construction: no `Call`, no `Assert`, no `Drop`, panic-free.
+///
+/// SOUNDNESS ARGUMENT.
+///  1. The mark is written ONLY after `Instance::try_resolve` DEVIRTUALIZES
+///     `<target_err as From<residual_err>>::from` to a CONCRETE impl method
+///     (`resolved != from_method`, no residual param, MIR available) and its real
+///     body passes the terminator allowlist — NEVER from a type/trait NAME. A hand-
+///     written `From` doing `x.unwrap()` / arithmetic has a `Call`/`Assert` and
+///     fails the scan → stays fail-closed UNKNOWN.
+///  2. `body_is_structurally_panic_free` walks EVERY block of the resolved impl's
+///     `optimized_mir` and admits ONLY provably-non-panicking control-flow
+///     terminators; any `Call`/`Assert`/`Drop`/tail-call/asm/terminate/yield — and
+///     any future terminator kind, via the catch-all — fails closed. Reading the
+///     GENERIC `optimized_mir` body is sound for THIS instance because a body's
+///     panic-capable-terminator set is INVARIANT-superset under monomorphization
+///     (type substitution and MIR-inlining can only ADD visible terminators, never
+///     hide one — drop elaboration already materializes a `Drop` terminator for any
+///     maybe-droppable generic-param local), so panic-free-generic ⟹
+///     panic-free-monomorphized.
+///  3. EVERY failure path (non-monomorphic target/residual, missing `From`
+///     diagnostic item / `from` method, unresolvable/undevirtualized/param-carrying
+///     instance, MIR unavailable, any non-allowlisted terminator) returns `false`.
+///     A wrong or absent resolution only LOSES a discharge — it can never fabricate
+///     one.
+fn converting_from_is_structurally_total<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    target_err: ty::Ty<'tcx>,
+    residual_err: ty::Ty<'tcx>,
+) -> bool {
+    // A non-monomorphic target/residual must NOT reach the `fully_monomorphized`
+    // `Instance::try_resolve` below — it ICEs ("cannot find N in param-env"). Fail
+    // closed (mirrors `tcx_clone_is_total` / `devirtualized_callee_name`).
+    if target_err.has_non_region_param() || residual_err.has_non_region_param() {
+        return false;
+    }
+    // Resolve `<target_err as core::convert::From<residual_err>>::from`: the `From`
+    // trait's diagnostic item and its sole `from` method. (Diagnostic item, not a
+    // path string — a user trait merely NAMED `From` cannot match.)
+    let Some(from_trait) = tcx.get_diagnostic_item(rustc_span::sym::From) else {
+        return false;
+    };
+    let Some(from_method) = tcx
+        .associated_item_def_ids(from_trait)
+        .iter()
+        .copied()
+        .find(|&did| tcx.item_name(did) == rustc_span::sym::from)
+    else {
+        return false;
+    };
+    // Trait-method instantiation args are [Self = target_err (`F`), trait param =
+    // residual_err (`E`)]; `from` binds no method generics, so this is complete.
+    let args = tcx.mk_args(&[target_err.into(), residual_err.into()]);
+    let Some(instance) =
+        ty::Instance::try_resolve(tcx, ty::TypingEnv::fully_monomorphized(), from_method, args)
+            .ok()
+            .flatten()
+    else {
+        return false;
+    };
+    // The resolution MUST have devirtualized to a concrete impl body (not the bare
+    // trait method) and left NO residual param — otherwise we have not identified
+    // the real code that runs. Fail closed unless its MIR is available to scan.
+    let resolved = instance.def_id();
+    if resolved == from_method
+        || instance.args.has_non_region_param()
+        || !tcx.is_mir_available(resolved)
+    {
+        return false;
+    }
+    // Read the CONCRETE From impl's real MIR and require it structurally panic-free.
+    body_is_structurally_panic_free(tcx.optimized_mir(resolved))
+}
+
+/// SOUNDNESS-CRITICAL. `true` IFF EVERY basic block of `body` ends in a terminator
+/// that PROVABLY cannot panic. This is an explicit ALLOWLIST — only pure control-
+/// flow / return / genuine-divergence terminators pass; the catch-all `_` arm fails
+/// closed on `Call`, `Assert`, `Drop`, `TailCall`, `InlineAsm`, `Yield`,
+/// `UnwindTerminate`, and ANY future terminator kind. Used to certify a resolved
+/// `From::from` body panic-free for the converting-`?` marker; a wrong answer here
+/// would forge a proof, so it is deliberately maximally conservative (it does NOT
+/// trust any inner callee — a total `Drop` glue also fails closed, which only loses
+/// a discharge).
+fn body_is_structurally_panic_free(body: &mir::Body<'_>) -> bool {
+    for bb_data in body.basic_blocks.iter() {
+        // A terminator-less block cannot occur in a built body; fail closed if one
+        // somehow does.
+        let Some(term) = &bb_data.terminator else {
+            return false;
+        };
+        match &term.kind {
+            // Pure control flow, returns, and genuine divergence sinks — none can
+            // panic. `Unreachable` is UB-if-reached, not a panic. `UnwindResume`
+            // runs only with an unwind ALREADY in flight, which a body containing no
+            // `Call`/`Assert`/`Drop` can never originate. `FalseEdge`/`FalseUnwind`
+            // are borrowck artifacts lowered to plain gotos. `CoroutineDrop` lowers
+            // to a return.
+            mir::TerminatorKind::Goto { .. }
+            | mir::TerminatorKind::SwitchInt { .. }
+            | mir::TerminatorKind::Return
+            | mir::TerminatorKind::Unreachable
+            | mir::TerminatorKind::UnwindResume
+            | mir::TerminatorKind::CoroutineDrop
+            | mir::TerminatorKind::FalseEdge { .. }
+            | mir::TerminatorKind::FalseUnwind { .. } => {}
+            // Everything panic-capable — `Call` (may panic; no inner callee is
+            // trusted here), `Assert` (overflow/bounds/div-by-zero), `Drop` (glue
+            // may panic), `TailCall`, `InlineAsm`, `Yield`, `UnwindTerminate` — and
+            // any UNKNOWN/future terminator kind FAILS CLOSED.
+            _ => return false,
+        }
+    }
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -7570,6 +10315,10 @@ fn std_try_carrier_kind<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<Std
     let path = crate::safe_def_path_str(tcx, def.did());
     let std_path =
         path.starts_with("core::") || path.starts_with("std::") || path.starts_with("alloc::");
+    // SOUNDNESS (crate-name forgery): the `?`-desugar Try/FromResidual totalization
+    // trusts the compiler-total `Try` impls of the std carriers; a `--crate-name core`
+    // dep could spell `core::result::Result` with a PANICKING `Try::branch`. Bind the
+    // carrier's defining crate scid to the real sysroot (name-prefix is a pre-filter).
     if !std_path || !is_real_sysroot_crate(tcx, def.did().krate) {
         return None;
     }
@@ -7641,6 +10390,134 @@ fn func_operand_is_unsafe_sig<'tcx>(tcx: TyCtxt<'tcx>, func: &mir::Operand<'tcx>
         },
         _ => false,
     }
+}
+
+/// Trust (F6 monomorphization gap): re-authenticate the arbitrary-precision stamp
+/// of a bignum RECEIVER local from the CONCRETE call it feeds.
+///
+/// A by-reference `<num_rational::Ratio<num_bigint::BigInt> as …>::method(&self)`
+/// call is fully monomorphized — the callee FnDef's `generic_args` carry the
+/// concrete `BigInt` — but the receiver operand's lowered LOCAL type can carry the
+/// identity-substituted `Ratio<T>` (element = un-substituted `TyKind::Param`), which
+/// `authenticate_arbitrary_precision` correctly refuses (fail-closed). That leaves
+/// the F6 bridge gate (`is_arbitrary_precision_ty`, which reads ONLY the stamp)
+/// stampless, so every by-reference num-rational read/predicate stays UNKNOWN.
+///
+/// This recovers the stamp the concrete call ALREADY proves: for each direct,
+/// fully-monomorphized `Call`, resolve the callee's concrete receiver (fn-sig
+/// input 0, refs peeled — matching the recognizers' "receiver = arg0" convention)
+/// and authenticate it with the EXACT SAME `StableCrateId`-gated writer that stamps
+/// at ty_convert.rs (`authenticate_arbitrary_precision`). On `Some`, rewrite the
+/// receiver ARGUMENT local's already-lowered bignum-named `Ty::Adt` stamp (peeling
+/// `Ref`/`RawPtr`) from `None` to the authenticated kind — only the stamp field
+/// changes; the residual `Unsupported{Param}` field types are never read (the
+/// bignum value is modeled opaquely).
+///
+/// SOUNDNESS. The stamp is written ONLY by `authenticate_arbitrary_precision` on
+/// the CONCRETE call receiver — identical authority (StableCrateId + concrete
+/// element authentication) to the existing stamp writer; the bignum-named ADT
+/// filter merely SELECTS which local receives an already-authenticated fact, and
+/// that local IS, by construction, this call's receiver value. Every branch FAILS
+/// CLOSED: a generic call (`has_non_region_param`); an `authenticate` `None` (a real
+/// `Ratio<i64>` / `Ratio<UserType>` / a same-named non-`num_rational` type —
+/// StableCrateId mismatch — / a user callee); a non-`Copy`/`Move` or
+/// non-Deref-projected receiver; an unresolvable local; a non-bignum-named or
+/// already-stamped local — all leave the stamp untouched. A wrong/absent source can
+/// only LOSE a discharge, never fabricate one. `authenticate_arbitrary_precision` is
+/// NOT weakened and the element is NEVER read from the callee NAME string.
+pub(crate) fn refine_bignum_receiver_stamps<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &mir::Body<'tcx>,
+    locals: &mut [LocalDecl],
+) {
+    for bb_data in body.basic_blocks.iter() {
+        let Some(term) = &bb_data.terminator else { continue };
+        let mir::TerminatorKind::Call { func, args, .. } = &term.kind else { continue };
+
+        // 1. Resolve the callee to a concrete FnDef instance. Fail-closed unless
+        //    the CALL itself is fully monomorphized (no non-region param).
+        let ty::TyKind::FnDef(callee_did, gen_args) = func.ty(&body.local_decls, tcx).kind()
+        else {
+            continue;
+        };
+        if gen_args.has_non_region_param() {
+            continue;
+        }
+
+        // 2. The callee's CONCRETE (instantiated) parameter types. Each MIR call
+        //    arg `i` has, by well-typedness, exactly `inputs[i]`'s type, so an arg
+        //    whose (Ref/RawPtr-peeled) param authenticates as bignum IS that concrete
+        //    bignum — stamping its local asserts a TRUE fact. Generalizes the
+        //    receiver (arg0) case to EVERY arg (e.g. `Vec::push(v)` — arg1 `v` — so
+        //    the interned value's OWN decl gets stamped and its drop-glue discharges).
+        let sig = tcx.fn_sig(*callee_did).instantiate(tcx, *gen_args).skip_binder();
+        for (i, arg) in args.iter().enumerate() {
+            let Some(param_ty) = sig.inputs().get(i) else { break };
+            let ty::TyKind::Adt(adt_def, adt_args) = peel_ref_rawptr(*param_ty).kind() else {
+                continue;
+            };
+            // 3. Authenticate the CONCRETE param with the SOLE stamp writer
+            //    (StableCrateId-gated). `None` ⇒ do nothing (fail-closed).
+            let Some(kind) =
+                ty_convert::authenticate_arbitrary_precision(tcx, adt_def.did(), adt_args)
+            else {
+                continue;
+            };
+            // 4. Rewrite the ARGUMENT local's stamp. The arg must name a local as a
+            //    whole (or a Deref chain onto it); a Field/Index-projected arg is NOT
+            //    the whole bignum value — fail-closed.
+            let (mir::Operand::Copy(place) | mir::Operand::Move(place)) = &arg.node else {
+                continue;
+            };
+            if !place.projection.iter().all(|e| matches!(e, mir::PlaceElem::Deref)) {
+                continue;
+            }
+            if let Some(decl) = locals.get_mut(place.local.as_usize()) {
+                stamp_bignum_adt_in_place(&mut decl.ty, kind);
+            }
+        }
+    }
+}
+
+/// Peel `Ref`/`RawPtr` wrappers off `ty` to reach the underlying value type (a call
+/// receiver/arg is passed as `&self`/`&arg`; the ArbPrec stamp lives on the pointee).
+fn peel_ref_rawptr<'tcx>(mut ty: ty::Ty<'tcx>) -> ty::Ty<'tcx> {
+    loop {
+        ty = match ty.kind() {
+            ty::TyKind::Ref(_, inner, _) => *inner,
+            ty::TyKind::RawPtr(inner, _) => *inner,
+            _ => return ty,
+        };
+    }
+}
+
+/// Stamp the innermost bignum-named `Ty::Adt` reachable through `Ref`/`RawPtr`
+/// wrappers with an authenticated arbitrary-precision provenance `kind`. Only an
+/// ADT that is bignum-named AND currently `arbitrary_precision: None` is rewritten;
+/// every other shape is left untouched (fail-closed). Only the stamp field changes.
+fn stamp_bignum_adt_in_place(ty: &mut Ty, kind: ArbPrecKind) {
+    match ty {
+        Ty::Ref { inner, .. } => stamp_bignum_adt_in_place(inner, kind),
+        Ty::RawPtr { pointee, .. } => stamp_bignum_adt_in_place(pointee, kind),
+        Ty::Adt { name, arbitrary_precision, .. } => {
+            if arbitrary_precision.is_none() && is_bignum_named_adt(name) {
+                *arbitrary_precision = Some(AdtAuth::ArbPrec(kind));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A `num_bigint`/`num_rational` big-type name (the crate-root re-export spellings
+/// the extractor produces). A pure TARGETING filter — the SOUNDNESS authority is the
+/// `StableCrateId`-gated `authenticate_arbitrary_precision` on the CONCRETE callee
+/// receiver, already passed by the sole caller — so a same-named user type is never
+/// stamped (its concrete receiver would not authenticate).
+fn is_bignum_named_adt(name: &str) -> bool {
+    matches!(name, "num_rational::Ratio" | "num_bigint::BigInt" | "num_bigint::BigUint")
+        || name.ends_with("::Ratio")
+        || name.ends_with("::BigInt")
+        || name.ends_with("::BigUint")
 }
 
 /// Convert a rustc Span to our SourceSpan: the RAW LO+HI range, deliberately NOT rebased
@@ -7870,10 +10747,26 @@ mod tests {
         assert!(p("core::panicking::panic_nounwind"));
         assert!(p("core::panicking::panic_cannot_unwind"));
         assert!(p("foo::bar::panic"));
+        // R177 diverging terminals: each site becomes a charged
+        // "must be proven unreachable" row instead of an Opaque bail.
+        assert!(p("core::option::unwrap_failed"));
+        assert!(p("core::option::expect_failed"));
+        assert!(p("core::result::unwrap_failed"));
+        assert!(p("alloc::raw_vec::handle_error"));
+        assert!(p("alloc::raw_vec::capacity_overflow"));
+        assert!(p("alloc::alloc::handle_alloc_error"));
+        assert!(p("std::process::abort"));
+        assert!(p("core::intrinsics::abort"));
+        assert!(p("core::slice::index::slice_index_fail"));
+        // A user fn SHARING a terminal tail is held STRICTER (charged), which
+        // is the sound direction for this class — documented on
+        // `is_diverging_panic_or_abort_terminal`.
+        assert!(p("my_crate::unwrap_failed"));
         // Non-panic diverging callees must STAY opaque / fail-closed.
         assert!(!p("std::process::exit"));
         assert!(!p("my_crate::run_forever"));
         assert!(!p("core::mem::drop"));
+        assert!(!p("my_crate::handle_error"));
     }
 
     #[test]
@@ -10267,6 +13160,182 @@ pub fn pass_function_item_other() -> i32 { consume_zst(helper_fn_item_other) }
             "core::intrinsics::atomic_cxchg_seqcst_acquire_relaxed",
             &cas_args(),
             "cxchg_seqcst_acquire_relaxed",
+        );
+    }
+
+    // --- Form A: const-generic ordering spelling (R151 / R147-legA) ---
+
+    #[test]
+    fn form_a_const_generic_xsub_release() {
+        // The banked R150B spelling, verbatim (log lines 4420/9208/9336).
+        let op = parse_atomic_intrinsic(
+            "core::intrinsics::atomic_xsub::<usize, usize, core::intrinsics::AtomicOrdering::Release>",
+            &ptr_val_args(),
+            &default_dest(),
+            &default_span(),
+        )
+        .expect("const-generic xsub must parse");
+        assert_eq!(op.op_kind, AtomicOpKind::FetchSub);
+        assert_eq!(op.ordering, AtomicOrdering::Release);
+        assert!(op.failure_ordering.is_none());
+        assert!(op.dest.is_some());
+        assert_eq!(op.place, Place::local(1));
+    }
+
+    #[test]
+    fn form_a_const_generic_load_pointer_pointee() {
+        // The rational::ARENA/POISONED wrapper-member shape (atomic.rs:3890-3892).
+        let op = parse_atomic_intrinsic(
+            "core::intrinsics::atomic_load::<*mut core::io::error::OsFunctions, core::intrinsics::AtomicOrdering::Acquire>",
+            &ptr_args(),
+            &default_dest(),
+            &default_span(),
+        )
+        .unwrap();
+        assert_eq!(op.op_kind, AtomicOpKind::Load);
+        assert_eq!(op.ordering, AtomicOrdering::Acquire);
+        assert!(op.dest.is_some());
+    }
+
+    #[test]
+    fn form_a_const_generic_store_relaxed() {
+        let op = parse_atomic_intrinsic(
+            "core::intrinsics::atomic_store::<usize, core::intrinsics::AtomicOrdering::Relaxed>",
+            &ptr_val_args(),
+            &default_dest(),
+            &default_span(),
+        )
+        .unwrap();
+        assert_eq!(op.op_kind, AtomicOpKind::Store);
+        assert!(op.dest.is_none());
+    }
+
+    #[test]
+    fn form_a_const_generic_cxchg_acqrel_acquire() {
+        // Pins SUCC-before-FAIL const-parameter order (intrinsics/mod.rs:97-123).
+        let op = parse_atomic_intrinsic(
+            "core::intrinsics::atomic_cxchg::<usize, core::intrinsics::AtomicOrdering::AcqRel, core::intrinsics::AtomicOrdering::Acquire>",
+            &cas_args(),
+            &default_dest(),
+            &default_span(),
+        )
+        .unwrap();
+        assert_eq!(op.op_kind, AtomicOpKind::CompareExchange);
+        assert_eq!(op.ordering, AtomicOrdering::AcqRel);
+        assert_eq!(op.failure_ordering, Some(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn form_a_const_generic_fence_seqcst() {
+        // Ordering is the ONLY generic (atomic.rs:4371 fence wrapper arms).
+        let op = parse_atomic_intrinsic(
+            "core::intrinsics::atomic_fence::<core::intrinsics::AtomicOrdering::SeqCst>",
+            &[],
+            &default_dest(),
+            &default_span(),
+        )
+        .unwrap();
+        assert_eq!(op.op_kind, AtomicOpKind::Fence);
+        assert!(op.dest.is_none());
+        assert_eq!(op.place, Place::local(0));
+    }
+
+    #[test]
+    fn form_a_const_generic_singlethreadfence_acqrel() {
+        let op = parse_atomic_intrinsic(
+            "core::intrinsics::atomic_singlethreadfence::<core::intrinsics::AtomicOrdering::AcqRel>",
+            &[],
+            &default_dest(),
+            &default_span(),
+        )
+        .unwrap();
+        assert_eq!(op.op_kind, AtomicOpKind::CompilerFence);
+        assert!(op.dest.is_none());
+    }
+
+    #[test]
+    fn form_a_const_generic_comma_bearing_type_arg() {
+        // Pins the RIGHT-to-left ordering strip against commas inside type args.
+        let op = parse_atomic_intrinsic(
+            "core::intrinsics::atomic_xchg::<*mut fn(usize, usize) -> usize, core::intrinsics::AtomicOrdering::SeqCst>",
+            &ptr_val_args(),
+            &default_dest(),
+            &default_span(),
+        )
+        .unwrap();
+        assert_eq!(op.op_kind, AtomicOpKind::Exchange);
+        assert_eq!(op.ordering, AtomicOrdering::SeqCst);
+    }
+
+    #[test]
+    fn all_orderings_for_const_generic_xsub() {
+        // Const-generic twin of all_orderings_for_xadd.
+        let cases = [
+            ("Relaxed", AtomicOrdering::Relaxed),
+            ("Acquire", AtomicOrdering::Acquire),
+            ("Release", AtomicOrdering::Release),
+            ("AcqRel", AtomicOrdering::AcqRel),
+            ("SeqCst", AtomicOrdering::SeqCst),
+        ];
+        for (name, expected) in cases {
+            let func = format!(
+                "core::intrinsics::atomic_xsub::<usize, usize, core::intrinsics::AtomicOrdering::{name}>"
+            );
+            let op =
+                parse_atomic_intrinsic(&func, &ptr_val_args(), &default_dest(), &default_span())
+                    .unwrap_or_else(|| panic!("{func} must parse"));
+            assert_eq!(op.op_kind, AtomicOpKind::FetchSub);
+            assert_eq!(op.ordering, expected, "wrong ordering for {name}");
+        }
+    }
+
+    // --- Form A const-generic: fail-closed (Malformed -> opaque terminator) ---
+
+    #[test]
+    fn form_a_const_generic_unrecognized_ordering_is_malformed() {
+        assert_malformed_atomic_metadata(
+            "core::intrinsics::atomic_xsub::<usize, usize, core::intrinsics::AtomicOrdering::Bogus>",
+            &ptr_val_args(),
+            "xsub::<usize, usize, core::intrinsics::AtomicOrdering::Bogus>",
+        );
+    }
+
+    #[test]
+    fn form_a_const_generic_unresolved_const_param_is_malformed() {
+        // A polymorphic body renders the unevaluated const as `ORD` — must NOT parse.
+        assert_malformed_atomic_metadata(
+            "core::intrinsics::atomic_load::<T, ORD>",
+            &ptr_args(),
+            "load::<T, ORD>",
+        );
+    }
+
+    #[test]
+    fn form_a_const_generic_short_path_ordering_is_malformed() {
+        // Full-path requirement is the forgeability defense — a trimmed rendering
+        // must fail closed rather than be guessed at.
+        assert_malformed_atomic_metadata(
+            "core::intrinsics::atomic_load::<usize, AtomicOrdering::Release>",
+            &ptr_args(),
+            "load::<usize, AtomicOrdering::Release>",
+        );
+    }
+
+    #[test]
+    fn form_a_const_generic_cas_single_ordering_is_malformed() {
+        assert_malformed_atomic_metadata(
+            "core::intrinsics::atomic_cxchg::<usize, core::intrinsics::AtomicOrdering::SeqCst>",
+            &cas_args(),
+            "cxchg::<usize, core::intrinsics::AtomicOrdering::SeqCst>",
+        );
+    }
+
+    #[test]
+    fn form_a_const_generic_unknown_op_is_malformed() {
+        assert_malformed_atomic_metadata(
+            "core::intrinsics::atomic_frob::<usize, core::intrinsics::AtomicOrdering::SeqCst>",
+            &ptr_val_args(),
+            "frob::<usize, core::intrinsics::AtomicOrdering::SeqCst>",
         );
     }
 

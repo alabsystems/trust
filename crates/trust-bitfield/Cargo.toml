@@ -1,0 +1,22 @@
+# trust-bitfield: fixed-width bit fields inside a machine word, as descriptors.
+#
+# The first Trust-owned component built ON TOP of another verified Trust crate:
+# every power of two, every low mask and both mask/descriptor readings come from
+# `trust-bits`. The dependency below is load-bearing — delete it and the crate
+# does not compile, and there is nothing to copy back in.
+#
+# Author: Andrew Yates <andrewyates.name@gmail.com>
+# Copyright 2026 Andrew Yates | License: MIT OR Apache-2.0
+
+[package]
+name = "trust-bitfield"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+trust-bits = { workspace = true }

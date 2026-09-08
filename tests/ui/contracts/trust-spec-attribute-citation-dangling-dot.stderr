@@ -1,0 +1,8 @@
+error: expected a name segment after `.` in the contract clause citation
+  --> $DIR/trust-spec-attribute-citation-dangling-dot.rs:16:33
+   |
+LL | #[trust::ensures(result <= x by Clean.)]
+   |                                 ^^^^^^
+
+error: aborting due to 1 previous error
+

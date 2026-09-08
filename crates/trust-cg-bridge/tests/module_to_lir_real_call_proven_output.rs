@@ -610,7 +610,7 @@ fn real_call_caller_emits_a_real_bl_with_branch26_reloc() {
         .values()
         .flat_map(|b| b.instructions.iter())
         .filter_map(|inst| match &inst.opcode {
-            trust_cg_lower::instructions::Opcode::Call { name } => Some(name.clone()),
+            trust_cg_lower::instructions::Opcode::Call { name, .. } => Some(name.clone()),
             _ => None,
         })
         .collect();

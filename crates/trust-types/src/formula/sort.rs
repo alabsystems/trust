@@ -252,6 +252,7 @@ mod tests {
             layout: None,
             enum_layout: None,
             adt_kind: None,
+            arbitrary_precision: None,
         };
         let mut defs = DatatypeDefs::new();
         assert!(insert_datatype_def(&mut defs, tree_adt.clone()));

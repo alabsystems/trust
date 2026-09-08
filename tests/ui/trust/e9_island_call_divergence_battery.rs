@@ -23,7 +23,7 @@ clean {
 fn wrapped_square(x: u64) -> u64
     //~^ ERROR Trust Level 0 safety verification incomplete
     //~| ERROR Trust strict verification failed
-    ensures result == div_sqr(x)
+    ensures result == div_sqr(x) //~ ERROR uncited `ensures` naming the Clean island definition `div_sqr`
 {
     x.wrapping_mul(x)
 }

@@ -4,7 +4,7 @@ use std::path::Path;
 use super::shared_helpers::{
     canonicalize_trust_no_verify, canonicalize_trust_verify_on, finalize_trust_no_verify,
     finalize_trust_no_verify_snapshot, strip_trust_no_verify,
-    trust_bootstrap_verify_unit_requested,
+    trust_bootstrap_verify_unit_argv_refusal, trust_bootstrap_verify_unit_requested,
 };
 use super::{
     ArgFileCommand, TrustVerifyEnvAction, enforce_trust_no_verify_capability,
@@ -924,4 +924,83 @@ fn the_on_switch_respects_the_positional_boundary() {
     let on = args.iter().position(|arg| arg == "-Ztrust-verify=on").unwrap();
     assert!(on < boundary, "{args:?}");
     assert_eq!(args.last(), Some(&OsString::from("-Ztrust-verify=off")), "{args:?}");
+}
+
+/// The lane's compiles are UNAUTHENTICATED and UNSCOPED by construction:
+/// exactly `-Ztrust-verify=on`, and nothing else from the verifier surface.
+/// A proof-session identity would masquerade as the authenticated self-verify
+/// lane (`self-verify-<nonce>` sessions, `targo-trust/src/self_verify_cli.rs`);
+/// a policy control would silently change what the lane's green means. Every
+/// spelling and token shape is refused, and the refusal carries the fix.
+#[test]
+fn a_verified_library_unit_refuses_identity_and_policy_controls() {
+    for control in [
+        "-Ztrust-verify-session=self-verify-1-2-3",
+        "-Ztrust-verify-session=bootstrap-library-core",
+        "-Ztrust_verify_session=x",
+        "-Ztrust-verify-package-name=core",
+        "-Ztrust-verify-crate-role=primary",
+        "-Ztrust-policy=advisory",
+        "-Ztrust_policy=advisory",
+        "-Ztrust-verify-level=0",
+        "-Ztrust-verify-full",
+    ] {
+        // Joined shape.
+        let args =
+            rustc_args(&["-Ztrust-verify=off", control, "--crate-name", "core", "src/lib.rs"]);
+        let message = trust_bootstrap_verify_unit_argv_refusal(&args)
+            .unwrap_or_else(|| panic!("lane accepted {control}"));
+        assert!(message.contains("refuses the verifier control"), "{message}");
+        assert!(message.contains("TRUST_BOOTSTRAP_VERIFY_LIBRARY"), "{message}");
+
+        // Split shape: `-Z` and the option as separate tokens.
+        let option = control.strip_prefix("-Z").unwrap();
+        let args = rustc_args(&["-Z", option, "--crate-name", "core", "src/lib.rs"]);
+        assert!(
+            trust_bootstrap_verify_unit_argv_refusal(&args).is_some(),
+            "lane accepted the split shape of {control}"
+        );
+    }
+}
+
+/// The refusal fires on the verifier surface only: the lane's own off-switch
+/// (which `canonicalize_trust_verify_on` replaces), ordinary flags, and
+/// positional arguments after `--` are all left alone.
+#[test]
+fn the_lane_argv_refusal_leaves_the_ordinary_argv_alone() {
+    let (args, _) = library_verify_case();
+    assert_eq!(trust_bootstrap_verify_unit_argv_refusal(&args), None);
+
+    let args = rustc_args(&[
+        "-Ztrust-verify=off",
+        "-Zalways-encode-mir",
+        "--cfg",
+        "feature=\"panic_immediate_abort\"",
+        "--crate-name",
+        "core",
+        "src/lib.rs",
+        "--",
+        "-Ztrust-policy=advisory",
+    ]);
+    assert_eq!(
+        trust_bootstrap_verify_unit_argv_refusal(&args),
+        None,
+        "a positional argument after `--` is not a compiler option"
+    );
+}
+
+/// The wired half: `finalize_trust_verify_control` refuses before it
+/// canonicalizes, so a lane unit can never leave the shim carrying both the
+/// on-switch and a session identity.
+#[test]
+#[should_panic(expected = "refuses the verifier control")]
+fn finalize_refuses_a_lane_unit_that_carries_a_session_identity() {
+    let mut args = rustc_args(&[
+        "-Ztrust-verify=off",
+        "-Ztrust-verify-session=self-verify-1-2-3",
+        "--crate-name",
+        "core",
+        "src/lib.rs",
+    ]);
+    finalize_trust_verify_control(&mut args, true, false, true, false);
 }

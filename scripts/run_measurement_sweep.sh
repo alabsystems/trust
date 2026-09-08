@@ -53,7 +53,11 @@ set -u
 # zsh; the `:-` keeps it working if the file is ever run through bash instead.
 REPO=${TRUST_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}
 SENTINEL=$REPO/.trust-measurement-in-flight
-RUSTC=${TRUST_RUSTC:-$REPO/build/aarch64-apple-darwin/stage1/bin/rustc}
+# Trust: `build/host` symlinks to `build/<host-triple>`, so this resolves on every
+# platform. Naming `aarch64-apple-darwin` literally made this line dead on any
+# non-Apple host (measured 2026-08-31 on aarch64-unknown-linux-gnu, where that
+# directory does not exist). The env/arg override above is unchanged.
+RUSTC=${TRUST_RUSTC:-$REPO/build/host/stage1/bin/rustc}
 LOCK=$REPO/scripts/trust_build_lock.sh
 
 FORCE=0

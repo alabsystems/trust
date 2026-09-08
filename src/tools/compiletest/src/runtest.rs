@@ -2578,6 +2578,23 @@ impl<'test> TestCx<'test> {
         {
             normalized = normalized.replace("try `trustc --explain", "try `rustc --explain");
         }
+        // (e) Trust: rustdoc's `--passes list` headers name the binary as INVOKED
+        //     (`rustc_driver::trust_display_binary("rustdoc")` in librustdoc's
+        //     config.rs) — `trustdoc` when the branded lane drives stage2/bin/trustdoc,
+        //     `rustdoc` when `--trust-vanilla` drives the private `rustdoc` alias.
+        //     Same class as (c): invocation-derived, so the expectation
+        //     (tests/rustdoc-ui/issues/issue-91713.stdout) stays pristine upstream and
+        //     the branded spelling is mapped back for comparison, for exactly these
+        //     two header lines and exactly this suite. The STATIC rebrand in the same
+        //     output (`runs some of trustdoc's lints`) is NOT folded — it is ledgered
+        //     in tests/upstream-rust/patches.toml and lives in the snapshot.
+        //     Measured 2026-08-29: without this the branded lane was 396/1 with the
+        //     vanilla lane at 397/0 on the same snapshot.
+        if self.config.suite == TestSuite::RustdocUi {
+            normalized = normalized
+                .replace("Available passes for running trustdoc:", "Available passes for running rustdoc:")
+                .replace("Default passes for trustdoc:", "Default passes for rustdoc:");
+        }
         // (d) Trust: the solver memory guard (`trust-router/src/memory_guard.rs`)
         //     prints an RSS-threshold telemetry line straight to stderr whenever
         //     the in-process solver crosses 75% of its memory limit. Whether it

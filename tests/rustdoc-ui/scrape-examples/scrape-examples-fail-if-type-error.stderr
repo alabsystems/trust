@@ -5,7 +5,7 @@ LL |   INVALID_FUNC();
    |   ^^^^^^^^^^^^ could not resolve path `INVALID_FUNC`
    |
    = note: this error was originally ignored because you are running `trustdoc`
-   = note: try running again with `trustc` or `targo check` and you may get a more detailed error
+   = note: try running again with `trustc` or `targo trust check` and you may get a more detailed error
 
 error: Compilation failed, aborting trustdoc
 

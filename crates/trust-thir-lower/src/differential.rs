@@ -118,6 +118,16 @@ pub enum DiffMode {
     /// The two modules were sample-interpreted and agreed on every input, with no reachable
     /// memory/provenance effect omitted from the interpreter outcome.
     Agreed,
+    /// Trust (absent-callee Stage 3): the two modules agreed on every sampled input UNDER THE
+    /// UNINTERPRETED-CALLEE SUBSTITUTION — every absent (bodyless) callee modeled on BOTH
+    /// sides as the same constant at every sampled return value, under the no-channel fence
+    /// and the count/shape pairing of `docs/design/2026-08-31-absent-callee-adjudication.md`.
+    /// This is a DISCLOSED verdict class under its own name: it is deliberately NOT `Agreed`
+    /// (`equal` stays `false`, and every `mode == DiffMode::Agreed` eligibility test —
+    /// splice, flip, the Agreed count — excludes it by construction), because the statement
+    /// is vacuous about the call site itself and assumes callee effects absent. See the
+    /// `docs/TCB.md` row for the exact claim.
+    AgreedUninterpretedCallee,
 }
 
 /// Outcome of comparing the THIR-side `Module` against the MIR-side oracle `Module` for one body,
@@ -485,6 +495,13 @@ pub fn compare<'tcx>(
 
     // (1) Build the MIR-side oracle module WITHOUT any query call (the snapshot was extracted
     //     above): bridge the VerifiableFunction to trust-ir.
+    // Trust (B5 stage 1b): the DIFFERENTIAL lane's coroutine frames carry real
+    // __upvar{i} fields (pre-transform bodies have no state-machine structure — the frame
+    // IS the upvar tuple), enabling shape-level signature agreement with the producer's
+    // upvar-typed envs. RAII-scoped so the native lane's opaque frame model is untouched.
+    // SAMPLE-MORE by construction: rows previously refused by the zero-field placeholder
+    // gate (`side_placeholder_free`) become honest comparisons; nothing refuses less.
+    let _coroutine_frames = trust_ir_bridge::CoroutineUpvarFramesGuard::enable();
     let oracle: Module = match trust_ir_bridge::lower_mir_compat_to_trust_ir(&vf) {
         Ok(m) => m,
         Err(e) => {
@@ -1721,6 +1738,9 @@ fn const_param_column_compare(thir_module: &Module, oracle: &Module) -> Option<D
                 }
                 return Some(rep);
             }
+            // `compare_entries` never mints the UC class; if it ever does, refuse the
+            // column agreement rather than launder one verdict class into another.
+            DiffMode::AgreedUninterpretedCallee => return Some(rep),
             DiffMode::NotRun => {
                 let floor = rep
                     .notes
@@ -2149,6 +2169,37 @@ pub(crate) fn compare_entries(
                     if tracing::enabled!(tracing::Level::DEBUG) {
                         aggregate_name_split_probe(thir_module, oracle, t, ot, MAX_STRUCT_DEPTH);
                     }
+                    // Trust (B5 stage 1b, reads): a `Ty::Ptr` LEAF is sampled as `NullPtr` —
+                    // a placeholder, not a value — so it needs the two-sided never-read proof
+                    // its top-level twin gets at `param_never_read` below. Without it, a leaf
+                    // the ORACLE reborrows (`Inst::Borrow`, null-checked by the interpreter)
+                    // and the PRODUCER merely returns manufactures a divergence about an
+                    // input no Rust caller can pass: measured, 7 rows on the first read-side
+                    // coroutine sweep (`async fn f(&self) -> &A { self }`, built MIR
+                    // `_0 = &(*_3)`). Refused = NotRun with its own note, never a verdict.
+                    match (
+                        aggregate_ptr_leaf_is_read(thir_fn, i),
+                        aggregate_ptr_leaf_is_read(oracle_fn, i),
+                    ) {
+                        (Ok(false), Ok(false)) => {}
+                        (Ok(true), _) | (_, Ok(true)) => {
+                            report.mode = DiffMode::NotRun;
+                            report.notes.push(format!(
+                                "ptr-leaf-read: aggregate param {i} ({t}) has a pointer leaf that \
+                                 is READ (dereferenced/reborrowed/passed) on at least one side — \
+                                 opaque null sampling refused (coverage-only skip)"
+                            ));
+                            return report;
+                        }
+                        (Err(e), _) | (_, Err(e)) => {
+                            report.mode = DiffMode::NotRun;
+                            report.notes.push(format!(
+                                "ptr-leaf-read probe failed for aggregate param {i}: {e} \
+                                 (coverage-only skip)"
+                            ));
+                            return report;
+                        }
+                    }
                     aggregate_tags.extend(lanes);
                     classes.push(ParamClass::Struct);
                     continue;
@@ -2282,6 +2333,30 @@ pub(crate) fn compare_entries(
             // the 7 tuple-vs-struct divergences of the waveYDCH baseline are
             // gone). Every signature mismatch is now published as a real
             // divergence — no enum-shaped exemption remains.
+            // Trust (wave-DS, wave-full-0901b): a disagreement attributable ENTIRELY to a
+            // producer-side DEGRADED spelling — a `Ty::Unit` placeholder standing where the
+            // oracle resolves a real type (the RMW/opaque field degradation, e.g. the
+            // `NonNull<dyn Fn> { () }` chain inside `Option<Box<dyn Fn>>`) — is a
+            // comparability LIMITATION, not a semantic divergence: the producer chose an
+            // opaque spelling and the comparator cannot equate what one side declines to
+            // spell. Published on the Err channel's coverage-only skip, exactly like an
+            // unresolvable id. Asymmetric on purpose: an oracle-side Unit against a producer
+            // real type is NOT a producer degradation and stays a published divergence.
+            // Measured: the 113793 `next` signature row — the LAST wave-full-0901 divergence
+            // — printed IDENTICAL sigs (`[Ptr]->[Enum(0)]` both sides) because the
+            // disagreement was three tables deep in the degraded payload chain.
+            if sig_tys_agree_modulo_degraded_unit(&thir_module, &oracle, thir_sig, oracle_sig)
+                .unwrap_or(false)
+            {
+                report.equal = false;
+                report.mode = DiffMode::NotRun;
+                report.notes.push(
+                    "signature comparability failure (producer-degraded spelling); \
+                     coverage-only skip (fail-closed)"
+                        .to_string(),
+                );
+                return report;
+            }
             report.equal = false;
             report.mode = DiffMode::MirOracle;
             report.notes.push(format!(
@@ -2630,14 +2705,39 @@ pub(crate) fn compare_entries(
                 match returns_agree(&thir_module, &oracle, &a.returns, &b.returns) {
                     Ok(true) => {}
                     Ok(false) => {
-                        report.equal = false;
-                        report.mode = DiffMode::MirOracle;
-                        report.samples_checked = checked;
-                        report.notes.push(format!(
-                            "DIVERGENCE on input {:?}{decoded}: THIR returned {:?}, MIR oracle returned {:?}",
-                            tuple, a.returns, b.returns
-                        ));
-                        return report;
+                        // Trust (divergences D5/D6 root-fix, wave-full-0831): a disagreement
+                        // ONLY in MATERIALIZED-POINTER lanes is NOT a genuine negative
+                        // witness — `InterpretPointer { allocation, .. }` numbers are
+                        // per-execution artifacts (globals materialize lazily, first-touch
+                        // order), so two sides returning the SAME str constant can differ as
+                        // `allocation 0` vs `allocation 1` (measured twice: `action_to_str`,
+                        // `match_bool`). This is the exact SYMMETRIC completion of the
+                        // provenance TAIL GATE: that gate already degrades a would-be-GREEN
+                        // on a body that materializes module-global provenance (closing the
+                        // numbering-coincidence false-agree); this arm degrades the would-be
+                        // false-DIVERGENCE the same way. A disagreement with any
+                        // NON-pointer lane differing stays the genuine `MirOracle` witness
+                        // it always was.
+                        if disagreement_only_in_materialized_ptrs(&a.returns, &b.returns) {
+                            if return_comparability_gap.is_none() {
+                                return_comparability_gap = Some((
+                                    tuple.clone(),
+                                    "materialized-pointer identity across independently-\
+                                     numbered executions is not adjudicable (allocation ids \
+                                     are per-execution artifacts)"
+                                        .to_string(),
+                                ));
+                            }
+                        } else {
+                            report.equal = false;
+                            report.mode = DiffMode::MirOracle;
+                            report.samples_checked = checked;
+                            report.notes.push(format!(
+                                "DIVERGENCE on input {:?}{decoded}: THIR returned {:?}, MIR oracle returned {:?}",
+                                tuple, a.returns, b.returns
+                            ));
+                            return report;
+                        }
                     }
                     Err(why) => {
                         if return_comparability_gap.is_none() {
@@ -2847,6 +2947,111 @@ const TY_CMP_DEPTH: u32 = 32;
 /// Trust: STRUCTURAL signature agreement across two independently-numbered modules (see the
 /// step-(5) comment). `Ok(false)` is a genuine interface divergence; `Err` is a comparability
 /// failure (unresolvable id / unmodeled table-indexed shape / depth) — always fail-closed.
+/// Trust (wave-DS): does the signature agree once a PRODUCER-side `Ty::Unit` is allowed to
+/// stand for anything? The tolerance is asymmetric — `a` is the producer, and only ITS Unit
+/// placeholders are a known degradation; every other pair must agree exactly as `tys_agree`
+/// demands. Used ONLY to reclassify an `Ok(false)` from the strict walk into the Err-channel
+/// comparability skip; it can never turn a disagreement into `Agreed`.
+fn sig_tys_agree_modulo_degraded_unit(
+    am: &Module,
+    bm: &Module,
+    a: &FuncTy,
+    b: &FuncTy,
+) -> Result<bool, String> {
+    if a.is_vararg != b.is_vararg
+        || a.params.len() != b.params.len()
+        || a.returns.len() != b.returns.len()
+    {
+        return Ok(false);
+    }
+    for (x, y) in a.params.iter().zip(&b.params).chain(a.returns.iter().zip(&b.returns)) {
+        if !tys_agree_modulo_degraded_unit(am, bm, x, y, 64)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Trust (wave-DS): the recursive walk behind [`sig_tys_agree_modulo_degraded_unit`] — the
+/// strict `tys_agree` shape with ONE extra arm: a producer-side `Ty::Unit` matches anything.
+fn tys_agree_modulo_degraded_unit(
+    am: &Module,
+    bm: &Module,
+    a: &Ty,
+    b: &Ty,
+    depth: u32,
+) -> Result<bool, String> {
+    if depth == 0 {
+        return Err("type nesting exceeds comparison depth (possible recursive def)".to_string());
+    }
+    match (a, b) {
+        (Ty::Unit, _) => Ok(true),
+        (Ty::Struct(x), Ty::Struct(y)) => {
+            let dx = am
+                .struct_def(*x)
+                .ok_or_else(|| format!("THIR-side struct id {} unresolvable", x.index()))?;
+            let dy = bm
+                .struct_def(*y)
+                .ok_or_else(|| format!("oracle-side struct id {} unresolvable", y.index()))?;
+            if dx.fields.len() != dy.fields.len() {
+                return Ok(false);
+            }
+            for (fx, fy) in dx.fields.iter().zip(&dy.fields) {
+                if !tys_agree_modulo_degraded_unit(am, bm, &fx.ty, &fy.ty, depth - 1)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        (Ty::Enum(x), Ty::Enum(y)) => {
+            let dx = am
+                .enum_def(*x)
+                .ok_or_else(|| format!("THIR-side enum id {} unresolvable", x.index()))?;
+            let dy = bm
+                .enum_def(*y)
+                .ok_or_else(|| format!("oracle-side enum id {} unresolvable", y.index()))?;
+            if dx.variants.len() != dy.variants.len() {
+                return Ok(false);
+            }
+            for (vx, vy) in dx.variants.iter().zip(&dy.variants) {
+                if vx.fields.len() != vy.fields.len() {
+                    return Ok(false);
+                }
+                for (fx, fy) in vx.fields.iter().zip(&vy.fields) {
+                    if !tys_agree_modulo_degraded_unit(am, bm, fx, fy, depth - 1)? {
+                        return Ok(false);
+                    }
+                }
+            }
+            // The strict walk's discriminant rule verbatim — a discriminant mismatch has no
+            // degradation story and must never be reclassified. The LAYOUT-descriptor rule is
+            // deliberately omitted: presence differences ARE the degradation this walk
+            // tolerates (the producer strips a descriptor its degraded chain cannot support).
+            match (dx.effective_discriminants(), dy.effective_discriminants()) {
+                (Some(ex), Some(ey)) if ex == ey => {}
+                _ => return Ok(false),
+            }
+            Ok(true)
+        }
+        (Ty::Tuple(xs), Ty::Tuple(ys)) => {
+            if xs.len() != ys.len() {
+                return Ok(false);
+            }
+            for (x, y) in xs.iter().zip(ys) {
+                if !tys_agree_modulo_degraded_unit(am, bm, x, y, depth - 1)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        // Every remaining pair — scalars, pointers, fat pointers, arrays, vectors, funcs —
+        // defers to the STRICT walk verbatim: the tolerance exists for the one degradation
+        // the producer actually performs, and widening it beyond `Ty::Unit` placeholders
+        // would erode the divergence channel this reclass exists to protect.
+        _ => tys_agree(am, bm, a, b, depth),
+    }
+}
+
 fn sig_tys_agree(am: &Module, bm: &Module, a: &FuncTy, b: &FuncTy) -> Result<bool, String> {
     if a.is_vararg != b.is_vararg || a.params.len() != b.params.len() {
         return Ok(false);
@@ -3226,6 +3431,38 @@ fn returns_agree(
     b: &[InterpretValue],
 ) -> Result<bool, String> {
     values_agree_list(am, bm, a, b, TY_CMP_DEPTH)
+}
+
+/// Trust (divergences D5/D6): does this returned-value disagreement consist ONLY of
+/// materialized-pointer lanes — every position either equal in kind, or a `Ptr(_)`-vs-`Ptr(_)`
+/// pair (directly, or as the DATA lane of two `FatPtr`s whose metadata lanes agree)? Such a
+/// disagreement is an allocation-numbering artifact, not a witness — see the mint-site
+/// comment. Any structural mismatch (length, kind class, differing metadata) answers `false`
+/// and the genuine divergence publishes.
+fn disagreement_only_in_materialized_ptrs(xs: &[InterpretValue], ys: &[InterpretValue]) -> bool {
+    if xs.len() != ys.len() {
+        return false;
+    }
+    let mut any_ptr_pair = false;
+    for (x, y) in xs.iter().zip(ys) {
+        if x.kind == y.kind {
+            continue;
+        }
+        match (&x.kind, &y.kind) {
+            (InterpretValueKind::Ptr(_), InterpretValueKind::Ptr(_)) => any_ptr_pair = true,
+            (
+                InterpretValueKind::FatPtr { data: dx, metadata: mx },
+                InterpretValueKind::FatPtr { data: dy, metadata: my },
+            ) if matches!(dx.kind, InterpretValueKind::Ptr(_))
+                && matches!(dy.kind, InterpretValueKind::Ptr(_))
+                && mx.kind == my.kind =>
+            {
+                any_ptr_pair = true;
+            }
+            _ => return false,
+        }
+    }
+    any_ptr_pair
 }
 
 fn values_agree_list(
@@ -4082,6 +4319,25 @@ fn nodes_using<'f>(func: &'f Function, vid: ValueId) -> Vec<&'f InstrNode> {
 /// signature instead of minting a verdict. Pinned by
 /// `array_lane_seed_substitutes_but_sig_quarantine_holds` (the rewritten slice-11 pin).
 fn zero_const(module: &Module, ty: &Ty) -> Option<Constant> {
+    // Trust (wave-UC hardening): a DEPTH BUDGET, because a SELF-REFERENTIAL StructDef —
+    // a struct whose field type reaches its own StructId through the module's type
+    // tables — made the recursion below UNBOUNDED, and the cost was not a wrong answer
+    // but a SIGBUS: the whole compile died by stack overflow, which the sweep records
+    // as `flag_induced_fail` with an EMPTY ice signature (measured: 53 files, cycle
+    // `zero_const -> FieldDef map -> zero_const`, period 5, on
+    // tests/ui/array-slice-vec/destructure-array-1.rs among others, the moment wave-UC
+    // let more unit-typed bodies reach sampling). Exhausting the budget answers `None`
+    // — the same fail-closed "this type has no seedable zero" every other arm uses —
+    // so the body is sampling-refused instead of the process dying. 64 matches the
+    // producer's `ADT_VISIT_FUEL` doctrine; no legitimately seedable type in the
+    // corpus nests anywhere near it.
+    zero_const_depth(module, ty, 64)
+}
+
+fn zero_const_depth(module: &Module, ty: &Ty, fuel: u32) -> Option<Constant> {
+    let Some(fuel) = fuel.checked_sub(1) else {
+        return None;
+    };
     match ty {
         Ty::I8
         | Ty::I16
@@ -4107,14 +4363,14 @@ fn zero_const(module: &Module, ty: &Ty) -> Option<Constant> {
         Ty::Unit => Some(Constant::PhantomData),
         Ty::Tuple(elems) => elems
             .iter()
-            .map(|t| zero_const(module, t))
+            .map(|t| zero_const_depth(module, t, fuel))
             .collect::<Option<Vec<_>>>()
             .map(Constant::Aggregate),
         Ty::Struct(id) => module
             .struct_def(*id)?
             .fields
             .iter()
-            .map(|f| zero_const(module, &f.ty))
+            .map(|f| zero_const_depth(module, &f.ty, fuel))
             .collect::<Option<Vec<_>>>()
             .map(Constant::Aggregate),
         // Trust (vtable slice 12): the Array zero — elem resolved through this module's own
@@ -4125,7 +4381,7 @@ fn zero_const(module: &Module, ty: &Ty) -> Option<Constant> {
         // `undef_is_dead_seed` exact rather than a zero "choice".
         Ty::Array(id, n) => {
             let elem = module.ty(*id)?;
-            let z = zero_const(module, elem)?;
+            let z = zero_const_depth(module, elem, fuel)?;
             Some(Constant::Array(vec![z; *n as usize]))
         }
         // Trust (B3-1b E5): a first-class enum zero-seeds as VARIANT 0 at its
@@ -4139,7 +4395,7 @@ fn zero_const(module: &Module, ty: &Ty) -> Option<Constant> {
             let (disc, variant) = (discs.first()?, def.variants.first()?);
             let mut elems = vec![Constant::Int(*disc)];
             for fty in &variant.fields {
-                elems.push(zero_const(module, fty)?);
+                elems.push(zero_const_depth(module, fty, fuel)?);
             }
             Some(Constant::Aggregate(elems))
         }
@@ -4909,7 +5165,7 @@ fn is_thir_defect(c: InterpretErrorCode) -> bool {
 /// and the return comparison is BIT equality on the IEEE pattern — deterministic on both sides
 /// because the same interpreter executes both modules (NaN payloads included). f16 stays out
 /// (interpreter-refused: "requires an explicit half-precision codec").
-fn is_interpretable_scalar(t: &Ty) -> bool {
+pub(crate) fn is_interpretable_scalar(t: &Ty) -> bool {
     matches!(
         t,
         Ty::Bool
@@ -5882,7 +6138,7 @@ fn build_side_args(
     Ok(args)
 }
 
-fn sample_values(t: &Ty) -> Vec<i128> {
+pub(crate) fn sample_values(t: &Ty) -> Vec<i128> {
     // Trust (B2): the aggregate ptr-leaf pool, and it is a SINGLETON on purpose. `build_arg`
     // turns the raw into `InterpretValueKind::NullPtr` regardless of its value, so a second
     // entry would buy nothing; and the singleton is what makes `aggregate_leaf_tys`' third
@@ -6035,6 +6291,130 @@ fn param_never_read(func: &Function, index: usize) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Trust (B5 stage 1b, reads): the aggregate-LEAF twin of [`param_never_read`], for the one
+/// leaf class whose sample is a placeholder rather than a value — a `Ty::Ptr` leaf, minted as
+/// `NullPtr` on both sides (the premise `aggregate_leaf_tys` argues from). That premise argues
+/// three uses: never extracted (inert), extracted and returned/compared/cast (same input, same
+/// observable), and dereferenced (both sides trap). It was measured wrong on a fourth: a
+/// REBORROW. The oracle spells built MIR's `_0 = &(*_3)` — the return of a captured `&self`
+/// from an `async fn` — as `Inst::Borrow`, which the interpreter null-checks (UB), while the
+/// producer's thin reborrow is the pointer value itself; seven manufactured divergences on the
+/// first read-side coroutine sweep, every one this shape.
+///
+/// So a `Ptr` leaf reached from entry param `index` — through any `ExtractField`/`Copy` chain
+/// rooted at the param, after `mem2reg` has folded the bridge's spill-and-reload of the param
+/// slot on a CLONE — may be used ONLY as a `Return` value, an `ICmp` operand or a `Cast`
+/// source; every other use (`Borrow`, `Load`, `Store`, `GEP`, a call/branch argument, ...) is a
+/// READ, and the caller then refuses to sample the aggregate at all, on either side. Same
+/// `rewrite_inst` sentinel probe as `param_never_read`, so a new `Inst` variant carrying an
+/// operand cannot slip past the scan. An aggregate with no `Ptr` leaf is never read (`false`).
+fn aggregate_ptr_leaf_is_read(func: &Function, index: usize) -> Result<bool, String> {
+    let mut func = func.clone();
+    let _ = trust_ir::mem2reg::promote_allocas_function(&mut func);
+    let entry = func.block(func.entry).ok_or_else(|| "missing entry block".to_string())?;
+    let (vid, _) =
+        entry.params.get(index).ok_or_else(|| format!("entry block has no param {index}"))?;
+    let mut derived: Vec<ValueId> = vec![*vid];
+    let mut ptr_leaves: Vec<ValueId> = Vec::new();
+    loop {
+        let mut changed = false;
+        for blk in &func.blocks {
+            for node in &blk.body {
+                // Trust (F1 sampler question, REFUSES MORE — the wave-B1 rev1 divergence's
+                // root fix): a derived aggregate value STORED to memory is transported where
+                // this walk cannot follow — the oracle side extracts fields as GEP+Load when
+                // mem2reg leaves the aggregate slot unpromoted, so its ptr leaves are Load
+                // results this ExtractField/Copy chase never finds, `ptr_leaves` stays empty,
+                // and "not read" is VACUOUS. Measured: a null-sampled ref lane then reached a
+                // Borrow and the oracle trapped while the THIR side completed
+                // (implied-bounds-closure-arg-outlives::{closure#0}). Memory transport ⇒
+                // conservatively READ ⇒ the sampler refuses the body (coverage-only skip).
+                if let Inst::Store { value, .. } = &node.inst {
+                    if derived.contains(value) || ptr_leaves.contains(value) {
+                        return Ok(true);
+                    }
+                }
+                // Trust (divergence D3 root-fix, wave-full-0831 — REFUSES MORE, the same
+                // vacuity as the Store conjunct one transport over): a derived aggregate or
+                // leaf passed as a CALL ARGUMENT (`<Self>::bar(self)`) is transported where
+                // this walk cannot follow — the CALLEE (or the oracle's spelling of the
+                // call) may dereference the field, and "not read" is VACUOUS again.
+                // Measured: a null-sampled ref FIELD of a by-value self reached the
+                // oracle's borrow-validity trap at ITS call lowering while the THIR side
+                // returned the null (ufcs-self-method-in-method-body::foo, one of the six
+                // wave-full-0831 divergences). Call transport ⇒ conservatively READ ⇒ the
+                // sampler refuses the body (coverage-only skip; the fail-closed direction).
+                //
+                // RETURN transport is deliberately NOT a read — the pinned
+                // `aggregate_ptr_leaf_that_is_only_returned_is_not_read` codifies why: a
+                // returned value is COMPARED AS A VALUE on both sides (null == null),
+                // nothing dereferences it, and refusing it would kill every pass-through
+                // body's sampling for no soundness gain (measured: 6 pinned tests red
+                // under the wider first cut of this conjunct).
+                if let Inst::Call { args, .. } = &node.inst {
+                    if args.iter().any(|a| derived.contains(a) || ptr_leaves.contains(a)) {
+                        return Ok(true);
+                    }
+                }
+                let (src, is_ptr) = match &node.inst {
+                    Inst::ExtractField { ty, aggregate, .. } => (*aggregate, matches!(ty, Ty::Ptr)),
+                    Inst::Copy { ty, operand } => (*operand, matches!(ty, Ty::Ptr)),
+                    _ => continue,
+                };
+                let from_leaf = ptr_leaves.contains(&src);
+                if !from_leaf && !derived.contains(&src) {
+                    continue;
+                }
+                for r in &node.results {
+                    if is_ptr || from_leaf {
+                        if !ptr_leaves.contains(r) {
+                            ptr_leaves.push(*r);
+                            changed = true;
+                        }
+                    } else if !derived.contains(r) {
+                        derived.push(*r);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if ptr_leaves.is_empty() {
+        return Ok(false);
+    }
+    let max_id = func.max_value_id();
+    if max_id == u32::MAX {
+        return Err("value id space exhausted (no probe sentinel)".to_string());
+    }
+    let sentinel = ValueId::new(max_id + 1);
+    for leaf in ptr_leaves {
+        let map: HashMap<ValueId, ValueId> = std::iter::once((leaf, sentinel)).collect();
+        for blk in &func.blocks {
+            for node in &blk.body {
+                if matches!(node.inst, Inst::Return { .. } | Inst::ICmp { .. } | Inst::Cast { .. })
+                {
+                    continue;
+                }
+                // The leaf's own definition (`ExtractField`/`Copy` RESULT) is not an operand
+                // use; a `Copy` that forwards it was folded into `ptr_leaves` above.
+                if let Inst::Copy { operand, .. } = &node.inst {
+                    if *operand == leaf {
+                        continue;
+                    }
+                }
+                let mut probe = node.inst.clone();
+                trust_ir::mem2reg::rewrite_inst(&mut probe, &map);
+                if probe != node.inst {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
 /// Trust (Q1): recover the REFERENT TYPE of a pointer parameter from the body.
 ///
 /// `Ty::Ptr` is opaque — a signature never names what it points at — so a read pointer param has
@@ -6534,15 +6914,12 @@ fn build_pointee_wrapper(
     let mut out = module.clone();
     let ty_id = out.add_func_type(wrapper_sig.clone());
     // The wrapper's id must be PROVABLY ABSENT from this module, and `functions.len()` does not
-    // establish that. A `FuncId` in this producer IS a rustc `DefIndex`
-    // (`admit_callee_inner`'s `FuncId::new(def_id.index.as_u32())`), so the id space is SPARSE:
-    // a module holding the body at 0 and one callee at DefIndex 2 has `len() == 2`, and a wrapper
-    // minted at 2 would collide — `function_by_id(2)` resolves index-first and would hand the
-    // callee's own `Inst::Call` to the WRAPPER instead, i.e. silent infinite recursion or a call
-    // to the wrong program object. This is the same requirement the fn-ptr adapter band states
-    // ("the id must be provably ABSENT from the callee ledger"); one past the maximum satisfies
-    // it without reserving anything, and `checked_add` fails the lane CLOSED at the top of the
-    // space rather than wrapping into the adapter band.
+    // establish that for an arbitrary Trust-IR input. Current producer modules are dense after
+    // assembly, but this helper also operates on independently supplied modules, whose ids may be
+    // sparse: a module holding the body at 0 and one callee at 2 has `len() == 2`, and a wrapper
+    // minted at 2 would collide — `function_by_id(2)` resolves index-first and could dispatch the
+    // callee's own call to the wrapper. One past the observed maximum is absent for both dense and
+    // sparse modules; `checked_add` fails the lane closed at the top of the id space.
     let func_id = FuncId::new(match out.functions.iter().map(|f| f.id.index()).max() {
         Some(max) => max.checked_add(1)?,
         None => 0,
@@ -12920,13 +13297,13 @@ mod tests {
         assert!(wrapped.func_type(f.ty).is_some(), "wrapper signature must be registered");
     }
 
-    /// The wrapper's id must be PROVABLY ABSENT, and `functions.len()` does not establish that.
-    /// A `FuncId` in this producer is a rustc `DefIndex`, so the id space is SPARSE: this is the
-    /// exact collision shape — body at 0, one callee at 2, `len() == 2`. A wrapper minted at
-    /// `len()` would take the callee's id, and `function_by_id` resolves index-first, so the
-    /// callee's own call would dispatch to the wrapper.
+    /// The wrapper's id must be PROVABLY ABSENT, and `functions.len()` does not establish that
+    /// for a generic Trust-IR module. This is the exact sparse-input collision shape — body at 0,
+    /// one callee at 2, `len() == 2`. A wrapper minted at `len()` would take the callee's id, and
+    /// `function_by_id` resolves index-first, so the callee's own call could dispatch to the
+    /// wrapper.
     #[test]
-    fn wrapper_id_does_not_collide_in_a_sparse_id_space() {
+    fn wrapper_id_does_not_collide_in_a_sparse_input_module() {
         let mut module = Module::new("m");
         let entry = q1_deref_entry(&mut module);
         let csig =
@@ -13546,5 +13923,113 @@ mod tests {
             .execute_func(wrapper, vec![value.clone()])
             .expect("wrapper executes an aggregate referent");
         assert_eq!(out.returns, vec![value]);
+    }
+    /// Trust (B5 stage 1b, reads): the aggregate ptr-leaf never-read proof, on the four shapes
+    /// its doc argues — inert/returned leaf (not read), reborrowed leaf (read: the oracle's
+    /// `Inst::Borrow`, the measured divergence shape), loaded leaf (read), and a leaf reached
+    /// through a nested aggregate and a `Copy` (read).
+    fn ptr_leaf_module(use_leaf: impl FnOnce(&mut Block, ValueId)) -> Module {
+        use trust_ir::{FieldDef, StructDef, StructRepr};
+        let v = ValueId::new;
+        let mut module = Module::new("ptr_leaf".to_string());
+        let inner = module.add_struct(StructDef {
+            id: trust_ir::StructId::new(0),
+            name: "inner".into(),
+            fields: vec![FieldDef { name: "p".into(), ty: Ty::Ptr, offset: None }],
+            size: None,
+            align: None,
+            repr: StructRepr::Rust,
+        });
+        let outer = module.add_struct(StructDef {
+            id: trust_ir::StructId::new(1),
+            name: "outer".into(),
+            fields: vec![
+                FieldDef { name: "n".into(), ty: Ty::I32, offset: None },
+                FieldDef { name: "i".into(), ty: Ty::Struct(inner), offset: None },
+            ],
+            size: None,
+            align: None,
+            repr: StructRepr::Rust,
+        });
+        let sig = module.add_func_type(FuncTy {
+            params: vec![Ty::Struct(outer)],
+            returns: vec![Ty::Ptr],
+            is_vararg: false,
+        });
+        let mut function =
+            Function::new(FuncId::new(0), "ptr_leaf", sig, trust_ir::BlockId::new(0));
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.params.push((v(0), Ty::Struct(outer)));
+        block.body.push(
+            InstrNode::new(Inst::ExtractField {
+                ty: Ty::Struct(inner),
+                aggregate: v(0),
+                field: 1,
+            })
+            .with_result(v(1)),
+        );
+        block.body.push(
+            InstrNode::new(Inst::ExtractField { ty: Ty::Ptr, aggregate: v(1), field: 0 })
+                .with_result(v(2)),
+        );
+        block.body.push(
+            InstrNode::new(Inst::Copy { ty: Ty::Ptr, operand: v(2) }).with_result(v(3)),
+        );
+        use_leaf(&mut block, v(3));
+        function.blocks.push(block);
+        module.add_function(function);
+        module
+    }
+
+    #[test]
+    fn aggregate_ptr_leaf_that_is_only_returned_is_not_read() {
+        let module = ptr_leaf_module(|block, leaf| {
+            block.body.push(InstrNode::new(Inst::Return { values: vec![leaf] }));
+        });
+        assert_eq!(aggregate_ptr_leaf_is_read(&module.functions[0], 0), Ok(false));
+    }
+
+    #[test]
+    fn aggregate_ptr_leaf_that_is_reborrowed_is_read() {
+        let module = ptr_leaf_module(|block, leaf| {
+            block.body.push(InstrNode::new(Inst::Borrow { ptr: leaf }).with_result(ValueId::new(9)));
+            block.body.push(InstrNode::new(Inst::Return { values: vec![ValueId::new(9)] }));
+        });
+        assert_eq!(aggregate_ptr_leaf_is_read(&module.functions[0], 0), Ok(true));
+    }
+
+    #[test]
+    fn aggregate_ptr_leaf_that_is_loaded_through_is_read() {
+        let module = ptr_leaf_module(|block, leaf| {
+            block.body.push(
+                InstrNode::new(Inst::Load { ty: Ty::I32, ptr: leaf, volatile: false, align: None })
+                    .with_result(ValueId::new(9)),
+            );
+            block.body.push(InstrNode::new(Inst::Return { values: vec![leaf] }));
+        });
+        assert_eq!(aggregate_ptr_leaf_is_read(&module.functions[0], 0), Ok(true));
+    }
+
+    #[test]
+    fn aggregate_without_a_ptr_leaf_is_never_read() {
+        let v = ValueId::new;
+        let mut block = Block::new(trust_ir::BlockId::new(0));
+        block.params.push((v(0), Ty::Tuple(vec![Ty::I32, Ty::I32])));
+        block.body.push(
+            InstrNode::new(Inst::ExtractField { ty: Ty::I32, aggregate: v(0), field: 0 })
+                .with_result(v(1)),
+        );
+        block.body.push(
+            InstrNode::new(Inst::Load { ty: Ty::I32, ptr: v(1), volatile: false, align: None })
+                .with_result(v(2)),
+        );
+        block.body.push(InstrNode::new(Inst::Return { values: vec![v(2)] }));
+        let module = single_block_module(
+            "no_ptr_leaf",
+            vec![Ty::Tuple(vec![Ty::I32, Ty::I32])],
+            vec![Ty::I32],
+            block,
+        );
+        assert_eq!(aggregate_ptr_leaf_is_read(&module.functions[0], 0), Ok(false));
     }
 }

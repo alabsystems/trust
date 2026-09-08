@@ -1,0 +1,182 @@
+{
+  "name": "cttz_u32_eight_is_3",
+  "def_path": "fx::cttz_u32_eight_is_3",
+  "span": {
+    "file": "fx.rs",
+    "line_start": 4,
+    "col_start": 0,
+    "line_end": 9,
+    "col_end": 1
+  },
+  "body": {
+    "locals": [
+      {
+        "index": 0,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": null
+      },
+      {
+        "index": 1,
+        "ty": {
+          "Int": {
+            "width": 32,
+            "signed": false
+          }
+        },
+        "name": "x"
+      }
+    ],
+    "blocks": [
+      {
+        "id": 0,
+        "stmts": [],
+        "terminator": {
+          "Call": {
+            "func": "@trust-rustc-intrinsic::core::intrinsics::cttz::<u32>",
+            "args": [
+              {
+                "Copy": {
+                  "local": 1,
+                  "projections": []
+                }
+              }
+            ],
+            "dest": {
+              "local": 0,
+              "projections": []
+            },
+            "target": 1,
+            "span": {
+              "file": "fx.rs",
+              "line_start": 8,
+              "col_start": 4,
+              "line_end": 8,
+              "col_end": 4
+            },
+            "atomic": null,
+            "is_foreign": false,
+            "is_unsafe_sig": false,
+            "callee_identity": {
+              "stable_crate_id": 12319311931140531292,
+              "def_index": 2133,
+              "substs_digest": [
+                12295953916534365648,
+                15423895294860648131
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 1,
+        "stmts": [],
+        "terminator": "Return"
+      }
+    ],
+    "arg_count": 1,
+    "return_ty": {
+      "Int": {
+        "width": 32,
+        "signed": false
+      }
+    }
+  },
+  "contracts": [
+    {
+      "kind": "Requires",
+      "span": {
+        "file": "fx.rs",
+        "line_start": 5,
+        "col_start": 13,
+        "line_end": 5,
+        "col_end": 19
+      },
+      "body": "__trust_lowered_compiler_contract__:x == 8"
+    },
+    {
+      "kind": "Ensures",
+      "span": {
+        "file": "fx.rs",
+        "line_start": 6,
+        "col_start": 12,
+        "line_end": 6,
+        "col_end": 23
+      },
+      "body": "__trust_lowered_compiler_contract__:(result) == (3)"
+    }
+  ],
+  "preconditions": [
+    {
+      "Eq": [
+        {
+          "Var": [
+            "x",
+            "Int"
+          ]
+        },
+        {
+          "Int": 8
+        }
+      ]
+    },
+    {
+      "And": [
+        {
+          "Ge": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 0
+            }
+          ]
+        },
+        {
+          "Le": [
+            {
+              "Var": [
+                "x",
+                "Int"
+              ]
+            },
+            {
+              "Int": 4294967295
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "postconditions": [
+    {
+      "Eq": [
+        {
+          "Var": [
+            "_0",
+            "Int"
+          ]
+        },
+        {
+          "Int": 3
+        }
+      ]
+    }
+  ],
+  "spec": {
+    "requires": [
+      "x == 8"
+    ],
+    "ensures": [
+      "(result) == (3)"
+    ],
+    "invariants": []
+  }
+}

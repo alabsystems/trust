@@ -61,6 +61,9 @@ trust-clean-origin = { workspace = true }
 # Trust: the Clean -> TrustIR producer. Consumes the SAME sealed CleanOriginPlan
 # `clean_origin_mir` emits MIR from, so the two languages meet in TrustIR.
 trust-clean-ir = { workspace = true }
+# Trust: independent reflector/gate over the actual emitted TrustIR Function.
+# A targeted WrappingBinOp disagreement is fatal before the record can escape.
+trust-clean-ir-gate = { workspace = true }
 trust-ir = { workspace = true, features = ["serde"] }
 trust-ir-bridge = { workspace = true, features = ["compiler-context"] }
 trust-mir-extract = { workspace = true }

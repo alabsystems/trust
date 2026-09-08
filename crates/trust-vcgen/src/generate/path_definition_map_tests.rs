@@ -181,7 +181,7 @@ fn checked_assert_with_cleanup(cleanup: BlockId) -> VerifiableFunction {
 }
 
 fn option_u64_ty() -> Ty {
-    Ty::Adt {
+    Ty::Adt { arbitrary_precision: None,
         adt_kind: None,
         layout: None,
         name: "core::option::Option".into(),
@@ -1887,7 +1887,7 @@ fn semantic_guard_map_keeps_block_def_when_operand_live() {
 }
 
 /// bb0: `x = 3; r = &mut x; [r = &mut x;] *r = 4e9; goto bb1`. With `reseat`,
-/// the SECOND `&mut x` makes `unique_whole_local_def(r)=None` so `*r=4e9` names
+/// the SECOND `&mut x` makes `crate::local_defs::unique_value_def(r)=None` so `*r=4e9` names
 /// the opaque `r*` (NOT `x`) — and `extract_block_definitions` still emits the
 /// stale `Eq(x, 3)`, which `build_semantic_guard_map` threads to bb1 raw.
 fn sem_reseat_havoc_fn(reseat: bool) -> VerifiableFunction {
@@ -2614,9 +2614,7 @@ fn kill_oracle_covers_whole_local_store() {
 fn kill_oracle_covers_set_discriminant() {
     let x = LocalDecl {
         index: 1,
-        ty: Ty::Adt {
-            adt_kind: None,
-            layout: None,
+        ty: Ty::Adt { arbitrary_precision: None, adt_kind: None, layout: None, 
             variants: Vec::new(),
             name: "E".into(),
             fields: vec![("__tag".into(), Ty::i64())],
@@ -2827,8 +2825,14 @@ fn kill_oracle_channel_coverage_report() {
     );
     // Adjudicated states (each `false` is backstopped by a separate fail-closed
     // gate, so no stale-fact false-PROOF results; each `true` is a locked kill):
-    //   - deinit (false): `Statement::Deinit` does not appear in current rustc
-    //                     MIR (trust-types marks it fail-closed if it ever does).
+    //   - deinit (TRUE, locked 2026-08-30 — dropped-def write-visibility fix):
+    //                     `extend_with_assigned_place_dests` puts every explicit
+    //                     place destination (Assign / SetDiscriminant / Deinit)
+    //                     into the gen-sets, so a `Deinit{x}` now kills facts
+    //                     about `x` directly instead of relying only on the
+    //                     trust-types fail-closed marker. A flip to `true` is
+    //                     the precision/soundness gain this sentinel's own
+    //                     adjudication says to lock.
     //   - drop_term (TRUE, locked — callee-write false-accept sweep): the OLD
     //                     adjudication ("a custom Drop mutates only through
     //                     `&mut self`, whose `&mut x` escape the mutable-borrow
@@ -2853,7 +2857,7 @@ fn kill_oracle_channel_coverage_report() {
     // precision/soundness gain to lock; a flip whose backstop also weakens is a
     // hole to fix.
     assert!(
-        !deinit && drop_term && !opaque && !intrinsic,
+        deinit && drop_term && !opaque && !intrinsic,
         "a residual kill-channel changed coverage; re-adjudicate the backstop \
          before locking: deinit={deinit} drop={drop_term} opaque={opaque} intrinsic={intrinsic}"
     );
@@ -3846,7 +3850,7 @@ fn two_field_store_fn(kind: Option<trust_types::AdtKind>) -> VerifiableFunction 
             layout,
             enum_layout,
             ..
-        } => Ty::Adt {
+        } => Ty::Adt { arbitrary_precision: None,
             name,
             fields,
             variants,
